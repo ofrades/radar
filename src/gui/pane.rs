@@ -57,6 +57,14 @@ pub struct Pane {
     #[cfg(feature = "vte")]
     terminal: Option<vte4::Terminal>,
     command: String,
+    /// This pane's font zoom, 1.0 = the theme's size. Ctrl+= and Ctrl+-
+    /// change it, Ctrl+0 resets it, and a theme reload keeps it.
+    #[cfg(feature = "vte")]
+    font_scale: std::rc::Rc<std::cell::Cell<f64>>,
+    /// Family and unscaled size as the last theme application left them, so
+    /// a zoom can rebuild the font without a theme in hand.
+    #[cfg(feature = "vte")]
+    base_font: std::rc::Rc<std::cell::RefCell<(String, f64)>>,
 }
 
 impl Pane {
@@ -82,10 +90,15 @@ impl Pane {
     }
 
     /// Apply a freshly loaded theme (used when omarchy switches themes).
+    ///
+    /// The pane's zoom survives the reload: the new size becomes the base and
+    /// the existing scale is applied on top of it.
     pub fn apply_theme(&self, theme: &Theme) {
         #[cfg(feature = "vte")]
         if let Some(terminal) = &self.terminal {
             apply_terminal_theme(terminal, theme);
+            *self.base_font.borrow_mut() = (theme.font_family.clone(), theme.font_size);
+            apply_scaled_font(terminal, &self.base_font, self.font_scale.get());
         }
         #[cfg(not(feature = "vte"))]
         {
@@ -121,7 +134,17 @@ impl Pane {
         shift_enter: ShiftEnter,
     ) -> Pane {
         let terminal = vte4::Terminal::new();
+        // The pane's own zoom state: 1.0 until Ctrl+= / Ctrl+- touch it. The
+        // base font is remembered so zoom can rebuild the font later without
+        // a theme, and so a theme reload re-applies the zoom on top of the
+        // new size.
+        let font_scale = std::rc::Rc::new(std::cell::Cell::new(1.0_f64));
+        let base_font = std::rc::Rc::new(std::cell::RefCell::new((
+            theme.font_family.clone(),
+            theme.font_size,
+        )));
         apply_terminal_theme(&terminal, theme);
+        apply_scaled_font(&terminal, &base_font, font_scale.get());
         terminal.set_scrollback_lines(10_000);
         terminal.set_mouse_autohide(true);
         terminal.set_allow_hyperlink(true);
@@ -162,6 +185,8 @@ impl Pane {
         // a TUI wants: only the Ctrl+Shift combinations are intercepted.
         let keys = gtk::EventControllerKey::new();
         let terminal_for_keys = terminal.clone();
+        let base_font_for_keys = base_font.clone();
+        let scale_for_keys = font_scale.clone();
         keys.connect_key_pressed(move |_, key, _, modifiers| {
             let copy = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
                 && modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK)
@@ -175,6 +200,30 @@ impl Pane {
             }
             if paste {
                 terminal_for_keys.paste_clipboard();
+                return glib::Propagation::Stop;
+            }
+            // Font zoom is per pane: Ctrl+= (or Ctrl++ — on most layouts that
+            // is Ctrl+Shift+=) grows this pane's font, Ctrl+- shrinks it,
+            // Ctrl+0 puts the theme size back. Only the Ctrl combinations are
+            // intercepted, so the program still receives a bare `=`, `-` or
+            // `0`.
+            let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+            if ctrl
+                && matches!(
+                    key,
+                    gtk::gdk::Key::plus | gtk::gdk::Key::equal | gtk::gdk::Key::KP_Add
+                )
+            {
+                zoom_step(&terminal_for_keys, &base_font_for_keys, &scale_for_keys, 1.0);
+                return glib::Propagation::Stop;
+            }
+            if ctrl && matches!(key, gtk::gdk::Key::minus | gtk::gdk::Key::KP_Subtract) {
+                zoom_step(&terminal_for_keys, &base_font_for_keys, &scale_for_keys, -1.0);
+                return glib::Propagation::Stop;
+            }
+            if ctrl && matches!(key, gtk::gdk::Key::_0 | gtk::gdk::Key::KP_0) {
+                scale_for_keys.set(1.0);
+                apply_scaled_font(&terminal_for_keys, &base_font_for_keys, 1.0);
                 return glib::Propagation::Stop;
             }
             // VTE cannot report the shift itself, so a TUI that wants a newline
@@ -198,6 +247,50 @@ impl Pane {
             glib::Propagation::Proceed
         });
         terminal.add_controller(keys);
+
+        // Ctrl+scroll zooms this pane's font, like the keys do. The controller
+        // only stops the event when Ctrl is held, so ordinary scrolling still
+        // reaches VTE — scrollback, and mouse-aware programs keep their wheel.
+        let scroll = gtk::EventControllerScroll::new(
+            gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
+        );
+        // Smooth touchpad deltas arrive as fractions of a wheel notch;
+        // accumulating them means one gentle swipe is one step, not ten.
+        let wheel = std::cell::Cell::new(0.0_f64);
+        let terminal_for_scroll = terminal.clone();
+        let base_font_for_scroll = base_font.clone();
+        let scale_for_scroll = font_scale.clone();
+        scroll.connect_scroll(move |controller, _, dy| {
+            if !controller
+                .current_event_state()
+                .contains(gtk::gdk::ModifierType::CONTROL_MASK)
+            {
+                return glib::Propagation::Proceed;
+            }
+            let mut acc = (wheel.get() + dy).clamp(-1.0, 1.0);
+            // Scrolling up (a negative delta) grows the font, like every
+            // other terminal.
+            if acc <= -1.0 {
+                zoom_step(
+                    &terminal_for_scroll,
+                    &base_font_for_scroll,
+                    &scale_for_scroll,
+                    1.0,
+                );
+                acc = 0.0;
+            } else if acc >= 1.0 {
+                zoom_step(
+                    &terminal_for_scroll,
+                    &base_font_for_scroll,
+                    &scale_for_scroll,
+                    -1.0,
+                );
+                acc = 0.0;
+            }
+            wheel.set(acc);
+            glib::Propagation::Stop
+        });
+        terminal.add_controller(scroll);
 
         // Spawn on first map, not at construction. Two reasons: the pty is sized
         // from a widget that now has its real size, and tabs that are never
@@ -233,6 +326,8 @@ impl Pane {
             widget: container.upcast(),
             terminal: Some(terminal),
             command: spec.display(),
+            font_scale,
+            base_font,
         }
     }
 
@@ -441,10 +536,84 @@ pub fn spawn_external_window(spec: &CommandSpec, cwd: &Path) -> std::io::Result<
 
 #[cfg(feature = "vte")]
 fn apply_terminal_theme(terminal: &vte4::Terminal, theme: &Theme) {
-    let mut font = gtk::pango::FontDescription::new();
-    font.set_family(&theme.font_family);
-    font.set_size((theme.font_size * gtk::pango::SCALE as f64) as i32);
-    terminal.set_font(Some(&font));
+    // Colours only: the font is applied separately, scaled by each pane's
+    // own zoom.
     let palette: Vec<&gtk::gdk::RGBA> = theme.palette.iter().collect();
     terminal.set_colors(Some(&theme.foreground), Some(&theme.background), &palette);
+}
+
+/// Zoom limits, as multiples of the theme's font size.
+#[cfg(feature = "vte")]
+const MIN_FONT_SCALE: f64 = 0.25;
+#[cfg(feature = "vte")]
+const MAX_FONT_SCALE: f64 = 4.0;
+
+/// The scale after one zoom step: `direction > 0` grows the font, `< 0`
+/// shrinks it.
+///
+/// Steps are multiplicative, like every other terminal, and rounded to two
+/// decimals so zooming out as many times as in lands exactly back on 1.0.
+#[cfg(feature = "vte")]
+fn next_scale(current: f64, direction: f64) -> f64 {
+    const STEP: f64 = 1.1;
+    let factor = if direction > 0.0 { STEP } else { 1.0 / STEP };
+    ((current * factor * 100.0).round() / 100.0).clamp(MIN_FONT_SCALE, MAX_FONT_SCALE)
+}
+
+/// Apply one zoom step to a terminal: recompute the scale, then redraw.
+#[cfg(feature = "vte")]
+fn zoom_step(
+    terminal: &vte4::Terminal,
+    base_font: &std::cell::RefCell<(String, f64)>,
+    scale: &std::cell::Cell<f64>,
+    direction: f64,
+) {
+    let zoom = next_scale(scale.get(), direction);
+    scale.set(zoom);
+    apply_scaled_font(terminal, base_font, zoom);
+}
+
+/// Draw a terminal with its base font scaled by `zoom`.
+#[cfg(feature = "vte")]
+fn apply_scaled_font(
+    terminal: &vte4::Terminal,
+    base_font: &std::cell::RefCell<(String, f64)>,
+    zoom: f64,
+) {
+    let base = base_font.borrow();
+    let mut font = gtk::pango::FontDescription::new();
+    font.set_family(&base.0);
+    font.set_size((base.1 * zoom * gtk::pango::SCALE as f64) as i32);
+    terminal.set_font(Some(&font));
+}
+
+#[cfg(all(test, feature = "vte"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zoom_round_trips_back_to_the_theme_size() {
+        let mut scale = 1.0;
+        for _ in 0..7 {
+            scale = next_scale(scale, 1.0);
+        }
+        for _ in 0..7 {
+            scale = next_scale(scale, -1.0);
+        }
+        assert!((scale - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn zoom_stays_within_limits() {
+        let mut scale = 1.0;
+        for _ in 0..60 {
+            scale = next_scale(scale, 1.0);
+        }
+        assert_eq!(scale, MAX_FONT_SCALE);
+        let mut scale = 1.0;
+        for _ in 0..60 {
+            scale = next_scale(scale, -1.0);
+        }
+        assert_eq!(scale, MIN_FONT_SCALE);
+    }
 }

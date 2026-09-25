@@ -63,6 +63,9 @@ pub struct Group {
     pub members: RefCell<Vec<Slot>>,
     /// The member whose widget is showing.
     pub active: RefCell<Option<Slot>>,
+    /// The header's chips, so a drag can carry the chip that was grabbed rather
+    /// than always the active member.
+    chips: RefCell<Vec<(Slot, gtk::Button)>>,
 }
 
 impl Group {
@@ -103,6 +106,7 @@ impl Group {
             menu_button,
             members: RefCell::new(Vec::new()),
             active: RefCell::new(None),
+            chips: RefCell::new(Vec::new()),
         });
         Group::accept_drags(&group);
         group
@@ -130,9 +134,24 @@ impl Group {
             .build();
         source.set_propagation_phase(gtk::PropagationPhase::Capture);
         let group_for_drag = group.clone();
-        source.connect_prepare(move |_, _, _| {
-            let slot = group_for_drag.active_slot();
-            super::trace(&format!("drag: prepare {:?}", slot.map(|slot| slot.as_str())));
+        source.connect_prepare(move |_, x, y| {
+            // The chip under the pointer, if any: grabbing "Changes" out of an
+            // agent+changes header must drag Changes, not whatever is showing.
+            // Coordinates and chip allocations are both relative to the header.
+            let grabbed = group_for_drag.chips.borrow().iter().find_map(|(slot, chip)| {
+                let alloc = chip.allocation();
+                (x >= alloc.x() as f64
+                    && x < (alloc.x() + alloc.width()) as f64
+                    && y >= alloc.y() as f64
+                    && y < (alloc.y() + alloc.height()) as f64)
+                    .then_some(*slot)
+            });
+            let slot = grabbed.or_else(|| group_for_drag.active_slot());
+            super::trace(&format!(
+                "drag: prepare at ({x:.0},{y:.0}) grabbed={:?} active={:?}",
+                grabbed.map(|slot| slot.as_str()),
+                group_for_drag.active_slot().map(|slot| slot.as_str())
+            ));
             slot.map(|slot| gdk::ContentProvider::for_value(&slot.as_str().to_value()))
         });
         let header_for_drag = group.header.clone();
@@ -225,6 +244,12 @@ impl Group {
 
     /// Show a member's widget, adding it if this group has not seen it before.
     pub fn insert(&self, slot: Slot, widget: &gtk::Widget, activate: bool) {
+        // A primitive's widget always has a parent — its old pane's stack — and
+        // GTK refuses, silently, to add a widget that already has one. Detach it
+        // first or the pane comes up empty.
+        if widget.parent().is_some() {
+            widget.unparent();
+        }
         let name = slot.as_str();
         if self.content.child_by_name(name).is_none() {
             self.content.add_named(widget, Some(name));
@@ -285,10 +310,11 @@ impl Group {
         while let Some(child) = self.header.first_child() {
             self.header.remove(&child);
         }
+        self.chips.borrow_mut().clear();
         let active = self.active_slot();
         for slot in self.members.borrow().iter() {
             let chip = gtk::Button::builder()
-                .tooltip_text(format!("{}\tclick to switch, drag onto another pane to group", label_for(*slot)))
+                .tooltip_text(format!("{}\tclick to switch — drag the header to move it", label_for(*slot)))
                 .build();
             chip.add_css_class("flat");
             chip.add_css_class("group-chip");
@@ -305,6 +331,7 @@ impl Group {
             chip.set_action_name(Some("win.primitive-activate"));
             chip.set_action_target_value(Some(&slot.as_str().to_variant()));
 
+            self.chips.borrow_mut().push((*slot, chip.clone()));
             self.header.append(&chip);
         }
         self.header.append(&self.menu_button);

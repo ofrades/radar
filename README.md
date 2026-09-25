@@ -58,6 +58,7 @@ the program. That keeps radar usable on a machine where you cannot install VTE.
 | Close tab | `Ctrl+Shift+W` |
 | Preferences | `Ctrl+,` |
 | Toggle sidebar | `F9` |
+| Zoom the focused pane's font | `Ctrl+=` / `Ctrl+-` (or `Ctrl+scroll`); `Ctrl+0` resets |
 | Refresh status | `Ctrl+Shift+R` |
 
 The **+** on the tab bar offers your preferred editor, agent, diff and shell plus
