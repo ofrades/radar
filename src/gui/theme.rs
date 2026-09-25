@@ -26,11 +26,11 @@ impl Default for Theme {
     fn default() -> Self {
         Theme {
             dark: true,
-            background: gdk::RGBA::parse("#111111").unwrap_or_else(|_| gdk::RGBA::BLACK),
-            foreground: gdk::RGBA::parse("#dddddd").unwrap_or_else(|_| gdk::RGBA::WHITE),
+            background: gdk::RGBA::parse("#111111").unwrap_or(gdk::RGBA::BLACK),
+            foreground: gdk::RGBA::parse("#dddddd").unwrap_or(gdk::RGBA::WHITE),
             palette: DEFAULT_PALETTE
                 .iter()
-                .map(|hex| gdk::RGBA::parse(*hex).unwrap_or_else(|_| gdk::RGBA::BLACK))
+                .map(|hex| gdk::RGBA::parse(*hex).unwrap_or(gdk::RGBA::BLACK))
                 .collect(),
             font_family: "monospace".to_string(),
             font_size: 11.0,

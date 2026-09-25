@@ -544,7 +544,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         ("win.show-sidebar", &["F9"]),
     ];
     for (action, keys) in accels {
-        let _ = gtk_app.set_accels_for_action(action, keys);
+        gtk_app.set_accels_for_action(action, keys);
     }
 }
 
@@ -614,7 +614,7 @@ impl App {
     /// Re-read the theme and repaint every live terminal.
     fn reload_theme(&self) {
         let theme = Theme::load();
-        if let Some(manager) = adw::StyleManager::default().downcast::<adw::StyleManager>().ok() {
+        if let Ok(manager) = adw::StyleManager::default().downcast::<adw::StyleManager>() {
             manager.set_color_scheme(if theme.dark {
                 adw::ColorScheme::ForceDark
             } else {
