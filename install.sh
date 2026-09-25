@@ -9,6 +9,7 @@
 #   ~/.local/bin/radar
 #   ~/.local/share/applications/radar.desktop
 #   ~/.local/share/icons/hicolor/scalable/apps/radar.svg
+#   ~/.config/autostart/radar.desktop
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -16,14 +17,15 @@ cd "$(dirname "$0")"
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
+AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
 PROFILE="release"
 
 for arg in "$@"; do
 	case "$arg" in
 	--debug) PROFILE="debug" ;;
 	--uninstall)
-		rm -f "$BIN_DIR/radar" "$APP_DIR/radar.desktop" "$ICON_DIR/radar.svg"
-		echo "removed radar from $BIN_DIR, $APP_DIR and $ICON_DIR"
+		rm -f "$BIN_DIR/radar" "$APP_DIR/radar.desktop" "$ICON_DIR/radar.svg" "$AUTOSTART_DIR/radar.desktop"
+		echo "removed radar from $BIN_DIR, $APP_DIR, $ICON_DIR and $AUTOSTART_DIR"
 		exit 0
 		;;
 	*)
@@ -45,6 +47,7 @@ fi
 install -Dm755 "$SRC" "$BIN_DIR/radar"
 install -Dm644 packaging/radar.desktop "$APP_DIR/radar.desktop"
 install -Dm644 packaging/radar.svg "$ICON_DIR/radar.svg"
+install -Dm644 packaging/radar-autostart.desktop "$AUTOSTART_DIR/radar.desktop"
 
 # Make sure the launcher cache notices the new entry.
 command -v update-desktop-database >/dev/null && update-desktop-database "$APP_DIR" 2>/dev/null || true
@@ -55,6 +58,7 @@ echo "installed:"
 echo "  $BIN_DIR/radar"
 echo "  $APP_DIR/radar.desktop"
 echo "  $ICON_DIR/radar.svg"
+echo "  $AUTOSTART_DIR/radar.desktop (starts Radar at login)"
 echo
 case ":$PATH:" in
 *":$BIN_DIR:"*) echo "run it:  radar" ;;

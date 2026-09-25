@@ -121,17 +121,21 @@ impl Db {
             .map(|s| s.to_string_lossy().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| path.display().to_string());
-        let next_order: i64 = self
-            .conn()
-            .query_row("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM projects", [], |row| {
-                row.get(0)
-            })?;
+        let next_order: i64 = self.conn().query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM projects",
+            [],
+            |row| row.get(0),
+        )?;
         self.conn().execute(
             "INSERT INTO projects (path, name, sort_order, added_at) VALUES (?1, ?2, ?3, ?4)",
             params![path.to_string_lossy(), name, next_order, now()],
         )?;
         let id = self.conn().last_insert_rowid();
-        self.log_event("project_added", Some(id), &serde_json::json!({ "path": path }))?;
+        self.log_event(
+            "project_added",
+            Some(id),
+            &serde_json::json!({ "path": path }),
+        )?;
         self.project(id)?
             .context("project vanished right after being inserted")
     }
@@ -159,8 +163,10 @@ impl Db {
         } else {
             name.to_string()
         };
-        self.conn()
-            .execute("UPDATE projects SET name = ?2 WHERE id = ?1", params![id, name])?;
+        self.conn().execute(
+            "UPDATE projects SET name = ?2 WHERE id = ?1",
+            params![id, name],
+        )?;
         Ok(())
     }
 
@@ -269,7 +275,12 @@ mod tests {
     fn add_project_names_it_after_the_directory() {
         let (db, dir) = db_with_tmpdir();
         let project = db.add_project(dir.path()).unwrap();
-        let expected = dir.path().file_name().unwrap().to_string_lossy().to_string();
+        let expected = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         assert_eq!(project.name, expected);
     }
 
@@ -381,7 +392,12 @@ mod tests {
     fn rename_falls_back_to_the_directory_name() {
         let (db, dir) = db_with_tmpdir();
         let project = db.add_project(dir.path()).unwrap();
-        let base = dir.path().file_name().unwrap().to_string_lossy().to_string();
+        let base = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         db.rename_project(project.id, "  ").unwrap();
         assert_eq!(db.project(project.id).unwrap().unwrap().name, base);
         db.rename_project(project.id, "My API").unwrap();

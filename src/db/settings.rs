@@ -224,9 +224,11 @@ mod tests {
         assert_eq!(db.ui_prefs().unwrap().last_project, Some(2));
         let rows: i64 = db
             .conn()
-            .query_row("SELECT COUNT(*) FROM settings WHERE key = 'ui'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key = 'ui'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(rows, 1, "settings must upsert, not accumulate");
     }
@@ -249,6 +251,9 @@ mod tests {
             add_root: Some(PathBuf::from("/definitely/not/here")),
             ..Default::default()
         };
-        assert_eq!(prefs.resolved_add_root(), crate::config::default_project_root());
+        assert_eq!(
+            prefs.resolved_add_root(),
+            crate::config::default_project_root()
+        );
     }
 }

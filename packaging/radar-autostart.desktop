@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Radar
+Comment=Restore project workspaces at login
+Exec=radar
+Icon=radar
+Terminal=false
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

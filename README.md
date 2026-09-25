@@ -52,23 +52,38 @@ the program. That keeps radar usable on a machine where you cannot install VTE.
 
 | Action | Shortcut |
 | --- | --- |
-| Find a project to add (sidebar search) | `Ctrl+Shift+N` |
-| Add any program as a tab | `Ctrl+Shift+P` |
-| New Editor / Agent / Diff tab | `Ctrl+Shift+E` / `Ctrl+Shift+A` / `Ctrl+Shift+G` |
-| New Board / Commands tab | `Ctrl+Shift+B` / `Ctrl+Shift+T` |
-| Close tab | `Ctrl+Shift+W` |
+| Keys & primitives overlay (open a primitive, read the keymap) | `Ctrl+Shift+K` |
+| Move between the panes on screen | `Ctrl+Arrows` |
+| Cycle panes — the sidebar included | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| The focused pane's menu (change program, close, move, group, split out) | `Menu` / `Shift+F10` |
+| Search projects (filter, or find one to add) | `Ctrl+Shift+N` |
+| Show or hide a primitive | `Ctrl+Shift+E` / `A` / `G` / `B` / `T` |
+| Change the focused pane's program | `Ctrl+Shift+P` |
+| Focus Editor / Agent / Changes / Commands | `Ctrl+Shift+1` – `4` |
 | Preferences | `Ctrl+,` |
-| Toggle sidebar | `F9` |
+| Toggle sidebar | `Ctrl+B` |
 | Zoom the focused pane's font | `Ctrl+=` / `Ctrl+-` (or `Ctrl+scroll`); `Ctrl+0` resets |
 | Refresh status | `Ctrl+Shift+R` |
 
-**Adding a project** opens no dialog: the sidebar flips into find mode. The same
-search box now filters directories under the scan root (usually `~/Work`) —
-repositories are marked `git`, ones already in the sidebar say `added`, and
-clicking a row (or pressing Enter) adds the project and opens it, so several can
-be added in one pass. `Esc` — or the **+** again — brings the project list back,
-and the small `from ~/Work` label above the list picks another directory to
-scan.
+**The keyboard drives the app, but each primitive keeps its own keys.** radar
+claims only the chords above, and `Ctrl+Arrows` come with a rule: a text
+cursor — in a search box, a dialog, an agent prompt — keeps them for moving
+by words. radar takes the chord only when the keys belong to a pane. Panes
+and the sidebar wear a quiet ring while they hold the keys, so you can see
+where they are.
+
+**The overlay** (`Ctrl+Shift+K`, also in the workspace menu) floats over the
+workspace: a row per primitive — open one, or see that it is already on
+screen — the settings, and the whole keymap. Type to filter, arrows to move,
+`Enter` to run, `Esc` to go back to the program you were looking at.
+
+**Adding a project** needs no dialog and no button: the sidebar's search box
+does both jobs. It filters your projects, and below them it lists directories
+under the scan root (usually `~/Work`) that match — repositories marked `git`,
+each with its own **+**, so several projects can be added in one search.
+Adding never leaves the search: the project joins the rows above the moment
+it is added. The small `from ~/Work` label picks another directory to scan,
+and `Esc` empties the search.
 
 The **+** on the tab bar offers your preferred editor, agent, diff and shell plus
 "Choose program…" (every terminal program radar can find, grouped by kind).
@@ -86,8 +101,16 @@ Everything lives in SQLite at `~/.local/share/radar/radar.db`:
 | --- | --- |
 | `projects` | path, name, pinned, order, recency, open count |
 | `tabs` | per project: slot, program, title, order, extra args |
+| `workspace_state` | per project: primitive groups, active primitive, split tree, divider positions, zoom |
 | `settings` | preferences (preferred programs, flag policy), UI state |
 | `events` | what happened, for history and recents |
+
+Closing the window keeps Radar running in the background, so embedded agents
+remain alive. Use **Workspace → Quit** (or `Ctrl+Shift+Q`) to exit. The install
+script adds a login autostart entry; after a reboot Radar relaunches the saved
+workspace for the last selected project. Other projects restore their layouts
+when selected. Their visible programs are launched again after a reboot; whether
+an agent resumes its prior conversation depends on that agent's CLI support.
 
 Set `RADAR_HOME` (or `--home`) to point at another directory — that is how the
 tests stay off your real data.

@@ -121,7 +121,9 @@ impl Tab {
 
     /// What the tab bar shows.
     pub fn display_title(&self, program_name: &str) -> String {
-        self.title.clone().unwrap_or_else(|| program_name.to_string())
+        self.title
+            .clone()
+            .unwrap_or_else(|| program_name.to_string())
     }
 }
 
@@ -155,7 +157,10 @@ impl Db {
     /// Replace a project's tabs in one transaction.
     pub fn set_tabs(&self, project_id: i64, tabs: &[Tab]) -> Result<()> {
         let tx = self.conn().unchecked_transaction()?;
-        tx.execute("DELETE FROM tabs WHERE project_id = ?1", params![project_id])?;
+        tx.execute(
+            "DELETE FROM tabs WHERE project_id = ?1",
+            params![project_id],
+        )?;
         for (index, tab) in tabs.iter().enumerate() {
             insert_tab(&tx, project_id, tab, index as i64)?;
         }
@@ -242,7 +247,11 @@ fn insert_tab(
             tab.title,
             sort_order,
             serde_json::to_string(&tab.extra_args)?,
-            if tab.created_at > 0 { tab.created_at } else { now() },
+            if tab.created_at > 0 {
+                tab.created_at
+            } else {
+                now()
+            },
         ],
     )?;
     Ok(())
@@ -283,7 +292,8 @@ mod tests {
         let ids: Vec<&str> = tabs.iter().map(|t| t.program_id.as_str()).collect();
         assert_eq!(ids, vec!["nvim", "claude", "hunk"]);
 
-        db.set_tabs(project, &[Tab::new(Slot::Shell, "bash")]).unwrap();
+        db.set_tabs(project, &[Tab::new(Slot::Shell, "bash")])
+            .unwrap();
         let tabs = db.tabs(project).unwrap();
         assert_eq!(tabs.len(), 1);
         assert_eq!(tabs[0].slot, Slot::Shell);
@@ -304,8 +314,12 @@ mod tests {
     #[test]
     fn add_tab_appends_and_returns_the_stored_row() {
         let (db, project, _dir) = project_with_tabs();
-        let first = db.add_tab(project, &Tab::new(Slot::Editor, "nvim")).unwrap();
-        let second = db.add_tab(project, &Tab::new(Slot::Agent, "codex")).unwrap();
+        let first = db
+            .add_tab(project, &Tab::new(Slot::Editor, "nvim"))
+            .unwrap();
+        let second = db
+            .add_tab(project, &Tab::new(Slot::Agent, "codex"))
+            .unwrap();
         assert!(first.id > 0);
         assert!(second.id > first.id);
         assert_eq!(second.sort_order, 1);
@@ -315,8 +329,12 @@ mod tests {
     #[test]
     fn reorder_moves_tabs_and_keeps_the_rest() {
         let (db, project, _dir) = project_with_tabs();
-        let a = db.add_tab(project, &Tab::new(Slot::Editor, "nvim")).unwrap();
-        let b = db.add_tab(project, &Tab::new(Slot::Agent, "claude")).unwrap();
+        let a = db
+            .add_tab(project, &Tab::new(Slot::Editor, "nvim"))
+            .unwrap();
+        let b = db
+            .add_tab(project, &Tab::new(Slot::Agent, "claude"))
+            .unwrap();
         let c = db.add_tab(project, &Tab::new(Slot::Diff, "hunk")).unwrap();
         db.reorder_tabs(project, &[c.id, a.id, b.id]).unwrap();
         let ids: Vec<i64> = db.tabs(project).unwrap().iter().map(|t| t.id).collect();
@@ -332,7 +350,10 @@ mod tests {
     fn tab_titles_override_the_program_name() {
         let tab = Tab::new(Slot::Editor, "nvim").with_title("Frontend");
         assert_eq!(tab.display_title("Neovim"), "Frontend");
-        assert_eq!(Tab::new(Slot::Editor, "nvim").display_title("Neovim"), "Neovim");
+        assert_eq!(
+            Tab::new(Slot::Editor, "nvim").display_title("Neovim"),
+            "Neovim"
+        );
     }
 
     #[test]

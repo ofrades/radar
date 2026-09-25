@@ -90,8 +90,12 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let a = db.add_project(first.path()).unwrap();
         let b = db.add_project(second.path()).unwrap();
-        db.log_event("opened", Some(a.id), &serde_json::json!({ "tab": "editor" }))
-            .unwrap();
+        db.log_event(
+            "opened",
+            Some(a.id),
+            &serde_json::json!({ "tab": "editor" }),
+        )
+        .unwrap();
         db.log_event("opened", Some(b.id), &serde_json::Value::Null)
             .unwrap();
 
@@ -107,7 +111,8 @@ mod tests {
     #[test]
     fn null_data_is_stored_as_nothing() {
         let db = Db::open_in_memory().unwrap();
-        db.log_event("ping", None, &serde_json::Value::Null).unwrap();
+        db.log_event("ping", None, &serde_json::Value::Null)
+            .unwrap();
         let event = &db.events(1).unwrap()[0];
         assert_eq!(event.kind, "ping");
         assert!(event.data.is_none());

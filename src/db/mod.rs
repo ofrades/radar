@@ -8,6 +8,7 @@ mod events;
 mod projects;
 mod settings;
 mod tabs;
+mod workspace;
 
 use std::path::{Component, Path, PathBuf};
 
@@ -18,11 +19,12 @@ pub use events::Event;
 pub use projects::Project;
 pub use settings::{Preferences, UiPrefs};
 pub use tabs::{Slot, Tab};
+pub use workspace::{WorkspaceAxis, WorkspaceGroup, WorkspaceLayout, WorkspaceState};
 
 use crate::config::Paths;
 
 /// Current schema version; bump with a migration below when changing tables.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 pub struct Db {
     conn: Connection,
@@ -101,6 +103,17 @@ impl Db {
                     data       TEXT
                 );
                 CREATE INDEX IF NOT EXISTS events_recent ON events(at DESC);
+                "#,
+            )?;
+        }
+        if version < 2 {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS workspace_state (
+                    project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                    state      TEXT    NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
                 "#,
             )?;
         }
