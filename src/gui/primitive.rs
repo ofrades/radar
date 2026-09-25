@@ -77,6 +77,10 @@ impl Primitive {
 
 }
 
+/// The icon for the sidebar, which is a primitive like the others: it is the
+/// project list.
+pub const PROJECTS_ICON: &str = "folder-symbolic";
+
 /// An icon for a primitive.
 pub fn icon_for(slot: Slot) -> Option<gio::Icon> {
     let name = match slot {
@@ -89,13 +93,8 @@ pub fn icon_for(slot: Slot) -> Option<gio::Icon> {
     Some(gio::ThemedIcon::new(name).upcast())
 }
 
-/// The label for a primitive, used in tooltips and menus.
+/// The label for a primitive, used in tooltips and menus. One source of truth:
+/// the database's slot labels.
 pub fn label_for(slot: Slot) -> &'static str {
-    match slot {
-        Slot::Editor => "Editor",
-        Slot::Agent => "Agent",
-        Slot::Diff => "Diff",
-        Slot::Shell => "Terminal",
-        Slot::Custom => "Program",
-    }
+    slot.label()
 }

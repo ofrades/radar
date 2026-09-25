@@ -41,8 +41,9 @@ pub use theme::Theme;
 
 type SharedDb = Rc<Db>;
 
-/// The four primitives, in layout order.
-const PRIMITIVES: [Slot; 4] = [Slot::Editor, Slot::Agent, Slot::Diff, Slot::Shell];
+/// The four content primitives, in layout order: the agent leads, because that
+/// is what the workspace is for.
+const PRIMITIVES: [Slot; 4] = [Slot::Agent, Slot::Diff, Slot::Shell, Slot::Editor];
 
 /// Open the app.
 pub fn run(paths: Paths, db: Db) -> Result<()> {
@@ -112,6 +113,7 @@ struct App {
     sidebar_list: gtk::ListBox,
     sidebar_search: gtk::SearchEntry,
     toggles: RefCell<HashMap<Slot, gtk::ToggleButton>>,
+    projects_toggle: gtk::ToggleButton,
     stack: gtk::Stack,
     toasts: adw::ToastOverlay,
     workspaces: RefCell<HashMap<i64, Rc<Workspace>>>,
@@ -147,17 +149,29 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
 
     // The four primitives, above the search box: the app's only chrome.
     let toggles = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    toggles.add_css_class("linked");
     toggles.set_halign(gtk::Align::Center);
+
+    // Projects: the sidebar itself, toggled like any other primitive.
+    let projects_toggle = gtk::ToggleButton::builder()
+        .icon_name(primitive::PROJECTS_ICON)
+        .tooltip_text("Projects\tCtrl+B")
+        .build();
+    projects_toggle.add_css_class("flat");
+    projects_toggle.set_action_name(Some("win.toggle-sidebar"));
+    toggles.append(&projects_toggle);
+
+    let divider = gtk::Separator::new(gtk::Orientation::Vertical);
+    divider.set_margin_top(4);
+    divider.set_margin_bottom(4);
+    divider.set_margin_start(2);
+    divider.set_margin_end(2);
+    toggles.append(&divider);
+
     let mut toggle_buttons = HashMap::new();
     for slot in PRIMITIVES {
         let button = gtk::ToggleButton::builder()
             .icon_name(icon_name(slot))
-            .tooltip_text(format!(
-                "{}\t{}",
-                label_for(slot),
-                accel_hint(slot)
-            ))
+            .tooltip_text(format!("{}\t{}", label_for(slot), accel_hint(slot)))
             .build();
         button.add_css_class("flat");
         button.set_action_name(Some("win.primitive-toggle"));
@@ -206,7 +220,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     let no_projects = status_page(
         "folder-open-symbolic",
         "No projects yet",
-        "Add a directory to get started. A project is an editor, an agent, a live diff and a terminal.",
+        "Add a directory to get started. A project is an agent, live changes, commands and an editor.",
         Some(("Add project", "win.add-project")),
     );
     stack.add_named(&no_projects, Some("_empty"));
@@ -247,6 +261,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         sidebar_list,
         sidebar_search: search.clone(),
         toggles: RefCell::new(toggle_buttons),
+        projects_toggle: projects_toggle.clone(),
         stack,
         toasts,
         workspaces: RefCell::new(HashMap::new()),
@@ -1112,7 +1127,9 @@ impl App {
         let preferences = self.db.preferences().unwrap_or_default();
         let mut visible = Vec::new();
         if stored.is_empty() {
-            visible = vec![Slot::Editor, Slot::Agent, Slot::Diff];
+            // The agent is the point of the workspace; everything else is one
+            // keystroke away.
+            visible = vec![Slot::Agent];
             for slot in &visible {
                 if let Some(program) = programs::for_slot(*slot, &preferences) {
                     workspace
@@ -1281,7 +1298,7 @@ impl App {
 
         // Terminal along the bottom, editor on the left, agent and diff stacked
         // on the right. Whatever is not visible simply is not there.
-        let side_slots: Vec<Slot> = [Slot::Agent, Slot::Diff]
+        let side_slots: Vec<Slot> = [Slot::Diff, Slot::Editor]
             .into_iter()
             .filter(|slot| visible.contains(slot))
             .collect();
@@ -1299,15 +1316,15 @@ impl App {
                 }
             }
         };
-        let editor = widget(Slot::Editor).filter(|_| visible.contains(&Slot::Editor));
-        let main = match (visible.contains(&Slot::Editor), editor, side) {
-            (true, Some(editor), Some(side)) => Some(self.stacked(
+        let agent = widget(Slot::Agent).filter(|_| visible.contains(&Slot::Agent));
+        let main = match (visible.contains(&Slot::Agent), agent, side) {
+            (true, Some(agent), Some(side)) => Some(self.stacked(
                 workspace,
                 "main",
                 gtk::Orientation::Horizontal,
-                &editor,
+                &agent,
                 &side,
-                900,
+                560,
             )),
             (_, Some(only), None) => Some(only),
             (_, None, Some(only)) => Some(only),
@@ -1402,6 +1419,7 @@ impl App {
             None::<&gtk::Widget>
         });
         self.sidebar_shown.set(showing);
+        self.projects_toggle.set_active(showing);
     }
 
     /// Store the primitives on screen, so the next launch looks the same.
@@ -1431,6 +1449,7 @@ impl App {
             .map(|workspace| workspace.visible_slots())
             .unwrap_or_default();
         let preferences = self.db.preferences().unwrap_or_default();
+        self.projects_toggle.set_active(self.sidebar_shown.get());
         for (slot, button) in self.toggles.borrow().iter() {
             button.set_active(visible.contains(slot));
             let available = *slot == Slot::Shell || programs::for_slot(*slot, &preferences).is_some();

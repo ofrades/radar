@@ -51,8 +51,8 @@ impl Slot {
         match self {
             Slot::Editor => "Editor",
             Slot::Agent => "Agent",
-            Slot::Diff => "Diff",
-            Slot::Shell => "Shell",
+            Slot::Diff => "Changes",
+            Slot::Shell => "Commands",
             Slot::Custom => "Program",
         }
     }
