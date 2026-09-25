@@ -61,6 +61,9 @@ impl Leaf {
         tab_bar.set_hexpand(true);
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        widget.set_vexpand(true);
+        widget.set_hexpand(true);
+        strip.set_valign(gtk::Align::Start);
         widget.append(&strip);
         widget.append(&tab_view);
 

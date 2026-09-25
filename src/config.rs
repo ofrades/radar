@@ -68,9 +68,18 @@ impl Paths {
             if candidate == target || !candidate.is_file() {
                 continue;
             }
-            if std::fs::copy(&candidate, &target).is_ok() {
-                return;
+            if std::fs::copy(&candidate, &target).is_err() {
+                continue;
             }
+            // SQLite keeps recent rows in the write-ahead log; copying the
+            // database alone would leave them behind in the old directory.
+            for suffix in ["-wal", "-shm"] {
+                let from = append_suffix(&candidate, suffix);
+                if from.is_file() {
+                    let _ = std::fs::copy(&from, append_suffix(&target, suffix));
+                }
+            }
+            return;
         }
     }
 
@@ -90,6 +99,13 @@ impl Paths {
         let file = dirs::home_dir()?.join(".config/omarchy/defaults/agent");
         read_trimmed(&file)
     }
+}
+
+/// `file` + `-wal` — SQLite's write-ahead log next to its database.
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 fn read_trimmed(path: &Path) -> Option<String> {
@@ -194,9 +210,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::with_root(dir.path());
         std::fs::write(dir.path().join("atlas.db"), b"old").unwrap();
+        std::fs::write(dir.path().join("atlas.db-wal"), b"log").unwrap();
 
         paths.ensure().unwrap();
         assert_eq!(std::fs::read(paths.database()).unwrap(), b"old");
+        assert_eq!(
+            std::fs::read(append_suffix(&paths.database(), "-wal")).unwrap(),
+            b"log",
+            "the write-ahead log has to travel with the database"
+        );
 
         // Once radar has its own database, the legacy copy must not win again.
         std::fs::write(paths.database(), b"new").unwrap();

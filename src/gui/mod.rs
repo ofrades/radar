@@ -1023,6 +1023,8 @@ impl App {
         }
 
         let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        holder.set_vexpand(true);
+        holder.set_hexpand(true);
         let first = Leaf::new();
         let root = Rc::new(Node::Leaf(first.clone()));
         holder.append(&root.widget());
@@ -1114,7 +1116,18 @@ impl App {
 
         // Every pane is a terminal: the program runs as its author intended.
         let pane = Rc::new(Pane::spawn(&spec, &workspace.project.path, &theme, &title));
+        trace(&format!(
+            "open_program {} ({}), leaf widget parented: {}",
+            program.id,
+            spec.display(),
+            leaf.widget.parent().is_some()
+        ));
         let tab_page = leaf.tab_view.append(pane.widget());
+        trace(&format!(
+            "  pages after append: {}, holder children: {}",
+            leaf.tab_view.n_pages(),
+            workspace.holder.observe_children().n_items()
+        ));
         tab_page.set_title(&title);
         tab_page.set_tooltip(&format!("{}\n{}", program.name, pane.command()));
         if let Some(icon) = icon_for(slot) {
@@ -1438,6 +1451,18 @@ fn sibling_of(parent: &Node, target: &Rc<Node>) -> Rc<Node> {
         return first.borrow().clone();
     }
     target.clone()
+}
+
+/// Append a line to a debug log. Removed once the layout is settled.
+fn trace(message: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/opencode/radar-trace.log")
+    {
+        let _ = writeln!(file, "{message}");
+    }
 }
 
 /// A stored tab for a slot, without importing the db module's builder.

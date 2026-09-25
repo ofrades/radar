@@ -1,5 +1,7 @@
 # radar
 
+<img src="packaging/radar.svg" alt="radar logo" width="96">
+
 A native workspace manager: **projects in a sidebar, one tab per tool**.
 
 Open radar and you get a real window. The sidebar lists your projects with their
@@ -119,7 +121,7 @@ radar doctor                # environment check
 ## Development
 
 ```bash
-cargo test                  # 81 tests: store, git parsing, registry, discovery
+cargo test                  # 82 tests: store, git parsing, registry, discovery
 cargo clippy --all-targets  # clean
 cargo build --features gui  # no VTE needed
 ```
