@@ -13,7 +13,7 @@ use super::{now, Db};
 
 /// The role a tab plays. The first four have a user preference attached, which
 /// is how "my preferred editor/agent/diff" works.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Slot {
     Editor,

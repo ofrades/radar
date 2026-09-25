@@ -1,21 +1,23 @@
 //! The app window.
 //!
-//! Layout, top to bottom, with no header bar in between:
+//! A project workspace is four primitives — editor, agent, diff, terminal — and
+//! nothing else. No tabs: the sidebar's four icons decide which primitives are on
+//! screen, and the layout arranges them the same way every time:
 //!
-//!   ┌────────────┬──────────────────────────────────────────────┐
-//!   │ filter  + ⋮│  1 │ 2 │ 3 │ ⋯      (a pane: tab strip)      │
-//!   │ project 1  │ ┌─────────────────────┬──────────────────┐   │
-//!   │ project 2  │ │ a leaf of terminals │ another leaf     │   │
-//!   │ project 3  │ └─────────────────────┴──────────────────┘   │
-//!   └────────────┴──────────────────────────────────────────────┘
+//!   ┌──────────┬───────────────────────────────┐
+//!   │ ▣ ▤ ◫ ▦  │   editor      │      agent     │
+//!   │ filter + │               ├────────────────┤
+//!   │ project  │               │      diff      │
+//!   │ project  ├───────────────┴────────────────┤
+//!   │ project  │            terminal            │
+//!   └──────────┴───────────────────────────────┘
 //!
-//! The sidebar and every split are `GtkPaned`, so all of them can be dragged to
-//! resize. Each pane is a [`Leaf`] with its own tab strip; splitting a pane
-//! replaces it in the tree with a pair.
+//! Hiding a primitive detaches its widget; the program keeps running, so putting
+//! the agent away for a moment never interrupts it.
 
 mod dialogs;
-mod leaf;
 mod pane;
+mod primitive;
 mod style;
 mod theme;
 
@@ -33,11 +35,14 @@ use crate::config::Paths;
 use crate::db::{Db, Project, Slot};
 use crate::programs::{self, CommandSpec, LaunchOptions, Program};
 
-use leaf::{Leaf, Page};
 use pane::Pane;
+use primitive::{label_for, Primitive};
 pub use theme::Theme;
 
 type SharedDb = Rc<Db>;
+
+/// The four primitives, in layout order.
+const PRIMITIVES: [Slot; 4] = [Slot::Editor, Slot::Agent, Slot::Diff, Slot::Shell];
 
 /// Open the app.
 pub fn run(paths: Paths, db: Db) -> Result<()> {
@@ -53,77 +58,48 @@ pub fn run(paths: Paths, db: Db) -> Result<()> {
         window.present();
     });
 
-    // Run with a clean argv: GApplication would otherwise try to interpret
-    // radar's own command line (and fail on arguments it does not know).
+    // A clean argv: GApplication would otherwise try to interpret radar's own
+    // command line.
     let _ = app.run_with_args(&["radar"]);
     Ok(())
 }
 
-/// Where a leaf sits inside its parent split.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Half {
-    First,
-    Second,
-}
-
-/// A node of the split tree.
-enum Node {
-    Leaf(Rc<Leaf>),
-    Split {
-        paned: gtk::Paned,
-        orientation: gtk::Orientation,
-        first: RefCell<Rc<Node>>,
-        second: RefCell<Rc<Node>>,
-    },
-}
-
-impl Node {
-    fn widget(&self) -> gtk::Widget {
-        match self {
-            Node::Leaf(leaf) => leaf.widget.clone().upcast(),
-            Node::Split { paned, .. } => paned.clone().upcast(),
-        }
-    }
-
-    fn leaves(&self) -> Vec<Rc<Leaf>> {
-        match self {
-            Node::Leaf(leaf) => vec![leaf.clone()],
-            Node::Split { first, second, .. } => {
-                let mut all = first.borrow().leaves();
-                all.extend(second.borrow().leaves());
-                all
-            }
-        }
-    }
-}
-
-/// A project's open workspace: its split tree, kept alive across project
-/// switches so running programs are never interrupted.
+/// A project's workspace: its primitives, and which are on screen.
 struct Workspace {
     project: Project,
-    /// Holds exactly one child: the root node's widget.
+    /// Opened primitives, by slot.
+    primitives: RefCell<HashMap<Slot, Rc<Primitive>>>,
+    /// Which program each slot uses, even before it is opened.
+    programs: RefCell<HashMap<Slot, String>>,
+    /// The primitives on screen, in layout order.
+    visible: RefCell<Vec<Slot>>,
+    /// Split positions the user dragged, keyed by layout signature.
+    positions: RefCell<HashMap<String, i32>>,
+    /// Holds exactly one child: the layout built from `visible`.
     holder: gtk::Box,
-    root: RefCell<Rc<Node>>,
-    focused: RefCell<Rc<Leaf>>,
-    /// Set while a pane is zoomed to the whole window.
-    zoom: RefCell<Option<Zoom>>,
-}
-
-struct Zoom {
-    leaf: Rc<Leaf>,
-    parent: gtk::Paned,
-    position: Half,
+    /// The set of visible primitives to return to after a zoom.
+    zoom: RefCell<Option<Vec<Slot>>>,
 }
 
 impl Workspace {
-    fn leaf(&self) -> Rc<Leaf> {
-        self.focused.borrow().clone()
+    fn primitive(&self, slot: Slot) -> Option<Rc<Primitive>> {
+        self.primitives.borrow().get(&slot).cloned()
     }
 
-    fn all_leaves(&self) -> Vec<Rc<Leaf>> {
-        self.root.borrow().leaves()
+    fn is_visible(&self, slot: Slot) -> bool {
+        self.visible.borrow().contains(&slot)
     }
 
+    /// The primitives on screen.
+    fn visible_slots(&self) -> Vec<Slot> {
+        self.visible.borrow().clone()
+    }
+
+    /// Sort a visible set into layout order.
+    fn ordered(slots: &mut Vec<Slot>) {
+        slots.sort_by_key(|slot| PRIMITIVES.iter().position(|other| other == slot).unwrap_or(9));
+        slots.dedup();
+    }
 }
 
 struct App {
@@ -135,6 +111,7 @@ struct App {
     sidebar_shown: Cell<bool>,
     sidebar_list: gtk::ListBox,
     sidebar_search: gtk::SearchEntry,
+    toggles: RefCell<HashMap<Slot, gtk::ToggleButton>>,
     stack: gtk::Stack,
     toasts: adw::ToastOverlay,
     workspaces: RefCell<HashMap<i64, Rc<Workspace>>>,
@@ -156,7 +133,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         .default_height(950)
         .build();
 
-    // ---- sidebar: filter, add, menu, list ----
+    // ---- sidebar ----
     let sidebar_list = gtk::ListBox::new();
     sidebar_list.set_selection_mode(gtk::SelectionMode::Single);
     sidebar_list.add_css_class("navigation-sidebar");
@@ -168,9 +145,30 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         .child(&sidebar_list)
         .build();
 
-    let sidebar_search = gtk::SearchEntry::new();
-    sidebar_search.set_placeholder_text(Some("Projects"));
-    sidebar_search.set_hexpand(true);
+    // The four primitives, above the search box: the app's only chrome.
+    let toggles = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    toggles.add_css_class("linked");
+    toggles.set_halign(gtk::Align::Center);
+    let mut toggle_buttons = HashMap::new();
+    for slot in PRIMITIVES {
+        let button = gtk::ToggleButton::builder()
+            .icon_name(icon_name(slot))
+            .tooltip_text(format!(
+                "{}\t{}",
+                label_for(slot),
+                accel_hint(slot)
+            ))
+            .build();
+        button.add_css_class("flat");
+        button.set_action_name(Some("win.primitive-toggle"));
+        button.set_action_target_value(Some(&slot.as_str().to_variant()));
+        toggles.append(&button);
+        toggle_buttons.insert(slot, button);
+    }
+
+    let search = gtk::SearchEntry::new();
+    search.set_placeholder_text(Some("Projects"));
+    search.set_hexpand(true);
 
     let add_button = gtk::Button::builder()
         .icon_name("list-add-symbolic")
@@ -185,18 +183,19 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         .build();
     workspace_menu.add_css_class("flat");
 
-    let sidebar_top = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    sidebar_top.set_margin_top(6);
-    sidebar_top.set_margin_bottom(6);
-    sidebar_top.set_margin_start(8);
-    sidebar_top.set_margin_end(6);
-    sidebar_top.append(&sidebar_search);
-    sidebar_top.append(&add_button);
-    sidebar_top.append(&workspace_menu);
+    let search_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    search_row.set_margin_start(8);
+    search_row.set_margin_end(6);
+    search_row.set_margin_bottom(6);
+    search_row.append(&search);
+    search_row.append(&add_button);
+    search_row.append(&workspace_menu);
 
     let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar_box.add_css_class("projects-sidebar");
-    sidebar_box.append(&sidebar_top);
+    sidebar_box.append(&toggles);
+    sidebar_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    sidebar_box.append(&search_row);
     sidebar_box.append(&sidebar_scroll);
 
     // ---- main area ----
@@ -207,7 +206,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     let no_projects = status_page(
         "folder-open-symbolic",
         "No projects yet",
-        "Add a directory to get started. Each project gets its own panes: an editor, an agent, a live diff.",
+        "Add a directory to get started. A project is an editor, an agent, a live diff and a terminal.",
         Some(("Add project", "win.add-project")),
     );
     stack.add_named(&no_projects, Some("_empty"));
@@ -219,7 +218,6 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     );
     stack.add_named(&no_selection, Some("_none"));
 
-    // ---- sidebar | main, draggable ----
     let splitter = gtk::Paned::new(gtk::Orientation::Horizontal);
     splitter.set_start_child(Some(&sidebar_box));
     splitter.set_end_child(Some(&stack));
@@ -227,7 +225,11 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     splitter.set_shrink_start_child(false);
     splitter.set_wide_handle(true);
     splitter.set_vexpand(true);
-    splitter.set_position(db.ui_prefs().map(|prefs| prefs.sidebar_width).unwrap_or(280));
+    splitter.set_position(
+        db.ui_prefs()
+            .map(|prefs| prefs.sidebar_width)
+            .unwrap_or(260),
+    );
 
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&splitter));
@@ -243,7 +245,8 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         splitter,
         sidebar_shown: Cell::new(true),
         sidebar_list,
-        sidebar_search: sidebar_search.clone(),
+        sidebar_search: search.clone(),
+        toggles: RefCell::new(toggle_buttons),
         stack,
         toasts,
         workspaces: RefCell::new(HashMap::new()),
@@ -266,23 +269,47 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         }
     }
     state.reload_theme();
-    // Keys belong to the pane, not to the filter box: whatever you type right
-    // after launch should reach the program you are looking at, the way it would
-    // in a terminal.
+    // Keys belong to the program you are looking at, not to the filter box.
     if let Some(workspace) = state.current_workspace() {
-        workspace.leaf().focus();
+        let first = workspace.visible.borrow().first().copied();
+        if let Some(primitive) = first.and_then(|slot| workspace.primitive(slot)) {
+            primitive.focus();
+        }
     }
 
-    // Development aid: lay out splits on startup so the layout can be checked
-    // without clicking. RADAR_SPLIT_ON_START=1.
-    if std::env::var("RADAR_SPLIT_ON_START").is_ok() {
-        let state_for_split = state.clone();
-        glib::timeout_add_local_once(Duration::from_millis(1500), move || {
-            state_for_split.split_focused(gtk::Orientation::Horizontal);
-            state_for_split.split_focused(gtk::Orientation::Vertical);
+    // Development aid: lay out every primitive on startup so the arrangement can
+    // be checked without clicking. RADAR_PRIMITIVES=1.
+    if std::env::var("RADAR_PRIMITIVES").is_ok() {
+        let state_for_all = state.clone();
+        glib::timeout_add_local_once(Duration::from_millis(1200), move || {
+            if let Some(workspace) = state_for_all.current_workspace() {
+                for slot in PRIMITIVES {
+                    state_for_all.show_primitive(&workspace, slot);
+                }
+            }
         });
     }
     window
+}
+
+fn icon_name(slot: Slot) -> &'static str {
+    match slot {
+        Slot::Editor => "accessories-text-editor-symbolic",
+        Slot::Agent => "application-x-executable-symbolic",
+        Slot::Diff => "view-dual-symbolic",
+        Slot::Shell => "utilities-terminal-symbolic",
+        Slot::Custom => "application-x-executable-symbolic",
+    }
+}
+
+fn accel_hint(slot: Slot) -> &'static str {
+    match slot {
+        Slot::Editor => "Ctrl+Shift+E",
+        Slot::Agent => "Ctrl+Shift+A",
+        Slot::Diff => "Ctrl+Shift+G",
+        Slot::Shell => "Ctrl+Shift+T",
+        Slot::Custom => "",
+    }
 }
 
 fn status_page(
@@ -323,31 +350,28 @@ fn connect_widgets(app: &SharedApp) {
         let app = app.clone();
         entry.connect_search_changed(move |entry| app.filter_sidebar(&entry.text()));
     }
-    // Remember the sidebar width when it is dragged.
     {
+        // Remember the sidebar width when it is dragged.
+        let splitter = app.splitter.clone();
         let app = app.clone();
-        let save = {
-            let app = app.clone();
-            let timer = Rc::new(RefCell::new(None::<glib::SourceId>));
-            move || {
-                if let Some(id) = timer.borrow_mut().take() {
-                    id.remove();
-                }
-                let app = app.clone();
-                let timer_for_cb = timer.clone();
-                let id = glib::timeout_add_local_once(Duration::from_millis(400), move || {
-                    let width = app.splitter.position();
-                    let mut prefs = app.db.ui_prefs().unwrap_or_default();
-                    prefs.sidebar_width = width;
-                    if let Err(error) = app.db.set_ui_prefs(&prefs) {
-                        eprintln!("radar: could not store the sidebar width: {error}");
-                    }
-                    *timer_for_cb.borrow_mut() = None;
-                });
-                *timer.borrow_mut() = Some(id);
+        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        splitter.connect_position_notify(move |splitter| {
+            if let Some(id) = pending.borrow_mut().take() {
+                id.remove();
             }
-        };
-        app.splitter.connect_position_notify(move |_| save());
+            let app = app.clone();
+            let pending_for_cb = pending.clone();
+            let position = splitter.position();
+            let id = glib::timeout_add_local_once(Duration::from_millis(400), move || {
+                let mut prefs = app.db.ui_prefs().unwrap_or_default();
+                prefs.sidebar_width = position;
+                if let Err(error) = app.db.set_ui_prefs(&prefs) {
+                    eprintln!("radar: could not store the sidebar width: {error}");
+                }
+                *pending_for_cb.borrow_mut() = None;
+            });
+            *pending.borrow_mut() = Some(id);
+        });
     }
 }
 
@@ -398,7 +422,6 @@ fn watch_theme(app: &SharedApp) {
     std::mem::forget(monitor);
 }
 
-/// A `gio::Menu` action string for a window action with no arguments.
 fn item(label: &str, action: &str) -> gio::MenuItem {
     gio::MenuItem::new(Some(label), Some(action))
 }
@@ -428,6 +451,18 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
         );
     }
     {
+        // Takes a project id, so a row's own button can call it.
+        let action = gio::SimpleAction::new("project-remove", Some(glib::VariantTy::INT32));
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some(id) = parameter.and_then(|value| value.get::<i32>()) else {
+                return;
+            };
+            app_for_action.confirm_remove(id as i64);
+        });
+        app.window.add_action(&action);
+    }
+    {
         let app = app.clone();
         add(
             "preferences",
@@ -435,7 +470,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
                 dialogs::preferences(&app.window, &app.db, {
                     let app = app.clone();
                     move || {
-                        app.refresh_pane_menus();
+                        app.refresh_menus();
                         app.toast("Preferences saved");
                     }
                 });
@@ -535,128 +570,6 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
             }),
         );
     }
-    {
-        let app = app.clone();
-        add(
-            "project-remove",
-            Box::new(move || {
-                let Some(project) = app.current_project() else { return };
-                let dialog = gtk::AlertDialog::builder()
-                    .message("Remove project?")
-                    .detail(format!(
-                        "{} will be removed from the sidebar. Nothing on disk is touched.",
-                        project.name
-                    ))
-                    .buttons(["Cancel", "Remove"])
-                    .cancel_button(0)
-                    .default_button(0)
-                    .build();
-                let app_for_response = app.clone();
-                dialog.choose(Some(&app.window), None::<&gio::Cancellable>, move |result| {
-                    if result == Ok(1) {
-                        if let Err(error) = app_for_response.db.remove_project(project.id) {
-                            eprintln!("radar: {error}");
-                        }
-                        app_for_response.workspaces.borrow_mut().remove(&project.id);
-                        *app_for_response.current.borrow_mut() = None;
-                        app_for_response.refresh_projects();
-                        app_for_response.show_placeholder();
-                        app_for_response.toast("Project removed");
-                    }
-                });
-            }),
-        );
-    }
-
-    // ---- panes and tabs ----
-    for (name, slot) in [
-        ("toggle-editor", Slot::Editor),
-        ("toggle-agent", Slot::Agent),
-        ("toggle-diff", Slot::Diff),
-        ("toggle-shell", Slot::Shell),
-    ] {
-        let app = app.clone();
-        add(
-            &format!("pane-{name}"),
-            Box::new(move || app.toggle_slot(slot)),
-        );
-    }
-    {
-        let app = app.clone();
-        add(
-            "tab-choose",
-            Box::new(move || {
-                let Some(workspace) = app.current_workspace() else {
-                    app.toast("Select a project first");
-                    return;
-                };
-                let leaf = workspace.leaf();
-                let window = app.window.clone();
-                let app = app.clone();
-                dialogs::choose_program(&window, move |program| {
-                    let slot = program.kind.default_slot();
-                    app.open_program(&leaf, program, slot, Vec::new());
-                });
-            }),
-        );
-    }
-    {
-        let app = app.clone();
-        add(
-            "tab-close",
-            Box::new(move || {
-                if let Some(workspace) = app.current_workspace() {
-                    let leaf = workspace.leaf();
-                    if let Some(page) = leaf.selected_page() {
-                        leaf.tab_view.close_page(&page);
-                    }
-                }
-            }),
-        );
-    }
-    {
-        let app = app.clone();
-        add(
-            "split-right",
-            Box::new(move || app.split_focused(gtk::Orientation::Horizontal)),
-        );
-    }
-    {
-        let app = app.clone();
-        add(
-            "split-down",
-            Box::new(move || app.split_focused(gtk::Orientation::Vertical)),
-        );
-    }
-    {
-        let app = app.clone();
-        add(
-            "split-close",
-            Box::new(move || app.close_focused_pane()),
-        );
-    }
-    {
-        let app = app.clone();
-        add(
-            "focus-prev",
-            Box::new(move || app.focus_sibling(false)),
-        );
-    }
-    {
-        let app = app.clone();
-        add(
-            "focus-next",
-            Box::new(move || app.focus_sibling(true)),
-        );
-    }
-    {
-        let app = app.clone();
-        add("zoom", Box::new(move || app.toggle_zoom()));
-    }
-    {
-        let app = app.clone();
-        add("toggle-sidebar", Box::new(move || app.toggle_sidebar()));
-    }
     for program in programs::external_programs() {
         let app = app.clone();
         let name = format!("open-external-{}", program.id);
@@ -677,6 +590,68 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
         );
     }
 
+    // ---- primitives: the only content there is ----
+    {
+        let action = gio::SimpleAction::new("primitive-toggle", Some(glib::VariantTy::STRING));
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some(name) = parameter.and_then(|value| value.get::<String>()) else {
+                return;
+            };
+            let slot = Slot::parse(&name);
+            let Some(workspace) = app_for_action.current_workspace() else {
+                app_for_action.toast("Select a project first");
+                return;
+            };
+            app_for_action.toggle_primitive(&workspace, slot);
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // Which program fills a primitive: the "preferred X" choice, per pane.
+        let action = gio::SimpleAction::new("primitive-program", Some(glib::VariantTy::STRING));
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some(name) = parameter.and_then(|value| value.get::<String>()) else {
+                return;
+            };
+            let slot = Slot::parse(&name);
+            let Some(workspace) = app_for_action.current_workspace() else {
+                return;
+            };
+            let window = app_for_action.window.clone();
+            let app_for_pick = app_for_action.clone();
+            dialogs::choose_program(&window, move |program| {
+                app_for_pick.set_primitive_program(&workspace, slot, program, true);
+            });
+        });
+        app.window.add_action(&action);
+    }
+    {
+        let action = gio::SimpleAction::new("primitive-focus", Some(glib::VariantTy::STRING));
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some(name) = parameter.and_then(|value| value.get::<String>()) else {
+                return;
+            };
+            let slot = Slot::parse(&name);
+            if let Some(workspace) = app_for_action.current_workspace() {
+                if let Some(primitive) = workspace.primitive(slot) {
+                    primitive.focus();
+                }
+            }
+        });
+        app.window.add_action(&action);
+    }
+    {
+        let app = app.clone();
+        add("zoom", Box::new(move || app.toggle_zoom()));
+    }
+    {
+        let app = app.clone();
+        add("toggle-sidebar", Box::new(move || app.toggle_sidebar()));
+    }
+
     // ---- workspace menu (in the sidebar, since there is no header bar) ----
     {
         let app = app.clone();
@@ -690,19 +665,19 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
         ("win.refresh", &["<Control><Shift>r"]),
         ("win.quit", &["<Control><Shift>q"]),
         ("win.toggle-sidebar", &["<Control>b"]),
-        ("win.pane-toggle-editor", &["<Control><Shift>e"]),
-        ("win.pane-toggle-agent", &["<Control><Shift>a"]),
-        ("win.pane-toggle-diff", &["<Control><Shift>g"]),
-        ("win.pane-toggle-shell", &["<Control><Shift>t"]),
-        ("win.tab-choose", &["<Control><Shift>p"]),
-        ("win.tab-close", &["<Control><Shift>w"]),
-        ("win.split-right", &["<Control><Shift>backslash"]),
-        ("win.split-down", &["<Control><Shift>minus"]),
-        ("win.focus-next", &["<Control><Shift>l"]),
         ("win.zoom", &["F11"]),
+        ("win.primitive-toggle::editor", &["<Control><Shift>e"]),
+        ("win.primitive-toggle::agent", &["<Control><Shift>a"]),
+        ("win.primitive-toggle::diff", &["<Control><Shift>g"]),
+        ("win.primitive-toggle::shell", &["<Control><Shift>t"]),
+        ("win.primitive-program::agent", &["<Control><Shift>p"]),
+        ("win.primitive-focus::editor", &["<Control><Shift>1"]),
+        ("win.primitive-focus::agent", &["<Control><Shift>2"]),
+        ("win.primitive-focus::diff", &["<Control><Shift>3"]),
+        ("win.primitive-focus::shell", &["<Control><Shift>4"]),
     ];
     for (action, keys) in accels {
-        gtk_app.set_accels_for_action(action, keys);
+        let _ = gtk_app.set_accels_for_action(action, keys);
     }
 }
 
@@ -725,8 +700,16 @@ impl App {
         project.append_item(&item("Pin or unpin", "win.project-pin"));
         project.append_item(&item("Move up", "win.project-move-up"));
         project.append_item(&item("Move down", "win.project-move-down"));
-        project.append_item(&item("Remove project…", "win.project-remove"));
         menu.append_section(None, &project);
+
+        let panes = gio::Menu::new();
+        for slot in PRIMITIVES {
+            panes.append_item(&item(
+                &format!("Toggle {}", label_for(slot)),
+                &format!("win.primitive-toggle::{}", slot.as_str()),
+            ));
+        }
+        menu.append_section(None, &panes);
 
         let externals = programs::external_programs();
         if !externals.is_empty() {
@@ -742,42 +725,36 @@ impl App {
         menu
     }
 
-    /// The menu of a pane: another tab here, another pane, or the workspace.
-    fn pane_menu_model(&self) -> gio::Menu {
-        let preferences = self.db.preferences().unwrap_or_default();
+    /// A pane's own menu: which program it runs, and what to do with it.
+    fn primitive_menu_model(&self, slot: Slot) -> gio::Menu {
         let menu = gio::Menu::new();
-
-        let tabs = gio::Menu::new();
-        for slot in [Slot::Editor, Slot::Agent, Slot::Diff, Slot::Shell] {
-            let name = programs::for_slot(slot, &preferences)
-                .map(|program| program.name)
-                .unwrap_or_else(|| "nothing installed".into());
-            let label = match slot {
-                Slot::Editor => format!("Editor — {name}"),
-                Slot::Agent => format!("Agent — {name}"),
-                Slot::Diff => format!("Diff — {name}"),
-                Slot::Shell => format!("Terminal — {name}"),
-                Slot::Custom => name,
-            };
-            tabs.append_item(&item(
-                &label,
-                &format!("win.pane-toggle-{}", slot.as_str()),
-            ));
-        }
-        tabs.append_item(&item("Choose program…", "win.tab-choose"));
-        menu.append_section(None, &tabs);
+        let program = gio::Menu::new();
+        program.append_item(&item(
+            "Change program…",
+            &format!("win.primitive-program::{}", slot.as_str()),
+        ));
+        menu.append_section(None, &program);
 
         let panes = gio::Menu::new();
-        panes.append_item(&item("Split right", "win.split-right"));
-        panes.append_item(&item("Split down", "win.split-down"));
-        panes.append_item(&item("Focus next pane", "win.focus-next"));
-        panes.append_item(&item("Zoom pane", "win.zoom"));
-        panes.append_item(&item("Close pane", "win.split-close"));
+        panes.append_item(&item(
+            &format!("Focus {}", label_for(slot)),
+            &format!("win.primitive-focus::{}", slot.as_str()),
+        ));
+        for other in PRIMITIVES {
+            if other == slot {
+                continue;
+            }
+            panes.append_item(&item(
+                &format!("Toggle {}", label_for(other)),
+                &format!("win.primitive-toggle::{}", other.as_str()),
+            ));
+        }
         menu.append_section(None, &panes);
 
-        let side = gio::Menu::new();
-        side.append_item(&item("Toggle sidebar", "win.toggle-sidebar"));
-        menu.append_section(None, &side);
+        let layout = gio::Menu::new();
+        layout.append_item(&item("Zoom pane (F11)", "win.zoom"));
+        layout.append_item(&item("Toggle sidebar", "win.toggle-sidebar"));
+        menu.append_section(None, &layout);
         menu
     }
 
@@ -800,7 +777,44 @@ impl App {
         self.workspaces.borrow().get(&id).cloned()
     }
 
-    /// Re-read the theme and repaint every live terminal.
+    /// Confirm, then remove a project from the sidebar. Never touches the disk.
+    fn confirm_remove(&self, id: i64) {
+        let Some(project) = self.db.project(id).ok().flatten() else {
+            return;
+        };
+        let dialog = gtk::AlertDialog::builder()
+            .message(format!("Remove {}?", project.name))
+            .detail("It leaves the sidebar. Nothing on disk is touched.")
+            .buttons(["Cancel", "Remove"])
+            .cancel_button(0)
+            .default_button(0)
+            .build();
+        // The callback outlives this borrow, so it works from owned handles: the
+        // database, the sidebar list, and the toast overlay.
+        let db = self.db.clone();
+        let toasts = self.toasts.clone();
+        let list = self.sidebar_list.clone();
+        let current = self.current.clone();
+        let window = self.window.clone();
+        dialog.choose(Some(&window), None::<&gio::Cancellable>, move |result| {
+            if result != Ok(1) {
+                return;
+            }
+            if let Err(error) = db.remove_project(project.id) {
+                eprintln!("radar: {error}");
+            }
+            if *current.borrow() == Some(project.id) {
+                *current.borrow_mut() = None;
+            }
+            // Rebuild the list from a fresh read; the row that asked for this is
+            // about to disappear.
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            toasts.add_toast(adw::Toast::new("Project removed"));
+        });
+    }
+
     fn reload_theme(&self) {
         let theme = Theme::load();
         if let Ok(manager) = adw::StyleManager::default().downcast::<adw::StyleManager>() {
@@ -811,10 +825,8 @@ impl App {
             });
         }
         for workspace in self.workspaces.borrow().values() {
-            for leaf in workspace.all_leaves() {
-                for page in leaf.pages.borrow().iter() {
-                    page.pane.apply_theme(&theme);
-                }
+            for primitive in workspace.primitives.borrow().values() {
+                primitive.pane.apply_theme(&theme);
             }
         }
         *self.theme.borrow_mut() = theme;
@@ -874,11 +886,11 @@ impl App {
     fn build_project_row(&self, project: &Project) -> (gtk::ListBoxRow, gtk::Label, gtk::Label) {
         let row = gtk::ListBoxRow::new();
 
-        let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         box_.set_margin_top(4);
         box_.set_margin_bottom(4);
         box_.set_margin_start(6);
-        box_.set_margin_end(6);
+        box_.set_margin_end(4);
 
         let texts = gtk::Box::new(gtk::Orientation::Vertical, 0);
         texts.set_hexpand(true);
@@ -908,6 +920,18 @@ impl App {
         badge.add_css_class("accent");
         badge.set_valign(gtk::Align::Center);
         box_.append(&badge);
+
+        // Remove, per row: the id travels with the action so no state is needed.
+        let remove = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Remove from sidebar")
+            .build();
+        remove.add_css_class("flat");
+        remove.add_css_class("row-action");
+        remove.set_valign(gtk::Align::Center);
+        remove.set_action_name(Some("win.project-remove"));
+        remove.set_action_target_value(Some(&(project.id as i32).to_variant()));
+        box_.append(&remove);
 
         row.set_child(Some(&box_));
         row.set_tooltip_text(Some(&project.display_path()));
@@ -1009,7 +1033,10 @@ impl App {
             "_none"
         };
         self.stack.set_visible_child_name(name);
+        self.sync_toggles();
     }
+
+    // ---- the workspace and its primitives ----
 
     fn select_project(&self, id: i64) {
         let Some(project) = self
@@ -1026,12 +1053,11 @@ impl App {
         self.stack.set_visible_child_name(&format!("project-{id}"));
         let _ = self.db.touch_project(id);
         let _ = self.db.remember_last_project(Some(id));
-        workspace.leaf().focus();
-        self.refresh_pane_menus();
+        self.sync_toggles();
+        self.refresh_menus();
         self.select_row_for(id);
+        let _ = workspace;
     }
-
-    // ---- the split tree ----
 
     fn workspace_for(&self, project: &Project) -> Rc<Workspace> {
         if let Some(existing) = self.workspaces.borrow().get(&project.id) {
@@ -1041,20 +1067,16 @@ impl App {
         let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
         holder.set_vexpand(true);
         holder.set_hexpand(true);
-        let first = Leaf::new();
-        let root = Rc::new(Node::Leaf(first.clone()));
-        holder.append(&root.widget());
 
         let workspace = Rc::new(Workspace {
             project: project.clone(),
+            primitives: RefCell::new(HashMap::new()),
+            programs: RefCell::new(HashMap::new()),
+            visible: RefCell::new(Vec::new()),
+            positions: RefCell::new(HashMap::new()),
             holder: holder.clone(),
-            root: RefCell::new(root.clone()),
-            focused: RefCell::new(first.clone()),
             zoom: RefCell::new(None),
         });
-
-        wire_close_page(self.db.clone(), workspace.clone(), first.clone());
-        wire_focus(&workspace, &first);
 
         self.stack
             .add_named(&holder, Some(&format!("project-{}", project.id)));
@@ -1076,7 +1098,7 @@ impl App {
             return workspace;
         }
 
-        // Restore stored tabs, or start with the standard trio.
+        // Which primitives were on screen last time, and which program each ran.
         let restore = self
             .db
             .ui_prefs()
@@ -1087,254 +1109,289 @@ impl App {
         } else {
             Vec::new()
         };
-        let tabs = if stored.is_empty() {
-            let preferences = self.db.preferences().unwrap_or_default();
-            [Slot::Editor, Slot::Agent, Slot::Diff]
-                .into_iter()
-                .filter_map(|slot| {
-                    programs::for_slot(slot, &preferences).map(|program| db_tab(slot, program.id))
-                })
-                .collect()
-        } else {
-            stored
-        };
-
         let preferences = self.db.preferences().unwrap_or_default();
-        for tab in tabs {
-            // A stored tab can name a program that is gone: fall back to the
-            // current choice for that slot rather than losing the tab.
-            let program = match programs::by_id(&tab.program_id) {
-                Some(program) if program.installed() => program,
-                _ => match programs::for_slot(tab.slot, &preferences) {
-                    Some(fallback) => fallback,
-                    None => {
-                        self.toast(&format!("{} is not installed", tab.program_id));
-                        continue;
-                    }
-                },
-            };
-            self.open_program(&first, program, tab.slot, tab.extra_args.clone());
+        let mut visible = Vec::new();
+        if stored.is_empty() {
+            visible = vec![Slot::Editor, Slot::Agent, Slot::Diff];
+            for slot in &visible {
+                if let Some(program) = programs::for_slot(*slot, &preferences) {
+                    workspace
+                        .programs
+                        .borrow_mut()
+                        .insert(*slot, program.id.clone());
+                }
+            }
+        } else {
+            for tab in &stored {
+                workspace
+                    .programs
+                    .borrow_mut()
+                    .insert(tab.slot, tab.program_id.clone());
+                visible.push(tab.slot);
+            }
         }
-        persist_tabs(&self.db, &workspace);
+        Workspace::ordered(&mut visible);
+        *workspace.visible.borrow_mut() = visible.clone();
+
+        // Open the ones that are on screen; a program that is gone falls back to
+        // the preferred one for its slot.
+        for slot in visible {
+            if self.ensure_primitive(&workspace, slot).is_none() {
+                continue;
+            }
+        }
+        self.layout(&workspace);
+        self.sync_toggles();
+        self.persist_primitives(&workspace);
         workspace
     }
 
-    /// Open a program as a new tab in `leaf`.
-    fn open_program(&self, leaf: &Rc<Leaf>, program: Program, slot: Slot, extra_args: Vec<String>) {
-        let Some(workspace) = self.current_workspace() else {
-            return;
-        };
-        let mut options = self.launch_options();
-        options.extra_args = extra_args.clone();
-        let spec = program.command_spec(&options);
-        let title = program.name.clone();
-        let theme = self.theme.borrow().clone();
-
-        // Every pane is a terminal: the program runs as its author intended.
-        let pane = Rc::new(Pane::spawn(&spec, &workspace.project.path, &theme, &title));
-        trace(&format!(
-            "open_program {} ({}), leaf widget parented: {}",
-            program.id,
-            spec.display(),
-            leaf.widget.parent().is_some()
-        ));
-        let tab_page = leaf.tab_view.append(pane.widget());
-        trace(&format!(
-            "  pages after append: {}, holder children: {}",
-            leaf.tab_view.n_pages(),
-            workspace.holder.observe_children().n_items()
-        ));
-        tab_page.set_title(&title);
-        tab_page.set_tooltip(&format!("{}\n{}", program.name, pane.command()));
-        if let Some(icon) = icon_for(slot) {
-            tab_page.set_icon(Some(&icon));
+    /// Open a primitive's program if it is not open yet.
+    fn ensure_primitive(&self, workspace: &Rc<Workspace>, slot: Slot) -> Option<Rc<Primitive>> {
+        if let Some(existing) = workspace.primitive(slot) {
+            return Some(existing);
         }
-        leaf.add_page(Page {
-            page: tab_page,
-            slot,
-            program_id: program.id.clone(),
-            title,
-            extra_args,
-            pane,
-        });
-        *workspace.focused.borrow_mut() = leaf.clone();
+        let preferences = self.db.preferences().unwrap_or_default();
+        let wanted = workspace.programs.borrow().get(&slot).cloned();
+        let program = wanted
+            .and_then(|id| programs::by_id(&id))
+            .filter(|program| program.installed())
+            .or_else(|| programs::for_slot(slot, &preferences))?;
+
+        workspace
+            .programs
+            .borrow_mut()
+            .insert(slot, program.id.clone());
+        let options = self.launch_options();
+        let spec = program.command_spec(&options);
+        let theme = self.theme.borrow().clone();
+        let pane = Rc::new(Pane::spawn(
+            &spec,
+            &workspace.project.path,
+            &theme,
+            &label_for(slot),
+        ));
+        let primitive = Primitive::new(slot, &program, pane);
+        primitive
+            .menu_button
+            .set_menu_model(Some(&self.primitive_menu_model(slot)));
+        workspace
+            .primitives
+            .borrow_mut()
+            .insert(slot, primitive.clone());
+        Some(primitive)
     }
 
-    /// Split the focused pane in two, and focus the new half.
-    fn split_focused(&self, orientation: gtk::Orientation) {
-        let Some(workspace) = self.current_workspace() else {
+    /// Show or hide one primitive. Hiding never stops the program.
+    fn toggle_primitive(&self, workspace: &Rc<Workspace>, slot: Slot) {
+        if slot == Slot::Custom {
             return;
-        };
-        let leaf = workspace.leaf();
-        let new_leaf = Leaf::new();
+        }
+        if workspace.is_visible(slot) {
+            workspace.visible.borrow_mut().retain(|other| *other != slot);
+        } else {
+            if self.ensure_primitive(workspace, slot).is_none() {
+                self.toast(&format!(
+                    "No {} installed — set one in Preferences",
+                    label_for(slot).to_lowercase()
+                ));
+                return;
+            }
+            let mut visible = workspace.visible.borrow_mut();
+            visible.push(slot);
+            Workspace::ordered(&mut visible);
+        }
+        *workspace.zoom.borrow_mut() = None;
+        trace(&format!(
+            "toggle {}: visible {:?}",
+            slot.as_str(),
+            workspace.visible_slots()
+                .iter()
+                .map(|slot| slot.as_str())
+                .collect::<Vec<_>>()
+        ));
+        self.layout(workspace);
+        self.sync_toggles();
+        self.persist_primitives(workspace);
+    }
 
-        // The new half gets a tab too: an empty pane is a puzzle, not a tool. It
-        // opens the same kind of program as the tab you split from — two agents,
-        // or two shells, side by side.
-        let preferences = self.db.preferences().unwrap_or_default();
-        let slot = leaf
-            .pages
-            .borrow()
-            .iter()
-            .find(|page| Some(page.page.clone()) == leaf.selected_page())
-            .map(|page| page.slot)
-            .unwrap_or(Slot::Shell);
-        let program = programs::for_slot(slot, &preferences)
-            .or_else(|| programs::for_slot(Slot::Shell, &preferences));
-        let Some(program) = program else {
-            self.toast("nothing installed for a new pane");
+    /// Show a primitive without toggling it off when it is already visible.
+    fn show_primitive(&self, workspace: &Rc<Workspace>, slot: Slot) {
+        if !workspace.is_visible(slot) {
+            self.toggle_primitive(workspace, slot);
+        }
+    }
+
+    /// Replace the program behind a primitive.
+    fn set_primitive_program(
+        &self,
+        workspace: &Rc<Workspace>,
+        slot: Slot,
+        program: Program,
+        visible: bool,
+    ) {
+        // Drop the old pane: its process belongs to the program being replaced.
+        if let Some(old) = workspace.primitives.borrow_mut().remove(&slot) {
+            old.widget.unparent();
+        }
+        workspace
+            .programs
+            .borrow_mut()
+            .insert(slot, program.id.clone());
+        if visible && !workspace.is_visible(slot) {
+            let mut list = workspace.visible.borrow_mut();
+            list.push(slot);
+            Workspace::ordered(&mut list);
+        }
+        self.ensure_primitive(workspace, slot);
+        self.layout(workspace);
+        self.sync_toggles();
+        self.persist_primitives(workspace);
+        self.toast(&format!("{} → {}", label_for(slot), program.name));
+    }
+
+    /// Arrange the visible primitives into panes, the same way every time.
+    fn layout(&self, workspace: &Rc<Workspace>) {
+        let visible = workspace.visible.borrow().clone();
+
+        // Everything is detached first: a widget lives in one parent at a time and
+        // GTK will not reparent it for us.
+        for primitive in workspace.primitives.borrow().values() {
+            primitive.widget.unparent();
+        }
+        while let Some(child) = workspace.holder.first_child() {
+            workspace.holder.remove(&child);
+        }
+
+        if visible.is_empty() {
+            workspace.holder.append(&status_page(
+                "view-list-symbolic",
+                "Every pane is hidden",
+                "Use the icons above the project list to bring one back.",
+                None,
+            ));
             return;
-        };
-        new_leaf.tab_view.set_hexpand(true);
-        wire_close_page(self.db.clone(), workspace.clone(), new_leaf.clone());
-        wire_focus(&workspace, &new_leaf);
-        self.open_program(&new_leaf, program, slot, Vec::new());
+        }
 
-        // GTK4 refuses, silently, to add a widget that already has a parent. Both
-        // halves are still parented (the sidebar's holder or the split they came
-        // from), so detach them first — otherwise the split is built with no
-        // children and the window keeps showing one pane.
-        leaf.widget.unparent();
-        new_leaf.widget.unparent();
+        let widget = |slot: Slot| {
+            workspace
+                .primitive(slot)
+                .map(|primitive| primitive.widget.clone().upcast::<gtk::Widget>())
+        };
+
+        // Terminal along the bottom, editor on the left, agent and diff stacked
+        // on the right. Whatever is not visible simply is not there.
+        let side_slots: Vec<Slot> = [Slot::Agent, Slot::Diff]
+            .into_iter()
+            .filter(|slot| visible.contains(slot))
+            .collect();
+        let side = match side_slots.len() {
+            0 => None,
+            1 => widget(side_slots[0]),
+            _ => {
+                let (top, bottom) = (widget(side_slots[0]), widget(side_slots[1]));
+                match (top, bottom) {
+                    (Some(top), Some(bottom)) => Some(
+                        self.stacked(workspace, "side", gtk::Orientation::Vertical, &top, &bottom, 520),
+                    ),
+                    (Some(only), None) | (None, Some(only)) => Some(only),
+                    _ => None,
+                }
+            }
+        };
+        let editor = widget(Slot::Editor).filter(|_| visible.contains(&Slot::Editor));
+        let main = match (visible.contains(&Slot::Editor), editor, side) {
+            (true, Some(editor), Some(side)) => Some(self.stacked(
+                workspace,
+                "main",
+                gtk::Orientation::Horizontal,
+                &editor,
+                &side,
+                900,
+            )),
+            (_, Some(only), None) => Some(only),
+            (_, None, Some(only)) => Some(only),
+            _ => None,
+        };
+        let terminal = widget(Slot::Shell).filter(|_| visible.contains(&Slot::Shell));
+        let root = match (main, terminal) {
+            (Some(main), Some(terminal)) => {
+                Some(self.stacked(workspace, "outer", gtk::Orientation::Vertical, &main, &terminal, 620))
+            }
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            _ => None,
+        };
+
+        if let Some(root) = root {
+            workspace.holder.append(&root);
+        }
+        trace(&format!(
+            "layout: {:?} ({} panes)",
+            visible.iter().map(|slot| slot.as_str()).collect::<Vec<_>>(),
+            workspace.primitives.borrow().len()
+        ));
+    }
+
+    /// A draggable divider whose position is remembered.
+    fn stacked(
+        &self,
+        workspace: &Rc<Workspace>,
+        key: &str,
+        orientation: gtk::Orientation,
+        first: &gtk::Widget,
+        second: &gtk::Widget,
+        default_position: i32,
+    ) -> gtk::Widget {
         let paned = gtk::Paned::new(orientation);
-        paned.set_start_child(Some(&leaf.widget));
-        paned.set_end_child(Some(&new_leaf.widget));
+        paned.set_wide_handle(true);
         paned.set_resize_start_child(true);
         paned.set_resize_end_child(true);
         paned.set_shrink_start_child(false);
         paned.set_shrink_end_child(false);
-        paned.set_wide_handle(true);
         paned.set_vexpand(true);
-        paned.set_position(match orientation {
-            gtk::Orientation::Horizontal => 700,
-            _ => 400,
+        paned.set_hexpand(true);
+        paned.set_start_child(Some(first));
+        paned.set_end_child(Some(second));
+        paned.set_position(
+            workspace
+                .positions
+                .borrow()
+                .get(key)
+                .copied()
+                .unwrap_or(default_position),
+        );
+
+        let workspace_for_position = workspace.clone();
+        let key = key.to_string();
+        paned.connect_position_notify(move |paned| {
+            workspace_for_position
+                .positions
+                .borrow_mut()
+                .insert(key.clone(), paned.position());
         });
-
-        let split = Rc::new(Node::Split {
-            paned: paned.clone(),
-            orientation,
-            first: RefCell::new(Rc::new(Node::Leaf(leaf.clone()))),
-            second: RefCell::new(Rc::new(Node::Leaf(new_leaf.clone()))),
-        });
-
-        // Replace the leaf with the pair, wherever it is in the tree.
-        let root = workspace.root.borrow().clone();
-        if let Some(parent) = find_parent_of_leaf(&root, &leaf) {
-            replace_leaf(&parent, &leaf, split);
-        } else {
-            detach(&workspace.holder, &root.widget());
-            workspace.holder.append(&split.widget());
-            *workspace.root.borrow_mut() = split;
-        }
-        trace(&format!(
-            "split {}: leaves now {}, holder children {}",
-            match orientation {
-                gtk::Orientation::Horizontal => "right",
-                _ => "down",
-            },
-            workspace.all_leaves().len(),
-            workspace.holder.observe_children().n_items()
-        ));
-        *workspace.focused.borrow_mut() = new_leaf.clone();
-        new_leaf.focus();
-        self.refresh_pane_menus();
-        persist_tabs(&self.db, &workspace);
-        self.toast(match orientation {
-            gtk::Orientation::Horizontal => "Split right",
-            _ => "Split down",
-        });
+        paned.upcast()
     }
 
-    fn close_focused_pane(&self) {
-        let Some(workspace) = self.current_workspace() else {
-            return;
-        };
-        let leaf = workspace.leaf();
-        let pages: Vec<adw::TabPage> = leaf
-            .pages
-            .borrow()
-            .iter()
-            .map(|page| page.page.clone())
-            .collect();
-        for page in pages {
-            leaf.tab_view.close_page(&page);
-        }
-    }
-
-    /// The orientation of the split holding a leaf, if any.
-    fn split_orientation(&self, leaf: &Rc<Leaf>) -> Option<gtk::Orientation> {
-        let workspace = self.current_workspace()?;
-        let root = workspace.root.borrow().clone();
-        let parent = find_parent_of_leaf(&root, leaf)?;
-        match &*parent {
-            Node::Split { orientation, .. } => Some(*orientation),
-            Node::Leaf(_) => None,
-        }
-    }
-
-    /// Move focus to the other pane of the nearest split.
-    fn focus_sibling(&self, forward: bool) {
-        let Some(workspace) = self.current_workspace() else {
-            return;
-        };
-        let leaves = workspace.all_leaves();
-        if leaves.len() < 2 {
-            return;
-        }
-        let current = workspace.leaf();
-        let index = leaves
-            .iter()
-            .position(|leaf| Rc::ptr_eq(leaf, &current))
-            .unwrap_or(0);
-        let next = if forward {
-            (index + 1) % leaves.len()
-        } else {
-            (index + leaves.len() - 1) % leaves.len()
-        };
-        *workspace.focused.borrow_mut() = leaves[next].clone();
-        leaves[next].focus();
-        let _ = self.split_orientation(&current);
-    }
-
-    /// Zoom the focused pane to the whole window, and back.
+    /// Zoom the first visible primitive to the whole window, and back.
     fn toggle_zoom(&self) {
-        let Some(workspace) = self.current_workspace() else { return };
-
-        if let Some(zoom) = workspace.zoom.borrow_mut().take() {
-            workspace.holder.remove(&zoom.leaf.widget);
-            zoom.leaf.widget.unparent();
-            match zoom.position {
-                Half::First => zoom.parent.set_start_child(Some(&zoom.leaf.widget)),
-                Half::Second => zoom.parent.set_end_child(Some(&zoom.leaf.widget)),
-            }
-            workspace.holder.append(&workspace.root.borrow().widget());
-            zoom.leaf.focus();
-            return;
-        }
-
-        let leaf = workspace.leaf();
-        let root = workspace.root.borrow().clone();
-        let Some(parent) = find_parent_of_leaf(&root, &leaf) else {
-            self.toast("Already full window");
+        let Some(workspace) = self.current_workspace() else {
             return;
         };
-        let position = position_of_leaf(&parent, &leaf);
-        let Node::Split { paned, .. } = &*parent else {
+        if let Some(previous) = workspace.zoom.borrow_mut().take() {
+            *workspace.visible.borrow_mut() = previous;
+            self.layout(&workspace);
+            self.sync_toggles();
             return;
-        };
-        match position {
-            Half::First => paned.set_start_child(None::<&gtk::Widget>),
-            Half::Second => paned.set_end_child(None::<&gtk::Widget>),
         }
-        leaf.widget.unparent();
-        detach(&workspace.holder, &root.widget());
-        workspace.holder.append(&leaf.widget);
-        *workspace.zoom.borrow_mut() = Some(Zoom {
-            leaf: leaf.clone(),
-            parent: paned.clone(),
-            position,
-        });
-        leaf.focus();
+        let visible = workspace.visible.borrow().clone();
+        if visible.len() < 2 {
+            self.toast("Only one pane is showing");
+            return;
+        }
+        *workspace.zoom.borrow_mut() = Some(visible.clone());
+        *workspace.visible.borrow_mut() = vec![visible[0]];
+        self.layout(&workspace);
+        self.sync_toggles();
     }
 
     fn toggle_sidebar(&self) {
@@ -1347,171 +1404,53 @@ impl App {
         self.sidebar_shown.set(showing);
     }
 
-    /// Focus a slot's tab in this pane, or open it here if there is none.
-    fn toggle_slot(&self, slot: Slot) {
-        let Some(workspace) = self.current_workspace() else {
-            self.toast("Select a project first");
-            return;
-        };
-        let leaf = workspace.leaf();
-        if let Some(page) = leaf.page_for_slot(slot) {
-            leaf.tab_view.set_selected_page(&page);
-            leaf.focus();
-            return;
+    /// Store the primitives on screen, so the next launch looks the same.
+    fn persist_primitives(&self, workspace: &Rc<Workspace>) {
+        let mut tabs = Vec::new();
+        for (index, slot) in workspace.visible.borrow().iter().enumerate() {
+            let program_id = workspace
+                .primitive(*slot)
+                .map(|primitive| primitive.program_id.clone())
+                .or_else(|| workspace.programs.borrow().get(slot).cloned());
+            let Some(program_id) = program_id else {
+                continue;
+            };
+            let mut tab = crate::db::Tab::new(*slot, program_id);
+            tab.sort_order = index as i64;
+            tabs.push(tab);
         }
+        if let Err(error) = self.db.set_tabs(workspace.project.id, &tabs) {
+            eprintln!("radar: could not store the panes: {error}");
+        }
+    }
+
+    /// Make the sidebar icons match the layout.
+    fn sync_toggles(&self) {
+        let visible = self
+            .current_workspace()
+            .map(|workspace| workspace.visible_slots())
+            .unwrap_or_default();
         let preferences = self.db.preferences().unwrap_or_default();
-        let Some(program) = programs::for_slot(slot, &preferences) else {
-            self.toast(&format!("No {} installed", slot.label().to_lowercase()));
-            return;
-        };
-        self.open_program(&leaf, program, slot, Vec::new());
-        persist_tabs(&self.db, &workspace);
+        for (slot, button) in self.toggles.borrow().iter() {
+            button.set_active(visible.contains(slot));
+            let available = *slot == Slot::Shell || programs::for_slot(*slot, &preferences).is_some();
+            button.set_sensitive(available);
+        }
     }
 
-    /// Rebuild the pane menus, which list the preferred programs.
-    fn refresh_pane_menus(&self) {
-        let model = self.pane_menu_model();
+    /// Rebuild the pane menus and the sidebar icons' sensitivity.
+    fn refresh_menus(&self) {
         for workspace in self.workspaces.borrow().values() {
-            for leaf in workspace.all_leaves() {
-                leaf.menu_button.set_menu_model(Some(&model));
+            for (slot, primitive) in workspace.primitives.borrow().iter() {
+                primitive
+                    .menu_button
+                    .set_menu_model(Some(&self.primitive_menu_model(*slot)));
             }
         }
-    }
-}
-
-/// Locate the split that directly contains a node (node identity).
-fn find_parent(root: &Rc<Node>, target: &Rc<Node>) -> Option<Rc<Node>> {
-    match &**root {
-        Node::Leaf(_) => None,
-        Node::Split { first, second, .. } => {
-            for child in [first, second] {
-                let child = child.borrow().clone();
-                if Rc::ptr_eq(&child, target) {
-                    return Some(root.clone());
-                }
-                if let Some(found) = find_parent(&child, target) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-    }
-}
-
-/// Locate the split that directly contains a leaf.
-///
-/// Identity has to be by leaf: a freshly built `Rc<Node>` around the same leaf is
-/// a different allocation, so pointer comparison on nodes would never match.
-fn find_parent_of_leaf(root: &Rc<Node>, leaf: &Rc<Leaf>) -> Option<Rc<Node>> {
-    match &**root {
-        Node::Leaf(_) => None,
-        Node::Split { first, second, .. } => {
-            for child in [first, second] {
-                let child = child.borrow().clone();
-                if matches!(&*child, Node::Leaf(found) if Rc::ptr_eq(found, leaf)) {
-                    return Some(root.clone());
-                }
-                if let Some(found) = find_parent_of_leaf(&child, leaf) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-    }
-}
-
-/// Which half of its parent a leaf sits in.
-fn position_of_leaf(parent: &Node, leaf: &Rc<Leaf>) -> Half {
-    if let Node::Split { first, .. } = parent {
-        if matches!(&**first.borrow(), Node::Leaf(found) if Rc::ptr_eq(found, leaf)) {
-            return Half::First;
-        }
-    }
-    Half::Second
-}
-
-/// The stored child node of a split, by half.
-fn child_node(parent: &Node, half: Half) -> Option<Rc<Node>> {
-    match parent {
-        Node::Split { first, second, .. } => Some(match half {
-            Half::First => first.borrow().clone(),
-            Half::Second => second.borrow().clone(),
-        }),
-        Node::Leaf(_) => None,
-    }
-}
-
-/// Swap the child of a split that holds `leaf` for another node.
-fn replace_leaf(parent: &Rc<Node>, leaf: &Rc<Leaf>, new: Rc<Node>) {
-    if let Node::Split {
-        paned,
-        first,
-        second,
-        ..
-    } = &**parent
-    {
-        match position_of_leaf(parent, leaf) {
-            Half::First => {
-                *first.borrow_mut() = new.clone();
-                paned.set_start_child(Some(&new.widget()));
-            }
-            Half::Second => {
-                *second.borrow_mut() = new.clone();
-                paned.set_end_child(Some(&new.widget()));
-            }
-        }
-    }
-}
-
-/// Swap a child of a split for another node, by node identity.
-fn replace_child(parent: &Rc<Node>, old: &Rc<Node>, new: Rc<Node>) {
-    if let Node::Split {
-        paned,
-        first,
-        second,
-        ..
-    } = &**parent
-    {
-        if Rc::ptr_eq(&first.borrow(), old) {
-            *first.borrow_mut() = new.clone();
-            paned.set_start_child(Some(&new.widget()));
-        } else if Rc::ptr_eq(&second.borrow(), old) {
-            *second.borrow_mut() = new.clone();
-            paned.set_end_child(Some(&new.widget()));
-        }
-    }
-}
-
-/// The node that keeps its place when a split loses one half.
-fn sibling_of(parent: &Node, target: &Rc<Node>) -> Rc<Node> {
-    if let Node::Split { first, second, .. } = parent {
-        if Rc::ptr_eq(&first.borrow(), target) {
-            return second.borrow().clone();
-        }
-        return first.borrow().clone();
-    }
-    target.clone()
-}
-
-/// Remove a child, but only when it really is that container's child.
-///
-/// GTK asserts when it is not, and the assertion is noise from defensive code
-/// rather than a bug worth showing anyone.
-fn detach(parent: &impl IsA<gtk::Widget>, child: &impl IsA<gtk::Widget>) {
-    let parent = parent.clone().upcast::<gtk::Widget>();
-    let child = child.clone().upcast::<gtk::Widget>();
-    if child.parent().is_some_and(|current| current == parent) {
-        parent
-            .downcast::<gtk::Box>()
-            .expect("detach is only used with boxes")
-            .remove(&child);
     }
 }
 
 /// Append a line to a debug log when `RADAR_TRACE` is set.
-///
-/// Layout bugs are much easier to see in a trace than in a screenshot, and a
-/// detached GUI app's stdout is not always where you think it is.
 fn trace(message: &str) {
     use std::io::Write;
     let Some(path) = std::env::var_os("RADAR_TRACE") else {
@@ -1524,82 +1463,4 @@ fn trace(message: &str) {
     {
         let _ = writeln!(file, "{message}");
     }
-}
-
-/// A stored tab for a slot, without importing the db module's builder.
-fn db_tab(slot: Slot, program_id: String) -> crate::db::Tab {
-    crate::db::Tab::new(slot, program_id)
-}
-
-
-/// Remove an emptied pane: its sibling takes its place, or the root stays.
-fn collapse_leaf(workspace: &Rc<Workspace>, leaf: &Rc<Leaf>) {
-    let root = workspace.root.borrow().clone();
-    if let Some(parent) = find_parent_of_leaf(&root, leaf) {
-        let buried = child_node(&parent, position_of_leaf(&parent, leaf));
-        let survivor = buried
-            .map(|node| sibling_of(&parent, &node))
-            .unwrap_or_else(|| root.clone());
-        survivor.widget().unparent();
-        match find_parent(&root, &parent) {
-            Some(grandparent) => replace_child(&grandparent, &parent, survivor.clone()),
-            None => {
-                detach(&workspace.holder, &root.widget());
-                workspace.holder.append(&survivor.widget());
-                *workspace.root.borrow_mut() = survivor.clone();
-            }
-        }
-    }
-    if let Some(next) = workspace.all_leaves().first() {
-        *workspace.focused.borrow_mut() = next.clone();
-    }
-}
-
-/// Wire a leaf's tab strip: closing a tab stores the change and tidies up.
-fn wire_close_page(db: SharedDb, workspace: Rc<Workspace>, leaf: Rc<Leaf>) {
-    let tab_view = leaf.tab_view.clone();
-    tab_view.connect_close_page(move |view, page| {
-        leaf.remove_page(page);
-        if leaf.is_empty() {
-            collapse_leaf(&workspace, &leaf);
-        }
-        persist_tabs(&db, &workspace);
-        view.close_page_finish(page, true);
-        true
-    });
-}
-
-/// Whatever you click in focuses that pane, which is what pane actions and zoom
-/// act on.
-fn wire_focus(workspace: &Rc<Workspace>, leaf: &Rc<Leaf>) {
-    let focus = gtk::EventControllerFocus::new();
-    let focused = workspace.focused.clone();
-    let leaf_for_focus = leaf.clone();
-    focus.connect_enter(move |_| {
-        *focused.borrow_mut() = leaf_for_focus.clone();
-    });
-    leaf.widget.add_controller(focus);
-}
-
-/// Store a workspace's tabs: every pane's, in tree order.
-fn persist_tabs(db: &Db, workspace: &Rc<Workspace>) {
-    let mut tabs = Vec::new();
-    for leaf in workspace.all_leaves() {
-        tabs.extend(leaf.to_tabs(workspace.project.id));
-    }
-    if let Err(error) = db.set_tabs(workspace.project.id, &tabs) {
-        eprintln!("radar: could not store tabs: {error}");
-    }
-}
-
-/// An icon for a tab, by slot.
-fn icon_for(slot: Slot) -> Option<gio::Icon> {
-    let name = match slot {
-        Slot::Editor => "accessories-text-editor-symbolic",
-        Slot::Agent => "utilities-terminal-symbolic",
-        Slot::Diff => "view-list-symbolic",
-        Slot::Shell => "utilities-terminal-symbolic",
-        Slot::Custom => "application-x-executable-symbolic",
-    };
-    Some(gio::ThemedIcon::new(name).upcast())
 }
