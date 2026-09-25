@@ -623,7 +623,7 @@ fn doctor(paths: &Paths, db: &Db) -> Result<()> {
             "default agent + agent flags",
             "part of omarchy",
         ),
-        ("hunk", radar::config::have("hunk"), "diff tabs", "mise use -g hunkdiff"),
+        ("lazygit", radar::config::have("lazygit"), "diff tabs", "pacman -S lazygit"),
         (
             "libvte-2.91-gtk4",
             vte_available(),

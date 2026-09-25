@@ -19,6 +19,41 @@ use super::icon_name;
 use super::primitive::label_for;
 use crate::db::Slot;
 
+/// What a drop should do, decided by where it landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropIntent {
+    /// Landed on a pane's header: join that pane, sharing its header.
+    Group,
+    /// Landed on a pane's body: this primitive gets a pane of its own.
+    SplitOut,
+    /// Nothing to do — dropping a primitive onto its own header, say.
+    Ignore,
+}
+
+/// Where a drop landed.
+pub fn drop_intent(
+    over_header: bool,
+    dragged: Slot,
+    members: &[Slot],
+    active: Option<Slot>,
+) -> DropIntent {
+    if dragged == Slot::Custom {
+        return DropIntent::Ignore;
+    }
+    if over_header {
+        // Joining this pane is pointless if it is already the primitive shown.
+        if active == Some(dragged) {
+            return DropIntent::Ignore;
+        }
+        return DropIntent::Group;
+    }
+    // On the body: a pane of its own. Already alone there, so nothing to do.
+    if members == [dragged] {
+        return DropIntent::Ignore;
+    }
+    DropIntent::SplitOut
+}
+
 pub struct Group {
     pub widget: gtk::Box,
     pub header: gtk::Box,
@@ -108,58 +143,72 @@ impl Group {
         group.header.add_controller(source);
 
         // ---- the whole pane accepts a drop ----
+        //
+        // One target for the entire pane, because a header is only ~22px tall and
+        // a terminal widget has its own drop target for text that would otherwise
+        // take the drop. Where you release decides what happens: the header joins
+        // panes, the body splits one out.
         let target = gtk::DropTarget::new(glib::types::Type::STRING, gdk::DragAction::MOVE);
         target.set_propagation_phase(PropagationPhase::Capture);
-        target.connect_accept(|_, drag| {
-            let accepts = drag.actions().contains(gdk::DragAction::MOVE);
-            super::trace(&format!("drop: accept asked (move allowed: {accepts})"));
-            accepts
-        });
+        target.connect_accept(|_, drag| drag.actions().contains(gdk::DragAction::MOVE));
+
         let widget_for_highlight = group.widget.clone();
-        target.connect_enter(move |_, _, _| {
-            widget_for_highlight.add_css_class("drop-target");
-            super::trace("drop: entered a pane");
+        let header_for_highlight = group.header.clone();
+        target.connect_motion(move |_, _, y| {
+            // Light up the half the drop would act on, so the gesture is readable
+            // before releasing.
+            let over_header =
+                y <= header_for_highlight.height() as f64 + 2.0;
+            if over_header {
+                header_for_highlight.add_css_class("drop-header");
+                widget_for_highlight.remove_css_class("drop-target");
+            } else {
+                widget_for_highlight.add_css_class("drop-target");
+                header_for_highlight.remove_css_class("drop-header");
+            }
             gdk::DragAction::MOVE
         });
         let widget_for_unhighlight = group.widget.clone();
+        let header_for_unhighlight = group.header.clone();
         target.connect_leave(move |_| {
             widget_for_unhighlight.remove_css_class("drop-target");
-            super::trace("drop: left a pane");
+            header_for_unhighlight.remove_css_class("drop-header");
         });
+
         let widget = group.widget.clone();
+        let header = group.header.clone();
         let group_for_drop = group.clone();
-        target.connect_drop(move |_, value, _, _| {
+        target.connect_drop(move |_, value, _, y| {
             let Ok(payload) = value.get::<String>() else {
                 super::trace("drop: payload was not a string");
                 return false;
             };
+            let dragged = Slot::parse(&payload);
+            let over_header = y <= header.height() as f64 + 2.0;
+            let members = group_for_drop.slots();
+            let intent = drop_intent(over_header, dragged, &members, group_for_drop.active_slot());
+            widget.remove_css_class("drop-target");
+            header.remove_css_class("drop-header");
             super::trace(&format!(
-                "drop: pane got payload={payload} (members {:?})",
-                group_for_drop
-                    .slots()
-                    .iter()
-                    .map(|slot| slot.as_str())
-                    .collect::<Vec<_>>()
+                "drop: payload={payload} y={y:.0} over_header={over_header} members={members:?} -> {intent:?}"
             ));
-            let slot = Slot::parse(&payload);
-            if slot == Slot::Custom {
-                return false;
+            match intent {
+                DropIntent::Ignore => false,
+                DropIntent::Group => {
+                    let Some(target_slot) = group_for_drop.active_slot() else {
+                        return false;
+                    };
+                    let _ = widget.activate_action(
+                        "primitive-group",
+                        Some(&(payload, target_slot.as_str().to_string()).to_variant()),
+                    );
+                    true
+                }
+                DropIntent::SplitOut => {
+                    let _ = widget.activate_action("primitive-split-out", Some(&payload.to_variant()));
+                    true
+                }
             }
-            if group_for_drop.contains(slot) && group_for_drop.slots().len() > 1 {
-                let _ = widget.activate_action("primitive-split-out", Some(&payload.to_variant()));
-                return true;
-            }
-            let Some(target_slot) = group_for_drop.active_slot() else {
-                return false;
-            };
-            if slot == target_slot {
-                return false;
-            }
-            let _ = widget.activate_action(
-                "primitive-group",
-                Some(&(payload, target_slot.as_str().to_string()).to_variant()),
-            );
-            true
         });
         group.widget.add_controller(target);
     }
@@ -249,5 +298,59 @@ impl Group {
             self.header.append(&chip);
         }
         self.header.append(&self.menu_button);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_drops_group_and_body_drops_split() {
+        let members = [Slot::Agent];
+        assert_eq!(
+            drop_intent(true, Slot::Diff, &members, Some(Slot::Agent)),
+            DropIntent::Group,
+            "onto another pane's header: join it"
+        );
+        assert_eq!(
+            drop_intent(false, Slot::Diff, &members, Some(Slot::Agent)),
+            DropIntent::SplitOut,
+            "onto another pane's body: a pane of its own"
+        );
+    }
+
+    #[test]
+    fn dropping_a_primitive_on_its_own_pane_does_nothing() {
+        assert_eq!(
+            drop_intent(true, Slot::Agent, &[Slot::Agent], Some(Slot::Agent)),
+            DropIntent::Ignore
+        );
+        assert_eq!(
+            drop_intent(false, Slot::Agent, &[Slot::Agent], Some(Slot::Agent)),
+            DropIntent::Ignore
+        );
+        assert_eq!(
+            drop_intent(
+                false,
+                Slot::Diff,
+                &[Slot::Agent, Slot::Diff],
+                Some(Slot::Agent)
+            ),
+            DropIntent::SplitOut,
+            "a member of this pane, dropped on the body: out it comes"
+        );
+    }
+
+    #[test]
+    fn a_non_primitive_payload_is_ignored() {
+        assert_eq!(
+            drop_intent(true, Slot::Custom, &[Slot::Agent], Some(Slot::Agent)),
+            DropIntent::Ignore
+        );
+        assert_eq!(
+            drop_intent(false, Slot::Custom, &[Slot::Agent], Some(Slot::Agent)),
+            DropIntent::Ignore
+        );
     }
 }

@@ -13,7 +13,7 @@ const UI_KEY: &str = "ui";
 
 /// The user's preferred program per slot — "preferred editor / agent / diff".
 ///
-/// Values are program ids from the registry (`nvim`, `claude`, `hunk`, …).
+/// Values are program ids from the registry (`nvim`, `claude`, `lazygit`, …).
 /// `None` means "pick the best installed one", so a fresh install still works.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]

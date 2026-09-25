@@ -12,7 +12,7 @@ alive, so a running agent is never interrupted.
 
 ```
 ┌────────────────┬──────────────────────────────────────────────┐
-│ Projects       │  Neovim │ OpenCode │ Hunk                    │
+│ Projects       │  Neovim │ OpenCode │ Lazygit                 │
 │ ────────────── │ ──────────────────────────────────────────── │
 │ api-server  ●3 │                                              │
 │ web-app        │            (a real terminal,                  │

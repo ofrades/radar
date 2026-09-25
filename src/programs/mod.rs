@@ -212,11 +212,14 @@ pub fn registry() -> Vec<Program> {
 
 
     // ---- Diffs ----
+    // lazygit leads: it is the general git TUI, so it is what the Changes
+    // primitive opens when nothing else is preferred. Hunk stays second as the
+    // focused reviewer for a single changeset.
+    programs.push(Program::new("lazygit", "Lazygit", "lazygit", Kind::Diff, "git TUI", 0));
     programs.push(
-        Program::new("hunk", "Hunk", "hunk", Kind::Diff, "live review of agent changes", 0)
+        Program::new("hunk", "Hunk", "hunk", Kind::Diff, "live review of agent changes", 1)
             .with_args(&["diff", "--watch"]),
     );
-    programs.push(Program::new("lazygit", "Lazygit", "lazygit", Kind::Diff, "git TUI", 1));
     programs.push(Program::new("gitui", "GitUI", "gitui", Kind::Diff, "git TUI", 2));
     programs.push(Program::new("tig", "Tig", "tig", Kind::Diff, "git browser", 3));
 
@@ -419,6 +422,18 @@ mod tests {
         for program in installed_of(Kind::Diff) {
             assert!(!program.external);
         }
+    }
+
+    #[test]
+    fn the_changes_slot_defaults_to_lazygit() {
+        // lazygit is the general git TUI, so it leads the Diff registry and
+        // therefore fills the Changes primitive when nothing is preferred.
+        if !crate::config::have("lazygit") {
+            return;
+        }
+        let chosen = for_slot(Slot::Diff, &Preferences::default()).expect("a diff program");
+        assert_eq!(chosen.id, "lazygit");
+        assert_eq!(installed_of(Kind::Diff)[0].id, "lazygit");
     }
 
     #[test]
