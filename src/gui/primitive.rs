@@ -37,11 +37,20 @@ impl Primitive {
             header.append(&image);
         }
 
-        let title = gtk::Label::new(Some(&program.name));
+        // The pane is named after the primitive it is — agent, changes, editor,
+        // commands — and the program behind it is the subtitle: the primitive is
+        // the thing you navigate, the program is an implementation detail.
+        let title = gtk::Label::new(Some(label_for(slot)));
         title.add_css_class("caption-heading");
         title.set_xalign(0.0);
-        title.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         header.append(&title);
+
+        let program_label = gtk::Label::new(Some(&program.name));
+        program_label.add_css_class("caption");
+        program_label.add_css_class("dim-label");
+        program_label.set_xalign(0.0);
+        program_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        header.append(&program_label);
 
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);

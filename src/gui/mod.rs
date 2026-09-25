@@ -210,16 +210,33 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         .build();
     workspace_menu.add_css_class("flat");
 
+    // The sidebar's own header, matching the panes: icon, name, actions.
+    let sidebar_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    sidebar_header.add_css_class("group-header");
+    sidebar_header.set_margin_start(6);
+    sidebar_header.set_margin_end(4);
+    sidebar_header.set_margin_top(2);
+    sidebar_header.set_margin_bottom(2);
+    sidebar_header.append(&gtk::Image::from_icon_name(primitive::PROJECTS_ICON));
+    let sidebar_title = gtk::Label::new(Some(primitive::PROJECTS_LABEL));
+    sidebar_title.add_css_class("caption-heading");
+    sidebar_title.set_xalign(0.0);
+    sidebar_title.set_hexpand(true);
+    sidebar_header.append(&sidebar_title);
+    sidebar_header.append(&add_button);
+    sidebar_header.append(&workspace_menu);
+
     let search_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     search_row.set_margin_start(8);
     search_row.set_margin_end(6);
+    search_row.set_margin_top(4);
     search_row.set_margin_bottom(6);
     search_row.append(&search);
-    search_row.append(&add_button);
-    search_row.append(&workspace_menu);
 
     let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar_box.add_css_class("projects-sidebar");
+    sidebar_box.append(&sidebar_header);
+    sidebar_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     sidebar_box.append(&toggles);
     sidebar_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     sidebar_box.append(&search_row);
