@@ -344,6 +344,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     register_actions(&state, app, &workspace_menu);
     connect_widgets(&state);
     start_status_drainer(&state);
+    wire_sidebar_drop(&state);
     watch_theme(&state);
     state.refresh_projects();
     if let Ok(prefs) = state.db.ui_prefs() {
@@ -1285,8 +1286,7 @@ impl App {
             group.insert(slot, &primitive.widget, true);
             group.rebuild_header();
             self.refresh_group_menu(&group);
-            self.wire_content_drop(&group);
-            workspace.push_group(group);
+                workspace.push_group(group);
         }
 
         self.layout(&workspace);
@@ -1352,8 +1352,7 @@ impl App {
             group.insert(slot, &primitive.widget, true);
             group.rebuild_header();
             self.refresh_group_menu(&group);
-            self.wire_content_drop(&group);
-            workspace.push_group(group);
+                workspace.push_group(group);
         }
         *workspace.zoom.borrow_mut() = None;
         self.layout(workspace);
@@ -1437,28 +1436,12 @@ impl App {
         own.insert(slot, &primitive.widget, true);
         own.rebuild_header();
         self.refresh_group_menu(&own);
-        self.wire_content_drop(&own);
         workspace.push_group(own);
         *workspace.zoom.borrow_mut() = None;
         self.layout(workspace);
         self.sync_toggles();
         self.persist_primitives(workspace);
         trace(&format!("split out: {}", slot.as_str()));
-    }
-
-    /// A pane's content accepts a dropped chip: that pulls it out into its own
-    /// pane, the opposite gesture from dropping on a header.
-    fn wire_content_drop(&self, group: &Rc<Group>) {
-        let target = gtk::DropTarget::new(glib::types::Type::STRING, gtk::gdk::DragAction::MOVE);
-        let content = group.content.clone();
-        target.connect_drop(move |_, value, _, _| {
-            let Ok(slot) = value.get::<String>() else {
-                return false;
-            };
-            let _ = content.activate_action("primitive-split-out", Some(&slot.to_variant()));
-            true
-        });
-        group.widget.add_controller(target);
     }
 
     /// Replace the program behind a primitive.
@@ -1754,6 +1737,29 @@ impl App {
             }
         }
     }
+}
+
+/// Dropping a pane on the project list pulls that primitive into a pane of its
+/// own: the natural counter-gesture to dropping it onto another pane.
+fn wire_sidebar_drop(app: &SharedApp) {
+    let target = gtk::DropTarget::new(
+        glib::types::Type::STRING,
+        gtk::gdk::DragAction::MOVE,
+    );
+    target.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let list = app.sidebar_list.clone();
+    target.connect_drop(move |_, value, _, _| {
+        let Ok(payload) = value.get::<String>() else {
+            return false;
+        };
+        trace(&format!("drop: sidebar got payload={payload}"));
+        let _ = list.activate_action("primitive-split-out", Some(&payload.to_variant()));
+        true
+    });
+    app.sidebar_list
+        .clone()
+        .upcast::<gtk::Widget>()
+        .add_controller(target);
 }
 
 /// Append a line to a debug log when `RADAR_TRACE` is set.

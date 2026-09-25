@@ -73,12 +73,15 @@ impl Group {
         group
     }
 
-    /// The header drags and accepts drops.
+    /// The header drags; the whole pane accepts drops.
     ///
-    /// Drag gestures live on the header box, not on the chips: a button claims
-    /// the press a drag needs. Both drop targets run in the *capture* phase so
-    /// that nothing inside a pane can swallow a drop — the terminal widget has
-    /// its own target for dropped text, which would otherwise win.
+    /// One target covers the entire pane — header and body — because a 22 pixel
+    /// header is a hard thing to hit, and because a terminal widget has its own
+    /// drop target that would otherwise take the drop. It runs in the capture
+    /// phase so this one always sees the event first.
+    ///
+    /// Dropping another pane here joins them; dropping one of *this* pane's own
+    /// primitives here pulls it out into a pane of its own.
     fn accept_drags(group: &Rc<Group>) {
         use gtk::PropagationPhase;
 
@@ -104,81 +107,61 @@ impl Group {
         });
         group.header.add_controller(source);
 
-        // ---- drop on the header: join this pane ----
+        // ---- the whole pane accepts a drop ----
         let target = gtk::DropTarget::new(glib::types::Type::STRING, gdk::DragAction::MOVE);
         target.set_propagation_phase(PropagationPhase::Capture);
-        let header = group.header.clone();
+        target.connect_accept(|_, drag| {
+            let accepts = drag.actions().contains(gdk::DragAction::MOVE);
+            super::trace(&format!("drop: accept asked (move allowed: {accepts})"));
+            accepts
+        });
+        let widget_for_highlight = group.widget.clone();
+        target.connect_enter(move |_, _, _| {
+            widget_for_highlight.add_css_class("drop-target");
+            super::trace("drop: entered a pane");
+            gdk::DragAction::MOVE
+        });
+        let widget_for_unhighlight = group.widget.clone();
+        target.connect_leave(move |_| {
+            widget_for_unhighlight.remove_css_class("drop-target");
+            super::trace("drop: left a pane");
+        });
+        let widget = group.widget.clone();
         let group_for_drop = group.clone();
         target.connect_drop(move |_, value, _, _| {
             let Ok(payload) = value.get::<String>() else {
-                super::trace("drop: header got a payload that is not a string");
+                super::trace("drop: payload was not a string");
                 return false;
             };
-            super::trace(&format!("drop: header payload={payload}"));
-            let source_slot = Slot::parse(&payload);
-            if source_slot == Slot::Custom {
-                return false;
-            }
-            let Some(target_slot) = group_for_drop.active_slot() else {
-                return false;
-            };
-            if source_slot == target_slot {
-                return false;
-            }
-            let _ = header.activate_action(
-                "primitive-group",
-                Some(&(payload, target_slot.as_str().to_string()).to_variant()),
-            );
-            true
-        });
-        let header_for_highlight = group.header.clone();
-        target.connect_enter(move |_, _, _| {
-            header_for_highlight.add_css_class("drop-target");
-            gdk::DragAction::MOVE
-        });
-        let header_for_unhighlight = group.header.clone();
-        target.connect_leave(move |_| {
-            header_for_unhighlight.remove_css_class("drop-target");
-        });
-        group.header.add_controller(target);
-
-        // ---- drop on the content: out into its own pane, or join ----
-        let content_target = gtk::DropTarget::new(glib::types::Type::STRING, gdk::DragAction::MOVE);
-        content_target.set_propagation_phase(PropagationPhase::Capture);
-        let content = group.content.clone();
-        let group_for_content = group.clone();
-        content_target.connect_drop(move |_, value, _, _| {
-            let Ok(payload) = value.get::<String>() else {
-                return false;
-            };
-            super::trace(&format!("drop: content payload={payload}"));
+            super::trace(&format!(
+                "drop: pane got payload={payload} (members {:?})",
+                group_for_drop
+                    .slots()
+                    .iter()
+                    .map(|slot| slot.as_str())
+                    .collect::<Vec<_>>()
+            ));
             let slot = Slot::parse(&payload);
             if slot == Slot::Custom {
                 return false;
             }
-            if group_for_content.contains(slot) && group_for_content.slots().len() > 1 {
-                let _ = content.activate_action("primitive-split-out", Some(&payload.to_variant()));
+            if group_for_drop.contains(slot) && group_for_drop.slots().len() > 1 {
+                let _ = widget.activate_action("primitive-split-out", Some(&payload.to_variant()));
                 return true;
             }
-            let Some(target_slot) = group_for_content.active_slot() else {
+            let Some(target_slot) = group_for_drop.active_slot() else {
                 return false;
             };
-            let _ = content.activate_action(
+            if slot == target_slot {
+                return false;
+            }
+            let _ = widget.activate_action(
                 "primitive-group",
                 Some(&(payload, target_slot.as_str().to_string()).to_variant()),
             );
             true
         });
-        let content_for_highlight = group.content.clone();
-        content_target.connect_enter(move |_, _, _| {
-            content_for_highlight.add_css_class("drop-target");
-            gdk::DragAction::MOVE
-        });
-        let content_for_unhighlight = group.content.clone();
-        content_target.connect_leave(move |_| {
-            content_for_unhighlight.remove_css_class("drop-target");
-        });
-        group.content.add_controller(content_target);
+        group.widget.add_controller(target);
     }
 
     /// Show a member's widget, adding it if this group has not seen it before.
