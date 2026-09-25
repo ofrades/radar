@@ -1,172 +1,17 @@
-//! Dialogs: choosing a program, and preferences.
+//! The preferences dialog.
 //!
 //! Each is a small modal window over the main one. Rows carry their payload in
 //! the activation handler rather than in widget data, which keeps everything
-//! safe and explicit. (Adding a project is not a dialog any more: the sidebar
-//! itself flips into find mode — see `gui::App::toggle_find_mode`.)
+//! safe and explicit. Adding a project happens from the sidebar's search.
 
 use std::rc::Rc;
 
 use adw::prelude::*;
 
 use crate::db::{Db, Slot};
-use crate::programs::{self, Program};
+use crate::programs;
 
 type SharedDb = Rc<Db>;
-
-/// A modal window with a search box and a list.
-fn picker_window(
-    title: &str,
-    placeholder: &str,
-) -> (gtk::Window, gtk::Box, gtk::ListBox, gtk::SearchEntry) {
-    let window = gtk::Window::builder()
-        .title(title)
-        .default_width(640)
-        .default_height(560)
-        .modal(true)
-        .build();
-    let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-
-    let search = gtk::SearchEntry::new();
-    search.set_placeholder_text(Some(placeholder));
-    search.set_margin_top(12);
-    search.set_margin_bottom(6);
-    search.set_margin_start(12);
-    search.set_margin_end(12);
-    outer.append(&search);
-
-    let list = gtk::ListBox::new();
-    list.set_selection_mode(gtk::SelectionMode::Single);
-    list.set_activate_on_single_click(false);
-    list.add_css_class("boxed-list");
-    list.set_margin_start(12);
-    list.set_margin_end(12);
-    list.set_margin_bottom(12);
-
-    let scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&list)
-        .build();
-    outer.append(&scroll);
-    window.set_child(Some(&outer));
-    (window, outer, list, search)
-}
-
-/// A row showing a title, a subtitle and an optional badge.
-fn row(title: &str, subtitle: &str, badge: Option<&str>, dim: bool) -> gtk::ListBoxRow {
-    let row = gtk::ListBoxRow::new();
-    let box_ = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    box_.set_margin_top(8);
-    box_.set_margin_bottom(8);
-    box_.set_margin_start(10);
-    box_.set_margin_end(10);
-
-    let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let label = gtk::Label::new(Some(title));
-    label.set_xalign(0.0);
-    label.set_hexpand(true);
-    if dim {
-        label.add_css_class("dim-label");
-    }
-    label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    top.append(&label);
-    if let Some(badge) = badge {
-        let tag = gtk::Label::new(Some(badge));
-        tag.add_css_class("dim-label");
-        tag.add_css_class("caption");
-        top.append(&tag);
-    }
-    box_.append(&top);
-
-    let sub = gtk::Label::new(Some(subtitle));
-    sub.set_xalign(0.0);
-    sub.add_css_class("dim-label");
-    sub.add_css_class("caption");
-    sub.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    box_.append(&sub);
-
-    row.set_child(Some(&box_));
-    row
-}
-
-/// Choose any installed program, grouped by kind.
-pub fn choose_program<F: Fn(Program) + 'static>(parent: &impl IsA<gtk::Window>, on_pick: F) {
-    let (window, _outer, list, search) = picker_window("Add a program", "Filter programs…");
-    window.set_transient_for(Some(parent));
-    let window_for_fill = window.clone();
-
-    let all = programs::embeddable();
-    let on_pick = Rc::new(on_pick);
-
-    let fill: Rc<dyn Fn(&str)> = {
-        let list = list.clone();
-        let on_pick = on_pick.clone();
-        Rc::new(move |query: &str| {
-            let window = window_for_fill.clone();
-            while let Some(child) = list.first_child() {
-                list.remove(&child);
-            }
-            let matcher = fuzzy_matcher::skim::SkimMatcherV2::default().ignore_case();
-            use fuzzy_matcher::FuzzyMatcher;
-            for kind in programs::Kind::ALL {
-                let of_kind: Vec<&Program> = all
-                    .iter()
-                    .filter(|p| p.kind == kind)
-                    .filter(|p| {
-                        query.is_empty()
-                            || matcher.fuzzy_match(&p.name, query).is_some()
-                            || matcher.fuzzy_match(&p.id, query).is_some()
-                    })
-                    .collect();
-                if of_kind.is_empty() {
-                    continue;
-                }
-                let header = gtk::ListBoxRow::new();
-                header.set_selectable(false);
-                header.set_activatable(false);
-                let label = gtk::Label::new(Some(kind.label()));
-                label.set_xalign(0.0);
-                label.add_css_class("caption-heading");
-                label.set_margin_top(12);
-                label.set_margin_start(10);
-                label.set_margin_bottom(4);
-                header.set_child(Some(&label));
-                list.append(&header);
-
-                for program in of_kind {
-                    let item = row(&program.name, &program.detail(), None, false);
-                    let program = program.clone();
-                    let on_pick = on_pick.clone();
-                    let window = window.clone();
-                    item.connect_activate(move |_| {
-                        on_pick(program.clone());
-                        window.close();
-                    });
-                    list.append(&item);
-                }
-            }
-            // Select the first real row so Enter works immediately.
-            for index in 0..list.observe_children().n_items() as i32 {
-                if let Some(child) = list.row_at_index(index) {
-                    if child.is_selectable() {
-                        list.select_row(Some(&child));
-                        break;
-                    }
-                }
-            }
-        })
-    };
-    fill("");
-
-    {
-        let fill = fill.clone();
-        search.connect_search_changed(move |entry| fill(&entry.text()));
-    }
-
-    search.grab_focus();
-    window.present();
-}
 
 /// Preferences: the preferred program per slot, and agent flag policy.
 pub fn preferences<F: Fn() + 'static>(

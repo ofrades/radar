@@ -1038,10 +1038,10 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
                 return;
             };
             let slot = Slot::parse(&name);
-            let Some(workspace) = app_for_action.current_workspace() else {
+            if app_for_action.current_workspace().is_none() {
                 return;
-            };
-            choose_program_for(&app_for_action, workspace, slot);
+            }
+            app_for_action.hud.present_programs(&app_for_action, slot);
         });
         app.window.add_action(&action);
     }
@@ -1060,7 +1060,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
                 else {
                     return;
                 };
-                choose_program_for(&app, workspace, slot);
+                app.hud.present_programs(&app, slot);
             }),
         );
     }
@@ -1172,17 +1172,6 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
     for (action, keys) in accels {
         gtk_app.set_accels_for_action(action, keys);
     }
-}
-
-fn choose_program_for(app: &SharedApp, workspace: Rc<Workspace>, slot: Slot) {
-    if slot == Slot::Board {
-        return;
-    }
-    let window = app.window.clone();
-    let app = app.clone();
-    dialogs::choose_program(&window, move |program| {
-        app.set_primitive_program(&workspace, slot, program, true);
-    });
 }
 
 impl App {
@@ -2087,18 +2076,25 @@ impl App {
         }
     }
 
-    /// Hovering a member selects its content and updates its menu, but leaves
-    /// keyboard focus where the user last put it.
+    /// Hovering a member selects its content and moves keyboard focus into that
+    /// primitive, the same focus-follows-pointer behavior as hovering a pane.
     fn hover_primitive(&self, workspace: &Rc<Workspace>, slot: Slot) {
         let Some(group) = workspace.group_of(slot) else {
             return;
         };
-        if group.active_slot() == Some(slot) {
-            return;
+        if group.active_slot() != Some(slot) {
+            group.activate(slot);
+            self.refresh_group_menu(&group);
+            self.persist_primitives(workspace);
         }
-        group.activate(slot);
-        self.refresh_group_menu(&group);
-        self.persist_primitives(workspace);
+        if let Some(primitive) = workspace.primitive(slot) {
+            let focused_here = self.window.focus_widget().is_some_and(|focus| {
+                focus == primitive.widget || focus.is_ancestor(&primitive.widget)
+            });
+            if !focused_here {
+                primitive.focus();
+            }
+        }
     }
 
     /// Drop one primitive onto another's header: they share that header.
@@ -2499,13 +2495,6 @@ impl App {
             glib::Propagation::Stop
         });
         paned.add_controller(resize_keys);
-
-        let divider_hover = gtk::EventControllerMotion::new();
-        let paned_on_enter = paned.clone();
-        divider_hover.connect_enter(move |_, _, _| paned_on_enter.add_css_class("divider-hover"));
-        let paned_on_leave = paned.clone();
-        divider_hover.connect_leave(move |_| paned_on_leave.remove_css_class("divider-hover"));
-        paned.add_controller(divider_hover);
         workspace.dividers.borrow_mut().push(paned.clone());
         paned.upcast()
     }

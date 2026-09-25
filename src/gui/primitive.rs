@@ -47,7 +47,7 @@ impl Primitive {
 
     pub fn focus(&self) {
         match &self.pane {
-            Some(pane) => pane.widget().grab_focus(),
+            Some(pane) => pane.focus(),
             None => self.widget.grab_focus(),
         };
     }

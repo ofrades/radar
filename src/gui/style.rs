@@ -23,7 +23,7 @@ paned > separator {
 paned.divider-focus > separator {
   background-color: alpha(@radar_accent, 0.9);
 }
-paned.divider-hover > separator {
+paned > separator:hover {
   background-color: alpha(@radar_accent, 0.55);
 }
 .projects-sidebar > separator,

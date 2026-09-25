@@ -199,11 +199,19 @@ impl Group {
     fn accept_drags(group: &Rc<Group>) {
         use gtk::PropagationPhase;
 
-        // Hovering a pane marks it as the pointer-active panel without moving
-        // GTK keyboard focus away from the running primitive.
+        // Hovering a pane activates its current primitive through the same
+        // window action used by chip hover and keyboard focus.
         let hover = gtk::EventControllerMotion::new();
+        hover.set_propagation_phase(gtk::PropagationPhase::Capture);
         let pane_on_enter = group.widget.clone();
-        hover.connect_enter(move |_, _, _| pane_on_enter.add_css_class("pointer-hover"));
+        let group_on_enter = group.clone();
+        hover.connect_enter(move |_, _, _| {
+            pane_on_enter.add_css_class("pointer-hover");
+            if let Some(slot) = group_on_enter.active_slot() {
+                let _ = pane_on_enter
+                    .activate_action("win.primitive-hover", Some(&slot.as_str().to_variant()));
+            }
+        });
         let pane_on_leave = group.widget.clone();
         hover.connect_leave(move |_| pane_on_leave.remove_css_class("pointer-hover"));
         group.widget.add_controller(hover);

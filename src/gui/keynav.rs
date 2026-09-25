@@ -155,9 +155,9 @@ fn keys_are_free(window: &adw::ApplicationWindow) -> bool {
     true
 }
 
-/// The things the keys can land on, with their rectangles: the sidebar, panes,
-/// and the narrow hit area of each divider.
-fn nav_targets(app: &SharedApp, workspace: &super::Workspace) -> Vec<(Target, Rect)> {
+/// Directional navigation lands on panels only; divider hit areas are kept out
+/// so Ctrl+Arrows always moves between the sidebar and panes.
+fn panel_targets(app: &SharedApp, workspace: &super::Workspace) -> Vec<(Target, Rect)> {
     let mut targets = Vec::new();
     if app.sidebar_shown.get() {
         if let Some(rect) = rect_of(&app.sidebar, &app.window) {
@@ -169,6 +169,12 @@ fn nav_targets(app: &SharedApp, workspace: &super::Workspace) -> Vec<(Target, Re
             targets.push((Target::Pane(group), rect));
         }
     }
+    targets
+}
+
+/// Ctrl+Tab also cycles through dividers so they remain keyboard-focusable.
+fn cycle_targets(app: &SharedApp, workspace: &super::Workspace) -> Vec<(Target, Rect)> {
+    let mut targets = panel_targets(app, workspace);
     for divider in workspace.dividers() {
         if let Some(rect) = divider_rect_of(&divider, &app.window) {
             targets.push((Target::Divider(divider), rect));
@@ -207,8 +213,8 @@ fn divider_rect_of(paned: &gtk::Paned, window: &adw::ApplicationWindow) -> Optio
     })
 }
 
-/// Where the keys are now: an index into `nav_targets`, if they are in the
-/// workspace at all.
+/// Where the keys are now: an index into the supplied navigation targets, if
+/// they are in the workspace at all.
 fn current_index(
     app: &SharedApp,
     targets: &[(Target, Rect)],
@@ -226,28 +232,36 @@ fn move_focus(app: &SharedApp, direction: Direction) {
     let Some(workspace) = app.current_workspace() else {
         return;
     };
-    let targets = nav_targets(app, &workspace);
+    let targets = panel_targets(app, &workspace);
     if targets.is_empty() {
         app.toast("No panes on screen — open one with the dock or Ctrl+Shift+K");
         return;
     }
     let focus = app.window.focus_widget();
-    let Some(current) = current_index(app, &targets, focus.as_ref()) else {
+    let current = current_index(app, &targets, focus.as_ref());
+    let current_rect = current
+        .and_then(|index| targets.get(index).map(|(_, rect)| *rect))
+        .or_else(|| {
+            let focus = focus.as_ref()?;
+            workspace
+                .dividers()
+                .into_iter()
+                .find(|divider| *focus == divider.clone().upcast::<gtk::Widget>())
+                .and_then(|divider| divider_rect_of(&divider, &app.window))
+        });
+    let Some(current_rect) = current_rect else {
         // The keys are nowhere in the workspace (a fresh window): hand them
         // to the first pane, so the chord works before any click.
         focus_target(app, &workspace, &targets[0].0);
         return;
     };
-    let Some((_, current_rect)) = targets.get(current) else {
-        return;
-    };
     let rest: Vec<(usize, Rect)> = targets
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index != current)
+        .filter(|(index, _)| Some(*index) != current)
         .map(|(index, (_, rect))| (index, *rect))
         .collect();
-    match pick(current_rect, &rest, direction) {
+    match pick(&current_rect, &rest, direction) {
         Some(index) => focus_target(app, &workspace, &targets[index].0),
         None => app.toast(&format!("Nothing {}", direction.word())),
     }
@@ -257,7 +271,7 @@ fn cycle_focus(app: &SharedApp, backwards: bool) {
     let Some(workspace) = app.current_workspace() else {
         return;
     };
-    let targets = nav_targets(app, &workspace);
+    let targets = cycle_targets(app, &workspace);
     if targets.is_empty() {
         return;
     }
@@ -417,12 +431,14 @@ mod tests {
     }
 
     #[test]
-    fn arrow_focus_can_land_on_the_divider_before_the_next_pane() {
-        let current = rect(0.0, 0.0, 300.0, 600.0);
+    fn arrow_focus_from_a_divider_moves_to_a_panel_on_that_side() {
         let divider = rect(296.0, 0.0, 8.0, 600.0);
-        let next_pane = rect(304.0, 0.0, 300.0, 600.0);
-        let rest = candidates(&[divider, next_pane]);
-        assert_eq!(pick(&current, &rest, Direction::Right), Some(0));
+        let panels = candidates(&[
+            rect(0.0, 0.0, 296.0, 600.0),
+            rect(304.0, 0.0, 300.0, 600.0),
+        ]);
+        assert_eq!(pick(&divider, &panels, Direction::Left), Some(0));
+        assert_eq!(pick(&divider, &panels, Direction::Right), Some(1));
     }
 
     #[test]

@@ -76,6 +76,8 @@ where they are.
 workspace: a row per primitive — open one, or see that it is already on
 screen — the settings, and the whole keymap. Type to filter, arrows to move,
 `Enter` to run, `Esc` to go back to the program you were looking at.
+Changing a pane's program from its menu or with `Ctrl+Shift+P` opens program
+choices in this same overlay.
 
 **Adding a project** needs no dialog and no button: the sidebar's search box
 does both jobs. It filters your projects, and below them it lists directories

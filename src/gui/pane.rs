@@ -72,6 +72,16 @@ impl Pane {
         &self.widget
     }
 
+    /// Put keyboard focus on the terminal itself when it is embedded. The
+    /// containing box is only layout; it is not the widget that receives keys.
+    pub fn focus(&self) -> bool {
+        #[cfg(feature = "vte")]
+        if let Some(terminal) = &self.terminal {
+            return terminal.grab_focus();
+        }
+        self.widget.grab_focus()
+    }
+
     pub fn command(&self) -> &str {
         &self.command
     }
@@ -339,6 +349,7 @@ impl Pane {
         outer.set_halign(gtk::Align::Center);
         outer.set_hexpand(true);
         outer.set_vexpand(true);
+        outer.set_focusable(true);
         outer.set_margin_top(24);
         outer.set_margin_bottom(24);
         outer.set_margin_start(24);
