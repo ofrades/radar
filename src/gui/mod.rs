@@ -870,6 +870,10 @@ impl App {
     }
 
     /// A pane's own menu: which program it runs, and what to do with it.
+    ///
+    /// Grouping is here too, not only in the drag gesture: a menu item per other
+    /// visible pane ("Group with Changes"), plus "Split out" when this pane holds
+    /// more than one primitive.
     fn primitive_menu_model(&self, slot: Slot) -> gio::Menu {
         let menu = gio::Menu::new();
         let program = gio::Menu::new();
@@ -880,6 +884,42 @@ impl App {
         menu.append_section(None, &program);
 
         let panes = gio::Menu::new();
+        // Group with any other pane that is on screen.
+        if let Some(workspace) = self.current_workspace() {
+            let others: Vec<Slot> = workspace
+                .visible_slots()
+                .into_iter()
+                .filter(|other| *other != slot && *other != Slot::Custom)
+                .collect();
+            if !others.is_empty() {
+                let group_with = gio::Menu::new();
+                for other in others {
+                    let entry = gio::MenuItem::new(
+                        Some(&format!("Group with {}", label_for(other))),
+                        None,
+                    );
+                    entry.set_action_and_target_value(
+                        Some("win.primitive-group"),
+                        Some(&(slot.as_str().to_string(), other.as_str().to_string()).to_variant()),
+                    );
+                    group_with.append_item(&entry);
+                }
+                menu.append_section(Some("Group"), &group_with);
+            }
+            if workspace
+                .group_of(slot)
+                .is_some_and(|group| group.slots().len() > 1)
+            {
+                let split_out = gio::Menu::new();
+                let entry = gio::MenuItem::new(Some("Split out into its own pane"), None);
+                entry.set_action_and_target_value(
+                    Some("win.primitive-split-out"),
+                    Some(&slot.as_str().to_variant()),
+                );
+                split_out.append_item(&entry);
+                menu.append_section(None, &split_out);
+            }
+        }
         panes.append_item(&item(
             &format!("Focus {}", label_for(slot)),
             &format!("win.primitive-focus::{}", slot.as_str()),
@@ -1753,7 +1793,7 @@ fn wire_sidebar_drop(app: &SharedApp) {
             return false;
         };
         trace(&format!("drop: sidebar got payload={payload}"));
-        let _ = list.activate_action("primitive-split-out", Some(&payload.to_variant()));
+        let _ = list.activate_action("win.primitive-split-out", Some(&payload.to_variant()));
         true
     });
     app.sidebar_list

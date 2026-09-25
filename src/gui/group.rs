@@ -121,9 +121,14 @@ impl Group {
         use gtk::PropagationPhase;
 
         // ---- drag a pane by its header ----
+        //
+        // Capture phase: the header is full of buttons (chips, the menu), and a
+        // button claims the press a drag needs. Seeing the press first means the
+        // drag starts no matter which child is under the pointer.
         let source = gtk::DragSource::builder()
             .actions(gdk::DragAction::MOVE)
             .build();
+        source.set_propagation_phase(gtk::PropagationPhase::Capture);
         let group_for_drag = group.clone();
         source.connect_prepare(move |_, _, _| {
             let slot = group_for_drag.active_slot();
@@ -198,14 +203,19 @@ impl Group {
                     let Some(target_slot) = group_for_drop.active_slot() else {
                         return false;
                     };
+                    // Full action name, prefix included: without "win." the lookup
+                    // silently fails and the drop does nothing.
                     let _ = widget.activate_action(
-                        "primitive-group",
+                        "win.primitive-group",
                         Some(&(payload, target_slot.as_str().to_string()).to_variant()),
                     );
                     true
                 }
                 DropIntent::SplitOut => {
-                    let _ = widget.activate_action("primitive-split-out", Some(&payload.to_variant()));
+                    let _ = widget.activate_action(
+                        "win.primitive-split-out",
+                        Some(&payload.to_variant()),
+                    );
                     true
                 }
             }
