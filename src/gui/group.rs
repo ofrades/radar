@@ -75,31 +75,46 @@ impl Group {
 
     /// The header drags and accepts drops.
     ///
-    /// Dragging the header drags the primitive it is showing; dropping one header
-    /// on another makes them share a header. The gestures live on the header box
-    /// rather than on the chips, because a button claims the press that a drag
-    /// would need.
+    /// Drag gestures live on the header box, not on the chips: a button claims
+    /// the press a drag needs. Both drop targets run in the *capture* phase so
+    /// that nothing inside a pane can swallow a drop — the terminal widget has
+    /// its own target for dropped text, which would otherwise win.
     fn accept_drags(group: &Rc<Group>) {
-        // Drag: whatever this header is showing.
+        use gtk::PropagationPhase;
+
+        // ---- drag a pane by its header ----
         let source = gtk::DragSource::builder()
             .actions(gdk::DragAction::MOVE)
             .build();
         let group_for_drag = group.clone();
         source.connect_prepare(move |_, _, _| {
-            let slot = group_for_drag.active_slot()?;
-            Some(gdk::ContentProvider::for_value(&slot.as_str().to_value()))
+            let slot = group_for_drag.active_slot();
+            super::trace(&format!("drag: prepare {:?}", slot.map(|slot| slot.as_str())));
+            slot.map(|slot| gdk::ContentProvider::for_value(&slot.as_str().to_value()))
+        });
+        let header_for_drag = group.header.clone();
+        source.connect_drag_begin(move |_, _| {
+            header_for_drag.add_css_class("dragging");
+            super::trace("drag: began");
+        });
+        let header_for_end = group.header.clone();
+        source.connect_drag_end(move |_, _, committed| {
+            header_for_end.remove_css_class("dragging");
+            super::trace(&format!("drag: ended (committed: {committed})"));
         });
         group.header.add_controller(source);
 
-        // Drop on the header: join this pane.
+        // ---- drop on the header: join this pane ----
         let target = gtk::DropTarget::new(glib::types::Type::STRING, gdk::DragAction::MOVE);
+        target.set_propagation_phase(PropagationPhase::Capture);
         let header = group.header.clone();
         let group_for_drop = group.clone();
         target.connect_drop(move |_, value, _, _| {
             let Ok(payload) = value.get::<String>() else {
+                super::trace("drop: header got a payload that is not a string");
                 return false;
             };
-            // The dragged header names the primitive it was showing.
+            super::trace(&format!("drop: header payload={payload}"));
             let source_slot = Slot::parse(&payload);
             if source_slot == Slot::Custom {
                 return false;
@@ -116,18 +131,27 @@ impl Group {
             );
             true
         });
+        let header_for_highlight = group.header.clone();
+        target.connect_enter(move |_, _, _| {
+            header_for_highlight.add_css_class("drop-target");
+            gdk::DragAction::MOVE
+        });
+        let header_for_unhighlight = group.header.clone();
+        target.connect_leave(move |_| {
+            header_for_unhighlight.remove_css_class("drop-target");
+        });
         group.header.add_controller(target);
 
-        // Drop on the content: pulling one of *this pane's* primitives out into a
-        // pane of its own. Anything else lands here as a grouping request, which
-        // is what dropping a pane onto another pane means.
+        // ---- drop on the content: out into its own pane, or join ----
         let content_target = gtk::DropTarget::new(glib::types::Type::STRING, gdk::DragAction::MOVE);
+        content_target.set_propagation_phase(PropagationPhase::Capture);
         let content = group.content.clone();
         let group_for_content = group.clone();
         content_target.connect_drop(move |_, value, _, _| {
             let Ok(payload) = value.get::<String>() else {
                 return false;
             };
+            super::trace(&format!("drop: content payload={payload}"));
             let slot = Slot::parse(&payload);
             if slot == Slot::Custom {
                 return false;
@@ -144,6 +168,15 @@ impl Group {
                 Some(&(payload, target_slot.as_str().to_string()).to_variant()),
             );
             true
+        });
+        let content_for_highlight = group.content.clone();
+        content_target.connect_enter(move |_, _, _| {
+            content_for_highlight.add_css_class("drop-target");
+            gdk::DragAction::MOVE
+        });
+        let content_for_unhighlight = group.content.clone();
+        content_target.connect_leave(move |_| {
+            content_for_unhighlight.remove_css_class("drop-target");
         });
         group.content.add_controller(content_target);
     }
