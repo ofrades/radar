@@ -69,38 +69,83 @@ impl Group {
             members: RefCell::new(Vec::new()),
             active: RefCell::new(None),
         });
-        Group::accept_drops(&group);
+        Group::accept_drags(&group);
         group
     }
 
-    /// The header is a drop target: dropping a chip here joins the two.
-    fn accept_drops(group: &Rc<Group>) {
+    /// The header drags and accepts drops.
+    ///
+    /// Dragging the header drags the primitive it is showing; dropping one header
+    /// on another makes them share a header. The gestures live on the header box
+    /// rather than on the chips, because a button claims the press that a drag
+    /// would need.
+    fn accept_drags(group: &Rc<Group>) {
+        // Drag: whatever this header is showing.
+        let source = gtk::DragSource::builder()
+            .actions(gdk::DragAction::MOVE)
+            .build();
+        let group_for_drag = group.clone();
+        source.connect_prepare(move |_, _, _| {
+            let slot = group_for_drag.active_slot()?;
+            Some(gdk::ContentProvider::for_value(&slot.as_str().to_value()))
+        });
+        group.header.add_controller(source);
+
+        // Drop on the header: join this pane.
         let target = gtk::DropTarget::new(glib::types::Type::STRING, gdk::DragAction::MOVE);
-        target.set_types(&[glib::types::Type::STRING]);
         let header = group.header.clone();
         let group_for_drop = group.clone();
         target.connect_drop(move |_, value, _, _| {
-            let Ok(source) = value.get::<String>() else {
+            let Ok(payload) = value.get::<String>() else {
                 return false;
             };
-            let Some(target_slot) = group_for_drop
-                .active
-                .borrow()
-                .or_else(|| group_for_drop.members.borrow().first().copied())
-            else {
-                return false;
-            };
-            if source == target_slot.as_str() {
+            // The dragged header names the primitive it was showing.
+            let source_slot = Slot::parse(&payload);
+            if source_slot == Slot::Custom {
                 return false;
             }
-            // Through the window action, so nothing here needs the app.
+            let Some(target_slot) = group_for_drop.active_slot() else {
+                return false;
+            };
+            if source_slot == target_slot {
+                return false;
+            }
             let _ = header.activate_action(
                 "primitive-group",
-                Some(&(source, target_slot.as_str().to_string()).to_variant()),
+                Some(&(payload, target_slot.as_str().to_string()).to_variant()),
             );
             true
         });
         group.header.add_controller(target);
+
+        // Drop on the content: pulling one of *this pane's* primitives out into a
+        // pane of its own. Anything else lands here as a grouping request, which
+        // is what dropping a pane onto another pane means.
+        let content_target = gtk::DropTarget::new(glib::types::Type::STRING, gdk::DragAction::MOVE);
+        let content = group.content.clone();
+        let group_for_content = group.clone();
+        content_target.connect_drop(move |_, value, _, _| {
+            let Ok(payload) = value.get::<String>() else {
+                return false;
+            };
+            let slot = Slot::parse(&payload);
+            if slot == Slot::Custom {
+                return false;
+            }
+            if group_for_content.contains(slot) && group_for_content.slots().len() > 1 {
+                let _ = content.activate_action("primitive-split-out", Some(&payload.to_variant()));
+                return true;
+            }
+            let Some(target_slot) = group_for_content.active_slot() else {
+                return false;
+            };
+            let _ = content.activate_action(
+                "primitive-group",
+                Some(&(payload, target_slot.as_str().to_string()).to_variant()),
+            );
+            true
+        });
+        group.content.add_controller(content_target);
     }
 
     /// Show a member's widget, adding it if this group has not seen it before.
@@ -185,15 +230,6 @@ impl Group {
             chip.set_action_name(Some("win.primitive-activate"));
             chip.set_action_target_value(Some(&slot.as_str().to_variant()));
 
-            // Dragging the chip is the gesture that groups panes.
-            let source = gtk::DragSource::builder()
-                .actions(gdk::DragAction::MOVE)
-                .build();
-            let payload = slot.as_str().to_string();
-            source.connect_prepare(move |_, _, _| {
-                Some(gdk::ContentProvider::for_value(&payload.to_value()))
-            });
-            chip.add_controller(source);
             self.header.append(&chip);
         }
         self.header.append(&self.menu_button);

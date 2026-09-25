@@ -8,7 +8,6 @@
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::gio;
 
 use super::pane::Pane;
 use crate::db::Slot;
@@ -16,53 +15,17 @@ use crate::programs::Program;
 
 pub struct Primitive {
     pub program_id: String,
-    pub widget: gtk::Box,
+    pub widget: gtk::Widget,
     pub pane: Rc<Pane>,
 }
 
 impl Primitive {
-    pub fn new(slot: Slot, program: &Program, pane: Rc<Pane>) -> Rc<Primitive> {
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        header.add_css_class("primitive-header");
-        header.set_margin_start(6);
-        header.set_margin_end(4);
-        header.set_margin_top(2);
-        header.set_margin_bottom(2);
-
-        if let Some(icon) = icon_for(slot) {
-            let image = gtk::Image::from_gicon(&icon);
-            image.set_pixel_size(14);
-            image.add_css_class("dim-label");
-            header.append(&image);
-        }
-
-        // The pane is named after the primitive it is — agent, changes, editor,
-        // commands — and the program behind it is the subtitle: the primitive is
-        // the thing you navigate, the program is an implementation detail.
-        let title = gtk::Label::new(Some(label_for(slot)));
-        title.add_css_class("caption-heading");
-        title.set_xalign(0.0);
-        header.append(&title);
-
-        let program_label = gtk::Label::new(Some(&program.name));
-        program_label.add_css_class("caption");
-        program_label.add_css_class("dim-label");
-        program_label.set_xalign(0.0);
-        program_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-        header.append(&program_label);
-
-        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        header.append(&spacer);
-
-        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        widget.set_vexpand(true);
-        widget.set_hexpand(true);
+    /// A primitive is just its content: the header belongs to the group it is in,
+    /// so naming it here as well would show the name twice.
+    pub fn new(program: &Program, pane: Rc<Pane>) -> Rc<Primitive> {
+        let widget = pane.widget().clone();
+        // Hovering the pane says what is running in it and how it was started.
         widget.set_tooltip_text(Some(&format!("{}\n{}", program.name, pane.command())));
-        widget.append(&header);
-        widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        widget.append(pane.widget());
-
         Rc::new(Primitive {
             program_id: program.id.clone(),
             widget,
@@ -73,24 +36,11 @@ impl Primitive {
     pub fn focus(&self) {
         self.pane.widget().grab_focus();
     }
-
 }
 
 /// The sidebar is a primitive like the others: it is the project list.
 pub const PROJECTS_ICON: &str = "folder-symbolic";
 pub const PROJECTS_LABEL: &str = "Project";
-
-/// An icon for a primitive.
-pub fn icon_for(slot: Slot) -> Option<gio::Icon> {
-    let name = match slot {
-        Slot::Editor => "accessories-text-editor-symbolic",
-        Slot::Agent => "application-x-executable-symbolic",
-        Slot::Diff => "view-dual-symbolic",
-        Slot::Shell => "utilities-terminal-symbolic",
-        Slot::Custom => "application-x-executable-symbolic",
-    };
-    Some(gio::ThemedIcon::new(name).upcast())
-}
 
 /// The label for a primitive, used in tooltips and menus. One source of truth:
 /// the database's slot labels.

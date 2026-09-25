@@ -182,12 +182,12 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         .child(&sidebar_list)
         .build();
 
-    // The dock: one toggle per primitive, along the bottom of the panes.
+    // The dock: one toggle per primitive, along the bottom of the sidebar.
     let toggles = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     toggles.add_css_class("dock");
     toggles.set_halign(gtk::Align::Center);
-    toggles.set_margin_top(3);
-    toggles.set_margin_bottom(3);
+    toggles.set_margin_top(4);
+    toggles.set_margin_bottom(4);
 
     // One toggle per primitive, in the order they are named: agent, changes,
     // project, editor, commands. The project toggle is the sidebar.
@@ -277,6 +277,8 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     sidebar_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     sidebar_box.append(&search_row);
     sidebar_box.append(&sidebar_scroll);
+    sidebar_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    sidebar_box.append(&toggles);
 
     // ---- main area ----
     let stack = gtk::Stack::builder()
@@ -298,15 +300,9 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     );
     stack.add_named(&no_selection, Some("_none"));
 
-    // The panes, with the dock under them.
-    let main_area = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    main_area.append(&stack);
-    main_area.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    main_area.append(&toggles);
-
     let splitter = gtk::Paned::new(gtk::Orientation::Horizontal);
     splitter.set_start_child(Some(&sidebar_box));
-    splitter.set_end_child(Some(&main_area));
+    splitter.set_end_child(Some(&stack));
     splitter.set_resize_start_child(false);
     splitter.set_shrink_start_child(false);
     splitter.set_wide_handle(true);
@@ -1286,7 +1282,7 @@ impl App {
             // Restored panes start as their own pane; grouping is a gesture you
             // make, not something restored behind your back.
             let group = Group::new();
-            group.insert(slot, &primitive.widget.clone().upcast::<gtk::Widget>(), true);
+            group.insert(slot, &primitive.widget, true);
             group.rebuild_header();
             self.refresh_group_menu(&group);
             self.wire_content_drop(&group);
@@ -1325,7 +1321,7 @@ impl App {
             &label_for(slot),
             pane::ShiftEnter::for_slot(slot),
         ));
-        let primitive = Primitive::new(slot, &program, pane);
+        let primitive = Primitive::new(&program, pane);
         workspace
             .primitives
             .borrow_mut()
@@ -1353,7 +1349,7 @@ impl App {
                 return;
             };
             let group = Group::new();
-            group.insert(slot, &primitive.widget.clone().upcast::<gtk::Widget>(), true);
+            group.insert(slot, &primitive.widget, true);
             group.rebuild_header();
             self.refresh_group_menu(&group);
             self.wire_content_drop(&group);
@@ -1410,7 +1406,7 @@ impl App {
                 workspace.forget_group(&source_group);
             }
         }
-        target_group.insert(source, &primitive.widget.clone().upcast::<gtk::Widget>(), true);
+        target_group.insert(source, &primitive.widget, true);
         target_group.rebuild_header();
         self.refresh_group_menu(&target_group);
         *workspace.zoom.borrow_mut() = None;
@@ -1438,7 +1434,7 @@ impl App {
         group.remove(slot);
         group.rebuild_header();
         let own = Group::new();
-        own.insert(slot, &primitive.widget.clone().upcast::<gtk::Widget>(), true);
+        own.insert(slot, &primitive.widget, true);
         own.rebuild_header();
         self.refresh_group_menu(&own);
         self.wire_content_drop(&own);
