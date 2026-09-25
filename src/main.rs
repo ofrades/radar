@@ -3,11 +3,12 @@
 //! Run without arguments to open the app. Every subcommand exists so the same
 //! state can be inspected, scripted and tested without a GUI.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use radar::board;
 use radar::config::Paths;
 use radar::db::{Db, Preferences, Slot, Tab};
 use radar::programs::{self, agents, Kind, LaunchOptions};
@@ -95,8 +96,86 @@ enum Command {
     },
     /// Check the environment radar needs
     Doctor,
+    /// Show a project's board (BOARD.md), creating it if needed
+    Board {
+        /// Project directory (default: the current directory)
+        path: Option<PathBuf>,
+    },
+    /// Work with cards on a project's board
+    Card {
+        #[command(subcommand)]
+        action: CardAction,
+    },
     /// Open the native app (needs a build with --features gui)
     Gui,
+}
+
+#[derive(Subcommand, Debug)]
+enum CardAction {
+    /// Add a card (default column: Backlog)
+    Add {
+        /// Project directory (default: the current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// The card's title
+        title: String,
+        /// Which column to put it in
+        #[arg(long)]
+        column: Option<String>,
+        /// Notes for the card
+        #[arg(long)]
+        body: Option<String>,
+        /// Claim it for this name right away
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// Release a card: drop its claim, nobody is on it
+    Release {
+        /// Project directory (default: the current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// The card's title
+        title: String,
+    },
+    /// Claim a card for a name
+    Claim {
+        /// Project directory (default: the current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// The card's title
+        title: String,
+        /// Who is claiming it
+        #[arg(long)]
+        by: String,
+    },
+    /// Move a card to a column
+    Move {
+        /// Project directory (default: the current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// The card's title
+        title: String,
+        /// Destination column
+        #[arg(long)]
+        to: String,
+    },
+    /// Mark a card done: checked, and moved to the last column
+    Done {
+        /// Project directory (default: the current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// The card's title
+        title: String,
+    },
+    /// Claim the first unclaimed card and print it — how an agent asks for work
+    Next {
+        /// Project directory (default: the current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Who is asking
+        #[arg(long)]
+        by: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -173,12 +252,197 @@ fn main() -> Result<()> {
             find(&db, &query.join(" "), root, depth, limit, cli.json)
         }
         Some(Command::Doctor) => doctor(&paths, &db),
+        Some(Command::Board { path }) => show_board(&db, path, cli.json),
+        Some(Command::Card { action }) => match action {
+            CardAction::Add {
+                path,
+                title,
+                column,
+                body,
+                by,
+            } => card_add(&db, path, &title, column.as_deref(), body.as_deref(), by.as_deref()),
+            CardAction::Claim { path, title, by } => {
+                card_claim(&db, path, &title, Some(&by), cli.json)
+            }
+            CardAction::Release { path, title } => card_claim(&db, path, &title, None, cli.json),
+            CardAction::Move { path, title, to } => card_move(&db, path, &title, &to, cli.json),
+            CardAction::Done { path, title } => card_done(&db, path, &title, cli.json),
+            CardAction::Next { path, by } => card_next(&db, path, &by, cli.json),
+        },
     }
 }
 
 fn require_project(db: &Db, path: &PathBuf) -> Result<radar::db::Project> {
     db.project_by_path(path)?
         .with_context(|| format!("{} is not in the sidebar", path.display()))
+}
+
+/// The directory a board command works on: the given path or the current
+/// directory — agents run with the project as their working directory, so
+/// `radar card next` just works from inside a pane.
+fn board_dir(path: Option<PathBuf>) -> Result<PathBuf> {
+    radar::db::normalize_path(path.unwrap_or_else(|| PathBuf::from(".")))
+}
+
+/// Log a board change against the project, when it is in the sidebar. A board
+/// works in any directory; the event log is a bonus, not a requirement.
+fn log_board(db: &Db, dir: &PathBuf, kind: &str, data: serde_json::Value) {
+    if let Ok(Some(project)) = db.project_by_path(dir) {
+        let _ = db.log_event(kind, Some(project.id), &data);
+    }
+}
+
+fn show_board(_db: &Db, path: Option<PathBuf>, json: bool) -> Result<()> {
+    let dir = board_dir(path)?;
+    let _ = board::ensure_file(&dir);
+    let b = board::load(&dir)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&b)?);
+        return Ok(());
+    }
+    for column in &b.columns {
+        println!("{} ({})", column.name, column.cards.len());
+        for card in &column.cards {
+            match &card.claimed_by {
+                Some(who) => println!("  · {}  @{}", card.title, who),
+                None => println!("  · {}", card.title),
+            }
+            for note in &card.body {
+                println!("      {}", note);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn card_add(
+    db: &Db,
+    path: Option<PathBuf>,
+    title: &str,
+    column: Option<&str>,
+    body: Option<&str>,
+    by: Option<&str>,
+) -> Result<()> {
+    let dir = board_dir(path)?;
+    let _ = board::ensure_file(&dir);
+    board::add_card(&dir, column, title, body.unwrap_or(""), by)?;
+    log_board(
+        db,
+        &dir,
+        "board_card_added",
+        serde_json::json!({ "title": title, "column": column, "by": by }),
+    );
+    println!("added \"{}\"", title);
+    Ok(())
+}
+
+fn card_claim(
+    db: &Db,
+    path: Option<PathBuf>,
+    title: &str,
+    by: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let dir = board_dir(path)?;
+    let found = board::claim_card(&dir, title, by)?;
+    if !found {
+        anyhow::bail!("no card titled \"{}\"", title);
+    }
+    log_board(
+        db,
+        &dir,
+        if by.is_some() {
+            "board_card_claimed"
+        } else {
+            "board_card_released"
+        },
+        serde_json::json!({ "title": title, "by": by }),
+    );
+    if json {
+        print_card(&dir, title)?;
+    } else {
+        match by {
+            Some(who) => println!("\"{}\" claimed by {}", title, who),
+            None => println!("\"{}\" released", title),
+        }
+    }
+    Ok(())
+}
+
+fn card_move(db: &Db, path: Option<PathBuf>, title: &str, to: &str, json: bool) -> Result<()> {
+    let dir = board_dir(path)?;
+    let found = board::move_card(&dir, title, to)?;
+    if !found {
+        anyhow::bail!("no card titled \"{}\"", title);
+    }
+    log_board(
+        db,
+        &dir,
+        "board_card_moved",
+        serde_json::json!({ "title": title, "to": to }),
+    );
+    if json {
+        print_card(&dir, title)?;
+    } else {
+        println!("\"{}\" moved to {}", title, to);
+    }
+    Ok(())
+}
+
+fn card_done(db: &Db, path: Option<PathBuf>, title: &str, json: bool) -> Result<()> {
+    let dir = board_dir(path)?;
+    let found = board::finish_card(&dir, title)?;
+    if !found {
+        anyhow::bail!("no card titled \"{}\"", title);
+    }
+    log_board(
+        db,
+        &dir,
+        "board_card_done",
+        serde_json::json!({ "title": title }),
+    );
+    if json {
+        print_card(&dir, title)?;
+    } else {
+        println!("\"{}\" done", title);
+    }
+    Ok(())
+}
+
+/// The work primitive: hand the agent the next unclaimed card, claimed in its
+/// name. An agent's whole loop is `card next` → do it → `card done`.
+fn card_next(db: &Db, path: Option<PathBuf>, by: &str, json: bool) -> Result<()> {
+    let dir = board_dir(path)?;
+    let _ = board::ensure_file(&dir);
+    let Some(card) = board::next_card(&dir, by)? else {
+        anyhow::bail!("no unclaimed cards");
+    };
+    log_board(
+        db,
+        &dir,
+        "board_card_claimed",
+        serde_json::json!({ "title": card.title, "by": by, "via": "next" }),
+    );
+    if json {
+        println!("{}", serde_json::to_string_pretty(&card)?);
+    } else {
+        println!("\"{}\" — claimed for {}", card.title, by);
+        for note in &card.body {
+            println!("      {}", note);
+        }
+    }
+    Ok(())
+}
+
+/// Print one card's current state, for `--json` answers.
+fn print_card(dir: &Path, title: &str) -> Result<()> {
+    let b = board::load(dir)?;
+    let card = b
+        .find(title)
+        .map(|(c, i)| &b.columns[c].cards[i])
+        .with_context(|| format!("no card titled \"{}\"", title))?;
+    println!("{}", serde_json::to_string_pretty(card)?);
+    Ok(())
 }
 
 fn list(db: &Db, json: bool) -> Result<()> {
@@ -297,6 +561,9 @@ fn open(db: &Db, path: &PathBuf, json: bool) -> Result<()> {
     db.touch_project(project.id)?;
     db.remember_last_project(Some(project.id))?;
     db.log_event("project_opened", Some(project.id), &serde_json::Value::Null)?;
+    // Starting a project starts its board: the file is there before any agent
+    // looks for it. A project that cannot carry a file still opens.
+    let _ = board::ensure_file(&project.path);
 
     let preferences = db.preferences()?;
     let stored = db.tabs(project.id)?;

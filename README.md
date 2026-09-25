@@ -52,7 +52,7 @@ the program. That keeps radar usable on a machine where you cannot install VTE.
 
 | Action | Shortcut |
 | --- | --- |
-| Add project… | `Ctrl+Shift+N` |
+| Find a project to add (sidebar search) | `Ctrl+Shift+N` |
 | Add any program as a tab | `Ctrl+Shift+P` |
 | New Editor / Agent / Diff tab | `Ctrl+Shift+E` / `Ctrl+Shift+A` / `Ctrl+Shift+G` |
 | Close tab | `Ctrl+Shift+W` |
@@ -60,6 +60,14 @@ the program. That keeps radar usable on a machine where you cannot install VTE.
 | Toggle sidebar | `F9` |
 | Zoom the focused pane's font | `Ctrl+=` / `Ctrl+-` (or `Ctrl+scroll`); `Ctrl+0` resets |
 | Refresh status | `Ctrl+Shift+R` |
+
+**Adding a project** opens no dialog: the sidebar flips into find mode. The same
+search box now filters directories under the scan root (usually `~/Work`) —
+repositories are marked `git`, ones already in the sidebar say `added`, and
+clicking a row (or pressing Enter) adds the project and opens it, so several can
+be added in one pass. `Esc` — or the **+** again — brings the project list back,
+and the small `from ~/Work` label above the list picks another directory to
+scan.
 
 The **+** on the tab bar offers your preferred editor, agent, diff and shell plus
 "Choose program…" (every terminal program radar can find, grouped by kind).

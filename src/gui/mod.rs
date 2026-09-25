@@ -24,6 +24,7 @@ mod theme;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -34,6 +35,7 @@ use gtk::glib;
 
 use crate::config::Paths;
 use crate::db::{Db, Project, Slot};
+use crate::discover::{self, Candidate};
 use crate::programs::{self, CommandSpec, LaunchOptions, Program};
 
 use pane::Pane;
@@ -158,6 +160,14 @@ struct App {
     status_tx: std::sync::mpsc::Sender<Vec<(i64, crate::git::Status)>>,
     status_rx: RefCell<std::sync::mpsc::Receiver<Vec<(i64, crate::git::Status)>>>,
     current: RefCell<Option<i64>>,
+    // Find mode: the sidebar itself searches for directories to add.
+    find_mode: Cell<bool>,
+    find_root: RefCell<PathBuf>,
+    find_candidates: RefCell<Vec<Candidate>>,
+    find_tx: std::sync::mpsc::Sender<(PathBuf, Vec<Candidate>)>,
+    find_rx: RefCell<std::sync::mpsc::Receiver<(PathBuf, Vec<Candidate>)>>,
+    find_root_button: gtk::Button,
+    add_button: gtk::Button,
 }
 
 type SharedApp = Rc<App>;
@@ -183,11 +193,11 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         .build();
 
     // The dock: one toggle per primitive, along the bottom of the sidebar.
-    let toggles = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    let toggles = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     toggles.add_css_class("dock");
     toggles.set_halign(gtk::Align::Center);
-    toggles.set_margin_top(4);
-    toggles.set_margin_bottom(4);
+    toggles.set_margin_top(6);
+    toggles.set_margin_bottom(6);
 
     // One toggle per primitive, in the order they are named: agent, changes,
     // project, editor, commands. The project toggle is the sidebar.
@@ -264,18 +274,25 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     sidebar_header.append(&add_button);
     sidebar_header.append(&workspace_menu);
 
-    let search_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    search_row.set_margin_start(8);
-    search_row.set_margin_end(6);
-    search_row.set_margin_top(4);
-    search_row.set_margin_bottom(6);
-    search_row.append(&search);
+    // The search goes straight into the sidebar box; its margins come from the
+    // stylesheet, aligned with the row inset.
+
+    // Shown only in find mode: where the directory search looks.
+    let find_root_button = gtk::Button::new();
+    find_root_button.add_css_class("flat");
+    find_root_button.add_css_class("caption");
+    find_root_button.set_halign(gtk::Align::Start);
+    find_root_button.set_margin_start(10);
+    find_root_button.set_margin_bottom(2);
+    find_root_button.set_tooltip_text(Some("Choose another directory to scan"));
+    find_root_button.set_visible(false);
 
     let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar_box.add_css_class("projects-sidebar");
     sidebar_box.append(&sidebar_header);
     sidebar_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    sidebar_box.append(&search_row);
+    sidebar_box.append(&search);
+    sidebar_box.append(&find_root_button);
     sidebar_box.append(&sidebar_scroll);
     sidebar_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     sidebar_box.append(&toggles);
@@ -319,6 +336,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     window.set_tooltip_text(Some(&format!("state: {}", paths.database().display())));
 
     let (status_tx, status_rx) = std::sync::mpsc::channel();
+    let (find_tx, find_rx) = std::sync::mpsc::channel();
     let state = Rc::new(App {
         db: db.clone(),
         theme: RefCell::new(Theme::load()),
@@ -339,11 +357,23 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         status_tx,
         status_rx: RefCell::new(status_rx),
         current: RefCell::new(None),
+        find_mode: Cell::new(false),
+        find_root: RefCell::new(
+            db.ui_prefs()
+                .map(|prefs| prefs.resolved_add_root())
+                .unwrap_or_else(|_| crate::config::default_project_root()),
+        ),
+        find_candidates: RefCell::new(Vec::new()),
+        find_tx,
+        find_rx: RefCell::new(find_rx),
+        find_root_button: find_root_button.clone(),
+        add_button: add_button.clone(),
     });
 
     register_actions(&state, app, &workspace_menu);
     connect_widgets(&state);
     start_status_drainer(&state);
+    start_find_drainer(&state);
     wire_sidebar_drop(&state);
     watch_theme(&state);
     state.refresh_projects();
@@ -354,12 +384,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     }
     state.reload_theme();
     // Keys belong to the program you are looking at, not to the filter box.
-    if let Some(workspace) = state.current_workspace() {
-        let first = workspace.visible_slots().first().copied();
-        if let Some(primitive) = first.and_then(|slot| workspace.primitive(slot)) {
-            primitive.focus();
-        }
-    }
+    state.refocus_workspace();
 
     // Development aid: lay out every primitive on startup so the arrangement can
     // be checked without clicking. RADAR_PRIMITIVES=1.
@@ -427,6 +452,69 @@ fn status_page(
     page.upcast()
 }
 
+/// A quiet, non-interactive find row: scanning notes and empty results.
+fn find_hint(text: &str) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
+    row.set_selectable(false);
+    row.set_activatable(false);
+    row.add_css_class("sidebar-empty");
+    let label = gtk::Label::new(Some(text));
+    label.add_css_class("caption");
+    label.add_css_class("dim-label");
+    label.set_xalign(0.0);
+    label.set_margin_top(10);
+    label.set_margin_start(8);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    row.set_child(Some(&label));
+    row
+}
+
+/// A candidate row in find mode: icon, name, path, badge — the same shape and
+/// stylesheet classes as a project row. Returns the name and badge labels so
+/// the row can be marked "added" in place.
+fn find_row(
+    title: &str,
+    subtitle: &str,
+    badge: Option<&str>,
+    dim: bool,
+) -> (gtk::ListBoxRow, gtk::Label, gtk::Label) {
+    let row = gtk::ListBoxRow::new();
+    let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+
+    let icon = gtk::Image::from_icon_name("folder-symbolic");
+    icon.add_css_class("row-icon");
+    icon.set_pixel_size(16);
+    icon.set_valign(gtk::Align::Center);
+    box_.append(&icon);
+
+    let texts = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    texts.set_valign(gtk::Align::Center);
+    texts.set_hexpand(true);
+    let name = gtk::Label::new(Some(title));
+    name.set_xalign(0.0);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    if dim {
+        name.add_css_class("dim-label");
+    }
+    texts.append(&name);
+    let sub = gtk::Label::new(Some(subtitle));
+    sub.set_xalign(0.0);
+    sub.add_css_class("caption");
+    sub.add_css_class("dim-label");
+    sub.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    texts.append(&sub);
+    box_.append(&texts);
+
+    let badge_label = gtk::Label::new(badge);
+    badge_label.add_css_class("badge");
+    badge_label.set_valign(gtk::Align::Center);
+    badge_label.set_visible(badge.is_some());
+    box_.append(&badge_label);
+
+    row.set_child(Some(&box_));
+    (row, name, badge_label)
+}
+
 fn connect_widgets(app: &SharedApp) {
     {
         let list = app.sidebar_list.clone();
@@ -441,7 +529,63 @@ fn connect_widgets(app: &SharedApp) {
     {
         let entry = app.sidebar_search.clone();
         let app = app.clone();
-        entry.connect_search_changed(move |entry| app.filter_sidebar(&entry.text()));
+        entry.connect_search_changed(move |entry| {
+            if app.find_mode.get() {
+                App::fill_find(&app, &entry.text());
+            } else {
+                app.filter_sidebar(&entry.text());
+            }
+        });
+    }
+    {
+        // Esc leaves find mode; the entry is where the mode's focus lives.
+        let app = app.clone();
+        let entry = app.sidebar_search.clone();
+        let controller = gtk::EventControllerKey::new();
+        controller.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape && app.find_mode.get() {
+                app.exit_find_mode();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        entry.add_controller(controller);
+    }
+    {
+        // Pick another directory for the find search to scan.
+        let app = app.clone();
+        let root_button = app.find_root_button.clone();
+        root_button.connect_clicked(move |_| {
+            #[allow(deprecated)]
+            let dialog = gtk::FileChooserDialog::new(
+                Some("Choose a directory to scan"),
+                Some(&app.window),
+                gtk::FileChooserAction::SelectFolder,
+                &[
+                    ("Cancel", gtk::ResponseType::Cancel),
+                    ("Scan", gtk::ResponseType::Accept),
+                ],
+            );
+            let app = app.clone();
+            #[allow(deprecated)]
+            dialog.connect_response(move |dialog, response| {
+                if response == gtk::ResponseType::Accept {
+                    if let Some(path) = dialog.file().and_then(|file| file.path()) {
+                        // Remember it, so the next find starts here.
+                        let mut prefs = app.db.ui_prefs().unwrap_or_default();
+                        prefs.add_root = Some(path.clone());
+                        if let Err(error) = app.db.set_ui_prefs(&prefs) {
+                            eprintln!("radar: could not store the scan root: {error}");
+                        }
+                        *app.find_root.borrow_mut() = path;
+                        app.rescan_find();
+                    }
+                }
+                dialog.close();
+            });
+            dialog.present();
+        });
     }
     {
         // Remember the sidebar width when it is dragged.
@@ -466,6 +610,27 @@ fn connect_widgets(app: &SharedApp) {
             *pending.borrow_mut() = Some(id);
         });
     }
+}
+
+/// Apply directory scans that arrived from the worker thread.
+fn start_find_drainer(app: &SharedApp) {
+    let app = app.clone();
+    glib::timeout_add_local(Duration::from_millis(120), move || {
+        let batch = {
+            let rx = app.find_rx.borrow();
+            rx.try_recv().ok()
+        };
+        if let Some((root, found)) = batch {
+            *app.find_candidates.borrow_mut() = found;
+            app.find_root_button
+                .set_label(&format!("from {}", crate::db::abbreviate(&root)));
+            // A scan may finish after the user already left find mode.
+            if app.find_mode.get() {
+                App::fill_find(&app, &app.sidebar_search.text());
+            }
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 /// Apply git statuses that arrived from the worker thread.
@@ -529,19 +694,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
     // ---- projects ----
     {
         let app = app.clone();
-        add(
-            "add-project",
-            Box::new(move || {
-                dialogs::add_project(&app.window, &app.db, {
-                    let app = app.clone();
-                    move |id| {
-                        app.refresh_projects();
-                        app.select_project(id);
-                        app.toast("Project added");
-                    }
-                });
-            }),
-        );
+        add("add-project", Box::new(move || app.toggle_find_mode()));
     }
     {
         // Takes a project id, so a row's own button can call it.
@@ -821,13 +974,23 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
         ("win.primitive-focus::shell", &["<Control><Shift>4"]),
     ];
     for (action, keys) in accels {
-        let _ = gtk_app.set_accels_for_action(action, keys);
+        gtk_app.set_accels_for_action(action, keys);
     }
 }
 
 impl App {
     fn toast(&self, text: &str) {
         self.toasts.add_toast(adw::Toast::new(text));
+    }
+
+    /// Put the keys back on the program you are looking at.
+    fn refocus_workspace(&self) {
+        if let Some(workspace) = self.current_workspace() {
+            let first = workspace.visible_slots().first().copied();
+            if let Some(primitive) = first.and_then(|slot| workspace.primitive(slot)) {
+                primitive.focus();
+            }
+        }
     }
 
     fn workspace_menu_model(&self) -> gio::Menu {
@@ -962,7 +1125,7 @@ impl App {
     }
 
     /// Confirm, then remove a project from the sidebar. Never touches the disk.
-    fn confirm_remove(&self, id: i64) {
+    fn confirm_remove(self: &Rc<Self>, id: i64) {
         let Some(project) = self.db.project(id).ok().flatten() else {
             return;
         };
@@ -973,29 +1136,19 @@ impl App {
             .cancel_button(0)
             .default_button(0)
             .build();
-        // The callback outlives this borrow, so it works from owned handles: the
-        // database, the sidebar list, and the toast overlay.
-        let db = self.db.clone();
-        let toasts = self.toasts.clone();
-        let list = self.sidebar_list.clone();
-        let current = self.current.clone();
-        let window = self.window.clone();
-        dialog.choose(Some(&window), None::<&gio::Cancellable>, move |result| {
+        // The callback outlives this borrow, so it works from an owned handle.
+        let app = self.clone();
+        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |result| {
             if result != Ok(1) {
                 return;
             }
-            if let Err(error) = db.remove_project(project.id) {
+            if let Err(error) = app.db.remove_project(project.id) {
                 eprintln!("radar: {error}");
             }
-            if *current.borrow() == Some(project.id) {
-                *current.borrow_mut() = None;
-            }
-            // Rebuild the list from a fresh read; the row that asked for this is
-            // about to disappear.
-            while let Some(child) = list.first_child() {
-                list.remove(&child);
-            }
-            toasts.add_toast(adw::Toast::new("Project removed"));
+            // Rebuild the sidebar from a fresh read; this also drops the
+            // selection of the removed project.
+            app.refresh_projects();
+            app.toasts.add_toast(adw::Toast::new("Project removed"));
         });
     }
 
@@ -1028,6 +1181,10 @@ impl App {
     // ---- projects ----
 
     fn refresh_projects(&self) {
+        if self.find_mode.get() {
+            // The find list owns the sidebar; projects come back on exit.
+            return;
+        }
         let projects = self.db.projects().unwrap_or_default();
         let selected = *self.current.borrow();
         *self.projects.borrow_mut() = projects.clone();
@@ -1037,12 +1194,30 @@ impl App {
         }
         self.rows.borrow_mut().clear();
         if projects.is_empty() {
-            let hint = gtk::Label::new(Some("No projects yet.\nPress + to add one."));
+            // A quiet hint, not a selectable row.
+            let empty = gtk::ListBoxRow::new();
+            empty.set_selectable(false);
+            empty.set_activatable(false);
+            empty.add_css_class("sidebar-empty");
+            let hint_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            hint_box.set_halign(gtk::Align::Center);
+            hint_box.set_margin_top(32);
+            hint_box.set_margin_bottom(24);
+            let icon = gtk::Image::from_icon_name("folder-open-symbolic");
+            icon.add_css_class("dim-label");
+            icon.set_pixel_size(28);
+            let title = gtk::Label::new(Some("No projects yet"));
+            title.add_css_class("caption-heading");
+            let hint = gtk::Label::new(Some("Press + to add a directory"));
+            hint.add_css_class("caption");
             hint.add_css_class("dim-label");
-            hint.set_justify(gtk::Justification::Center);
-            hint.set_margin_top(24);
             hint.set_wrap(true);
-            self.sidebar_list.append(&hint);
+            hint.set_justify(gtk::Justification::Center);
+            hint_box.append(&icon);
+            hint_box.append(&title);
+            hint_box.append(&hint);
+            empty.set_child(Some(&hint_box));
+            self.sidebar_list.append(&empty);
             self.show_placeholder();
             return;
         }
@@ -1070,21 +1245,41 @@ impl App {
     fn build_project_row(&self, project: &Project) -> (gtk::ListBoxRow, gtk::Label, gtk::Label) {
         let row = gtk::ListBoxRow::new();
 
-        let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        box_.set_margin_top(4);
-        box_.set_margin_bottom(4);
-        box_.set_margin_start(6);
-        box_.set_margin_end(4);
+        // Inset and rounded corners come from the stylesheet; the row only lays
+        // out its content: icon, name, summary, badge, trash.
+        let missing = project.is_missing();
+        let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
 
-        let texts = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let icon = gtk::Image::from_icon_name(if missing {
+            "dialog-warning-symbolic"
+        } else {
+            "folder-symbolic"
+        });
+        icon.add_css_class("row-icon");
+        if missing {
+            icon.add_css_class("missing");
+        }
+        icon.set_pixel_size(16);
+        icon.set_valign(gtk::Align::Center);
+        box_.append(&icon);
+
+        let texts = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        texts.set_valign(gtk::Align::Center);
         texts.set_hexpand(true);
+        let name_line = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let name = gtk::Label::new(Some(&project.name));
         name.set_xalign(0.0);
         name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        name_line.append(&name);
         if project.pinned {
-            name.set_text(&format!("{}  📌", project.name));
+            let pin = gtk::Image::from_icon_name("starred-symbolic");
+            pin.add_css_class("pin-icon");
+            pin.set_pixel_size(12);
+            pin.set_valign(gtk::Align::Center);
+            pin.set_tooltip_text(Some("Pinned"));
+            name_line.append(&pin);
         }
-        texts.append(&name);
+        texts.append(&name_line);
 
         let parent = project
             .path
@@ -1100,12 +1295,13 @@ impl App {
         box_.append(&texts);
 
         let badge = gtk::Label::new(None);
-        badge.add_css_class("caption");
-        badge.add_css_class("accent");
+        badge.add_css_class("badge");
         badge.set_valign(gtk::Align::Center);
+        badge.set_visible(false);
         box_.append(&badge);
 
-        // Remove, per row: the id travels with the action so no state is needed.
+        // Remove, per row: the id travels with the action so no state is
+        // needed. The stylesheet reveals it on hover or keyboard focus.
         let remove = gtk::Button::builder()
             .icon_name("user-trash-symbolic")
             .tooltip_text("Remove from sidebar")
@@ -1118,10 +1314,14 @@ impl App {
         box_.append(&remove);
 
         row.set_child(Some(&box_));
-        row.set_tooltip_text(Some(&project.display_path()));
+        row.set_tooltip_text(Some(&if missing {
+            format!("{} (missing)", project.display_path())
+        } else {
+            project.display_path()
+        }));
 
         let status = self.status.borrow().get(&project.id).cloned();
-        let (text, count) = match (&status, project.is_missing()) {
+        let (text, count) = match (&status, missing) {
             (_, true) => ("missing".to_string(), None),
             (Some(status), _) => (
                 status.summary(),
@@ -1130,9 +1330,9 @@ impl App {
             (None, _) => ("…".to_string(), None),
         };
         summary.set_text(&format!("{text}  ·  {parent}"));
-        match count {
-            Some(changed) => badge.set_text(&format!("●{changed}")),
-            None => badge.set_visible(false),
+        if let Some(changed) = count {
+            badge.set_text(&changed.to_string());
+            badge.set_visible(true);
         }
         (row, summary, badge)
     }
@@ -1148,11 +1348,16 @@ impl App {
                 .parent()
                 .map(crate::db::abbreviate)
                 .unwrap_or_else(|| project.display_path());
+            if project.is_missing() {
+                summary.set_text(&format!("missing  ·  {parent}"));
+                badge.set_visible(false);
+                continue;
+            }
             match self.status.borrow().get(id) {
                 Some(status) => {
                     summary.set_text(&format!("{}  ·  {parent}", status.summary()));
                     if status.changed > 0 {
-                        badge.set_text(&format!("●{}", status.changed));
+                        badge.set_text(&status.changed.to_string());
                         badge.set_visible(true);
                     } else {
                         badge.set_visible(false);
@@ -1218,6 +1423,131 @@ impl App {
         };
         self.stack.set_visible_child_name(name);
         self.sync_toggles();
+    }
+
+    // ---- find mode: the sidebar itself searches for projects to add ----
+
+    /// Flip between the project list and find mode: the same search box
+    /// filtering directories under the scan root, a row click to add one.
+    fn toggle_find_mode(&self) {
+        if self.find_mode.get() {
+            self.exit_find_mode();
+            return;
+        }
+        self.find_mode.set(true);
+        if !self.sidebar_shown.get() {
+            self.toggle_sidebar();
+        }
+        self.sidebar_search
+            .set_placeholder_text(Some("Find directories to add…"));
+        self.add_button.set_icon_name("window-close-symbolic");
+        self.add_button.set_tooltip_text(Some("Exit search (Esc)"));
+        let root = self
+            .db
+            .ui_prefs()
+            .map(|prefs| prefs.resolved_add_root())
+            .unwrap_or_else(|_| crate::config::default_project_root());
+        *self.find_root.borrow_mut() = root.clone();
+        self.find_root_button.set_label(&format!(
+            "from {}",
+            crate::db::abbreviate(&root)
+        ));
+        self.find_root_button.set_visible(true);
+        // Find rows own the list now; project rows come back on exit.
+        self.rows.borrow_mut().clear();
+        self.rescan_find();
+        self.sidebar_search.grab_focus();
+    }
+
+    fn exit_find_mode(&self) {
+        self.find_mode.set(false);
+        self.sidebar_search.set_placeholder_text(Some("Filter"));
+        self.add_button.set_icon_name("list-add-symbolic");
+        self.add_button.set_tooltip_text(Some("Add project (Ctrl+Shift+N)"));
+        self.find_root_button.set_visible(false);
+        // Clearing the text fires the search handler; find mode is already
+        // off, so it lands as a plain filter over the rebuilt list.
+        self.sidebar_search.set_text("");
+        self.refresh_projects();
+        self.refocus_workspace();
+    }
+
+    /// Scan the root for candidate directories, off the main thread. The
+    /// drainer fills the list when the results arrive.
+    fn rescan_find(&self) {
+        let root = self.find_root.borrow().clone();
+        while let Some(child) = self.sidebar_list.first_child() {
+            self.sidebar_list.remove(&child);
+        }
+        self.sidebar_list.append(&find_hint(&format!(
+            "Scanning {}…",
+            crate::db::abbreviate(&root)
+        )));
+        let tx = self.find_tx.clone();
+        std::thread::spawn(move || {
+            let found = discover::scan(&root, 3, 800);
+            let _ = tx.send((root, found));
+        });
+    }
+
+    /// Rebuild the find list for a query: best match first, every row wired
+    /// to add its directory. Needs the `Rc<App>` because rows act on it.
+    fn fill_find(app: &SharedApp, query: &str) {
+        while let Some(child) = app.sidebar_list.first_child() {
+            app.sidebar_list.remove(&child);
+        }
+
+        let known: Vec<PathBuf> = app
+            .db
+            .projects()
+            .map(|projects| projects.into_iter().map(|p| p.path).collect())
+            .unwrap_or_default();
+        let mut all = app.find_candidates.borrow().clone();
+        discover::mark_known(&mut all, &known);
+        let matches = discover::filter(&all, query);
+        if matches.is_empty() {
+            app.sidebar_list.append(&find_hint("No directories match."));
+            return;
+        }
+
+        for candidate in matches {
+            let badge = if candidate.known {
+                Some("added")
+            } else if candidate.is_repo {
+                Some("git")
+            } else {
+                None
+            };
+            let (item, name, badge_label) = find_row(
+                &candidate.name,
+                &candidate.display_path(),
+                badge,
+                candidate.known,
+            );
+            let path = candidate.path.clone();
+            let db = app.db.clone();
+            let app_for_activate = app.clone();
+            item.connect_activate(move |row| match db.add_project(&path) {
+                Ok(project) => {
+                    // `add_project` is idempotent: an "added" row simply
+                    // selects its project again.
+                    name.add_css_class("dim-label");
+                    badge_label.set_text("added");
+                    badge_label.set_visible(true);
+                    app_for_activate.select_project(project.id);
+                    app_for_activate.toast(&format!("Added {}", project.name));
+                }
+                Err(error) => {
+                    eprintln!("radar: {error}");
+                    // Keep the list usable and explain on the row.
+                    row.set_tooltip_text(Some(&error.to_string()));
+                }
+            });
+            app.sidebar_list.append(&item);
+        }
+        if let Some(first) = app.sidebar_list.row_at_index(0) {
+            app.sidebar_list.select_row(Some(&first));
+        }
     }
 
     // ---- the workspace and its panes ----
@@ -1358,7 +1688,7 @@ impl App {
             &spec,
             &workspace.project.path,
             &theme,
-            &label_for(slot),
+            label_for(slot),
             pane::ShiftEnter::for_slot(slot),
         ));
         let primitive = Primitive::new(&program, pane);
@@ -1793,7 +2123,13 @@ fn wire_sidebar_drop(app: &SharedApp) {
             return false;
         };
         trace(&format!("drop: sidebar got payload={payload}"));
-        let _ = list.activate_action("win.primitive-split-out", Some(&payload.to_variant()));
+        // Deferred one main-loop turn so the relayout happens after the drag
+        // has fully finished — see the note in group.rs's drop handler.
+        let list = list.clone();
+        let variant = payload.to_variant();
+        glib::idle_add_local_once(move || {
+            let _ = list.activate_action("win.primitive-split-out", Some(&variant));
+        });
         true
     });
     app.sidebar_list

@@ -224,17 +224,25 @@ impl Group {
                     };
                     // Full action name, prefix included: without "win." the lookup
                     // silently fails and the drop does nothing.
-                    let _ = widget.activate_action(
-                        "win.primitive-group",
-                        Some(&(payload, target_slot.as_str().to_string()).to_variant()),
-                    );
+                    // Deferred one main-loop turn: relayouting while the drop is
+                    // still finishing leaves the rebuilt tree unallocated (0x0)
+                    // — every pane gone, only the sidebar left. After the idle
+                    // the drag is fully over and the relayout sticks.
+                    let widget = widget.clone();
+                    let variant =
+                        (payload, target_slot.as_str().to_string()).to_variant();
+                    glib::idle_add_local_once(move || {
+                        let _ = widget.activate_action("win.primitive-group", Some(&variant));
+                    });
                     true
                 }
                 DropIntent::SplitOut => {
-                    let _ = widget.activate_action(
-                        "win.primitive-split-out",
-                        Some(&payload.to_variant()),
-                    );
+                    let widget = widget.clone();
+                    let variant = payload.to_variant();
+                    glib::idle_add_local_once(move || {
+                        let _ =
+                            widget.activate_action("win.primitive-split-out", Some(&variant));
+                    });
                     true
                 }
             }

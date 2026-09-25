@@ -208,28 +208,30 @@ fn parse_card_line(line: &str) -> Option<Card> {
     Some(card)
 }
 
-/// The claim is a trailing `@name`, so an agent claims by appending text. The
-/// token comes out of the title, otherwise rendering would write it twice.
+/// The claim is a trailing `@name`, so an agent claims by appending text. All
+/// trailing `@name` tokens come out of the title — the last one wins — so
+/// claiming over someone else's claim is just appending your name. An `@`
+/// mention in the middle of the title is prose, not a claim.
 fn split_claim(title: &str) -> (String, Option<String>) {
-    let Some(token) = title.split_whitespace().next_back() else {
-        return (title.to_string(), None);
-    };
-    let Some(name) = token.strip_prefix('@') else {
-        return (title.to_string(), None);
-    };
-    let valid = !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
-    if !valid {
-        return (title.to_string(), None);
+    let mut claim = None;
+    let mut bare = title;
+    while let Some(token) = bare.split_whitespace().next_back() {
+        let Some(name) = token.strip_prefix('@') else {
+            break;
+        };
+        let valid = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+        if !valid {
+            break;
+        }
+        if claim.is_none() {
+            claim = Some(name.to_string());
+        }
+        bare = bare.strip_suffix(token).unwrap_or(bare).trim_end();
     }
-    let bare = title
-        .strip_suffix(token)
-        .unwrap_or(title)
-        .trim_end()
-        .to_string();
-    (bare, Some(name.to_string()))
+    (bare.to_string(), claim)
 }
 
 /// The path of a project's board file.
@@ -512,6 +514,16 @@ mod tests {
         let (title, claim) = split_claim("fix @agent-2");
         assert_eq!(title, "fix");
         assert_eq!(claim.as_deref(), Some("agent-2"));
+
+        // Appending a name over someone's claim replaces it, token and all.
+        let (title, claim) = split_claim("fix @claude @codex");
+        assert_eq!(title, "fix");
+        assert_eq!(claim.as_deref(), Some("codex"));
+
+        // A mention in prose is not the claim.
+        let (title, claim) = split_claim("email @bob about specs");
+        assert_eq!(title, "email @bob about specs");
+        assert_eq!(claim, None);
     }
 
     #[test]

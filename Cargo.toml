@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "vte_probe"
 required-features = ["vte"]
 
+[[example]]
+name = "keys_probe"
+required-features = ["vte"]
+
 [features]
 default = []
 # `gui` builds the app with GTK4 + libadwaita (already installed on omarchy).

@@ -105,13 +105,15 @@ fn is_inside_repo(root: &Path, path: &Path) -> bool {
 }
 
 fn scan_with_fd(root: &Path, max_depth: usize, limit: usize) -> Result<Vec<Candidate>, ()> {
+    // No `--hidden`: dot directories are never project material, and this way
+    // fd also refuses to descend into them. A hidden scan *root* still works —
+    // the filter applies to what fd finds below the root, not the root itself.
     let mut command = Command::new("fd");
     command
         .arg("--type")
         .arg("d")
         .arg("--max-depth")
         .arg(max_depth.to_string())
-        .arg("--hidden")
         .arg("--no-ignore-vcs")
         .arg("--print0")
         .arg("--color")
@@ -153,7 +155,8 @@ fn scan_with_walk(root: &Path, max_depth: usize, limit: usize) -> Vec<Candidate>
                 return true;
             }
             let name = entry.file_name().to_string_lossy();
-            !SKIP_DIRS.iter().any(|skip| *skip == name)
+            // Dot directories are never offered, and never descended into.
+            !name.starts_with('.') && !SKIP_DIRS.iter().any(|skip| *skip == name)
         });
     for entry in walker.flatten() {
         if entry.depth() == 0 || !entry.file_type().is_dir() {
@@ -242,6 +245,7 @@ mod tests {
             "infra/k8s",
             "node_modules/pkg",
             "api-server/target/debug",
+            ".hidden-project/inner",
         ] {
             std::fs::create_dir_all(root.join(path)).unwrap();
         }
@@ -260,6 +264,21 @@ mod tests {
         assert!(names.contains(&"terraform"), "{names:?}");
         assert!(!names.contains(&"node_modules"), "noise must be skipped");
         assert!(!names.contains(&"debug"), "target must be skipped");
+        assert!(!names.contains(&".hidden-project"), "{names:?}");
+        assert!(
+            !names.contains(&"inner"),
+            "must not descend into dot directories: {names:?}"
+        );
+    }
+
+    #[test]
+    fn walk_fallback_ignores_dot_directories_too() {
+        let dir = fixture();
+        let found = scan_with_walk(dir.path(), 3, 100);
+        let names: Vec<&str> = found.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"api-server"));
+        assert!(!names.contains(&".hidden-project"), "{names:?}");
+        assert!(!names.contains(&"inner"), "{names:?}");
     }
 
     #[test]
