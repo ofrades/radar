@@ -266,6 +266,22 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         }
     }
     state.reload_theme();
+    // Keys belong to the pane, not to the filter box: whatever you type right
+    // after launch should reach the program you are looking at, the way it would
+    // in a terminal.
+    if let Some(workspace) = state.current_workspace() {
+        workspace.leaf().focus();
+    }
+
+    // Development aid: lay out splits on startup so the layout can be checked
+    // without clicking. RADAR_SPLIT_ON_START=1.
+    if std::env::var("RADAR_SPLIT_ON_START").is_ok() {
+        let state_for_split = state.clone();
+        glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+            state_for_split.split_focused(gtk::Orientation::Horizontal);
+            state_for_split.split_focused(gtk::Orientation::Vertical);
+        });
+    }
     window
 }
 
@@ -1152,13 +1168,20 @@ impl App {
         let leaf = workspace.leaf();
         let new_leaf = Leaf::new();
 
-        // The new half gets a tab too: an empty pane is a puzzle, not a tool.
+        // The new half gets a tab too: an empty pane is a puzzle, not a tool. It
+        // opens the same kind of program as the tab you split from — two agents,
+        // or two shells, side by side.
         let preferences = self.db.preferences().unwrap_or_default();
-        let slot = match orientation {
-            gtk::Orientation::Horizontal => Slot::Shell,
-            _ => Slot::Diff,
-        };
-        let Some(program) = programs::for_slot(slot, &preferences) else {
+        let slot = leaf
+            .pages
+            .borrow()
+            .iter()
+            .find(|page| Some(page.page.clone()) == leaf.selected_page())
+            .map(|page| page.slot)
+            .unwrap_or(Slot::Shell);
+        let program = programs::for_slot(slot, &preferences)
+            .or_else(|| programs::for_slot(Slot::Shell, &preferences));
+        let Some(program) = program else {
             self.toast("nothing installed for a new pane");
             return;
         };
@@ -1167,6 +1190,12 @@ impl App {
         wire_focus(&workspace, &new_leaf);
         self.open_program(&new_leaf, program, slot, Vec::new());
 
+        // GTK4 refuses, silently, to add a widget that already has a parent. Both
+        // halves are still parented (the sidebar's holder or the split they came
+        // from), so detach them first — otherwise the split is built with no
+        // children and the window keeps showing one pane.
+        leaf.widget.unparent();
+        new_leaf.widget.unparent();
         let paned = gtk::Paned::new(orientation);
         paned.set_start_child(Some(&leaf.widget));
         paned.set_end_child(Some(&new_leaf.widget));
@@ -1193,10 +1222,19 @@ impl App {
         if let Some(parent) = find_parent_of_leaf(&root, &leaf) {
             replace_leaf(&parent, &leaf, split);
         } else {
-            workspace.holder.remove(&root.widget());
+            detach(&workspace.holder, &root.widget());
             workspace.holder.append(&split.widget());
             *workspace.root.borrow_mut() = split;
         }
+        trace(&format!(
+            "split {}: leaves now {}, holder children {}",
+            match orientation {
+                gtk::Orientation::Horizontal => "right",
+                _ => "down",
+            },
+            workspace.all_leaves().len(),
+            workspace.holder.observe_children().n_items()
+        ));
         *workspace.focused.borrow_mut() = new_leaf.clone();
         new_leaf.focus();
         self.refresh_pane_menus();
@@ -1264,6 +1302,7 @@ impl App {
 
         if let Some(zoom) = workspace.zoom.borrow_mut().take() {
             workspace.holder.remove(&zoom.leaf.widget);
+            zoom.leaf.widget.unparent();
             match zoom.position {
                 Half::First => zoom.parent.set_start_child(Some(&zoom.leaf.widget)),
                 Half::Second => zoom.parent.set_end_child(Some(&zoom.leaf.widget)),
@@ -1287,7 +1326,8 @@ impl App {
             Half::First => paned.set_start_child(None::<&gtk::Widget>),
             Half::Second => paned.set_end_child(None::<&gtk::Widget>),
         }
-        workspace.holder.remove(&root.widget());
+        leaf.widget.unparent();
+        detach(&workspace.holder, &root.widget());
         workspace.holder.append(&leaf.widget);
         *workspace.zoom.borrow_mut() = Some(Zoom {
             leaf: leaf.clone(),
@@ -1453,13 +1493,34 @@ fn sibling_of(parent: &Node, target: &Rc<Node>) -> Rc<Node> {
     target.clone()
 }
 
-/// Append a line to a debug log. Removed once the layout is settled.
+/// Remove a child, but only when it really is that container's child.
+///
+/// GTK asserts when it is not, and the assertion is noise from defensive code
+/// rather than a bug worth showing anyone.
+fn detach(parent: &impl IsA<gtk::Widget>, child: &impl IsA<gtk::Widget>) {
+    let parent = parent.clone().upcast::<gtk::Widget>();
+    let child = child.clone().upcast::<gtk::Widget>();
+    if child.parent().is_some_and(|current| current == parent) {
+        parent
+            .downcast::<gtk::Box>()
+            .expect("detach is only used with boxes")
+            .remove(&child);
+    }
+}
+
+/// Append a line to a debug log when `RADAR_TRACE` is set.
+///
+/// Layout bugs are much easier to see in a trace than in a screenshot, and a
+/// detached GUI app's stdout is not always where you think it is.
 fn trace(message: &str) {
     use std::io::Write;
+    let Some(path) = std::env::var_os("RADAR_TRACE") else {
+        return;
+    };
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/opencode/radar-trace.log")
+        .open(path)
     {
         let _ = writeln!(file, "{message}");
     }
@@ -1479,10 +1540,11 @@ fn collapse_leaf(workspace: &Rc<Workspace>, leaf: &Rc<Leaf>) {
         let survivor = buried
             .map(|node| sibling_of(&parent, &node))
             .unwrap_or_else(|| root.clone());
+        survivor.widget().unparent();
         match find_parent(&root, &parent) {
             Some(grandparent) => replace_child(&grandparent, &parent, survivor.clone()),
             None => {
-                workspace.holder.remove(&root.widget());
+                detach(&workspace.holder, &root.widget());
                 workspace.holder.append(&survivor.widget());
                 *workspace.root.borrow_mut() = survivor.clone();
             }

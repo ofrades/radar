@@ -140,3 +140,13 @@ src/main.rs      CLI
 The core (`db`, `programs`, `discover`, `git`) has no GTK dependency, so it can
 back other front-ends — a shell widget, a status bar, or the `--json` output of
 the CLI — without duplicating any state.
+
+## Development aids
+
+Two environment variables exist because layout bugs are hard to see otherwise:
+
+- `RADAR_SPLIT_ON_START=1` builds a split layout on startup (split right, then
+  split down), so the pane geometry can be checked without clicking.
+- `RADAR_TRACE=/tmp/radar.log` appends what happens when tabs are opened and
+  panes are split, which is far easier to read than a screenshot when a widget
+  does not appear.
