@@ -18,7 +18,6 @@ pub struct Primitive {
     pub program_id: String,
     pub widget: gtk::Box,
     pub pane: Rc<Pane>,
-    pub menu_button: gtk::MenuButton,
 }
 
 impl Primitive {
@@ -56,14 +55,6 @@ impl Primitive {
         spacer.set_hexpand(true);
         header.append(&spacer);
 
-        let menu_button = gtk::MenuButton::builder()
-            .icon_name("view-more-symbolic")
-            .tooltip_text("Pane menu")
-            .build();
-        menu_button.add_css_class("flat");
-        menu_button.set_valign(gtk::Align::Center);
-        header.append(&menu_button);
-
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.set_vexpand(true);
         widget.set_hexpand(true);
@@ -76,7 +67,6 @@ impl Primitive {
             program_id: program.id.clone(),
             widget,
             pane,
-            menu_button,
         })
     }
 

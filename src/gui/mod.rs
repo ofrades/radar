@@ -16,6 +16,7 @@
 //! the agent away for a moment never interrupts it.
 
 mod dialogs;
+mod group;
 mod pane;
 mod primitive;
 mod style;
@@ -36,6 +37,7 @@ use crate::db::{Db, Project, Slot};
 use crate::programs::{self, CommandSpec, LaunchOptions, Program};
 
 use pane::Pane;
+use group::Group;
 use primitive::{label_for, Primitive};
 pub use theme::Theme;
 
@@ -65,21 +67,27 @@ pub fn run(paths: Paths, db: Db) -> Result<()> {
     Ok(())
 }
 
-/// A project's workspace: its primitives, and which are on screen.
+/// A project's workspace: its primitives, arranged into groups.
+///
+/// A group is a pane with one header. It holds one primitive by default; drag a
+/// header onto another and they share a header, with a chip each to switch. Drag
+/// one out again and it becomes its own pane. The layout places groups by what
+/// they lead with: agent on the left, changes and editor stacked beside it,
+/// commands along the bottom.
 struct Workspace {
     project: Project,
     /// Opened primitives, by slot.
     primitives: RefCell<HashMap<Slot, Rc<Primitive>>>,
     /// Which program each slot uses, even before it is opened.
     programs: RefCell<HashMap<Slot, String>>,
-    /// The primitives on screen, in layout order.
-    visible: RefCell<Vec<Slot>>,
-    /// Split positions the user dragged, keyed by layout signature.
+    /// The panes, in layout order.
+    groups: RefCell<Vec<Rc<Group>>>,
+    /// Divider positions the user dragged, keyed by layout signature.
     positions: RefCell<HashMap<String, i32>>,
-    /// Holds exactly one child: the layout built from `visible`.
+    /// Holds exactly one child: the layout built from `groups`.
     holder: gtk::Box,
-    /// The set of visible primitives to return to after a zoom.
-    zoom: RefCell<Option<Vec<Slot>>>,
+    /// The panes to return to after a zoom.
+    zoom: RefCell<Option<Vec<Rc<Group>>>>,
 }
 
 impl Workspace {
@@ -87,19 +95,46 @@ impl Workspace {
         self.primitives.borrow().get(&slot).cloned()
     }
 
+    fn groups(&self) -> Vec<Rc<Group>> {
+        self.groups.borrow().clone()
+    }
+
+    /// Which pane holds a primitive.
+    fn group_of(&self, slot: Slot) -> Option<Rc<Group>> {
+        self.groups.borrow().iter().find(|group| group.contains(slot)).cloned()
+    }
+
     fn is_visible(&self, slot: Slot) -> bool {
-        self.visible.borrow().contains(&slot)
+        self.group_of(slot).is_some()
     }
 
-    /// The primitives on screen.
+    /// Every primitive on screen, in layout order.
     fn visible_slots(&self) -> Vec<Slot> {
-        self.visible.borrow().clone()
+        let mut all: Vec<Slot> = self
+            .groups
+            .borrow()
+            .iter()
+            .flat_map(|group| group.slots())
+            .collect();
+        all.sort_by_key(|slot| PRIMITIVES.iter().position(|other| other == slot).unwrap_or(9));
+        all.dedup();
+        all
     }
 
-    /// Sort a visible set into layout order.
-    fn ordered(slots: &mut Vec<Slot>) {
-        slots.sort_by_key(|slot| PRIMITIVES.iter().position(|other| other == slot).unwrap_or(9));
-        slots.dedup();
+    /// The primitive a pane leads with: the first one in `PRIMITIVES` it holds.
+    fn anchor(group: &Rc<Group>) -> Option<Slot> {
+        group
+            .slots()
+            .into_iter()
+            .min_by_key(|slot| PRIMITIVES.iter().position(|other| other == slot).unwrap_or(9))
+    }
+
+    fn push_group(&self, group: Rc<Group>) {
+        self.groups.borrow_mut().push(group);
+    }
+
+    fn forget_group(&self, group: &Rc<Group>) {
+        self.groups.borrow_mut().retain(|other| !Rc::ptr_eq(other, group));
     }
 }
 
@@ -147,9 +182,12 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         .child(&sidebar_list)
         .build();
 
-    // The four primitives, above the search box: the app's only chrome.
-    let toggles = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    // The dock: one toggle per primitive, along the bottom of the panes.
+    let toggles = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    toggles.add_css_class("dock");
     toggles.set_halign(gtk::Align::Center);
+    toggles.set_margin_top(3);
+    toggles.set_margin_bottom(3);
 
     // One toggle per primitive, in the order they are named: agent, changes,
     // project, editor, commands. The project toggle is the sidebar.
@@ -237,8 +275,6 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     sidebar_box.add_css_class("projects-sidebar");
     sidebar_box.append(&sidebar_header);
     sidebar_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    sidebar_box.append(&toggles);
-    sidebar_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     sidebar_box.append(&search_row);
     sidebar_box.append(&sidebar_scroll);
 
@@ -262,9 +298,15 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     );
     stack.add_named(&no_selection, Some("_none"));
 
+    // The panes, with the dock under them.
+    let main_area = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    main_area.append(&stack);
+    main_area.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    main_area.append(&toggles);
+
     let splitter = gtk::Paned::new(gtk::Orientation::Horizontal);
     splitter.set_start_child(Some(&sidebar_box));
-    splitter.set_end_child(Some(&stack));
+    splitter.set_end_child(Some(&main_area));
     splitter.set_resize_start_child(false);
     splitter.set_shrink_start_child(false);
     splitter.set_wide_handle(true);
@@ -316,7 +358,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     state.reload_theme();
     // Keys belong to the program you are looking at, not to the filter box.
     if let Some(workspace) = state.current_workspace() {
-        let first = workspace.visible.borrow().first().copied();
+        let first = workspace.visible_slots().first().copied();
         if let Some(primitive) = first.and_then(|slot| workspace.primitive(slot)) {
             primitive.focus();
         }
@@ -324,6 +366,15 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
 
     // Development aid: lay out every primitive on startup so the arrangement can
     // be checked without clicking. RADAR_PRIMITIVES=1.
+    if std::env::var("RADAR_GROUP_TEST").is_ok() {
+        let state_for_group = state.clone();
+        glib::timeout_add_local_once(Duration::from_millis(1400), move || {
+            if let Some(workspace) = state_for_group.current_workspace() {
+                state_for_group.show_primitive(&workspace, Slot::Diff);
+                state_for_group.group_into(&workspace, Slot::Diff, Slot::Agent);
+            }
+        });
+    }
     if std::env::var("RADAR_PRIMITIVES").is_ok() {
         let state_for_all = state.clone();
         glib::timeout_add_local_once(Duration::from_millis(1200), move || {
@@ -643,12 +694,59 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
             let Some(name) = parameter.and_then(|value| value.get::<String>()) else {
                 return;
             };
-            let slot = Slot::parse(&name);
             let Some(workspace) = app_for_action.current_workspace() else {
                 app_for_action.toast("Select a project first");
                 return;
             };
-            app_for_action.toggle_primitive(&workspace, slot);
+            app_for_action.toggle_primitive(&workspace, Slot::parse(&name));
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // Clicking a chip in a shared header.
+        let action = gio::SimpleAction::new("primitive-activate", Some(glib::VariantTy::STRING));
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some(name) = parameter.and_then(|value| value.get::<String>()) else {
+                return;
+            };
+            let Some(workspace) = app_for_action.current_workspace() else {
+                return;
+            };
+            app_for_action.activate_primitive(&workspace, Slot::parse(&name));
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // Dropping one header onto another: they share the target's header.
+        let action = gio::SimpleAction::new(
+            "primitive-group",
+            Some(glib::VariantTy::new("(ss)").expect("a tuple type")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some(pair) = parameter.and_then(|value| value.get::<(String, String)>()) else {
+                return;
+            };
+            let Some(workspace) = app_for_action.current_workspace() else {
+                return;
+            };
+            app_for_action.group_into(&workspace, Slot::parse(&pair.0), Slot::parse(&pair.1));
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // Dropping a chip on a pane's content pulls it out into its own pane.
+        let action = gio::SimpleAction::new("primitive-split-out", Some(glib::VariantTy::STRING));
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some(name) = parameter.and_then(|value| value.get::<String>()) else {
+                return;
+            };
+            let Some(workspace) = app_for_action.current_workspace() else {
+                return;
+            };
+            app_for_action.split_out(&workspace, Slot::parse(&name));
         });
         app.window.add_action(&action);
     }
@@ -681,7 +779,11 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
             };
             let slot = Slot::parse(&name);
             if let Some(workspace) = app_for_action.current_workspace() {
-                if let Some(primitive) = workspace.primitive(slot) {
+                if let Some(primitive) = workspace
+                    .group_of(slot)
+                    .and_then(|group| group.active_slot())
+                    .and_then(|active| workspace.primitive(active))
+                {
                     primitive.focus();
                 }
             }
@@ -1081,7 +1183,7 @@ impl App {
         self.sync_toggles();
     }
 
-    // ---- the workspace and its primitives ----
+    // ---- the workspace and its panes ----
 
     fn select_project(&self, id: i64) {
         let Some(project) = self
@@ -1094,14 +1196,13 @@ impl App {
             return;
         };
         *self.current.borrow_mut() = Some(id);
-        let workspace = self.workspace_for(&project);
+        self.workspace_for(&project);
         self.stack.set_visible_child_name(&format!("project-{id}"));
         let _ = self.db.touch_project(id);
         let _ = self.db.remember_last_project(Some(id));
         self.sync_toggles();
         self.refresh_menus();
         self.select_row_for(id);
-        let _ = workspace;
     }
 
     fn workspace_for(&self, project: &Project) -> Rc<Workspace> {
@@ -1117,7 +1218,7 @@ impl App {
             project: project.clone(),
             primitives: RefCell::new(HashMap::new()),
             programs: RefCell::new(HashMap::new()),
-            visible: RefCell::new(Vec::new()),
+            groups: RefCell::new(Vec::new()),
             positions: RefCell::new(HashMap::new()),
             holder: holder.clone(),
             zoom: RefCell::new(None),
@@ -1155,18 +1256,16 @@ impl App {
             Vec::new()
         };
         let preferences = self.db.preferences().unwrap_or_default();
-        let mut visible = Vec::new();
+        let mut wanted: Vec<Slot> = Vec::new();
         if stored.is_empty() {
             // The agent is the point of the workspace; everything else is one
             // keystroke away.
-            visible = vec![Slot::Agent];
-            for slot in &visible {
-                if let Some(program) = programs::for_slot(*slot, &preferences) {
-                    workspace
-                        .programs
-                        .borrow_mut()
-                        .insert(*slot, program.id.clone());
-                }
+            wanted.push(Slot::Agent);
+            if let Some(program) = programs::for_slot(Slot::Agent, &preferences) {
+                workspace
+                    .programs
+                    .borrow_mut()
+                    .insert(Slot::Agent, program.id.clone());
             }
         } else {
             for tab in &stored {
@@ -1174,19 +1273,26 @@ impl App {
                     .programs
                     .borrow_mut()
                     .insert(tab.slot, tab.program_id.clone());
-                visible.push(tab.slot);
+                wanted.push(tab.slot);
             }
         }
-        Workspace::ordered(&mut visible);
-        *workspace.visible.borrow_mut() = visible.clone();
+        wanted.sort_by_key(|slot| PRIMITIVES.iter().position(|other| other == slot).unwrap_or(9));
+        wanted.dedup();
 
-        // Open the ones that are on screen; a program that is gone falls back to
-        // the preferred one for its slot.
-        for slot in visible {
-            if self.ensure_primitive(&workspace, slot).is_none() {
+        for slot in wanted {
+            let Some(primitive) = self.ensure_primitive(&workspace, slot) else {
                 continue;
-            }
+            };
+            // Restored panes start as their own pane; grouping is a gesture you
+            // make, not something restored behind your back.
+            let group = Group::new();
+            group.insert(slot, &primitive.widget.clone().upcast::<gtk::Widget>(), true);
+            group.rebuild_header();
+            self.refresh_group_menu(&group);
+            self.wire_content_drop(&group);
+            workspace.push_group(group);
         }
+
         self.layout(&workspace);
         self.sync_toggles();
         self.persist_primitives(&workspace);
@@ -1220,9 +1326,6 @@ impl App {
             pane::ShiftEnter::for_slot(slot),
         ));
         let primitive = Primitive::new(slot, &program, pane);
-        primitive
-            .menu_button
-            .set_menu_model(Some(&self.primitive_menu_model(slot)));
         workspace
             .primitives
             .borrow_mut()
@@ -1230,44 +1333,136 @@ impl App {
         Some(primitive)
     }
 
-    /// Show or hide one primitive. Hiding never stops the program.
+    /// Show or hide a primitive. Hiding never stops the program.
     fn toggle_primitive(&self, workspace: &Rc<Workspace>, slot: Slot) {
         if slot == Slot::Custom {
             return;
         }
-        if workspace.is_visible(slot) {
-            workspace.visible.borrow_mut().retain(|other| *other != slot);
+        if let Some(group) = workspace.group_of(slot) {
+            group.remove(slot);
+            if group.is_empty() {
+                workspace.forget_group(&group);
+            }
+            group.rebuild_header();
         } else {
-            if self.ensure_primitive(workspace, slot).is_none() {
+            let Some(primitive) = self.ensure_primitive(workspace, slot) else {
                 self.toast(&format!(
                     "No {} installed — set one in Preferences",
                     label_for(slot).to_lowercase()
                 ));
                 return;
-            }
-            let mut visible = workspace.visible.borrow_mut();
-            visible.push(slot);
-            Workspace::ordered(&mut visible);
+            };
+            let group = Group::new();
+            group.insert(slot, &primitive.widget.clone().upcast::<gtk::Widget>(), true);
+            group.rebuild_header();
+            self.refresh_group_menu(&group);
+            self.wire_content_drop(&group);
+            workspace.push_group(group);
         }
         *workspace.zoom.borrow_mut() = None;
-        trace(&format!(
-            "toggle {}: visible {:?}",
-            slot.as_str(),
-            workspace.visible_slots()
-                .iter()
-                .map(|slot| slot.as_str())
-                .collect::<Vec<_>>()
-        ));
         self.layout(workspace);
         self.sync_toggles();
         self.persist_primitives(workspace);
     }
 
-    /// Show a primitive without toggling it off when it is already visible.
+    /// Show a primitive without hiding it when it is already on screen.
     fn show_primitive(&self, workspace: &Rc<Workspace>, slot: Slot) {
         if !workspace.is_visible(slot) {
             self.toggle_primitive(workspace, slot);
         }
+    }
+
+    /// Clicking a chip: switch that pane to the primitive.
+    fn activate_primitive(&self, workspace: &Rc<Workspace>, slot: Slot) {
+        if let Some(group) = workspace.group_of(slot) {
+            group.activate(slot);
+            self.refresh_group_menu(&group);
+            if let Some(primitive) = workspace.primitive(slot) {
+                primitive.focus();
+            }
+            return;
+        }
+        self.show_primitive(workspace, slot);
+        if let Some(group) = workspace.group_of(slot) {
+            group.activate(slot);
+            self.refresh_group_menu(&group);
+        }
+    }
+
+    /// Drop one primitive onto another's header: they share that header.
+    fn group_into(&self, workspace: &Rc<Workspace>, source: Slot, target: Slot) {
+        if source == target || source == Slot::Custom {
+            return;
+        }
+        let Some(primitive) = self.ensure_primitive(workspace, source) else {
+            return;
+        };
+        let Some(target_group) = workspace.group_of(target) else {
+            return;
+        };
+        if let Some(source_group) = workspace.group_of(source) {
+            if Rc::ptr_eq(&source_group, &target_group) {
+                return;
+            }
+            source_group.remove(source);
+            source_group.rebuild_header();
+            if source_group.is_empty() {
+                workspace.forget_group(&source_group);
+            }
+        }
+        target_group.insert(source, &primitive.widget.clone().upcast::<gtk::Widget>(), true);
+        target_group.rebuild_header();
+        self.refresh_group_menu(&target_group);
+        *workspace.zoom.borrow_mut() = None;
+        self.layout(workspace);
+        self.sync_toggles();
+        self.persist_primitives(workspace);
+        trace(&format!(
+            "group: {} joined {}",
+            source.as_str(),
+            target.as_str()
+        ));
+    }
+
+    /// Pull a primitive out of a shared header into its own pane.
+    fn split_out(&self, workspace: &Rc<Workspace>, slot: Slot) {
+        let Some(group) = workspace.group_of(slot) else {
+            return;
+        };
+        if group.slots().len() < 2 {
+            return; // already its own pane
+        }
+        let Some(primitive) = self.ensure_primitive(workspace, slot) else {
+            return;
+        };
+        group.remove(slot);
+        group.rebuild_header();
+        let own = Group::new();
+        own.insert(slot, &primitive.widget.clone().upcast::<gtk::Widget>(), true);
+        own.rebuild_header();
+        self.refresh_group_menu(&own);
+        self.wire_content_drop(&own);
+        workspace.push_group(own);
+        *workspace.zoom.borrow_mut() = None;
+        self.layout(workspace);
+        self.sync_toggles();
+        self.persist_primitives(workspace);
+        trace(&format!("split out: {}", slot.as_str()));
+    }
+
+    /// A pane's content accepts a dropped chip: that pulls it out into its own
+    /// pane, the opposite gesture from dropping on a header.
+    fn wire_content_drop(&self, group: &Rc<Group>) {
+        let target = gtk::DropTarget::new(glib::types::Type::STRING, gtk::gdk::DragAction::MOVE);
+        let content = group.content.clone();
+        target.connect_drop(move |_, value, _, _| {
+            let Ok(slot) = value.get::<String>() else {
+                return false;
+            };
+            let _ = content.activate_action("primitive-split-out", Some(&slot.to_variant()));
+            true
+        });
+        group.widget.add_controller(target);
     }
 
     /// Replace the program behind a primitive.
@@ -1281,91 +1476,98 @@ impl App {
         // Drop the old pane: its process belongs to the program being replaced.
         if let Some(old) = workspace.primitives.borrow_mut().remove(&slot) {
             old.widget.unparent();
+            if let Some(group) = workspace.group_of(slot) {
+                group.remove(slot);
+                if group.is_empty() {
+                    workspace.forget_group(&group);
+                }
+                group.rebuild_header();
+            }
         }
         workspace
             .programs
             .borrow_mut()
             .insert(slot, program.id.clone());
-        if visible && !workspace.is_visible(slot) {
-            let mut list = workspace.visible.borrow_mut();
-            list.push(slot);
-            Workspace::ordered(&mut list);
+        if visible {
+            self.show_primitive(workspace, slot);
+        } else {
+            self.layout(workspace);
+            self.sync_toggles();
+            self.persist_primitives(workspace);
         }
-        self.ensure_primitive(workspace, slot);
-        self.layout(workspace);
-        self.sync_toggles();
-        self.persist_primitives(workspace);
         self.toast(&format!("{} → {}", label_for(slot), program.name));
     }
 
-    /// Arrange the visible primitives into panes, the same way every time.
+    /// Arrange the panes: agent on the left, changes and editor stacked beside
+    /// it, commands along the bottom. Whatever is not open is not there.
     fn layout(&self, workspace: &Rc<Workspace>) {
-        let visible = workspace.visible.borrow().clone();
+        let groups = workspace.groups();
 
-        // Everything is detached first: a widget lives in one parent at a time and
-        // GTK will not reparent it for us.
-        for primitive in workspace.primitives.borrow().values() {
-            primitive.widget.unparent();
+        for group in &groups {
+            group.widget.unparent();
         }
         while let Some(child) = workspace.holder.first_child() {
             workspace.holder.remove(&child);
         }
 
-        if visible.is_empty() {
+        if groups.is_empty() {
             workspace.holder.append(&status_page(
                 "view-list-symbolic",
                 "Every pane is hidden",
-                "Use the icons above the project list to bring one back.",
+                "Use the dock along the bottom to bring one back.",
                 None,
             ));
             return;
         }
 
-        let widget = |slot: Slot| {
-            workspace
-                .primitive(slot)
-                .map(|primitive| primitive.widget.clone().upcast::<gtk::Widget>())
-        };
-
-        // Terminal along the bottom, editor on the left, agent and diff stacked
-        // on the right. Whatever is not visible simply is not there.
-        let side_slots: Vec<Slot> = [Slot::Diff, Slot::Editor]
-            .into_iter()
-            .filter(|slot| visible.contains(slot))
+        let bottom: Vec<Rc<Group>> = groups
+            .iter()
+            .filter(|group| Workspace::anchor(group) == Some(Slot::Shell))
+            .cloned()
             .collect();
-        let side = match side_slots.len() {
-            0 => None,
-            1 => widget(side_slots[0]),
-            _ => {
-                let (top, bottom) = (widget(side_slots[0]), widget(side_slots[1]));
-                match (top, bottom) {
-                    (Some(top), Some(bottom)) => Some(
-                        self.stacked(workspace, "side", gtk::Orientation::Vertical, &top, &bottom, 520),
-                    ),
-                    (Some(only), None) | (None, Some(only)) => Some(only),
-                    _ => None,
-                }
-            }
-        };
-        let agent = widget(Slot::Agent).filter(|_| visible.contains(&Slot::Agent));
-        let main = match (visible.contains(&Slot::Agent), agent, side) {
-            (true, Some(agent), Some(side)) => Some(self.stacked(
+        let rest: Vec<Rc<Group>> = groups
+            .iter()
+            .filter(|group| !bottom.iter().any(|other| Rc::ptr_eq(other, group)))
+            .cloned()
+            .collect();
+        let main_left = rest
+            .iter()
+            .find(|group| Workspace::anchor(group) == Some(Slot::Agent))
+            .cloned()
+            .or_else(|| rest.first().cloned());
+        let side: Vec<Rc<Group>> = rest
+            .iter()
+            .filter(|group| match &main_left {
+                Some(main) => !Rc::ptr_eq(main, group),
+                None => true,
+            })
+            .cloned()
+            .collect();
+
+        let side_row = self.stack_groups(workspace, "side", gtk::Orientation::Vertical, &side);
+        let main = match (main_left, side_row) {
+            (Some(main), Some(side)) => Some(self.stacked(
                 workspace,
                 "main",
                 gtk::Orientation::Horizontal,
-                &agent,
+                &main.widget.clone().upcast::<gtk::Widget>(),
                 &side,
-                560,
+                0.42,
             )),
-            (_, Some(only), None) => Some(only),
-            (_, None, Some(only)) => Some(only),
-            _ => None,
+            (Some(only), None) => Some(only.widget.clone().upcast::<gtk::Widget>()),
+            (None, Some(only)) => Some(only),
+            (None, None) => None,
         };
-        let terminal = widget(Slot::Shell).filter(|_| visible.contains(&Slot::Shell));
-        let root = match (main, terminal) {
-            (Some(main), Some(terminal)) => {
-                Some(self.stacked(workspace, "outer", gtk::Orientation::Vertical, &main, &terminal, 620))
-            }
+        let bottom_row = self.stack_groups(workspace, "bottom", gtk::Orientation::Horizontal, &bottom);
+        let root = match (main, bottom_row) {
+            (Some(main), Some(bottom)) => Some(self.stacked(
+                workspace,
+                "outer",
+                gtk::Orientation::Vertical,
+                &main,
+                &bottom,
+                0.68,
+            )),
             (Some(only), None) | (None, Some(only)) => Some(only),
             _ => None,
         };
@@ -1374,13 +1576,55 @@ impl App {
             workspace.holder.append(&root);
         }
         trace(&format!(
-            "layout: {:?} ({} panes)",
-            visible.iter().map(|slot| slot.as_str()).collect::<Vec<_>>(),
-            workspace.primitives.borrow().len()
+            "layout: {} pane(s) {:?}",
+            groups.len(),
+            groups
+                .iter()
+                .map(|group| group
+                    .slots()
+                    .iter()
+                    .map(|slot| slot.as_str())
+                    .collect::<Vec<_>>()
+                    .join("+"))
+                .collect::<Vec<_>>()
         ));
     }
 
-    /// A draggable divider whose position is remembered.
+    /// Fold a list of panes into nested dividers along one axis.
+    fn stack_groups(
+        &self,
+        workspace: &Rc<Workspace>,
+        key: &str,
+        orientation: gtk::Orientation,
+        groups: &[Rc<Group>],
+    ) -> Option<gtk::Widget> {
+        let widgets: Vec<gtk::Widget> = groups
+            .iter()
+            .map(|group| group.widget.clone().upcast::<gtk::Widget>())
+            .collect();
+        let mut iter = widgets.iter().rev();
+        let mut acc = iter.next()?.clone();
+        for (index, widget) in iter.enumerate() {
+            let first = index % 2 == 0;
+            let (left, right) = if first { (widget, &acc) } else { (&acc, widget) };
+            let fraction = if orientation == gtk::Orientation::Horizontal {
+                0.55
+            } else {
+                0.5
+            };
+            acc = self.stacked(
+                workspace,
+                &format!("{key}{index}"),
+                orientation,
+                left,
+                right,
+                fraction,
+            );
+        }
+        Some(acc)
+    }
+
+    /// A draggable divider whose position is remembered as a fraction.
     fn stacked(
         &self,
         workspace: &Rc<Workspace>,
@@ -1388,7 +1632,7 @@ impl App {
         orientation: gtk::Orientation,
         first: &gtk::Widget,
         second: &gtk::Widget,
-        default_position: i32,
+        fraction: f64,
     ) -> gtk::Widget {
         let paned = gtk::Paned::new(orientation);
         paned.set_wide_handle(true);
@@ -1400,13 +1644,19 @@ impl App {
         paned.set_hexpand(true);
         paned.set_start_child(Some(first));
         paned.set_end_child(Some(second));
+
+        let extent = if orientation == gtk::Orientation::Horizontal {
+            self.window.width().max(700)
+        } else {
+            self.window.height().max(500)
+        };
         paned.set_position(
             workspace
                 .positions
                 .borrow()
                 .get(key)
                 .copied()
-                .unwrap_or(default_position),
+                .unwrap_or((extent as f64 * fraction) as i32),
         );
 
         let workspace_for_position = workspace.clone();
@@ -1420,24 +1670,24 @@ impl App {
         paned.upcast()
     }
 
-    /// Zoom the first visible primitive to the whole window, and back.
+    /// Zoom the focused pane to the whole window, and back.
     fn toggle_zoom(&self) {
         let Some(workspace) = self.current_workspace() else {
             return;
         };
         if let Some(previous) = workspace.zoom.borrow_mut().take() {
-            *workspace.visible.borrow_mut() = previous;
+            *workspace.groups.borrow_mut() = previous;
             self.layout(&workspace);
             self.sync_toggles();
             return;
         }
-        let visible = workspace.visible.borrow().clone();
-        if visible.len() < 2 {
+        let groups = workspace.groups();
+        if groups.len() < 2 {
             self.toast("Only one pane is showing");
             return;
         }
-        *workspace.zoom.borrow_mut() = Some(visible.clone());
-        *workspace.visible.borrow_mut() = vec![visible[0]];
+        *workspace.zoom.borrow_mut() = Some(groups.clone());
+        *workspace.groups.borrow_mut() = vec![groups[0].clone()];
         self.layout(&workspace);
         self.sync_toggles();
     }
@@ -1454,9 +1704,10 @@ impl App {
     }
 
     /// Store the primitives on screen, so the next launch looks the same.
+    /// Grouping is a gesture, not state: panes come back as separate panes.
     fn persist_primitives(&self, workspace: &Rc<Workspace>) {
         let mut tabs = Vec::new();
-        for (index, slot) in workspace.visible.borrow().iter().enumerate() {
+        for (index, slot) in workspace.visible_slots().iter().enumerate() {
             let program_id = workspace
                 .primitive(*slot)
                 .map(|primitive| primitive.program_id.clone())
@@ -1473,7 +1724,7 @@ impl App {
         }
     }
 
-    /// Make the sidebar icons match the layout.
+    /// Make the dock match the layout.
     fn sync_toggles(&self) {
         let visible = self
             .current_workspace()
@@ -1483,18 +1734,27 @@ impl App {
         self.projects_toggle.set_active(self.sidebar_shown.get());
         for (slot, button) in self.toggles.borrow().iter() {
             button.set_active(visible.contains(slot));
-            let available = *slot == Slot::Shell || programs::for_slot(*slot, &preferences).is_some();
+            let available =
+                *slot == Slot::Shell || programs::for_slot(*slot, &preferences).is_some();
             button.set_sensitive(available);
         }
     }
 
-    /// Rebuild the pane menus and the sidebar icons' sensitivity.
+    /// The pane menu belongs to whichever primitive its header is showing.
+    fn refresh_group_menu(&self, group: &Rc<Group>) {
+        let Some(slot) = group.active_slot() else {
+            return;
+        };
+        group
+            .menu_button
+            .set_menu_model(Some(&self.primitive_menu_model(slot)));
+    }
+
+    /// Rebuild every pane menu, after a preference change.
     fn refresh_menus(&self) {
         for workspace in self.workspaces.borrow().values() {
-            for (slot, primitive) in workspace.primitives.borrow().iter() {
-                primitive
-                    .menu_button
-                    .set_menu_model(Some(&self.primitive_menu_model(*slot)));
+            for group in workspace.groups() {
+                self.refresh_group_menu(&group);
             }
         }
     }

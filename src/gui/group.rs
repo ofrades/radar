@@ -13,12 +13,11 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::gdk;
+use gtk::glib;
 
-use super::primitive::{icon_name, label_for};
+use super::icon_name;
+use super::primitive::label_for;
 use crate::db::Slot;
-
-/// Start dragging a chip, carrying the primitive's slot as a string.
-pub const DRAG_TYPE: &str = "application/x-radar-primitive";
 
 pub struct Group {
     pub widget: gtk::Box,
@@ -95,7 +94,7 @@ impl Group {
                 return false;
             }
             // Through the window action, so nothing here needs the app.
-            header.activate_action(
+            let _ = header.activate_action(
                 "primitive-group",
                 Some(&(source, target_slot.as_str().to_string()).to_variant()),
             );
@@ -193,25 +192,6 @@ impl Group {
             let payload = slot.as_str().to_string();
             source.connect_prepare(move |_, _, _| {
                 Some(gdk::ContentProvider::for_value(&payload.to_value()))
-            });
-            source.connect_drag_begin(|source, drag| {
-                drag.set_icon(Some(&gdk::Texture::from_bytes(
-                    &glib::Bytes::from_static(b""),
-                )
-                .unwrap_or_else(|_| {
-                    // A 1x1 transparent icon: the chip itself is the visual cue.
-                    gdk::Texture::from_bytes(&glib::Bytes::from_static(&[
-                        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
-                        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-                        0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
-                        0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
-                        0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
-                        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-                    ]))
-                    .unwrap_or_else(|_| gdk::Texture::from_bytes(&glib::Bytes::from_static(&[0])).expect("icon"))
-                })))
-                .ok();
-                let _ = source;
             });
             chip.add_controller(source);
             self.header.append(&chip);
