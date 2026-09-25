@@ -77,9 +77,9 @@ impl Primitive {
 
 }
 
-/// The icon for the sidebar, which is a primitive like the others: it is the
-/// project list.
+/// The sidebar is a primitive like the others: it is the project list.
 pub const PROJECTS_ICON: &str = "folder-symbolic";
+pub const PROJECTS_LABEL: &str = "Project";
 
 /// An icon for a primitive.
 pub fn icon_for(slot: Slot) -> Option<gio::Icon> {

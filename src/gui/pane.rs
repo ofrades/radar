@@ -16,6 +16,41 @@ use vte4::prelude::*;
 use super::theme::Theme;
 use crate::programs::CommandSpec;
 
+/// What Shift+Enter should send to a program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftEnter {
+    /// Plain Enter, the standard terminal behaviour.
+    Off,
+    /// `ESC [ 1 3 ; 2 u`: the kitty keyboard encoding for Shift+Enter, which
+    /// agent TUIs that ask for the protocol parse.
+    Kitty,
+    /// `ESC CR`: what terminals send for Meta+Enter, which many TUIs accept as
+    /// "newline without submitting".
+    Meta,
+}
+
+impl ShiftEnter {
+    /// Only for the panes where it makes sense: an agent prompt wants a newline,
+    /// a shell or an editor does not, and synthesising a key there would corrupt
+    /// real input.
+    ///
+    /// Kitty form, because the agent TUIs people use ask for that protocol; VTE
+    /// cannot provide it, so this is the missing half. Switch to `Meta` (ESC CR,
+    /// the classic Meta+Enter) if a particular agent prefers that.
+    pub fn for_slot(slot: crate::db::Slot) -> ShiftEnter {
+        if slot != crate::db::Slot::Agent {
+            return ShiftEnter::Off;
+        }
+        // An escape hatch that does not depend on configuration: some agents want
+        // the classic Meta+Enter instead, some want nothing at all.
+        match std::env::var("RADAR_SHIFT_ENTER").as_deref() {
+            Ok("meta") => ShiftEnter::Meta,
+            Ok("off") => ShiftEnter::Off,
+            _ => ShiftEnter::Kitty,
+        }
+    }
+}
+
 /// A running (or launchable) program in a tab.
 pub struct Pane {
     widget: gtk::Widget,
@@ -59,19 +94,32 @@ impl Pane {
     }
 
     /// Run `spec` in `cwd`.
-    pub fn spawn(spec: &CommandSpec, cwd: &Path, theme: &Theme, title: &str) -> Pane {
+    pub fn spawn(
+        spec: &CommandSpec,
+        cwd: &Path,
+        theme: &Theme,
+        title: &str,
+        shift_enter: ShiftEnter,
+    ) -> Pane {
         #[cfg(feature = "vte")]
         {
-            Pane::spawn_embedded(spec, cwd, theme, title)
+            Pane::spawn_embedded(spec, cwd, theme, title, shift_enter)
         }
         #[cfg(not(feature = "vte"))]
         {
+            let _ = shift_enter;
             Pane::spawn_external(spec, cwd, theme, title)
         }
     }
 
     #[cfg(feature = "vte")]
-    fn spawn_embedded(spec: &CommandSpec, cwd: &Path, theme: &Theme, title: &str) -> Pane {
+    fn spawn_embedded(
+        spec: &CommandSpec,
+        cwd: &Path,
+        theme: &Theme,
+        title: &str,
+        shift_enter: ShiftEnter,
+    ) -> Pane {
         let terminal = vte4::Terminal::new();
         apply_terminal_theme(&terminal, theme);
         terminal.set_scrollback_lines(10_000);
@@ -128,6 +176,24 @@ impl Pane {
             if paste {
                 terminal_for_keys.paste_clipboard();
                 return glib::Propagation::Stop;
+            }
+            // VTE cannot report the shift itself, so a TUI that wants a newline
+            // from Shift+Enter gets the sequence it parses.
+            let shift_only = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK)
+                && !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                && !modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
+            if shift_only && (key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter) {
+                match shift_enter {
+                    ShiftEnter::Off => {}
+                    ShiftEnter::Kitty => {
+                        terminal_for_keys.feed_child(b"\x1b[13;2u");
+                        return glib::Propagation::Stop;
+                    }
+                    ShiftEnter::Meta => {
+                        terminal_for_keys.feed_child(b"\x1b\r");
+                        return glib::Propagation::Stop;
+                    }
+                }
             }
             glib::Propagation::Proceed
         });

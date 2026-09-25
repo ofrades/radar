@@ -151,37 +151,50 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     let toggles = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     toggles.set_halign(gtk::Align::Center);
 
-    // Projects: the sidebar itself, toggled like any other primitive.
-    let projects_toggle = gtk::ToggleButton::builder()
-        .icon_name(primitive::PROJECTS_ICON)
-        .tooltip_text("Projects\tCtrl+B")
-        .build();
-    projects_toggle.add_css_class("flat");
-    projects_toggle.set_action_name(Some("win.toggle-sidebar"));
-    toggles.append(&projects_toggle);
-
-    let divider = gtk::Separator::new(gtk::Orientation::Vertical);
-    divider.set_margin_top(4);
-    divider.set_margin_bottom(4);
-    divider.set_margin_start(2);
-    divider.set_margin_end(2);
-    toggles.append(&divider);
-
+    // One toggle per primitive, in the order they are named: agent, changes,
+    // project, editor, commands. The project toggle is the sidebar.
     let mut toggle_buttons = HashMap::new();
-    for slot in PRIMITIVES {
+    let mut add_toggle = |slot: Slot, project: bool, row: &gtk::Box| {
         let button = gtk::ToggleButton::builder()
-            .icon_name(icon_name(slot))
-            .tooltip_text(format!("{}\t{}", label_for(slot), accel_hint(slot)))
+            .icon_name(if project {
+                primitive::PROJECTS_ICON
+            } else {
+                icon_name(slot)
+            })
+            .tooltip_text(if project {
+                format!("{}\tCtrl+B", primitive::PROJECTS_LABEL)
+            } else {
+                format!("{}\t{}", label_for(slot), accel_hint(slot))
+            })
             .build();
         button.add_css_class("flat");
-        button.set_action_name(Some("win.primitive-toggle"));
-        button.set_action_target_value(Some(&slot.as_str().to_variant()));
-        toggles.append(&button);
-        toggle_buttons.insert(slot, button);
+        if project {
+            button.set_action_name(Some("win.toggle-sidebar"));
+        } else {
+            button.set_action_name(Some("win.primitive-toggle"));
+            button.set_action_target_value(Some(&slot.as_str().to_variant()));
+            toggle_buttons.insert(slot, button.clone());
+        }
+        row.append(&button);
+        button
+    };
+    let mut projects_toggle: Option<gtk::ToggleButton> = None;
+    for (slot, is_project) in [
+        (Slot::Agent, false),
+        (Slot::Diff, false),
+        (Slot::Custom, true),
+        (Slot::Editor, false),
+        (Slot::Shell, false),
+    ] {
+        let button = add_toggle(slot, is_project, &toggles);
+        if is_project {
+            projects_toggle = Some(button);
+        }
     }
+    let projects_toggle = projects_toggle.expect("the project toggle is in the row");
 
     let search = gtk::SearchEntry::new();
-    search.set_placeholder_text(Some("Projects"));
+    search.set_placeholder_text(Some("Filter"));
     search.set_hexpand(true);
 
     let add_button = gtk::Button::builder()
@@ -1187,6 +1200,7 @@ impl App {
             &workspace.project.path,
             &theme,
             &label_for(slot),
+            pane::ShiftEnter::for_slot(slot),
         ));
         let primitive = Primitive::new(slot, &program, pane);
         primitive
