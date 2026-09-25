@@ -16,7 +16,7 @@ use crate::programs::Program;
 pub struct Primitive {
     pub program_id: String,
     pub widget: gtk::Widget,
-    pub pane: Rc<Pane>,
+    pub pane: Option<Rc<Pane>>,
 }
 
 impl Primitive {
@@ -29,12 +29,26 @@ impl Primitive {
         Rc::new(Primitive {
             program_id: program.id.clone(),
             widget,
-            pane,
+            pane: Some(pane),
+        })
+    }
+
+    /// A built-in primitive: radar draws the content itself and no program
+    /// runs, so there is no pty to keep alive and nothing to relaunch.
+    pub fn builtin(program_id: &str, widget: gtk::Widget, tooltip: &str) -> Rc<Primitive> {
+        widget.set_tooltip_text(Some(tooltip));
+        Rc::new(Primitive {
+            program_id: program_id.to_string(),
+            widget,
+            pane: None,
         })
     }
 
     pub fn focus(&self) {
-        self.pane.widget().grab_focus();
+        match &self.pane {
+            Some(pane) => pane.widget().grab_focus(),
+            None => self.widget.grab_focus(),
+        };
     }
 }
 

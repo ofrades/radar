@@ -78,6 +78,32 @@ tabbar > tabbox > tab > box {
   background: alpha(@accent_bg_color, 0.18);
 }
 
+/* Board: the project's kanban pane. Columns are calm panels, cards are small
+   raised surfaces; the claim chip borrows the sidebar badge's accent. */
+.board-column {
+  border-radius: 8px;
+  background: alpha(currentColor, 0.05);
+  padding: 8px;
+}
+.board-column.drop-hint {
+  background: alpha(@accent_bg_color, 0.18);
+}
+.board-card {
+  border-radius: 6px;
+  background: alpha(currentColor, 0.08);
+  padding: 6px 8px;
+}
+.board-card:hover {
+  background: alpha(currentColor, 0.13);
+}
+.board-card-done {
+  text-decoration: line-through;
+}
+.board-claim {
+  color: @accent_color;
+  font-weight: 700;
+}
+
 /* Trash button appears only while the row is hovered or focused. */
 .projects-sidebar row .row-action {
   opacity: 0;

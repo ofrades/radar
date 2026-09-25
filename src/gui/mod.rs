@@ -15,6 +15,7 @@
 //! Hiding a primitive detaches its widget; the program keeps running, so putting
 //! the agent away for a moment never interrupts it.
 
+mod board;
 mod dialogs;
 mod group;
 mod pane;
@@ -47,7 +48,7 @@ type SharedDb = Rc<Db>;
 
 /// The four content primitives, in layout order: the agent leads, because that
 /// is what the workspace is for.
-const PRIMITIVES: [Slot; 4] = [Slot::Agent, Slot::Diff, Slot::Shell, Slot::Editor];
+const PRIMITIVES: [Slot; 5] = [Slot::Agent, Slot::Diff, Slot::Board, Slot::Shell, Slot::Editor];
 
 /// Open the app.
 pub fn run(paths: Paths, db: Db) -> Result<()> {
@@ -230,6 +231,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     for (slot, is_project) in [
         (Slot::Agent, false),
         (Slot::Diff, false),
+        (Slot::Board, false),
         (Slot::Custom, true),
         (Slot::Editor, false),
         (Slot::Shell, false),
@@ -415,6 +417,7 @@ fn icon_name(slot: Slot) -> &'static str {
         Slot::Editor => "accessories-text-editor-symbolic",
         Slot::Agent => "application-x-executable-symbolic",
         Slot::Diff => "view-dual-symbolic",
+        Slot::Board => "view-grid-symbolic",
         Slot::Shell => "utilities-terminal-symbolic",
         Slot::Custom => "application-x-executable-symbolic",
     }
@@ -425,6 +428,7 @@ fn accel_hint(slot: Slot) -> &'static str {
         Slot::Editor => "Ctrl+Shift+E",
         Slot::Agent => "Ctrl+Shift+A",
         Slot::Diff => "Ctrl+Shift+G",
+        Slot::Board => "Ctrl+Shift+B",
         Slot::Shell => "Ctrl+Shift+T",
         Slot::Custom => "",
     }
@@ -956,7 +960,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
     }
 
     // ---- keyboard ----
-    let accels: [(&str, &[&str]); 15] = [
+    let accels: [(&str, &[&str]); 16] = [
         ("win.add-project", &["<Control><Shift>n"]),
         ("win.preferences", &["<Control>comma"]),
         ("win.refresh", &["<Control><Shift>r"]),
@@ -966,6 +970,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
         ("win.primitive-toggle::editor", &["<Control><Shift>e"]),
         ("win.primitive-toggle::agent", &["<Control><Shift>a"]),
         ("win.primitive-toggle::diff", &["<Control><Shift>g"]),
+        ("win.primitive-toggle::board", &["<Control><Shift>b"]),
         ("win.primitive-toggle::shell", &["<Control><Shift>t"]),
         ("win.primitive-program::agent", &["<Control><Shift>p"]),
         ("win.primitive-focus::editor", &["<Control><Shift>1"]),
@@ -1039,12 +1044,15 @@ impl App {
     /// more than one primitive.
     fn primitive_menu_model(&self, slot: Slot) -> gio::Menu {
         let menu = gio::Menu::new();
-        let program = gio::Menu::new();
-        program.append_item(&item(
-            "Change program…",
-            &format!("win.primitive-program::{}", slot.as_str()),
-        ));
-        menu.append_section(None, &program);
+        // Built-ins have no program to change.
+        if slot != Slot::Board {
+            let program = gio::Menu::new();
+            program.append_item(&item(
+                "Change program…",
+                &format!("win.primitive-program::{}", slot.as_str()),
+            ));
+            menu.append_section(None, &program);
+        }
 
         let panes = gio::Menu::new();
         // Group with any other pane that is on screen.
@@ -1163,7 +1171,9 @@ impl App {
         }
         for workspace in self.workspaces.borrow().values() {
             for primitive in workspace.primitives.borrow().values() {
-                primitive.pane.apply_theme(&theme);
+                if let Some(pane) = &primitive.pane {
+                    pane.apply_theme(&theme);
+                }
             }
         }
         *self.theme.borrow_mut() = theme;
@@ -1567,6 +1577,9 @@ impl App {
         self.stack.set_visible_child_name(&format!("project-{id}"));
         let _ = self.db.touch_project(id);
         let _ = self.db.remember_last_project(Some(id));
+        // Starting a project starts its board: BOARD.md is there before any
+        // agent looks for it.
+        let _ = crate::board::ensure_file(&project.path);
         self.sync_toggles();
         self.refresh_menus();
         self.select_row_for(id);
@@ -1669,6 +1682,25 @@ impl App {
     fn ensure_primitive(&self, workspace: &Rc<Workspace>, slot: Slot) -> Option<Rc<Primitive>> {
         if let Some(existing) = workspace.primitive(slot) {
             return Some(existing);
+        }
+        // The board is the one primitive that runs nothing: the pane is
+        // radar's own widget over the project's BOARD.md.
+        if slot == Slot::Board {
+            let pane = board::BoardPane::new(&workspace.project.path, &self.window);
+            workspace
+                .programs
+                .borrow_mut()
+                .insert(slot, "board".to_string());
+            let primitive = Primitive::builtin(
+                "board",
+                pane.widget().clone(),
+                "Board\nbuilt into radar — the project's BOARD.md",
+            );
+            workspace
+                .primitives
+                .borrow_mut()
+                .insert(slot, primitive.clone());
+            return Some(primitive);
         }
         let preferences = self.db.preferences().unwrap_or_default();
         let wanted = workspace.programs.borrow().get(&slot).cloned();
@@ -2083,8 +2115,9 @@ impl App {
         self.projects_toggle.set_active(self.sidebar_shown.get());
         for (slot, button) in self.toggles.borrow().iter() {
             button.set_active(visible.contains(slot));
-            let available =
-                *slot == Slot::Shell || programs::for_slot(*slot, &preferences).is_some();
+            let available = *slot == Slot::Shell
+                || *slot == Slot::Board
+                || programs::for_slot(*slot, &preferences).is_some();
             button.set_sensitive(available);
         }
     }

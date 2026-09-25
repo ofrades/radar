@@ -20,12 +20,21 @@ pub enum Slot {
     Agent,
     Diff,
     Shell,
+    /// The project's kanban board: built into radar, no program to run.
+    Board,
     /// Anything else: any program the registry knows about.
     Custom,
 }
 
 impl Slot {
-    pub const ALL: [Slot; 5] = [Slot::Editor, Slot::Agent, Slot::Diff, Slot::Shell, Slot::Custom];
+    pub const ALL: [Slot; 6] = [
+        Slot::Editor,
+        Slot::Agent,
+        Slot::Diff,
+        Slot::Shell,
+        Slot::Board,
+        Slot::Custom,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -33,6 +42,7 @@ impl Slot {
             Slot::Agent => "agent",
             Slot::Diff => "diff",
             Slot::Shell => "shell",
+            Slot::Board => "board",
             Slot::Custom => "custom",
         }
     }
@@ -43,6 +53,7 @@ impl Slot {
             "agent" => Slot::Agent,
             "diff" => Slot::Diff,
             "shell" => Slot::Shell,
+            "board" => Slot::Board,
             _ => Slot::Custom,
         }
     }
@@ -53,6 +64,7 @@ impl Slot {
             Slot::Agent => "Agent",
             Slot::Diff => "Changes",
             Slot::Shell => "Commands",
+            Slot::Board => "Board",
             Slot::Custom => "Program",
         }
     }
@@ -64,7 +76,7 @@ impl Slot {
             Slot::Agent => Some("agent"),
             Slot::Diff => Some("diff"),
             Slot::Shell => Some("shell"),
-            Slot::Custom => None,
+            Slot::Board | Slot::Custom => None,
         }
     }
 }
@@ -336,12 +348,11 @@ mod tests {
     }
 
     #[test]
-    fn tabs_survive_slots_having_preferences() {
+    fn slots_without_preferences_are_the_builtin_and_the_custom_one() {
         for slot in Slot::ALL {
-            if let Some(key) = slot.preference_key() {
-                assert!(!key.is_empty());
-            } else {
-                assert_eq!(slot, Slot::Custom);
+            match slot.preference_key() {
+                Some(key) => assert!(!key.is_empty()),
+                None => assert!(matches!(slot, Slot::Custom | Slot::Board)),
             }
         }
     }

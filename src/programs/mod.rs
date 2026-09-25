@@ -57,7 +57,7 @@ impl Kind {
             Slot::Agent => Some(Kind::Agent),
             Slot::Diff => Some(Kind::Diff),
             Slot::Shell => Some(Kind::Shell),
-            Slot::Custom => None,
+            Slot::Board | Slot::Custom => None,
         }
     }
 }

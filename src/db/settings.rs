@@ -46,7 +46,7 @@ impl Preferences {
             Slot::Agent => self.agent.as_deref(),
             Slot::Diff => self.diff.as_deref(),
             Slot::Shell => self.shell.as_deref(),
-            Slot::Custom => None,
+            Slot::Board | Slot::Custom => None,
         }
     }
 
@@ -56,7 +56,7 @@ impl Preferences {
             Slot::Agent => self.agent = value,
             Slot::Diff => self.diff = value,
             Slot::Shell => self.shell = value,
-            Slot::Custom => {}
+            Slot::Board | Slot::Custom => {}
         }
     }
 }

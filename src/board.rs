@@ -399,6 +399,46 @@ pub fn finish_card(project: &Path, title: &str) -> Result<bool> {
     .map_or(Ok(false), Ok)
 }
 
+/// Replace a card: the GUI's edit dialog. The card is found by its old title;
+/// the updated card may carry a new title, notes, claim, or column.
+pub fn update_card(project: &Path, title: &str, updated: Card, column: Option<&str>) -> Result<bool> {
+    let title = title.to_string();
+    let column = column.map(str::to_string);
+    edit(project, move |board| {
+        let Some((c, i)) = board.find(&title) else {
+            return Ok(None);
+        };
+        if let Some(target) = &column {
+            if let Some(to) = board.column_named(target) {
+                if to != c {
+                    // The old card is dropped: the updated one replaces it in
+                    // the new column.
+                    board.columns[c].cards.remove(i);
+                    board.columns[to].cards.push(updated.clone());
+                    return Ok(Some(true));
+                }
+            }
+        }
+        board.columns[c].cards[i] = updated.clone();
+        Ok(Some(true))
+    })?
+    .map_or(Ok(false), Ok)
+}
+
+/// Delete a card. There is no undo: the file is the record (and, in a
+/// repository, git history is the undo).
+pub fn remove_card(project: &Path, title: &str) -> Result<bool> {
+    let title = title.to_string();
+    edit(project, move |board| {
+        let Some((c, i)) = board.find(&title) else {
+            return Ok(None);
+        };
+        board.columns[c].cards.remove(i);
+        Ok(Some(true))
+    })?
+    .map_or(Ok(false), Ok)
+}
+
 /// The work primitive: claim the first unclaimed card and return it. Columns
 /// are scanned in file order, so "next" means "top of the leftmost column that
 /// still has unclaimed cards".
@@ -661,6 +701,41 @@ mod tests {
         add_card(&project, None, "only", "", None).unwrap();
         finish_card(&project, "only").unwrap();
         assert!(next_card(&project, "claude").unwrap().is_none());
+    }
+
+    #[test]
+    fn update_card_edits_moves_and_renames() {
+        let (_dir, project) = project();
+        ensure_file(&project).unwrap();
+        add_card(&project, None, "old title", "a note", None).unwrap();
+
+        // Rename and claim in place.
+        let mut card = Card::new("new title");
+        card.claimed_by = Some("claude".into());
+        card.body = vec!["a note".into()];
+        assert!(update_card(&project, "old title", card.clone(), None).unwrap());
+        let board = load(&project).unwrap();
+        assert_eq!(board.columns[0].cards[0].title, "new title");
+        assert_eq!(board.columns[0].cards[0].claimed_by.as_deref(), Some("claude"));
+
+        // Move by way of an update.
+        assert!(update_card(&project, "new title", card, Some("Review")).unwrap());
+        let board = load(&project).unwrap();
+        assert_eq!(board.columns[2].cards[0].title, "new title");
+        assert!(!update_card(&project, "ghost", Card::new("x"), None).unwrap());
+    }
+
+    #[test]
+    fn remove_card_deletes_only_that_card() {
+        let (_dir, project) = project();
+        ensure_file(&project).unwrap();
+        add_card(&project, None, "keep", "", None).unwrap();
+        add_card(&project, None, "drop", "", None).unwrap();
+        assert!(remove_card(&project, "drop").unwrap());
+        let board = load(&project).unwrap();
+        assert_eq!(board.columns[0].cards.len(), 1);
+        assert_eq!(board.columns[0].cards[0].title, "keep");
+        assert!(!remove_card(&project, "drop").unwrap());
     }
 
     #[test]
