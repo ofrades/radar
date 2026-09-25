@@ -1,9 +1,10 @@
-//! A primitive: one of the four things a project workspace is made of.
+//! A primitive: one of the things a project workspace is made of.
 //!
-//! Editor, agent, diff, terminal — no tabs, no tab strips. A pane is a small
-//! header (icon, program, menu) over a terminal running that program, and hiding
-//! a pane does not stop its program: the widget is detached, the process and its
-//! pty keep going, so an agent never dies because you looked away.
+//! Editor, agent, diff, terminal — and the board, radar's one built-in. No
+//! tabs, no tab strips. A pane is a small header (icon, program, menu) over a
+//! terminal running that program, and hiding a pane does not stop its program:
+//! the widget is detached, the process and its pty keep going, so an agent
+//! never dies because you looked away.
 
 use std::rc::Rc;
 

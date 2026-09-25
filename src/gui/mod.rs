@@ -1,7 +1,8 @@
 //! The app window.
 //!
-//! A project workspace is four primitives — editor, agent, diff, terminal — and
-//! nothing else. No tabs: the sidebar's four icons decide which primitives are on
+//! A project workspace is a handful of primitives — editor, agent, diff,
+//! terminal, the board — and nothing else. No tabs: the sidebar's icons decide
+//! which primitives are on
 //! screen, and the layout arranges them the same way every time:
 //!
 //!   ┌──────────┬───────────────────────────────┐

@@ -55,6 +55,7 @@ the program. That keeps radar usable on a machine where you cannot install VTE.
 | Find a project to add (sidebar search) | `Ctrl+Shift+N` |
 | Add any program as a tab | `Ctrl+Shift+P` |
 | New Editor / Agent / Diff tab | `Ctrl+Shift+E` / `Ctrl+Shift+A` / `Ctrl+Shift+G` |
+| New Board / Commands tab | `Ctrl+Shift+B` / `Ctrl+Shift+T` |
 | Close tab | `Ctrl+Shift+W` |
 | Preferences | `Ctrl+,` |
 | Toggle sidebar | `F9` |
@@ -108,7 +109,30 @@ radar programs diff         # the registry, by kind
 radar prefs                 # resolved preference per slot
 radar prefs agent claude    # set one
 radar pin / move / rename / remove / prune
+radar board                 # the project's kanban (BOARD.md)
+radar card add / claim / release / move / done / next
 radar doctor                # environment check
+```
+
+## The board
+
+Every project has a kanban, and the kanban is a file: `BOARD.md` in the project
+root, created when the project opens. Columns are `## ` headings, cards are
+`- [ ]` lines, a claim is a `@name` on the card's line, indented lines under a
+card are its notes.
+
+That plainness is the point: an agent already running in the project claims
+work and moves it along by editing the file with the tools it already has — no
+radar API, no adapter. radar's **Board** pane (Ctrl+Shift+B) renders the same
+file as a native kanban: drag cards between columns, click to edit, and the
+pane re-reads the file whenever anyone — an agent, the CLI, `git checkout` —
+writes it. The file is the board; radar is one of its editors.
+
+For scripts that want a lock-free answer to "what should I do next":
+
+```bash
+radar card next --by claude   # claims the first unclaimed card, prints it
+radar card done "Fix login"   # marks it done, moves it to the last column
 ```
 
 ## How it fits with omarchy
@@ -130,7 +154,7 @@ radar doctor                # environment check
 ## Development
 
 ```bash
-cargo test                  # 82 tests: store, git parsing, registry, discovery
+cargo test                  # 104 tests: store, board, git parsing, registry, discovery
 cargo clippy --all-targets  # clean
 cargo build --features gui  # no VTE needed
 ```
@@ -139,16 +163,17 @@ Layout:
 
 ```
 src/db/          SQLite: projects, tabs, settings, events  (+ migrations)
+src/board.rs     the kanban: BOARD.md parse/render, atomic card ops
 src/programs/    program registry, omarchy agent knowledge, argv building
 src/discover/    directory discovery: fd or walk, fuzzy filtering
 src/git.rs       branch / ahead / behind / changed, read-only
-src/gui/         window, sidebar, tabs, dialogs, theme, terminal panes
+src/gui/         window, sidebar, panes, dialogs, theme, terminal panes
 src/main.rs      CLI
 ```
 
-The core (`db`, `programs`, `discover`, `git`) has no GTK dependency, so it can
-back other front-ends — a shell widget, a status bar, or the `--json` output of
-the CLI — without duplicating any state.
+The core (`db`, `board`, `programs`, `discover`, `git`) has no GTK dependency,
+so it can back other front-ends — a shell widget, a status bar, or the `--json`
+output of the CLI — without duplicating any state.
 
 ## Development aids
 
