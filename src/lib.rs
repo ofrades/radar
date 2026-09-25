@@ -9,6 +9,7 @@
 //! (behind the `gui` feature) is a thin layer on top so the core stays
 //! testable and reusable from the CLI.
 
+pub mod board;
 pub mod config;
 pub mod db;
 pub mod discover;

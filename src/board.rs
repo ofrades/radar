@@ -1,0 +1,662 @@
+//! The board: a project's kanban, stored as `BOARD.md` in the project root.
+//!
+//! The file is the board. Agents run in the project with no radar in sight, so
+//! the format has to be plain markdown they can read and edit with the tools
+//! they already have: columns are `## ` headings, cards are `- [ ]` lines, a
+//! claim is an `@name` on the card's line, and indented lines under a card are
+//! its notes. radar parses that into a [`Board`] for the GUI pane and the CLI,
+//! and writes the same file back when a card is moved or edited there.
+//!
+//! Because agents edit the file directly, every mutation goes parse → change →
+//! write atomically (temporary file + rename), re-reading when the file moved
+//! under us, so a claim is not lost because another agent wrote first.
+
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use anyhow::{bail, Context, Result};
+use serde::Serialize;
+
+/// The board file, in the project root where agents and `git diff` see it.
+pub const FILE_NAME: &str = "BOARD.md";
+/// Scratch file for atomic writes; renamed over [`FILE_NAME`] when complete.
+pub const TEMP_NAME: &str = ".BOARD.md.tmp";
+
+/// Columns a fresh board starts with.
+pub const DEFAULT_COLUMNS: [&str; 4] = ["Backlog", "In progress", "Review", "Done"];
+
+/// How many times a mutation re-reads the file before giving up.
+const ATTEMPTS: usize = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Board {
+    /// Everything before the first column heading, kept verbatim: the title
+    /// and the note that tells an agent how to use the file.
+    pub header: String,
+    pub columns: Vec<Column>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Column {
+    pub name: String,
+    pub cards: Vec<Card>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Card {
+    pub title: String,
+    /// Notes, one line each, the indent stripped.
+    pub body: Vec<String>,
+    /// Who has picked the card up: the `@name` on its line.
+    pub claimed_by: Option<String>,
+    /// Written as `- [x]` and shown struck through; cosmetic — the column is
+    /// the real state.
+    pub done: bool,
+}
+
+impl Card {
+    pub fn new(title: impl Into<String>) -> Card {
+        Card {
+            title: title.into(),
+            body: Vec::new(),
+            claimed_by: None,
+            done: false,
+        }
+    }
+}
+
+impl Board {
+    /// A board with the default columns and the how-to note.
+    pub fn default_for(project_name: &str) -> Board {
+        Board {
+            header: default_header(project_name),
+            columns: DEFAULT_COLUMNS
+                .iter()
+                .map(|name| Column {
+                    name: (*name).to_string(),
+                    cards: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn column_named(&self, name: &str) -> Option<usize> {
+        self.columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(name))
+    }
+
+    /// First (column, card) whose title matches, exactly.
+    pub fn find(&self, title: &str) -> Option<(usize, usize)> {
+        for (c, column) in self.columns.iter().enumerate() {
+            if let Some(i) = column.cards.iter().position(|card| card.title == title) {
+                return Some((c, i));
+            }
+        }
+        None
+    }
+
+    /// Render the canonical file: header, then one heading per column with its
+    /// cards. Deterministic, so an unchanged board round-trips byte for byte.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&self.header);
+        for column in &self.columns {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            out.push_str("## ");
+            out.push_str(&column.name);
+            out.push('\n');
+            for card in &column.cards {
+                out.push_str(if card.done { "- [x] " } else { "- [ ] " });
+                out.push_str(&card.title);
+                if let Some(who) = &card.claimed_by {
+                    out.push_str(" @");
+                    out.push_str(who);
+                }
+                out.push('\n');
+                for line in &card.body {
+                    out.push_str("      ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Parse the markdown. Lenient on purpose: agents write free-form markdown, so
+/// anything under a column that is not a card line becomes notes for the card
+/// above it rather than being dropped. Everything before the first `## `
+/// heading is the header, even lines that look like cards — that is what keeps
+/// the how-to note (which contains examples) out of the columns.
+pub fn parse(text: &str) -> Board {
+    let mut board = Board {
+        header: String::new(),
+        columns: Vec::new(),
+    };
+    let mut in_header = true;
+    let mut header = String::new();
+    let mut last_card: Option<(usize, usize)> = None;
+
+    for line in text.lines() {
+        if let Some(name) = line.strip_prefix("## ") {
+            in_header = false;
+            board.columns.push(Column {
+                name: name.trim().to_string(),
+                cards: Vec::new(),
+            });
+            last_card = None;
+            continue;
+        }
+        if in_header {
+            header.push_str(line);
+            header.push('\n');
+            continue;
+        }
+        if let Some(card) = parse_card_line(line) {
+            board.columns.last_mut().unwrap().cards.push(card);
+            let c = board.columns.len() - 1;
+            last_card = Some((c, board.columns[c].cards.len() - 1));
+            continue;
+        }
+        // Notes: indented, or plain prose, under the card above.
+        if let Some((c, i)) = last_card {
+            let note = line.trim();
+            if !note.is_empty() {
+                board.columns[c].cards[i].body.push(note.to_string());
+            }
+        }
+    }
+
+    // Canonical header: no trailing blank lines; render puts the blank line
+    // back, so parse is idempotent no matter how the file was spaced.
+    let trimmed = header.trim_end().to_string();
+    board.header = if trimmed.is_empty() {
+        trimmed
+    } else {
+        format!("{trimmed}\n")
+    };
+    board
+}
+
+/// `- [ ] Title @who`, `- [x] Title`, even `- Title`: all cards. A title that
+/// merely starts with `[` (say `- [WIP] refactor`) stays a title.
+fn parse_card_line(line: &str) -> Option<Card> {
+    let rest = line.trim_start().strip_prefix("- ")?;
+    let mut rest = rest.trim_start();
+    let mut done = false;
+    if let Some(after) = rest.strip_prefix('[') {
+        let (checked, after) = match after.strip_prefix('x').or_else(|| after.strip_prefix('X')) {
+            Some(tail) => (true, tail),
+            None => (false, after.strip_prefix(' ').unwrap_or(after)),
+        };
+        if let Some(tail) = after.strip_prefix(']') {
+            done = checked;
+            rest = tail.trim_start();
+        }
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    let (title, claimed_by) = split_claim(rest);
+    let mut card = Card::new(title);
+    card.done = done;
+    card.claimed_by = claimed_by;
+    Some(card)
+}
+
+/// The claim is a trailing `@name`, so an agent claims by appending text. The
+/// token comes out of the title, otherwise rendering would write it twice.
+fn split_claim(title: &str) -> (String, Option<String>) {
+    let Some(token) = title.split_whitespace().next_back() else {
+        return (title.to_string(), None);
+    };
+    let Some(name) = token.strip_prefix('@') else {
+        return (title.to_string(), None);
+    };
+    let valid = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+    if !valid {
+        return (title.to_string(), None);
+    }
+    let bare = title
+        .strip_suffix(token)
+        .unwrap_or(title)
+        .trim_end()
+        .to_string();
+    (bare, Some(name.to_string()))
+}
+
+/// The path of a project's board file.
+pub fn file_path(project: &Path) -> PathBuf {
+    project.join(FILE_NAME)
+}
+
+/// Create the board file if the project has none. Never overwrites: the file
+/// belongs to the project once it exists.
+pub fn ensure_file(project: &Path) -> Result<PathBuf> {
+    let path = file_path(project);
+    if path.exists() {
+        return Ok(path);
+    }
+    let name = project
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "project".to_string());
+    std::fs::write(&path, Board::default_for(&name).render())
+        .with_context(|| format!("creating {}", path.display()))?;
+    Ok(path)
+}
+
+/// Read the board. A missing file reads as an empty default board, so
+/// `radar board next` works before anything has opened the project.
+pub fn load(project: &Path) -> Result<Board> {
+    let path = file_path(project);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let name = project
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".to_string());
+            return Ok(Board::default_for(&name));
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    Ok(parse(&text))
+}
+
+/// Write the board atomically: temporary file, then rename, so a reader never
+/// sees half a file.
+pub fn save(project: &Path, board: &Board) -> Result<()> {
+    let path = file_path(project);
+    let temp = project.join(TEMP_NAME);
+    std::fs::write(&temp, board.render()).with_context(|| format!("writing {}", temp.display()))?;
+    std::fs::rename(&temp, &path).with_context(|| format!("renaming over {}", path.display()))?;
+    Ok(())
+}
+
+fn mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Apply `change` to the board and save it, retrying when the file changed
+/// under us. `Ok(None)` means "nothing to do" (no card by that name): no
+/// write, no retry.
+fn edit<T>(
+    project: &Path,
+    change: impl Fn(&mut Board) -> Result<Option<T>>,
+) -> Result<Option<T>> {
+    let path = file_path(project);
+    for _ in 0..ATTEMPTS {
+        let before = mtime(&path);
+        let mut board = load(project)?;
+        let Some(result) = change(&mut board)? else {
+            return Ok(None);
+        };
+        if before == mtime(&path) {
+            save(project, &board)?;
+            return Ok(Some(result));
+        }
+    }
+    bail!(
+        "{} kept changing while editing; nothing was written",
+        path.display()
+    )
+}
+
+/// Add a card. `column` defaults to the first column; an unknown column name
+/// is an error, not a silently new column.
+pub fn add_card(
+    project: &Path,
+    column: Option<&str>,
+    title: &str,
+    body: &str,
+    who: Option<&str>,
+) -> Result<String> {
+    let column_name = column.unwrap_or(DEFAULT_COLUMNS[0]).to_string();
+    let card = Card {
+        title: title.trim().to_string(),
+        body: body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+        claimed_by: who.map(str::to_string),
+        done: false,
+    };
+    let stored = card.clone();
+    let unknown = format!("no column named “{}”", column_name);
+    match edit(project, move |board| {
+        let Some(index) = board.column_named(&column_name) else {
+            anyhow::bail!("{}", unknown);
+        };
+        board.columns[index].cards.push(stored.clone());
+        Ok(Some(card.title.clone()))
+    })? {
+        Some(title) => Ok(title),
+        None => Err(anyhow::anyhow!("no column named “{}”", column.unwrap_or(DEFAULT_COLUMNS[0]))),
+    }
+}
+
+/// Move the first card titled `title` to the end of `to_column`.
+pub fn move_card(project: &Path, title: &str, to_column: &str) -> Result<bool> {
+    let target = to_column.to_string();
+    let title = title.to_string();
+    edit(project, move |board| {
+        let Some(to) = board.column_named(&target) else {
+            anyhow::bail!("no column named “{}”", target);
+        };
+        let Some((from, at)) = board.find(&title) else {
+            return Ok(None);
+        };
+        if from != to {
+            let card = board.columns[from].cards.remove(at);
+            board.columns[to].cards.push(card);
+        }
+        Ok(Some(true))
+    })?
+    .map_or(Ok(false), Ok)
+}
+
+/// Claim a card for `who`, or release it when `who` is `None`. Returns whether
+/// a card was found.
+pub fn claim_card(project: &Path, title: &str, who: Option<&str>) -> Result<bool> {
+    let title = title.to_string();
+    let who = who.map(str::to_string);
+    edit(project, move |board| {
+        let Some((c, i)) = board.find(&title) else {
+            return Ok(None);
+        };
+        board.columns[c].cards[i].claimed_by = who.clone();
+        Ok(Some(true))
+    })?
+    .map_or(Ok(false), Ok)
+}
+
+/// Mark a card done: checked, and moved to the last column.
+pub fn finish_card(project: &Path, title: &str) -> Result<bool> {
+    let title = title.to_string();
+    edit(project, move |board| {
+        let Some((c, i)) = board.find(&title) else {
+            return Ok(None);
+        };
+        board.columns[c].cards[i].done = true;
+        if c + 1 < board.columns.len() {
+            let card = board.columns[c].cards.remove(i);
+            board.columns.last_mut().unwrap().cards.push(card);
+        }
+        Ok(Some(true))
+    })?
+    .map_or(Ok(false), Ok)
+}
+
+/// The work primitive: claim the first unclaimed card and return it. Columns
+/// are scanned in file order, so "next" means "top of the leftmost column that
+/// still has unclaimed cards".
+pub fn next_card(project: &Path, who: &str) -> Result<Option<Card>> {
+    let who = who.to_string();
+    edit(project, move |board| {
+        for column in &mut board.columns {
+            if let Some(card) = column.cards.iter_mut().find(|card| {
+                !card.done && card.claimed_by.is_none() && !card.title.is_empty()
+            }) {
+                card.claimed_by = Some(who.clone());
+                return Ok(Some(card.clone()));
+            }
+        }
+        Ok(None)
+    })
+}
+
+fn default_header(project_name: &str) -> String {
+    format!(
+        "# Board — {name}\n\
+         \n\
+         This file is the project's kanban; radar renders it as a board.\n\
+         Edit it directly:\n\
+         \n\
+         - Claim a card: add your name to the end of its line, like `@you`\n\
+         - Move work along: move the card's line under another column\n\
+         - Add work: a new `- [ ]` line under any column\n\
+         - Notes for a card: indent lines under it\n",
+        name = project_name
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn board_with(text: &str) -> Board {
+        parse(text)
+    }
+
+    #[test]
+    fn a_fresh_board_renders_the_default_columns() {
+        let board = Board::default_for("api-server");
+        let text = board.render();
+        assert!(text.starts_with("# Board — api-server"));
+        for column in DEFAULT_COLUMNS {
+            assert!(text.contains(&format!("## {column}")));
+        }
+        // Round-trips: what we write is what we read.
+        assert_eq!(parse(&text), board);
+    }
+
+    #[test]
+    fn parse_reads_columns_cards_claims_and_notes() {
+        let board = board_with(
+            "# Board\n\n\
+             ## Backlog\n\
+             - [ ] Add rate limiting\n\
+             ## In progress\n\
+             - [ ] Fix login redirect @claude\n\
+                   the 302 loop happens with a stale cookie\n\
+                   check the middleware first\n\
+             ## Done\n\
+             - [x] Bump deps\n",
+        );
+        assert_eq!(board.columns.len(), 3);
+        assert_eq!(board.columns[0].cards[0].title, "Add rate limiting");
+        let claimed = &board.columns[1].cards[0];
+        assert_eq!(claimed.claimed_by.as_deref(), Some("claude"));
+        assert_eq!(claimed.body.len(), 2);
+        assert_eq!(claimed.body[0], "the 302 loop happens with a stale cookie");
+        assert!(board.columns[2].cards[0].done);
+    }
+
+    #[test]
+    fn parse_accepts_a_bare_bullet_as_a_card() {
+        let board = board_with("## Backlog\n- just an idea\n");
+        assert_eq!(board.columns[0].cards[0].title, "just an idea");
+        assert!(!board.columns[0].cards[0].done);
+    }
+
+    #[test]
+    fn the_header_is_kept_and_render_is_stable() {
+        let text = "# T\n\nfree-form\nnotes\n## Column\n- a card\n";
+        let board = board_with(text);
+        assert_eq!(board.header, "# T\n\nfree-form\nnotes\n");
+        // Render canonicalises spacing, then holds still: parsing the render
+        // gives the same board, and rendering again gives the same text.
+        let rendered = board.render();
+        assert_eq!(parse(&rendered), board);
+        assert_eq!(parse(&rendered).render(), rendered);
+    }
+
+    #[test]
+    fn prose_under_a_card_becomes_notes_instead_of_being_lost() {
+        let board = board_with("## Backlog\n- a card\nplain note\n");
+        assert_eq!(board.columns[0].cards[0].body, vec!["plain note"]);
+    }
+
+    #[test]
+    fn a_claim_must_be_the_last_word_and_alphanumeric() {
+        let (title, claim) = split_claim("fix the @claude");
+        assert_eq!(title, "fix the");
+        assert_eq!(claim.as_deref(), Some("claude"));
+
+        let (title, claim) = split_claim("@claude fix it");
+        assert_eq!(title, "@claude fix it");
+        assert_eq!(claim, None);
+
+        assert_eq!(split_claim("fix it @with space").1, None);
+
+        let (title, claim) = split_claim("fix @agent-2");
+        assert_eq!(title, "fix");
+        assert_eq!(claim.as_deref(), Some("agent-2"));
+    }
+
+    #[test]
+    fn find_matches_the_first_card_with_that_title() {
+        let board = board_with("## A\n- one\n## B\n- one\n- two\n");
+        let (c, _) = board.find("one").unwrap();
+        assert_eq!(board.columns[c].name, "A");
+        assert!(board.find("missing").is_none());
+    }
+
+    #[test]
+    fn moving_between_columns_reorders() {
+        let board = board_with("## A\n- x\n- y\n## B\n\n");
+        let mut moved = board.clone();
+        let (from, at) = moved.find("x").unwrap();
+        let card = moved.columns[from].cards.remove(at);
+        moved.columns[1].cards.push(card);
+        assert_eq!(moved.columns[1].cards[0].title, "x");
+        assert_eq!(moved.columns[0].cards.len(), 1);
+    }
+
+    #[test]
+    fn render_canonicalises_claims_and_notes() {
+        let board = board_with("## A\n- [ ] fix @claude\nnote here\n");
+        let text = board.render();
+        assert!(text.contains("- [ ] fix @claude\n      note here\n"));
+        assert_eq!(parse(&text), board);
+    }
+
+    #[test]
+    fn column_lookup_ignores_case() {
+        let board = board_with("## In Progress\n- x\n");
+        assert_eq!(board.column_named("in progress"), Some(0));
+        assert_eq!(board.column_named("Done"), None);
+    }
+
+    #[test]
+    fn everything_before_the_first_heading_is_header() {
+        // The how-to note contains card-shaped lines; they must stay header.
+        let board = board_with("- not a card, an example\n## Later\n- another\n");
+        assert_eq!(board.columns.len(), 1);
+        assert_eq!(board.columns[0].cards.len(), 1);
+        assert!(board.header.contains("not a card, an example"));
+    }
+
+    // --- file operations, against a real directory ---
+
+    fn project() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        (dir, path)
+    }
+
+    #[test]
+    fn ensure_file_creates_once_and_never_overwrites() {
+        let (_dir, project) = project();
+        let path = ensure_file(&project).unwrap();
+        assert!(path.exists());
+        std::fs::write(&path, "## Custom\n- [x] kept @me\n").unwrap();
+        ensure_file(&project).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "## Custom\n- [x] kept @me\n");
+    }
+
+    #[test]
+    fn add_move_and_finish_cards_through_the_file() {
+        let (_dir, project) = project();
+        ensure_file(&project).unwrap();
+        add_card(&project, None, "first task", "with a note", None).unwrap();
+        add_card(&project, Some("review"), "second task", "", None).unwrap();
+
+        let board = load(&project).unwrap();
+        assert_eq!(board.columns[0].cards[0].title, "first task");
+        assert_eq!(board.columns[0].cards[0].body, vec!["with a note"]);
+        assert_eq!(board.columns[2].cards[0].title, "second task");
+
+        assert!(move_card(&project, "first task", "In progress").unwrap());
+        let board = load(&project).unwrap();
+        assert_eq!(board.columns[1].cards[0].title, "first task");
+        // Notes travel with the card.
+        assert_eq!(board.columns[1].cards[0].body, vec!["with a note"]);
+        assert!(!move_card(&project, "no such card", "Done").unwrap());
+
+        assert!(finish_card(&project, "first task").unwrap());
+        let board = load(&project).unwrap();
+        let (c, i) = board.find("first task").unwrap();
+        assert_eq!(c, board.columns.len() - 1);
+        assert!(board.columns[c].cards[i].done);
+    }
+
+    #[test]
+    fn add_card_rejects_an_unknown_column() {
+        let (_dir, project) = project();
+        ensure_file(&project).unwrap();
+        let err = add_card(&project, Some("Nope"), "x", "", None).unwrap_err();
+        assert!(err.to_string().contains("Nope"));
+    }
+
+    #[test]
+    fn claim_and_release_round_trip() {
+        let (_dir, project) = project();
+        ensure_file(&project).unwrap();
+        add_card(&project, None, "task", "", None).unwrap();
+        assert!(claim_card(&project, "task", Some("codex")).unwrap());
+        let board = load(&project).unwrap();
+        assert_eq!(board.columns[0].cards[0].claimed_by.as_deref(), Some("codex"));
+        assert!(claim_card(&project, "task", None).unwrap());
+        assert_eq!(load(&project).unwrap().columns[0].cards[0].claimed_by, None);
+        assert!(!claim_card(&project, "ghost", Some("x")).unwrap());
+    }
+
+    #[test]
+    fn next_card_claims_the_first_unclaimed_and_only_once() {
+        let (_dir, project) = project();
+        ensure_file(&project).unwrap();
+        add_card(&project, None, "one", "", None).unwrap();
+        add_card(&project, None, "two", "", None).unwrap();
+
+        let first = next_card(&project, "claude").unwrap().unwrap();
+        assert_eq!(first.title, "one");
+        // The claimed card is not handed out twice.
+        let second = next_card(&project, "codex").unwrap().unwrap();
+        assert_eq!(second.title, "two");
+        assert!(next_card(&project, "droid").unwrap().is_none());
+
+        let board = load(&project).unwrap();
+        assert_eq!(board.columns[0].cards[0].claimed_by.as_deref(), Some("claude"));
+        assert_eq!(board.columns[0].cards[1].claimed_by.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn next_card_skips_done_cards() {
+        let (_dir, project) = project();
+        ensure_file(&project).unwrap();
+        add_card(&project, None, "only", "", None).unwrap();
+        finish_card(&project, "only").unwrap();
+        assert!(next_card(&project, "claude").unwrap().is_none());
+    }
+
+    #[test]
+    fn ops_work_before_the_file_exists() {
+        let (_dir, project) = project();
+        add_card(&project, None, "early", "", None).unwrap();
+        assert!(file_path(&project).exists());
+        assert_eq!(load(&project).unwrap().columns[0].cards[0].title, "early");
+    }
+}
+
