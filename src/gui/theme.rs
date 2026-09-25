@@ -5,7 +5,7 @@
 //! the sixteen ANSI colours (plus background/foreground) and a per-app config
 //! for each terminal it supports. We read colours from there and the font from
 //! the user's own alacritty/ghostty config, falling back to something sane so
-//! atlas is usable on any machine.
+//! radar is usable on any machine.
 
 use std::path::{Path, PathBuf};
 
@@ -149,8 +149,10 @@ fn terminal_font() -> Option<(String, f64)> {
 }
 
 fn font_from_config(path: &Path, text: &str) -> Option<(String, f64)> {
-    let name = path.file_name()?.to_string_lossy().to_string();
-    if name.contains("ghostty") {
+    // Identify the terminal by its whole path: ghostty's config file is called
+    // `config`, so the file name alone says nothing.
+    let where_ = path.to_string_lossy();
+    if where_.contains("ghostty") {
         // ghostty: font-family = JetBrainsMono Nerd Font / font-size = 11
         let family = scalar_after(text, "font-family")?;
         let size = scalar_after(text, "font-size")
@@ -158,18 +160,36 @@ fn font_from_config(path: &Path, text: &str) -> Option<(String, f64)> {
             .unwrap_or(11.0);
         return Some((family, size));
     }
-    if name.contains("kitty") {
+    if where_.contains("kitty") {
         // kitty: font_family JetBrainsMono Nerd Font / font_size 11
         let family = line_value(text, "font_family")?;
-        let size = line_value(text, "font_size").and_then(|s| s.parse().ok()).unwrap_or(11.0);
+        let size = line_value(text, "font_size")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(11.0);
         return Some((family, size));
     }
-    // alacritty: `family = "X"` (inside [font.normal]) and `size = 8`
+    // alacritty: `family = "X"`, either its own key or inside an inline table
+    // (`normal = { family = "X" }`), plus a plain `size = 8`.
     let family = text
         .lines()
-        .filter_map(|line| line.split_once('='))
-        .find(|(key, _)| key.trim() == "family")
-        .map(|(_, value)| value.trim().trim_matches('"').to_string())?;
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            if key.trim() == "family" {
+                return Some(value.trim().trim_matches('"').to_string());
+            }
+            // Inside an inline table: take what follows `family =`.
+            let after = value.split_once("family")?.1;
+            let inner = after.split_once('=')?.1;
+            Some(
+                inner
+                    .trim()
+                    .trim_end_matches('}')
+                    .trim()
+                    .trim_matches('"')
+                    .to_string(),
+            )
+        })
+        .find(|family| !family.is_empty())?;
     let size = text
         .lines()
         .filter_map(|line| line.split_once('='))
@@ -250,6 +270,22 @@ size = 8.0
         let (family, size) = font_from_config(Path::new("/home/u/.config/alacritty/alacritty.toml"), config).unwrap();
         assert_eq!(family, "JetBrainsMono Nerd Font");
         assert_eq!(size, 8.0);
+    }
+
+    #[test]
+    fn alacritty_inline_tables_are_read() {
+        // The shape omarchy and most alacritty users have.
+        let config = "[font]\nnormal = { family = \"JetBrainsMono Nerd Font\" }\nsize = 8\n";
+        let (family, size) =
+            font_from_config(Path::new("/home/u/.config/alacritty/alacritty.toml"), config).unwrap();
+        assert_eq!(family, "JetBrainsMono Nerd Font");
+        assert_eq!(size, 8.0);
+    }
+
+    #[test]
+    fn a_config_without_a_font_is_not_a_match() {
+        let config = "[colors]\nbackground = \"#000000\"\n";
+        assert!(font_from_config(Path::new("/home/u/.config/alacritty/alacritty.toml"), config).is_none());
     }
 
     #[test]

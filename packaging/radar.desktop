@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Radar
+GenericName=Project workspace
+Comment=Projects in a sidebar, one tab per tool: editor, agent, diff
+Exec=radar
+Icon=radar
+Terminal=false
+Categories=Development;IDE;
+Keywords=projects;agents;git;diff;editor;workspace;
+StartupNotify=true
+StartupWMClass=dev.omarchy.Radar

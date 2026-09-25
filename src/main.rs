@@ -1,4 +1,4 @@
-//! atlas — native workspace manager.
+//! radar — native workspace manager.
 //!
 //! Run without arguments to open the app. Every subcommand exists so the same
 //! state can be inspected, scripted and tested without a GUI.
@@ -8,21 +8,21 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use atlas::config::Paths;
-use atlas::db::{Db, Preferences, Slot, Tab};
-use atlas::programs::{self, agents, Kind, LaunchOptions};
-use atlas::{discover, git};
+use radar::config::Paths;
+use radar::db::{Db, Preferences, Slot, Tab};
+use radar::programs::{self, agents, Kind, LaunchOptions};
+use radar::{discover, git};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "atlas",
+    name = "radar",
     version,
     about = "Native workspace manager: projects in a sidebar, tools in tabs",
     long_about = None
 )]
 struct Cli {
-    /// Override the state directory (default: ~/.local/share/atlas, or
-    /// $ATLAS_HOME)
+    /// Override the state directory (default: ~/.local/share/radar, or
+    /// $RADAR_HOME)
     #[arg(long, global = true)]
     home: Option<PathBuf>,
 
@@ -77,7 +77,7 @@ enum Command {
     },
     /// List agents, what omarchy picked, and what is installed
     Agents,
-    /// List every program atlas knows about
+    /// List every program radar knows about
     Programs {
         /// Filter by kind: editor, agent, diff, shell, tool
         kind: Option<String>,
@@ -93,7 +93,7 @@ enum Command {
         #[arg(long, default_value_t = 40)]
         limit: usize,
     },
-    /// Check the environment atlas needs
+    /// Check the environment radar needs
     Doctor,
     /// Open the native app (needs a build with --features gui)
     Gui,
@@ -176,7 +176,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn require_project(db: &Db, path: &PathBuf) -> Result<atlas::db::Project> {
+fn require_project(db: &Db, path: &PathBuf) -> Result<radar::db::Project> {
     db.project_by_path(path)?
         .with_context(|| format!("{} is not in the sidebar", path.display()))
 }
@@ -216,7 +216,7 @@ fn list(db: &Db, json: bool) -> Result<()> {
         return Ok(());
     }
     if rows.is_empty() {
-        println!("no projects yet — add one with `atlas add <dir>`");
+        println!("no projects yet — add one with `radar add <dir>`");
         return Ok(());
     }
     let width = projects
@@ -393,7 +393,7 @@ fn prefs(db: &Db, slot: Option<String>, program: Option<String>, json: bool) -> 
             if let Some(id) = program.as_deref() {
                 anyhow::ensure!(
                     programs::by_id(id).is_some(),
-                    "{id} is not a program atlas knows about (see `atlas programs`)"
+                    "{id} is not a program radar knows about (see `radar programs`)"
                 );
             }
             db.set_preference(slot, program.as_deref())?;
@@ -489,7 +489,7 @@ fn show_agents(db: &Db, json: bool) -> Result<()> {
         default.unwrap_or_else(|| "(none set — `omarchy default agent <name>`)".into())
     );
     println!(
-        "preferred in atlas: {}",
+        "preferred in radar: {}",
         preferences.agent.as_deref().unwrap_or("(follow omarchy)")
     );
     println!();
@@ -591,7 +591,7 @@ fn find(db: &Db, query: &str, root: PathBuf, depth: usize, limit: usize, json: b
 }
 
 fn doctor(paths: &Paths, db: &Db) -> Result<()> {
-    println!("atlas {}", env!("CARGO_PKG_VERSION"));
+    println!("radar {}", env!("CARGO_PKG_VERSION"));
     println!("state:  {}", paths.data_dir.display());
     println!("config: {}", paths.config_dir.display());
     println!(
@@ -611,26 +611,38 @@ fn doctor(paths: &Paths, db: &Db) -> Result<()> {
     println!("projects: {}", db.projects()?.len());
     println!();
 
-    let checks: [(&str, bool, &str); 8] = [
-        ("git", atlas::config::have("git"), "project status"),
-        ("fd", atlas::config::have("fd"), "fast directory scanning"),
-        ("rg", atlas::config::have("rg"), "searching"),
-        ("fzf", atlas::config::have("fzf"), "external fuzzy picking"),
-        ("omarchy", atlas::config::have("omarchy"), "default agent + agent flags"),
-        ("hunk", atlas::config::have("hunk"), "diff tabs"),
+    // name, present, what it gives us, how to get it when missing
+    let checks: [(&str, bool, &str, &str); 8] = [
+        ("git", radar::config::have("git"), "project status", "pacman -S git"),
+        ("fd", radar::config::have("fd"), "fast directory scanning", "pacman -S fd"),
+        ("rg", radar::config::have("rg"), "searching", "pacman -S ripgrep"),
+        ("fzf", radar::config::have("fzf"), "external fuzzy picking", "pacman -S fzf"),
+        (
+            "omarchy",
+            radar::config::have("omarchy"),
+            "default agent + agent flags",
+            "part of omarchy",
+        ),
+        ("hunk", radar::config::have("hunk"), "diff tabs", "mise use -g hunkdiff"),
         (
             "libvte-2.91-gtk4",
             vte_available(),
-            "the GUI (install with: omarchy pkg add vte4)",
+            "embedded terminals",
+            "omarchy pkg add vte4",
         ),
         (
             "gtk4",
             gtk_available(),
-            "the GUI (install with: omarchy pkg add gtk4 libadwaita)",
+            "the app itself",
+            "omarchy pkg add gtk4 libadwaita",
         ),
     ];
-    for (name, ok, why) in checks {
-        println!("{} {:<20} {}", if ok { "ok  " } else { "miss" }, name, why);
+    for (name, present, gives, remedy) in checks {
+        if present {
+            println!("ok   {name:<20} {gives}");
+        } else {
+            println!("miss {name:<20} {gives} — install with: {remedy}");
+        }
     }
     println!();
     println!(
@@ -674,7 +686,7 @@ fn gtk_available() -> bool {
 
 #[cfg(feature = "gui")]
 fn run_gui(paths: Paths, db: Db) -> Result<()> {
-    atlas::gui::run(paths, db)
+    radar::gui::run(paths, db)
 }
 
 #[cfg(not(feature = "gui"))]
@@ -685,7 +697,7 @@ fn run_gui(_paths: Paths, _db: Db) -> Result<()> {
          omarchy pkg add vte4\n\
          then rebuild:\n  \
          cargo run --features gui\n\n\
-         The CLI works already: atlas list, atlas find, atlas doctor"
+         The CLI works already: radar list, radar find, radar doctor"
     );
     std::process::exit(2);
 }

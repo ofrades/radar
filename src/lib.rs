@@ -1,4 +1,4 @@
-//! atlas — a native workspace manager.
+//! radar — a native workspace manager.
 //!
 //! The shape of the app: projects live in a sidebar, and each project owns a
 //! set of tabs, each tab running one tool (editor, agent, diff, shell) in an

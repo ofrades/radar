@@ -2,7 +2,7 @@
 //!
 //! The ids, names and "don't stop to ask" flags mirror omarchy's own launcher
 //! (`/usr/share/omarchy/bin/omarchy-agent`) so that `omarchy default agent`,
-//! the keybinding, and atlas all agree on how an agent should be started.
+//! the keybinding, and radar all agree on how an agent should be started.
 //! `omarchy default agent` is the source of truth for which one is preferred.
 
 use crate::db::Preferences;
@@ -260,6 +260,9 @@ pub fn have_omarchy() -> bool {
 
 /// The agent a project should start: the preferred one if it is installed,
 /// then omarchy's default, then the first installed agent.
+///
+/// Agents are terminal programs. radar gives them a terminal and stays out of
+/// the way — no API adapters, no reimplemented session browsers.
 pub fn preferred_agent(preferences: &Preferences) -> Option<Program> {
     if let Some(id) = preferences.agent.as_deref() {
         if let Some(program) = super::by_id(id) {

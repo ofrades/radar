@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="sweep" x1="64" y1="64" x2="104" y2="24" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2dd5b7" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#2dd5b7" stop-opacity="0.06"/>
+    </linearGradient>
+    <radialGradient id="blip" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#2dd5b7" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#2dd5b7" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="face">
+      <rect x="6" y="10" width="116" height="108" rx="14"/>
+    </clipPath>
+  </defs>
+
+  <!-- panel -->
+  <rect x="6" y="10" width="116" height="108" rx="14" fill="#111c18"/>
+  <rect x="6" y="10" width="116" height="108" rx="14" fill="none" stroke="#23372b" stroke-width="3"/>
+
+  <g clip-path="url(#face)">
+    <!-- range rings -->
+    <circle cx="64" cy="64" r="46" fill="none" stroke="#2a4238" stroke-width="2.5"/>
+    <circle cx="64" cy="64" r="32" fill="none" stroke="#2a4238" stroke-width="2"/>
+    <circle cx="64" cy="64" r="17" fill="none" stroke="#355445" stroke-width="2"/>
+
+    <!-- crosshair -->
+    <path d="M64 14V114M14 64H114" stroke="#23372b" stroke-width="2"/>
+
+    <!-- sweep -->
+    <path d="M64 64 L64 18 A46 46 0 0 1 103.8 41 Z" fill="url(#sweep)"/>
+    <path d="M64 64 L64 18" stroke="#2dd5b7" stroke-width="2.5" stroke-linecap="round"/>
+
+    <!-- contact -->
+    <circle cx="93" cy="48" r="11" fill="url(#blip)"/>
+    <circle cx="93" cy="48" r="4.5" fill="#2dd5b7"/>
+    <circle cx="44" cy="86" r="3" fill="#509475"/>
+
+    <!-- hub -->
+    <circle cx="64" cy="64" r="4" fill="#81b8a8"/>
+  </g>
+</svg>

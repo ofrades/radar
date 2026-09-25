@@ -172,7 +172,7 @@ pub fn add_project<F: Fn(i64) + 'static>(
                             window.close();
                         }
                         Err(error) => {
-                            eprintln!("atlas: {error}");
+                            eprintln!("radar: {error}");
                             // Keep the dialog usable and explain on the row.
                             item.set_tooltip_text(Some(&error.to_string()));
                         }
@@ -210,6 +210,7 @@ pub fn add_project<F: Fn(i64) + 'static>(
         let candidates = candidates.clone();
         let button_for_click = root_button.clone();
         let window = window.clone();
+        let db = db.clone();
         let _ = &root_button;
         button_for_click.connect_clicked(move |_| {
             // gtk4-rs 0.8 has no binding for GtkFileDialog yet, so use the
@@ -227,11 +228,18 @@ pub fn add_project<F: Fn(i64) + 'static>(
             let fill = fill.clone();
             let candidates = candidates.clone();
             let root_button = root_button.clone();
+            let db = db.clone();
             #[allow(deprecated)]
             dialog.connect_response(move |dialog, response| {
                 if response == gtk::ResponseType::Accept {
                     if let Some(path) = dialog.file().and_then(|file| file.path()) {
                         root_button.set_label(&format!("scanning {}", crate::db::abbreviate(&path)));
+                        // Remember it, so the next add starts here.
+                        let mut prefs = db.ui_prefs().unwrap_or_default();
+                        prefs.add_root = Some(path.clone());
+                        if let Err(error) = db.set_ui_prefs(&prefs) {
+                            eprintln!("radar: could not store the scan root: {error}");
+                        }
                         *candidates.borrow_mut() = discover::scan(&path, 3, 800);
                         fill("");
                     }
@@ -389,7 +397,7 @@ pub fn preferences<F: Fn() + 'static>(
                 candidates.get(index as usize - 1).map(|p| p.id.clone())
             };
             if let Err(error) = db.set_preference(slot, program.as_deref()) {
-                eprintln!("atlas: {error}");
+                eprintln!("radar: {error}");
             }
             on_changed();
         });
@@ -419,7 +427,7 @@ pub fn preferences<F: Fn() + 'static>(
         let mut prefs = db_handle.preferences().unwrap_or_default();
         prefs.agent_auto_flags = switch.is_active();
         if let Err(error) = db_handle.set_preferences(&prefs) {
-            eprintln!("atlas: {error}");
+            eprintln!("radar: {error}");
         }
         on_changed_flags();
     });

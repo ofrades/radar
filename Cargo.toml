@@ -1,5 +1,5 @@
 [package]
-name = "atlas"
+name = "radar"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
@@ -7,15 +7,19 @@ description = "Native workspace manager: projects in a sidebar, tools in tabs"
 license = "MIT"
 
 [[bin]]
-name = "atlas"
+name = "radar"
 path = "src/main.rs"
+
+[[example]]
+name = "vte_probe"
+required-features = ["vte"]
 
 [features]
 default = []
 # `gui` builds the app with GTK4 + libadwaita (already installed on omarchy).
 # `vte` adds embedded terminals via libvte-2.91-gtk4 (Arch: `vte4`). Without it
 # every tab still works, but programs open in their own terminal window instead
-# of inside atlas.
+# of inside radar.
 gui = ["dep:gtk", "dep:adw"]
 vte = ["gui", "dep:vte4"]
 

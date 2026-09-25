@@ -31,7 +31,7 @@ pub struct Db {
 impl Db {
     /// Open (creating if needed) the database at `paths.database()`.
     pub fn open(paths: &Paths) -> Result<Db> {
-        paths.ensure().context("creating atlas directories")?;
+        paths.ensure().context("creating radar directories")?;
         let conn = Connection::open(paths.database())
             .with_context(|| format!("opening {}", paths.database().display()))?;
         Db::from_conn(conn)

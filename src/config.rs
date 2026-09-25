@@ -2,9 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-/// Where atlas keeps its state.
+/// Where radar keeps its state.
 ///
-/// `ATLAS_HOME` overrides everything, which is what the tests and the
+/// `RADAR_HOME` overrides everything, which is what the tests and the
 /// `--home` flag use.
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -15,7 +15,7 @@ pub struct Paths {
 impl Paths {
     /// Resolve from the environment, creating nothing.
     pub fn resolve() -> Paths {
-        if let Ok(home) = std::env::var("ATLAS_HOME") {
+        if let Ok(home) = std::env::var("RADAR_HOME") {
             let dir = PathBuf::from(home);
             return Paths {
                 config_dir: dir.clone(),
@@ -24,10 +24,10 @@ impl Paths {
         }
         let data_dir = dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-            .join("atlas");
+            .join("radar");
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("~/.config"))
-            .join("atlas");
+            .join("radar");
         Paths {
             data_dir,
             config_dir,
@@ -42,16 +42,47 @@ impl Paths {
         }
     }
 
-    /// `~/.local/share/atlas/atlas.db`
+    /// `~/.local/share/radar/radar.db`
     pub fn database(&self) -> PathBuf {
-        self.data_dir.join("atlas.db")
+        self.data_dir.join("radar.db")
     }
 
     /// Create data and config directories if they are missing.
     pub fn ensure(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.data_dir)?;
         std::fs::create_dir_all(&self.config_dir)?;
+        self.adopt_legacy_database();
         Ok(())
+    }
+
+    /// Carry the database over from the days the project was called `atlas`.
+    ///
+    /// Nothing is deleted: the old file stays where it is, so a copy is made
+    /// only while `radar.db` does not exist yet.
+    fn adopt_legacy_database(&self) {
+        let target = self.database();
+        if target.exists() {
+            return;
+        }
+        for candidate in self.legacy_databases() {
+            if candidate == target || !candidate.is_file() {
+                continue;
+            }
+            if std::fs::copy(&candidate, &target).is_ok() {
+                return;
+            }
+        }
+    }
+
+    /// Everywhere an `atlas.db` could be sitting.
+    fn legacy_databases(&self) -> Vec<PathBuf> {
+        let mut candidates = vec![self.data_dir.join("atlas.db")];
+        if let Ok(home) = std::env::var("ATLAS_HOME") {
+            candidates.push(PathBuf::from(home).join("atlas.db"));
+        } else if let Some(dir) = dirs::data_dir() {
+            candidates.push(dir.join("atlas").join("atlas.db"));
+        }
+        candidates
     }
 
     /// omarchy's record of the chosen default agent, if any.
@@ -71,15 +102,12 @@ fn read_trimmed(path: &Path) -> Option<String> {
     }
 }
 
-/// The directory `atlas add` starts from.
+/// The directory `radar add` starts from: the home directory.
+///
+/// Whichever directory you pick in the add dialog is remembered in settings
+/// (`ui.add_root`), so this is only the starting point.
 pub fn default_project_root() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let work = home.join("Work");
-    if work.is_dir() {
-        work
-    } else {
-        home
-    }
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// `$SHELL`, falling back to a sane default.
@@ -154,22 +182,30 @@ mod tests {
     }
 
     #[test]
-    fn paths_use_atlas_home_when_set() {
-        std::env::set_var("ATLAS_HOME", "/tmp/atlas-test-home");
+    fn paths_use_radar_home_when_set() {
+        std::env::set_var("RADAR_HOME", "/tmp/radar-test-home");
         let paths = Paths::resolve();
-        assert_eq!(paths.database(), PathBuf::from("/tmp/atlas-test-home/atlas.db"));
-        std::env::remove_var("ATLAS_HOME");
+        assert_eq!(paths.database(), PathBuf::from("/tmp/radar-test-home/radar.db"));
+        std::env::remove_var("RADAR_HOME");
     }
 
     #[test]
-    fn default_root_prefers_work_dir() {
-        let root = default_project_root();
-        let home = dirs::home_dir().unwrap();
-        let work = home.join("Work");
-        if work.is_dir() {
-            assert_eq!(root, work);
-        } else {
-            assert_eq!(root, home);
-        }
+    fn first_run_adopts_the_old_atlas_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path());
+        std::fs::write(dir.path().join("atlas.db"), b"old").unwrap();
+
+        paths.ensure().unwrap();
+        assert_eq!(std::fs::read(paths.database()).unwrap(), b"old");
+
+        // Once radar has its own database, the legacy copy must not win again.
+        std::fs::write(paths.database(), b"new").unwrap();
+        paths.ensure().unwrap();
+        assert_eq!(std::fs::read(paths.database()).unwrap(), b"new");
+    }
+
+    #[test]
+    fn default_root_is_the_home_directory() {
+        assert_eq!(default_project_root(), dirs::home_dir().unwrap());
     }
 }

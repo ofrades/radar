@@ -1,8 +1,8 @@
-//! The program registry: everything atlas can put in a tab.
+//! The program registry: everything radar can put in a tab.
 //!
 //! Two kinds of program exist here. *Embedded* programs are terminal UIs
 //! (nvim, hunk, an agent CLI) that run inside a tab's terminal. *External*
-//! programs are GUI applications (Zed, VS Code) that atlas launches as their
+//! programs are GUI applications (Zed, VS Code) that radar launches as their
 //! own window — you cannot draw Zed inside a terminal, so we do not pretend to.
 
 pub mod agents;
@@ -148,7 +148,7 @@ impl Program {
     }
 }
 
-/// Every program atlas knows about, installed or not.
+/// Every program radar knows about, installed or not.
 ///
 /// Order within a kind is the preference order used when nothing is chosen.
 pub fn registry() -> Vec<Program> {
@@ -209,6 +209,7 @@ pub fn registry() -> Vec<Program> {
 
     // ---- Agents: omarchy's list, plus a few the registry knows directly ----
     programs.extend(agents::programs());
+
 
     // ---- Diffs ----
     programs.push(
