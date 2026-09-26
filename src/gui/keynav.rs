@@ -1,16 +1,16 @@
 //! Keyboard control: moving the keys between primitives.
 //!
-//! radar claims a few chords for itself — the ones a terminal program would
-//! otherwise eat — and passes every other key through untouched, so each
-//! primitive keeps the keys it was written for:
+//! radar claims a few chords for itself — all on Alt, so the Ctrl vocabulary
+//! of the programs in the panels reaches them the way their authors wrote
+//! it — and passes every other key through untouched:
 //!
-//! - `Ctrl+Arrows` move focus between panes, the sidebar, and dividers. Plain
+//! - `Alt+Arrows` move focus between panes, the sidebar, and dividers. Plain
 //!   arrows resize a focused divider. The chord is taken here, in the capture
-//!   phase on the window, because a VTE terminal encodes `Ctrl+Arrows` and
-//!   would send it to the shell as word movement instead. Text fields keep
-//!   the chord: a cursor moves by words there, and radar never competes with
-//!   a text cursor.
-//! - `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle panes and dividers in layout order.
+//!   phase on the window, so the terminal program never sees it. Text fields
+//!   keep the chord too: radar never competes with a text cursor.
+//! - `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle panes and dividers in layout order —
+//!   the one chord left on Ctrl, because the window manager owns Alt+Tab and
+//!   it never even reaches the window.
 //! - `Menu` (or `Shift+F10`) opens the focused pane's menu — every pane
 //!   action radar has, no mouse needed.
 //!
@@ -107,6 +107,7 @@ pub fn install(app: &SharedApp) {
     let app_for_keys = app.clone();
     controller.connect_key_pressed(move |_, key, _, modifiers| {
         let app = &app_for_keys;
+        let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
         let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
         let hud_open = app.hud.is_visible();
@@ -118,12 +119,14 @@ pub fn install(app: &SharedApp) {
             gtk::gdk::Key::Down => Some(Direction::Down),
             _ => None,
         } {
-            if ctrl && !shift && !hud_open && keys_are_free(&app.window) {
+            if alt && !ctrl && !shift && !hud_open && keys_are_free(&app.window) {
                 move_focus(app, direction);
                 return glib::Propagation::Stop;
             }
             return glib::Propagation::Proceed;
         }
+        // The cycle stays on Ctrl: Alt+Tab belongs to the window manager and
+        // is grabbed before the window can ever see it.
         if ctrl && key == gtk::gdk::Key::Tab && !hud_open {
             cycle_focus(app, shift);
             return glib::Propagation::Stop;
@@ -139,8 +142,8 @@ pub fn install(app: &SharedApp) {
     install_ring(app);
 }
 
-/// False when the keys are in a text field: a cursor keeps `Ctrl+Arrows` for
-/// word movement, the way it always was.
+/// False when the keys are in a text field: radar never competes with a text
+/// cursor, even for chords the field would ignore anyway.
 fn keys_are_free(window: &adw::ApplicationWindow) -> bool {
     let Some(focus) = window.focus_widget() else {
         return true;
@@ -156,7 +159,7 @@ fn keys_are_free(window: &adw::ApplicationWindow) -> bool {
 }
 
 /// Directional navigation lands on panels only; divider hit areas are kept out
-/// so Ctrl+Arrows always moves between the sidebar and panes.
+/// so Alt+Arrows always moves between the sidebar and panes.
 fn panel_targets(app: &SharedApp, workspace: &super::Workspace) -> Vec<(Target, Rect)> {
     let mut targets = Vec::new();
     if app.sidebar_shown.get() {
@@ -234,7 +237,7 @@ fn move_focus(app: &SharedApp, direction: Direction) {
     };
     let targets = panel_targets(app, &workspace);
     if targets.is_empty() {
-        app.toast("No panes on screen — open one with the dock or Ctrl+Shift+K");
+        app.toast("No panes on screen — open one with the dock or Alt+H");
         return;
     }
     let focus = app.window.focus_widget();

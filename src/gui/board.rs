@@ -8,7 +8,7 @@
 //! monitor re-reads the file when someone else (an agent, a `git checkout`)
 //! changes it, just like the theme monitor re-applies colours.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -23,6 +23,9 @@ use crate::board::{self, Board, Card, Column};
 /// single write can fire several monitor events; one rebuild is enough.
 const RELOAD_DEBOUNCE_MS: u64 = 150;
 
+/// Who the board's live counts talk to: the header routing in mod.rs.
+type BoardObserver = Box<dyn Fn(Option<String>)>;
+
 pub struct BoardPane {
     project: PathBuf,
     widget: gtk::ScrolledWindow,
@@ -30,6 +33,10 @@ pub struct BoardPane {
     dialog_parent: gtk::Window,
     /// Guards against scheduling two reloads for one burst of file events.
     pending_reload: Cell<Option<glib::SourceId>>,
+    /// Who to tell when the board's shape changes, and the last shape told
+    /// (so an observer wired after the pane opened still gets it).
+    observer: RefCell<Option<BoardObserver>>,
+    last_stats: RefCell<Option<String>>,
 }
 
 impl BoardPane {
@@ -59,6 +66,8 @@ impl BoardPane {
             columns_box,
             dialog_parent: parent.clone().upcast(),
             pending_reload: Cell::new(None),
+            observer: RefCell::new(None),
+            last_stats: RefCell::new(None),
         });
         pane.reload();
         pane.watch();
@@ -68,6 +77,19 @@ impl BoardPane {
     /// The board pane as a widget, the way primitives are mounted.
     pub fn widget(&self) -> &gtk::Widget {
         self.widget.upcast_ref()
+    }
+
+    /// Watch the board's live shape: card and column counts after every read
+    /// of BOARD.md, whoever wrote it. Replays the last counts, so an observer
+    /// wired after the pane opened is not left waiting for the next edit.
+    pub fn set_info_observer(&self, observer: impl Fn(Option<String>) + 'static) {
+        let replay = self.last_stats.borrow().clone();
+        *self.observer.borrow_mut() = Some(Box::new(observer));
+        if let Some(stats) = replay {
+            if let Some(emit) = self.observer.borrow().as_ref() {
+                emit(Some(stats));
+            }
+        }
     }
 
     /// Re-read BOARD.md and rebuild the columns. Cheap: a board is a page of
@@ -81,6 +103,17 @@ impl BoardPane {
         }
         for column in &b.columns {
             self.columns_box.append(&self.build_column(&b, column));
+        }
+        // The header wants the board's shape, live.
+        let cards: usize = b.columns.iter().map(|column| column.cards.len()).sum();
+        let stats = if cards == 0 {
+            "no cards".to_string()
+        } else {
+            format!("{cards} cards · {} columns", b.columns.len())
+        };
+        *self.last_stats.borrow_mut() = Some(stats.clone());
+        if let Some(emit) = self.observer.borrow().as_ref() {
+            emit(Some(stats));
         }
     }
 

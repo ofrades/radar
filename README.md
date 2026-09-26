@@ -52,31 +52,35 @@ the program. That keeps radar usable on a machine where you cannot install VTE.
 
 | Action | Shortcut |
 | --- | --- |
-| Keys & primitives overlay (open a primitive, read the keymap) | `Ctrl+Shift+K` |
-| Move between the panes on screen | `Ctrl+Arrows` |
+| Keys & primitives overlay (open a primitive, read the keymap) | `Alt+H` |
+| Move between the panes on screen | `Alt+Arrows` |
 | Cycle panes — the sidebar included | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | The focused pane's menu (change program, close, move, group, split out) | `Menu` / `Shift+F10` |
-| Search projects (filter, or find one to add) | `Ctrl+Shift+N` |
-| Show or hide a primitive | `Ctrl+Shift+E` / `A` / `G` / `B` / `T` |
-| Change the focused pane's program | `Ctrl+Shift+P` |
-| Focus Editor / Agent / Changes / Commands | `Ctrl+Shift+1` – `4` |
-| Preferences | `Ctrl+,` |
-| Toggle sidebar | `Ctrl+B` |
-| Zoom the focused pane's font | `Ctrl+=` / `Ctrl+-` (or `Ctrl+scroll`); `Ctrl+0` resets |
-| Refresh status | `Ctrl+Shift+R` |
+| Search projects (filter, or find one to add) | `Alt+N` |
+| Show or hide a primitive | `Alt+E` / `A` / `G` / `K` / `T` |
+| Change the focused pane's program | `Alt+P` |
+| Focus Editor / Agent / Changes / Commands | `Alt+1` – `4` |
+| Preferences | `Alt+,` |
+| Toggle sidebar | `Alt+B` |
+| Zoom the focused pane's font | `Alt+=` / `Alt+-` (or `Ctrl+scroll`); `Alt+0` resets |
+| Zoom the focused pane to the whole window | `Alt+F` |
+| Refresh status | `Alt+R` |
 
-**The keyboard drives the app, but each primitive keeps its own keys.** radar
-claims only the chords above, and `Ctrl+Arrows` come with a rule: a text
-cursor — in a search box, a dialog, an agent prompt — keeps them for moving
-by words. radar takes the chord only when the keys belong to a pane. Panes
-and the sidebar wear a quiet ring while they hold the keys, so you can see
-where they are.
+**The keyboard drives the app, but each primitive keeps its own keys.** All of
+radar's chords sit on Alt — every Ctrl key a program wants, in any panel,
+reaches it untouched. The one exception is `Ctrl+Tab` for cycling: the window
+manager owns `Alt+Tab`, so it never reaches the app at all. And `Alt+Arrows`
+come with a rule: a text cursor — in a search box, a dialog, an agent
+prompt — keeps them. radar takes the chord only when the keys belong to a
+pane. Opening a panel — with a chord, the dock, or the HUD — puts the keys
+straight into it. Panes and the sidebar wear a quiet ring while they hold
+the keys, so you can see where they are.
 
-**The overlay** (`Ctrl+Shift+K`, also in the workspace menu) floats over the
+**The overlay** (`Alt+H`, also in the workspace menu) floats over the
 workspace: a row per primitive — open one, or see that it is already on
 screen — the settings, and the whole keymap. Type to filter, arrows to move,
 `Enter` to run, `Esc` to go back to the program you were looking at.
-Changing a pane's program from its menu or with `Ctrl+Shift+P` opens program
+Changing a pane's program from its menu or with `Alt+P` opens program
 choices in this same overlay.
 
 **Adding a project** needs no dialog and no button: the sidebar's search box
@@ -108,7 +112,7 @@ Everything lives in SQLite at `~/.local/share/radar/radar.db`:
 | `events` | what happened, for history and recents |
 
 Closing the window keeps Radar running in the background, so embedded agents
-remain alive. Use **Workspace → Quit** (or `Ctrl+Shift+Q`) to exit. The install
+remain alive. Use **Workspace → Quit** (or `Alt+Q`) to exit. The install
 script adds a login autostart entry; after a reboot Radar relaunches the saved
 workspace for the last selected project. Other projects restore their layouts
 when selected. Their visible programs are launched again after a reboot; whether
@@ -148,7 +152,7 @@ card are its notes.
 
 That plainness is the point: an agent already running in the project claims
 work and moves it along by editing the file with the tools it already has — no
-radar API, no adapter. radar's **Board** pane (Ctrl+Shift+B) renders the same
+radar API, no adapter. radar's **Board** pane (Alt+K) renders the same
 file as a native kanban: drag cards between columns, click to edit, and the
 pane re-reads the file whenever anyone — an agent, the CLI, `git checkout` —
 writes it. The file is the board; radar is one of its editors.

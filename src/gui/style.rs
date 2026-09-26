@@ -173,6 +173,14 @@ paned > separator:hover {
   color: @radar_accent;
   background: none;
 }
+/* Live info from the active member's program: dim text at the header's
+   right edge. A bell (an agent asking for attention) turns it accented. */
+.group-header label.pane-info {
+  margin: 0 6px;
+}
+.group-header label.pane-info.attention {
+  color: @radar_accent;
+}
 .group-header button.flat,
 .projects-sidebar button.flat {
   min-height: 26px;

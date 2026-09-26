@@ -193,6 +193,9 @@ struct App {
     status: RefCell<HashMap<i64, crate::git::Status>>,
     status_tx: std::sync::mpsc::Sender<Vec<(i64, crate::git::Status)>>,
     status_rx: RefCell<std::sync::mpsc::Receiver<Vec<(i64, crate::git::Status)>>>,
+    /// What each pane's program last said about itself — its name and its own
+    /// live title, or its exit — keyed by (project, slot).
+    header_info: RefCell<HashMap<(i64, Slot), String>>,
     current: RefCell<Option<i64>>,
     // The search box doubles as the add flow: candidates for the query show
     // under the projects, each with its own add button.
@@ -251,7 +254,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
                 icon_name(slot)
             })
             .tooltip_text(if project {
-                format!("{}\tCtrl+B", primitive::PROJECTS_LABEL)
+                format!("{}\tAlt+B", primitive::PROJECTS_LABEL)
             } else {
                 format!("{}\t{}", label_for(slot), accel_hint(slot))
             })
@@ -295,26 +298,18 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     ));
     search.set_hexpand(true);
 
-    let workspace_menu = gtk::MenuButton::builder()
-        .icon_name("view-more-symbolic")
-        .tooltip_text("Workspace menu")
-        .build();
-    workspace_menu.add_css_class("flat");
-
-    // The sidebar's own header, matching the panes: icon, name, actions.
-    // Full-bleed like a pane header — the strip's surface reaches the
-    // sidebar's edges, and the stylesheet's padding insets the content.
-    let sidebar_header = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    // Brand header: the app logo, not a pane header. No menu button.
+    let sidebar_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     sidebar_header.add_css_class("group-header");
-    let header_icon = gtk::Image::from_icon_name(primitive::PROJECTS_ICON);
-    header_icon.set_pixel_size(16);
+    let header_icon = gtk::Image::from_icon_name("radar");
+    header_icon.set_pixel_size(20);
+    header_icon.set_tooltip_text(Some("Radar"));
     sidebar_header.append(&header_icon);
-    let sidebar_title = gtk::Label::new(Some(primitive::PROJECTS_LABEL));
+    let sidebar_title = gtk::Label::new(Some("Radar"));
     sidebar_title.add_css_class("caption-heading");
     sidebar_title.set_xalign(0.0);
     sidebar_title.set_hexpand(true);
     sidebar_header.append(&sidebar_title);
-    sidebar_header.append(&workspace_menu);
 
     // The search goes straight into the sidebar box; its margins come from the
     // stylesheet, aligned with the row inset.
@@ -375,7 +370,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&splitter));
     // The overlay panel floats above everything else: keys and primitives,
-    // one keystroke away (Ctrl+Shift+K).
+    // one keystroke away (Alt+H).
     let hud = hud::Hud::new();
     let root = gtk::Overlay::new();
     // The frame: the panel hairline around the whole app, so the outer edge
@@ -410,6 +405,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         status: RefCell::new(HashMap::new()),
         status_tx,
         status_rx: RefCell::new(status_rx),
+        header_info: RefCell::new(HashMap::new()),
         current: RefCell::new(None),
         find_root: RefCell::new(
             db.ui_prefs()
@@ -424,9 +420,9 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         pointer_motion_ms: Cell::new(0),
     });
 
-    register_actions(&state, app, &workspace_menu);
+    register_actions(&state, app);
     connect_widgets(&state);
-    // The overlay panel and radar's own chords (Ctrl+Arrows and friends).
+    // The overlay panel and radar's own chords (Alt+Arrows and friends).
     hud.wire(&state);
     keynav::install(&state);
     let state_for_close = Rc::downgrade(&state);
@@ -494,11 +490,11 @@ fn icon_name(slot: Slot) -> &'static str {
 
 fn accel_hint(slot: Slot) -> &'static str {
     match slot {
-        Slot::Editor => "Ctrl+Shift+E",
-        Slot::Agent => "Ctrl+Shift+A",
-        Slot::Diff => "Ctrl+Shift+G",
-        Slot::Board => "Ctrl+Shift+B",
-        Slot::Shell => "Ctrl+Shift+T",
+        Slot::Editor => "Alt+E",
+        Slot::Agent => "Alt+A",
+        Slot::Diff => "Alt+G",
+        Slot::Board => "Alt+K",
+        Slot::Shell => "Alt+T",
         Slot::Custom => "",
     }
 }
@@ -822,7 +818,7 @@ fn item(label: &str, action: &str) -> gio::MenuItem {
     gio::MenuItem::new(Some(label), Some(action))
 }
 
-fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu: &gtk::MenuButton) {
+fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
     let add = |name: &str, handler: Box<dyn Fn()>| {
         let action = gio::SimpleAction::new(name, None);
         action.connect_activate(move |_, _| handler());
@@ -1217,6 +1213,52 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
         app.window.add_action(&action);
     }
     {
+        // A pane's program reported live state — its own title, or its exit.
+        // Aim it at the pane's header, wherever the pane is grouped today.
+        // Empty text clears: the header goes back to just the chips.
+        let action = gio::SimpleAction::new(
+            "pane-info",
+            Some(glib::VariantTy::new("(xss)").unwrap()),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((project_id, slot, text)) =
+                parameter.and_then(|value| value.get::<(i64, String, String)>())
+            else {
+                return;
+            };
+            let text = if text.is_empty() { None } else { Some(text) };
+            app_for_action.store_header_info(project_id, Slot::parse(&slot), text);
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // The terminal bell — how agent CLIs ask for attention. The pane's
+        // header marks it until that pane is looked at.
+        let action = gio::SimpleAction::new(
+            "pane-bell",
+            Some(glib::VariantTy::new("(xs)").unwrap()),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((project_id, slot)) =
+                parameter.and_then(|value| value.get::<(i64, String)>())
+            else {
+                return;
+            };
+            let slot = Slot::parse(&slot);
+            for workspace in app_for_action.workspaces.borrow().values() {
+                if workspace.project.id != project_id {
+                    continue;
+                }
+                if let Some(group) = workspace.group_of(slot) {
+                    group.set_attention(slot);
+                }
+            }
+        });
+        app.window.add_action(&action);
+    }
+    {
         let app = app.clone();
         add("zoom", Box::new(move || app.toggle_zoom(None)));
     }
@@ -1225,31 +1267,28 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application, workspace_menu:
         add("toggle-sidebar", Box::new(move || app.toggle_sidebar()));
     }
 
-    // ---- workspace menu (in the sidebar, since there is no header bar) ----
-    {
-        let app = app.clone();
-        workspace_menu.set_menu_model(Some(&app.workspace_menu_model()));
-    }
-
     // ---- keyboard ----
+    // Alt is radar's only modifier, so every Ctrl chord reaches the programs
+    // in the panels the way their authors wrote them. The one exception is
+    // cycling: the window manager owns Alt+Tab, so the cycle stays on Ctrl.
     let accels: [(&str, &[&str]); 17] = [
-        ("win.find-projects", &["<Control><Shift>n"]),
-        ("win.preferences", &["<Control>comma"]),
-        ("win.refresh", &["<Control><Shift>r"]),
-        ("win.quit", &["<Control><Shift>q"]),
-        ("win.toggle-sidebar", &["<Control>b"]),
-        ("win.zoom", &["F11"]),
-        ("win.hud", &["<Control><Shift>k"]),
-        ("win.primitive-toggle::editor", &["<Control><Shift>e"]),
-        ("win.primitive-toggle::agent", &["<Control><Shift>a"]),
-        ("win.primitive-toggle::diff", &["<Control><Shift>g"]),
-        ("win.primitive-toggle::board", &["<Control><Shift>b"]),
-        ("win.primitive-toggle::shell", &["<Control><Shift>t"]),
-        ("win.pane-program", &["<Control><Shift>p"]),
-        ("win.primitive-focus::editor", &["<Control><Shift>1"]),
-        ("win.primitive-focus::agent", &["<Control><Shift>2"]),
-        ("win.primitive-focus::diff", &["<Control><Shift>3"]),
-        ("win.primitive-focus::shell", &["<Control><Shift>4"]),
+        ("win.find-projects", &["<Alt>n"]),
+        ("win.preferences", &["<Alt>comma"]),
+        ("win.refresh", &["<Alt>r"]),
+        ("win.quit", &["<Alt>q"]),
+        ("win.toggle-sidebar", &["<Alt>b"]),
+        ("win.zoom", &["<Alt>f"]),
+        ("win.hud", &["<Alt>h"]),
+        ("win.primitive-toggle::editor", &["<Alt>e"]),
+        ("win.primitive-toggle::agent", &["<Alt>a"]),
+        ("win.primitive-toggle::diff", &["<Alt>g"]),
+        ("win.primitive-toggle::board", &["<Alt>k"]),
+        ("win.primitive-toggle::shell", &["<Alt>t"]),
+        ("win.pane-program", &["<Alt>p"]),
+        ("win.primitive-focus::editor", &["<Alt>1"]),
+        ("win.primitive-focus::agent", &["<Alt>2"]),
+        ("win.primitive-focus::diff", &["<Alt>3"]),
+        ("win.primitive-focus::shell", &["<Alt>4"]),
     ];
     for (action, keys) in accels {
         gtk_app.set_accels_for_action(action, keys);
@@ -1272,37 +1311,6 @@ impl App {
                 primitive.focus();
             }
         }
-    }
-
-    fn workspace_menu_model(&self) -> gio::Menu {
-        let menu = gio::Menu::new();
-        let workspace = gio::Menu::new();
-        workspace.append_item(&item("Find projects…", "win.find-projects"));
-        workspace.append_item(&item("Keys and primitives…", "win.hud"));
-        workspace.append_item(&item("Refresh", "win.refresh"));
-        workspace.append_item(&item("Preferences…", "win.preferences"));
-        workspace.append_item(&item("Quit", "win.quit"));
-        menu.append_section(None, &workspace);
-
-        let project = gio::Menu::new();
-        project.append_item(&item("Rename project…", "win.project-rename"));
-        project.append_item(&item("Pin or unpin", "win.project-pin"));
-        project.append_item(&item("Move up", "win.project-move-up"));
-        project.append_item(&item("Move down", "win.project-move-down"));
-        menu.append_section(None, &project);
-
-        let externals = programs::external_programs();
-        if !externals.is_empty() {
-            let open_in = gio::Menu::new();
-            for program in externals {
-                open_in.append(
-                    Some(&format!("Open in {}", program.name)),
-                    Some(&format!("win.open-external-{}", program.id)),
-                );
-            }
-            menu.append_section(None, &open_in);
-        }
-        menu
     }
 
     /// A pane's own menu: only operations that act on this pane or its active
@@ -1388,7 +1396,7 @@ impl App {
                 ));
             }
         }
-        let zoom = gio::MenuItem::new(Some("Zoom pane (F11)"), None);
+        let zoom = gio::MenuItem::new(Some("Zoom pane (Alt+F)"), None);
         zoom.set_action_and_target_value(
             Some("win.pane-zoom"),
             Some(&slot.as_str().to_variant()),
@@ -2029,6 +2037,19 @@ impl App {
         // radar's own widget over the project's BOARD.md.
         if slot == Slot::Board {
             let pane = board::BoardPane::new(&workspace.project.path, &self.window);
+            // The board's header lives on the board's own counts.
+            let window = self.window.clone();
+            let project_id = workspace.project.id;
+            pane.set_info_observer(move |text| {
+                let _ = gtk::prelude::WidgetExt::activate_action(
+                    &window,
+                    "win.pane-info",
+                    Some(
+                        &(project_id, Slot::Board.as_str(), text.unwrap_or_default())
+                            .to_variant(),
+                    ),
+                );
+            });
             workspace
                 .programs
                 .borrow_mut()
@@ -2065,6 +2086,29 @@ impl App {
             label_for(slot),
             pane::ShiftEnter::for_slot(slot),
         ));
+        // The pane's header wants the program's live self-description: its
+        // name plus whatever it puts in the terminal title, and its exit when
+        // it goes away. The window action routes it — the pane outlives any
+        // one group, so the observer aims at the action, not at a header.
+        let window = self.window.clone();
+        let project_id = workspace.project.id;
+        let name = program.name.clone();
+        pane.set_info_observer(move |text| {
+            let info = text.map(|text| format!("{name} · {text}"));
+            let _ = gtk::prelude::WidgetExt::activate_action(
+                &window,
+                "win.pane-info",
+                Some(&(project_id, slot.as_str(), info.unwrap_or_default()).to_variant()),
+            );
+        });
+        let window = self.window.clone();
+        pane.set_bell_observer(move || {
+            let _ = gtk::prelude::WidgetExt::activate_action(
+                &window,
+                "win.pane-bell",
+                Some(&(project_id, slot.as_str()).to_variant()),
+            );
+        });
         let primitive = Primitive::new(&program, pane);
         workspace
             .primitives
@@ -2079,6 +2123,7 @@ impl App {
             return;
         }
         self.restore_zoom(workspace);
+        let opening = workspace.group_of(slot).is_none();
         if let Some(group) = workspace.group_of(slot) {
             group.remove(slot);
             if group.is_empty() {
@@ -2111,6 +2156,14 @@ impl App {
         self.refresh_workspace_menus(workspace);
         self.persist_primitives(workspace);
         self.apply_status_labels();
+        // Opening a panel is a claim on it: the chord, the dock button, the
+        // menu — every "open" lands the keys in the panel it opened, ready to
+        // type into. Hiding goes quietly.
+        if opening {
+            if let Some(primitive) = workspace.primitive(slot) {
+                primitive.focus();
+            }
+        }
     }
 
     /// Close every primitive in a pane while leaving their programs available
@@ -2700,6 +2753,45 @@ impl App {
         group
             .menu_button
             .set_menu_model(Some(&self.primitive_menu_model(slot)));
+        // A pane rebuilt into a new group starts with a blank header; restore
+        // whatever each member's program has said so far.
+        for workspace in self.workspaces.borrow().values() {
+            for member in group.slots() {
+                let home = workspace.group_of(member);
+                if home.is_some_and(|home| Rc::ptr_eq(&home, group)) {
+                    if let Some(text) =
+                        self.header_info.borrow().get(&(workspace.project.id, member))
+                    {
+                        group.set_member_info(member, text);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Remember what a pane's program said and aim it at the pane's header,
+    /// wherever that pane is grouped today. `None` clears.
+    fn store_header_info(&self, project_id: i64, slot: Slot, text: Option<String>) {
+        {
+            let mut info = self.header_info.borrow_mut();
+            match &text {
+                Some(entry) => {
+                    info.insert((project_id, slot), entry.clone());
+                }
+                None => {
+                    info.remove(&(project_id, slot));
+                }
+            }
+        }
+        let shown = text.unwrap_or_default();
+        for workspace in self.workspaces.borrow().values() {
+            if workspace.project.id != project_id {
+                continue;
+            }
+            if let Some(group) = workspace.group_of(slot) {
+                group.set_member_info(slot, &shown);
+            }
+        }
     }
 
     /// Rebuild every pane menu, after a preference change.

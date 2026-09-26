@@ -9,6 +9,7 @@
 //! window through actions, so this module needs no reference back to the app.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -110,6 +111,13 @@ pub struct Group {
     /// The header's chips, so a drag can carry the chip that was grabbed rather
     /// than always the active member.
     chips: RefCell<Vec<(Slot, gtk::Button)>>,
+    /// Live info each member's program reports — its name, and whatever the
+    /// program says it is doing — keyed by member.
+    info: RefCell<HashMap<Slot, String>>,
+    /// Members that rang the terminal bell and have not been looked at since.
+    attention: RefCell<HashSet<Slot>>,
+    /// The active member's info, dim, at the header's right edge.
+    info_label: gtk::Label,
 }
 
 impl Group {
@@ -127,6 +135,16 @@ impl Group {
         menu_button.set_valign(gtk::Align::Center);
         menu_button.set_halign(gtk::Align::End);
         menu_button.set_hexpand(true);
+
+        // Live info from the active member's program: dim text at the right
+        // edge, invisible until a program has something to say.
+        let info_label = gtk::Label::new(None);
+        info_label.add_css_class("dim-label");
+        info_label.add_css_class("caption");
+        info_label.add_css_class("pane-info");
+        info_label.set_valign(gtk::Align::Center);
+        info_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        info_label.set_visible(false);
 
         let content = gtk::Stack::builder()
             .transition_type(gtk::StackTransitionType::Crossfade)
@@ -204,6 +222,9 @@ impl Group {
             members: RefCell::new(Vec::new()),
             active: RefCell::new(None),
             chips: RefCell::new(Vec::new()),
+            info: RefCell::new(HashMap::new()),
+            attention: RefCell::new(HashSet::new()),
+            info_label,
         });
         Group::accept_drags(&group);
         group
@@ -427,6 +448,9 @@ impl Group {
         if let Some(active) = *self.active.borrow() {
             self.content.set_visible_child_name(active.as_str());
         }
+        self.info.borrow_mut().remove(&slot);
+        self.attention.borrow_mut().remove(&slot);
+        self.apply_info();
         self.is_empty()
     }
 
@@ -456,6 +480,9 @@ impl Group {
                 chip.remove_css_class("active");
             }
         }
+        // Looking at a member answers its bell.
+        self.attention.borrow_mut().remove(&slot);
+        self.apply_info();
     }
 
     /// The chip whose button (or child) currently holds keyboard focus.
@@ -467,6 +494,44 @@ impl Group {
 
     pub fn active_slot(&self) -> Option<Slot> {
         self.active.borrow().or_else(|| self.members.borrow().first().copied())
+    }
+
+    /// Live info a member's program reported — its name, its own title, its
+    /// exit. Empty text clears: the header goes back to just the chips.
+    pub fn set_member_info(&self, slot: Slot, text: &str) {
+        if text.is_empty() {
+            self.info.borrow_mut().remove(&slot);
+        } else {
+            self.info.borrow_mut().insert(slot, text.to_string());
+        }
+        if self.active_slot() == Some(slot) {
+            self.apply_info();
+        }
+    }
+
+    /// A member rang the terminal bell — an agent asking for attention. The
+    /// header marks it until that member is looked at.
+    pub fn set_attention(&self, slot: Slot) {
+        self.attention.borrow_mut().insert(slot);
+        if self.active_slot() == Some(slot) {
+            self.apply_info();
+        }
+    }
+
+    /// Push the active member's info onto the header label.
+    fn apply_info(&self) {
+        let active = self.active_slot();
+        let text = active.and_then(|slot| self.info.borrow().get(&slot).cloned());
+        self.info_label.set_visible(text.is_some());
+        self.info_label.set_text(text.as_deref().unwrap_or(""));
+        self.info_label.set_tooltip_text(text.as_deref());
+        let wants_attention =
+            active.is_some_and(|slot| self.attention.borrow().contains(&slot));
+        if wants_attention {
+            self.info_label.add_css_class("attention");
+        } else {
+            self.info_label.remove_css_class("attention");
+        }
     }
 
     /// A chip per member, showing which one is active.
@@ -510,7 +575,9 @@ impl Group {
             self.chips.borrow_mut().push((*slot, chip.clone()));
             self.header.append(&chip);
         }
+        self.header.append(&self.info_label);
         self.header.append(&self.menu_button);
+        self.apply_info();
     }
 }
 

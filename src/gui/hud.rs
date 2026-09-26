@@ -1,6 +1,6 @@
 //! The overlay panel: every primitive, every key, one place.
 //!
-//! Opened with `Ctrl+Shift+K` (or from the workspace menu), it floats over
+//! Opened with `Alt+H` (or from the workspace menu), it floats over
 //! the workspace: type to filter, pick a primitive to open, run an action, or
 //! just read the keymap. It holds nothing of its own — every row fires the
 //! same `win.` action the chips, the dock and the pane menus use, so each
@@ -22,19 +22,19 @@ use crate::programs::{self, Program};
 /// Per-primitive toggles are not listed here — their keys are on the
 /// primitive rows themselves.
 const KEYMAP: &[(&str, &str)] = &[
-    ("Move between panes and the sidebar", "Ctrl+← → ↑ ↓"),
+    ("Move between panes and the sidebar", "Alt+← → ↑ ↓"),
     ("Resize the focused divider", "← → ↑ ↓"),
     ("Cycle panes and dividers", "Ctrl+Tab / Ctrl+Shift+Tab"),
-    ("This overlay", "Ctrl+Shift+K"),
+    ("This overlay", "Alt+H"),
     ("The pane menu", "Right-click / Menu / Shift+F10"),
-    ("Focus Editor / Agent / Changes / Commands", "Ctrl+Shift+1–4"),
-    ("Change the focused pane's program", "Ctrl+Shift+P"),
-    ("Search projects (and add one)", "Ctrl+Shift+N"),
-    ("Zoom the focused pane", "F11"),
-    ("Refresh theme and git status", "Ctrl+Shift+R"),
-    ("Quit", "Ctrl+Shift+Q"),
-    ("Copy / paste in a terminal", "Ctrl+Shift+C / Ctrl+Shift+V"),
-    ("Terminal font size — Ctrl+0 resets", "Ctrl+= / Ctrl+-"),
+    ("Focus Editor / Agent / Changes / Commands", "Alt+1–4"),
+    ("Change the focused pane's program", "Alt+P"),
+    ("Search projects (and add one)", "Alt+N"),
+    ("Zoom the focused pane", "Alt+F"),
+    ("Refresh theme and git status", "Alt+R"),
+    ("Quit", "Alt+Q"),
+    ("Copy / paste in a terminal", "Alt+C / Alt+V"),
+    ("Terminal font size — Alt+0 resets", "Alt+= / Alt+-"),
     ("Newline in the agent prompt", "Shift+Enter"),
 ];
 
@@ -164,8 +164,17 @@ impl Hud {
         }
         self.root.set_visible(false);
         self.search.set_text("");
-        // The keys go back to the program you were looking at.
-        app.refocus_workspace();
+        // The keys go back to the program you were looking at — unless the
+        // row just activated already moved them there. Opening a primitive
+        // from a row focuses it; refocusing the workspace would yank the
+        // keys out of the panel the row just opened.
+        let focus_in_hud = app
+            .window
+            .focus_widget()
+            .is_some_and(|focus| focus.is_ancestor(&self.root));
+        if focus_in_hud {
+            app.refocus_workspace();
+        }
     }
 
     /// Connect the panel to the app: row activation, and the keys while the
@@ -310,7 +319,7 @@ impl Hud {
         let sidebar = self.row_widget(
             Some(primitive::PROJECTS_ICON),
             "Projects",
-            Some("Ctrl+B"),
+            Some("Alt+B"),
             app.sidebar_shown.get().then_some("on screen"),
         );
         self.push(
@@ -321,16 +330,16 @@ impl Hud {
 
         self.section("Actions");
         for (label, keys, action, extra) in [
-            ("Search projects", "Ctrl+Shift+N", "win.find-projects", "find add"),
-            ("Preferences…", "Ctrl+,", "win.preferences", "settings prefs"),
+            ("Search projects", "Alt+N", "win.find-projects", "find add"),
+            ("Preferences…", "Alt+,", "win.preferences", "settings prefs"),
             (
                 "Pane menu",
                 "Right-click / Menu / Shift+F10",
                 "win.pane-menu",
                 "context",
             ),
-            ("Zoom the focused pane", "F11", "win.zoom", "maximize"),
-            ("Refresh", "Ctrl+Shift+R", "win.refresh", "reload status"),
+            ("Zoom the focused pane", "Alt+F", "win.zoom", "maximize"),
+            ("Refresh", "Alt+R", "win.refresh", "reload status"),
         ] {
             let row = self.row_widget(None, label, Some(keys), None);
             self.push(row, format!("{label} {keys} {extra}"), Kind::Action(action));

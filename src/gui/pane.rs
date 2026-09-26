@@ -5,7 +5,9 @@
 //! clipboard and keyboard behaviour are the real thing. Without it we degrade
 //! to a card that can launch the same command in a separate terminal window.
 
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 
 use adw::prelude::*;
 #[cfg(feature = "vte")]
@@ -15,6 +17,10 @@ use vte4::prelude::*;
 
 use super::theme::Theme;
 use crate::programs::CommandSpec;
+
+/// Who a pane's live signals talk to: the header routing in mod.rs.
+type InfoObserver = Box<dyn Fn(Option<String>)>;
+type BellObserver = Box<dyn Fn()>;
 
 /// What Shift+Enter should send to a program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,14 +63,19 @@ pub struct Pane {
     #[cfg(feature = "vte")]
     terminal: Option<vte4::Terminal>,
     command: String,
-    /// This pane's font zoom, 1.0 = the theme's size. Ctrl+= and Ctrl+-
-    /// change it, Ctrl+0 resets it, and a theme reload keeps it.
+    /// This pane's font zoom, 1.0 = the theme's size. Alt+= and Alt+-
+    /// change it, Alt+0 resets it, and a theme reload keeps it.
     #[cfg(feature = "vte")]
     font_scale: std::rc::Rc<std::cell::Cell<f64>>,
     /// Family and unscaled size as the last theme application left them, so
     /// a zoom can rebuild the font without a theme in hand.
     #[cfg(feature = "vte")]
     base_font: std::rc::Rc<std::cell::RefCell<(String, f64)>>,
+    /// Who to tell when this pane's program reports something live: its own
+    /// window title, or that it has exited. `None` means "went quiet".
+    observer: Rc<RefCell<Option<InfoObserver>>>,
+    /// Who to tell when the program rings the terminal bell.
+    bells: Rc<RefCell<Option<BellObserver>>>,
 }
 
 impl Pane {
@@ -84,6 +95,17 @@ impl Pane {
 
     pub fn command(&self) -> &str {
         &self.command
+    }
+
+    /// Watch this pane's live signals. `Some(text)` when the program's own
+    /// title or its exit has something to say; `None` when it went quiet.
+    pub fn set_info_observer(&self, observer: impl Fn(Option<String>) + 'static) {
+        *self.observer.borrow_mut() = Some(Box::new(observer));
+    }
+
+    /// Watch for the terminal bell — how agent CLIs ask for attention.
+    pub fn set_bell_observer(&self, bell: impl Fn() + 'static) {
+        *self.bells.borrow_mut() = Some(Box::new(bell));
     }
 
     /// Does this pane hold a live terminal?
@@ -144,7 +166,7 @@ impl Pane {
         shift_enter: ShiftEnter,
     ) -> Pane {
         let terminal = vte4::Terminal::new();
-        // The pane's own zoom state: 1.0 until Ctrl+= / Ctrl+- touch it. The
+        // The pane's own zoom state: 1.0 until Alt+= / Alt+- touch it. The
         // base font is remembered so zoom can rebuild the font later without
         // a theme, and so a theme reload re-applies the zoom on top of the
         // new size.
@@ -191,19 +213,16 @@ impl Pane {
         container.append(&trouble);
         container.append(&terminal);
 
-        // Copy and paste, handled on the terminal itself so we never steal keys
-        // a TUI wants: only the Ctrl+Shift combinations are intercepted.
+        // Copy and paste, handled on the terminal itself. radar's chords live
+        // on Alt, so the TUI's Ctrl vocabulary stays untouched.
         let keys = gtk::EventControllerKey::new();
         let terminal_for_keys = terminal.clone();
         let base_font_for_keys = base_font.clone();
         let scale_for_keys = font_scale.clone();
         keys.connect_key_pressed(move |_, key, _, modifiers| {
-            let copy = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
-                && modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK)
-                && (key == gtk::gdk::Key::c || key == gtk::gdk::Key::C);
-            let paste = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
-                && modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK)
-                && (key == gtk::gdk::Key::v || key == gtk::gdk::Key::V);
+            let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
+            let copy = alt && (key == gtk::gdk::Key::c || key == gtk::gdk::Key::C);
+            let paste = alt && (key == gtk::gdk::Key::v || key == gtk::gdk::Key::V);
             if copy {
                 terminal_for_keys.copy_clipboard_format(vte4::Format::Text);
                 return glib::Propagation::Stop;
@@ -212,13 +231,12 @@ impl Pane {
                 terminal_for_keys.paste_clipboard();
                 return glib::Propagation::Stop;
             }
-            // Font zoom is per pane: Ctrl+= (or Ctrl++ — on most layouts that
-            // is Ctrl+Shift+=) grows this pane's font, Ctrl+- shrinks it,
-            // Ctrl+0 puts the theme size back. Only the Ctrl combinations are
+            // Font zoom is per pane: Alt+= (or Alt++ — on most layouts that
+            // is Alt+Shift+=) grows this pane's font, Alt+- shrinks it,
+            // Alt+0 puts the theme size back. Only the Alt combinations are
             // intercepted, so the program still receives a bare `=`, `-` or
-            // `0`.
-            let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
-            if ctrl
+            // `0`, and keeps every Ctrl chord for itself.
+            if alt
                 && matches!(
                     key,
                     gtk::gdk::Key::plus | gtk::gdk::Key::equal | gtk::gdk::Key::KP_Add
@@ -227,11 +245,11 @@ impl Pane {
                 zoom_step(&terminal_for_keys, &base_font_for_keys, &scale_for_keys, 1.0);
                 return glib::Propagation::Stop;
             }
-            if ctrl && matches!(key, gtk::gdk::Key::minus | gtk::gdk::Key::KP_Subtract) {
+            if alt && matches!(key, gtk::gdk::Key::minus | gtk::gdk::Key::KP_Subtract) {
                 zoom_step(&terminal_for_keys, &base_font_for_keys, &scale_for_keys, -1.0);
                 return glib::Propagation::Stop;
             }
-            if ctrl && matches!(key, gtk::gdk::Key::_0 | gtk::gdk::Key::KP_0) {
+            if alt && matches!(key, gtk::gdk::Key::_0 | gtk::gdk::Key::KP_0) {
                 scale_for_keys.set(1.0);
                 apply_scaled_font(&terminal_for_keys, &base_font_for_keys, 1.0);
                 return glib::Propagation::Stop;
@@ -258,7 +276,8 @@ impl Pane {
         });
         terminal.add_controller(keys);
 
-        // Ctrl+scroll zooms this pane's font, like the keys do. The controller
+        // Ctrl+scroll zooms this pane's font — the mouse twin of the Alt+=
+        // / Alt+- keys. The controller
         // only stops the event when Ctrl is held, so ordinary scrolling still
         // reaches VTE — scrollback, and mouse-aware programs keep their wheel.
         let scroll = gtk::EventControllerScroll::new(
@@ -302,6 +321,33 @@ impl Pane {
         });
         terminal.add_controller(scroll);
 
+        // Live signals for the pane header: what the program says it is (the
+        // window title TUIs broadcast), when it is gone (child exit), and the
+        // bell agent CLIs ring when they finish. The observers are installed
+        // later, once the header that wants this exists; these handles let
+        // the already-connected signals reach them.
+        let observer: Rc<RefCell<Option<InfoObserver>>> = Rc::new(RefCell::new(None));
+        let bells: Rc<RefCell<Option<BellObserver>>> = Rc::new(RefCell::new(None));
+        let observer_for_title = observer.clone();
+        terminal.connect_window_title_changed(move |terminal| {
+            let text = terminal.window_title().map(|title| title.to_string());
+            if let Some(emit) = observer_for_title.borrow().as_ref() {
+                emit(text);
+            }
+        });
+        let observer_for_exit = observer.clone();
+        terminal.connect_child_exited(move |_, status| {
+            if let Some(emit) = observer_for_exit.borrow().as_ref() {
+                emit(Some(exit_text(status)));
+            }
+        });
+        let bells_for_bell = bells.clone();
+        terminal.connect_bell(move |_| {
+            if let Some(ring) = bells_for_bell.borrow().as_ref() {
+                ring();
+            }
+        });
+
         // Spawn on first map, not at construction. Two reasons: the pty is sized
         // from a widget that now has its real size, and tabs that are never
         // opened do not start a process at all.
@@ -338,6 +384,8 @@ impl Pane {
             command: spec.display(),
             font_scale,
             base_font,
+            observer,
+            bells,
         }
     }
 
@@ -395,7 +443,26 @@ impl Pane {
             #[cfg(feature = "vte")]
             terminal: None,
             command: spec.display(),
+            observer: Rc::new(RefCell::new(None)),
+            bells: Rc::new(RefCell::new(None)),
         }
+    }
+}
+
+/// What a pane's header says once its program is gone. `status` is the
+/// waitpid status VTE reports: exit code in the high byte, signal in the low
+/// one.
+#[cfg(feature = "vte")]
+fn exit_text(status: i32) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    let status = std::process::ExitStatus::from_raw(status);
+    match status.code() {
+        Some(0) => "exited".to_string(),
+        Some(code) => format!("exited ({code})"),
+        None => match status.signal() {
+            Some(signal) => format!("killed by signal {signal}"),
+            None => "exited".to_string(),
+        },
     }
 }
 
@@ -601,6 +668,13 @@ fn apply_scaled_font(
 #[cfg(all(test, feature = "vte"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_text_reads_exit_codes_and_signals() {
+        assert_eq!(exit_text(0 << 8), "exited");
+        assert_eq!(exit_text(1 << 8), "exited (1)");
+        assert_eq!(exit_text(9), "killed by signal 9");
+    }
 
     #[test]
     fn zoom_round_trips_back_to_the_theme_size() {
