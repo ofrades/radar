@@ -169,13 +169,14 @@ radar card move "Fix login" --to Review  # hands the card over: the claim drops
 ### The convention
 
 A board nobody is made to use is a wall decoration, so radar puts the board in
-the agents' way at both ends. When an **agent pane opens**, radar writes the
-convention into the project before the agent draws a frame: the board file, a
-skill describing the loop (`.opencode/skills/board/SKILL.md` for opencode,
-`.claude/skills/board/SKILL.md` for Claude Code, a pointer in `AGENTS.md` for
-the harnesses that only read that), and a `RADAR_AGENT` environment variable
-— `claude-mx7k2b1f`, unique per launch — so two instances of the same agent
-never hold each other's cards, and a claim on the board says which one.
+the agents' way at both ends — without touching a single agent's
+configuration. When an **agent pane opens**, radar writes the convention into
+the project: the board file, a skill describing the loop
+(`.opencode/skills/board/SKILL.md` for opencode, `.claude/skills/board/SKILL.md`
+for Claude Code, a pointer in `AGENTS.md` for the harnesses that only read
+that), and a `RADAR_AGENT` environment variable — `claude-mx7k2b1f`, unique
+per launch — so two instances of the same agent never hold each other's cards,
+and a claim on the board says which one.
 
 The loop the skill teaches: claim with `radar card next --by "$RADAR_AGENT"`,
 work one card at a time, hand over by moving to **Review** with a note for
@@ -184,14 +185,15 @@ whoever checks, and prefer picking up Review work — a card is done when a
 claim, so the handover is real: the moment a worker's card reaches Review, the
 worker's edit rights are gone until it claims again.
 
-And the requirement has teeth. `radar hook guard` is the check an agent
-harness's pre-edit hook calls (Claude Code pipes the tool call as JSON and
-reads exit 2 as a veto whose stderr goes back to the model; an opencode plugin
-calls the same logic in-process): an edit to a project file without a live
-claim by `$RADAR_AGENT` is denied, and the denial text is the remedy — claim
-work, then retry. `BOARD.md` itself, the harness directories, and agents
-launched outside radar are always allowed through: a guard that blocks its own
-remedy is a deadlock, not a convention.
+And the requirement has teeth, in the one place every agent already answers
+to: **git**. radar installs a `pre-commit` hook in the repository's own hooks
+directory (never touching a hook it did not write, never writing outside
+`.git`), and the hook refuses a commit from a radar-launched agent that holds
+no board claim — whatever tool the agent edited with. The refusal text is the
+remedy, so the agent claims and retries. Humans in their own terminals set no
+`RADAR_AGENT` and are never blocked. The check is `radar hook guard --commit`
+— the same subcommand can judge a file edit for a harness that offers pre-edit
+hooks, but nothing needs to be configured for the gate to hold.
 
 ## How it fits with omarchy
 

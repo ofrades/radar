@@ -188,7 +188,7 @@ enum CardAction {
 
 #[derive(Subcommand, Debug)]
 enum HookAction {
-    /// Judge one edit the way an agent harness's pre-edit hook would: deny
+    /// Judge one edit or commit the way an agent harness's hook would: deny
     /// (exit 2) unless the project's BOARD.md shows a live claim by
     /// $RADAR_AGENT. The tool call's JSON is read from stdin when piped, so
     /// the same command serves a hook and a human checking by hand.
@@ -197,6 +197,10 @@ enum HookAction {
         /// JSON, `tool_input.file_path`)
         #[arg(long)]
         file: Option<PathBuf>,
+        /// Judge a commit, not an edit: the git pre-commit hook's question,
+        /// which needs no file — only the claim
+        #[arg(long)]
+        commit: bool,
         /// The project directory (default: the current directory)
         #[arg(long)]
         path: Option<PathBuf>,
@@ -299,7 +303,17 @@ fn main() -> Result<()> {
             } => card_next(&db, path, &by, in_column.as_deref(), cli.json),
         },
         Some(Command::Hook { action }) => match action {
-            HookAction::Guard { file, path } => hook_guard(&db, file, path),
+            HookAction::Guard {
+                file,
+                commit,
+                path,
+            } => {
+                if commit {
+                    hook_commit_guard(&db, path)
+                } else {
+                    hook_guard(&db, file, path)
+                }
+            }
         },
     }
 }
@@ -498,7 +512,20 @@ fn hook_guard(_db: &Db, file: Option<PathBuf>, path: Option<PathBuf>) -> Result<
 
     let dir = board_dir(path)?;
     let who = std::env::var("RADAR_AGENT").ok().filter(|s| !s.is_empty());
-    match radar::skill::guard_decision(&dir, who.as_deref(), file.as_deref()) {
+    guard_exit(radar::skill::guard_decision(&dir, who.as_deref(), file.as_deref()))
+}
+
+/// The commit gate: the git pre-commit hook's half of the convention. No file
+/// is weighed — the claim is the whole question, since whatever an agent
+/// edited with, the work enters the repository here.
+fn hook_commit_guard(_db: &Db, path: Option<PathBuf>) -> Result<()> {
+    let dir = board_dir(path)?;
+    let who = std::env::var("RADAR_AGENT").ok().filter(|s| !s.is_empty());
+    guard_exit(radar::skill::commit_decision(&dir, who.as_deref()))
+}
+
+fn guard_exit(decision: radar::skill::GuardDecision) -> Result<()> {
+    match decision {
         radar::skill::GuardDecision::Allow => Ok(()),
         radar::skill::GuardDecision::Deny(reason) => {
             eprintln!("{reason}");
