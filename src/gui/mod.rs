@@ -19,6 +19,7 @@
 mod board;
 mod dialogs;
 mod group;
+mod home;
 mod hud;
 mod keynav;
 mod pane;
@@ -40,10 +41,11 @@ use gtk::glib;
 
 use crate::config::Paths;
 use crate::db::{
-    Db, Project, Slot, WorkspaceAxis, WorkspaceGroup, WorkspaceLayout, WorkspaceState,
+    Db, NewWorkspaceLayout, Project, Slot, WorkspaceAxis, WorkspaceGroup, WorkspaceLayout,
+    WorkspaceState,
 };
 use crate::discover::{self, Candidate};
-use crate::programs::{self, CommandSpec, LaunchOptions, Program};
+use crate::programs::{self, CommandSpec, Kind, LaunchOptions, Program};
 
 use pane::Pane;
 use group::Group;
@@ -993,6 +995,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
                 let spec = CommandSpec {
                     argv: program.command_spec(&LaunchOptions::default()).argv,
                     env_unset: Vec::new(),
+                    env_set: Vec::new(),
                 };
                 match pane::spawn_external_window(&spec, &project.path) {
                     Ok(()) => app.toast(&format!("Opened in {label}")),
@@ -1502,6 +1505,7 @@ impl App {
             safe: !preferences.agent_auto_flags,
             extra_args: Vec::new(),
             prompt: None,
+            agent_instance: None,
         }
     }
 
@@ -2076,7 +2080,20 @@ impl App {
             .programs
             .borrow_mut()
             .insert(slot, program.id.clone());
-        let options = self.launch_options();
+        let mut options = self.launch_options();
+        // An agent meets the board at launch: the board file and the skill
+        // that makes it the convention are both in place before the agent
+        // draws its first frame, and the launch claims work under a name
+        // unique to this instance — two agents of the same kind never hold
+        // each other's cards.
+        if program.kind == Kind::Agent {
+            if let Err(error) = crate::board::ensure_file(&workspace.project.path)
+                .and_then(|_| crate::skill::install(&workspace.project.path))
+            {
+                eprintln!("radar: setting up the board: {error}");
+            }
+            options.agent_instance = Some(crate::programs::launch::now_stamp());
+        }
         let spec = program.command_spec(&options);
         let theme = self.theme.borrow().clone();
         let pane = Rc::new(Pane::spawn(

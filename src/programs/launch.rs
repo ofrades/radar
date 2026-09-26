@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::agents;
+use super::Kind;
 use super::Program;
 
 /// How a program should be started.
@@ -14,6 +15,9 @@ pub struct LaunchOptions {
     pub extra_args: Vec<String>,
     /// An initial prompt, for agents that take one.
     pub prompt: Option<String>,
+    /// A unique instance name for an agent launch, folded into `RADAR_AGENT`
+    /// (see [`command_spec`]). Irrelevant for non-agents.
+    pub agent_instance: Option<String>,
 }
 
 /// A resolved command line.
@@ -23,6 +27,8 @@ pub struct CommandSpec {
     pub argv: Vec<String>,
     /// Environment variables to remove before launching.
     pub env_unset: Vec<String>,
+    /// Environment variables to add before launching.
+    pub env_set: Vec<(String, String)>,
 }
 
 impl CommandSpec {
@@ -38,6 +44,19 @@ impl CommandSpec {
 
 /// Build the command line for `program`.
 pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
+    // Agents launched by radar carry their claim name: `$RADAR_AGENT` is what
+    // the board's skill and guard use to tell "who is asking" apart, so two
+    // instances of the same agent never hold each other's cards. Unique per
+    // launch (see [`agent_instance_name`]); the `omarchy` wrapper execs the
+    // agent, so the variable reaches it either way.
+    let env_set = match (program.kind, &options.agent_instance) {
+        (Kind::Agent, Some(instance)) => vec![(
+            "RADAR_AGENT".to_string(),
+            format!("{}-{instance}", program.id),
+        )],
+        _ => Vec::new(),
+    };
+
     // omarchy's wrapper knows how its default agent wants to be started, and
     // keeps working when those flags change. Only used when the user has not
     // asked for safe mode.
@@ -52,6 +71,7 @@ pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
         return CommandSpec {
             argv,
             env_unset: Vec::new(),
+            env_set,
         };
     }
 
@@ -69,7 +89,33 @@ pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
     CommandSpec {
         argv,
         env_unset: program.env_unset.clone(),
+        env_set,
     }
+}
+
+/// A short base-36 stamp of a moment: the unique suffix in a `RADAR_AGENT`
+/// claim name (`claude-mx7k2b1f`) — short enough to read on a board line,
+/// unique enough that two instances of the same agent never hold the same
+/// card, and stable across restarts so stale claims stay attributable.
+pub fn instance_stamp(millis: u128) -> String {
+    let mut n = millis;
+    let mut stamp = Vec::new();
+    while n > 0 {
+        let digit = (n % 36) as u32;
+        stamp.push(char::from_digit(digit, 36).unwrap_or('0'));
+        n /= 36;
+    }
+    stamp.iter().rev().collect()
+}
+
+/// The stamp for *now*.
+pub fn now_stamp() -> String {
+    instance_stamp(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    )
 }
 
 #[cfg(test)]
@@ -164,6 +210,36 @@ mod tests {
         let hermes = program("hermes", "hermes").with_env_unset(&["HERMES_SESSION_SOURCE"]);
         let spec = command_spec(&hermes, &LaunchOptions::default());
         assert_eq!(spec.env_unset, vec!["HERMES_SESSION_SOURCE"]);
+    }
+
+    #[test]
+    fn an_agent_launch_sets_its_claim_name() {
+        let agent = program("claude", "claude");
+        let options = LaunchOptions {
+            agent_instance: Some("mx7k2b1f".into()),
+            ..Default::default()
+        };
+        let spec = command_spec(&agent, &options);
+        assert_eq!(
+            spec.env_set,
+            vec![("RADAR_AGENT".to_string(), "claude-mx7k2b1f".to_string())]
+        );
+
+        // Editors get nothing, and neither do agents without an instance.
+        let mut editor = program("nvim", "nvim");
+        editor.kind = Kind::Editor;
+        assert!(command_spec(&editor, &options).env_set.is_empty());
+        assert!(command_spec(&agent, &LaunchOptions::default()).env_set.is_empty());
+    }
+
+    #[test]
+    fn stamps_are_short_base36_and_ordered() {
+        assert_eq!(instance_stamp(0), "");
+        assert_eq!(instance_stamp(36), "10");
+        let a = instance_stamp(1_769_420_000_000);
+        let b = instance_stamp(1_769_420_000_001);
+        assert_ne!(a, b);
+        assert!(a.len() <= 8, "{a} is too long for a board line");
     }
 
     #[test]

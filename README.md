@@ -140,6 +140,7 @@ radar prefs agent claude    # set one
 radar pin / move / rename / remove / prune
 radar board                 # the project's kanban (BOARD.md)
 radar card add / claim / release / move / done / next
+radar hook guard            # the board's pre-edit check, for harness hooks
 radar doctor                # environment check
 ```
 
@@ -160,9 +161,37 @@ writes it. The file is the board; radar is one of its editors.
 For scripts that want a lock-free answer to "what should I do next":
 
 ```bash
-radar card next --by claude   # claims the first unclaimed card, prints it
-radar card done "Fix login"   # marks it done, moves it to the last column
+radar card next --by claude-mx7k2b1f   # claims the first unclaimed card, prints it
+radar card next --in Review --by codex-9x3k1a   # a reviewer picks up review work
+radar card move "Fix login" --to Review  # hands the card over: the claim drops
 ```
+
+### The convention
+
+A board nobody is made to use is a wall decoration, so radar puts the board in
+the agents' way at both ends. When an **agent pane opens**, radar writes the
+convention into the project before the agent draws a frame: the board file, a
+skill describing the loop (`.opencode/skills/board/SKILL.md` for opencode,
+`.claude/skills/board/SKILL.md` for Claude Code, a pointer in `AGENTS.md` for
+the harnesses that only read that), and a `RADAR_AGENT` environment variable
+— `claude-mx7k2b1f`, unique per launch — so two instances of the same agent
+never hold each other's cards, and a claim on the board says which one.
+
+The loop the skill teaches: claim with `radar card next --by "$RADAR_AGENT"`,
+work one card at a time, hand over by moving to **Review** with a note for
+whoever checks, and prefer picking up Review work — a card is done when a
+*different* agent closes it with `radar card done`. Moving a card drops its
+claim, so the handover is real: the moment a worker's card reaches Review, the
+worker's edit rights are gone until it claims again.
+
+And the requirement has teeth. `radar hook guard` is the check an agent
+harness's pre-edit hook calls (Claude Code pipes the tool call as JSON and
+reads exit 2 as a veto whose stderr goes back to the model; an opencode plugin
+calls the same logic in-process): an edit to a project file without a live
+claim by `$RADAR_AGENT` is denied, and the denial text is the remedy — claim
+work, then retry. `BOARD.md` itself, the harness directories, and agents
+launched outside radar are always allowed through: a guard that blocks its own
+remedy is a deadlock, not a convention.
 
 ## How it fits with omarchy
 
@@ -183,7 +212,7 @@ radar card done "Fix login"   # marks it done, moves it to the last column
 ## Development
 
 ```bash
-cargo test                  # 104 tests: store, board, git parsing, registry, discovery
+cargo test                  # 116 tests: store, board, skill, git parsing, registry, discovery
 cargo clippy --all-targets  # clean
 cargo build --features gui  # no VTE needed
 ```
@@ -193,6 +222,7 @@ Layout:
 ```
 src/db/          SQLite: projects, tabs, settings, events  (+ migrations)
 src/board.rs     the kanban: BOARD.md parse/render, atomic card ops
+src/skill.rs     the convention: skill install, the pre-edit guard
 src/programs/    program registry, omarchy agent knowledge, argv building
 src/discover/    directory discovery: fd or walk, fuzzy filtering
 src/git.rs       branch / ahead / behind / changed, read-only

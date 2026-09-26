@@ -365,6 +365,11 @@ impl Pane {
             // here rather than moved out of the captures.
             let terminal = terminal_for_spawn.clone();
             let argv = spec_for_spawn.argv.clone();
+            let extra_env: Vec<String> = spec_for_spawn
+                .env_set
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect();
             let command = spec_for_spawn.display();
             let cwd_string = cwd.to_string_lossy().to_string();
             let problem = problem.clone();
@@ -373,7 +378,16 @@ impl Pane {
             let title = title.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
                 try_spawn(
-                    terminal, argv, cwd_string, problem, fallback, trouble, title, command, 0,
+                    terminal,
+                    argv,
+                    extra_env,
+                    cwd_string,
+                    problem,
+                    fallback,
+                    trouble,
+                    title,
+                    command,
+                    0,
                 );
             });
         });
@@ -479,6 +493,7 @@ fn exit_text(status: i32) -> String {
 fn try_spawn(
     terminal: vte4::Terminal,
     argv: Vec<String>,
+    extra_env: Vec<String>,
     cwd: String,
     problem: gtk::Label,
     fallback: gtk::Button,
@@ -492,6 +507,7 @@ fn try_spawn(
     // values it needs for a retry are cloned up front.
     let terminal_for_retry = terminal.clone();
     let argv_for_retry = argv.clone();
+    let extra_env_for_retry = extra_env.clone();
     let cwd_for_retry = cwd.clone();
     let problem_for_retry = problem.clone();
     let fallback_for_retry = fallback.clone();
@@ -516,14 +532,20 @@ fn try_spawn(
     // A terminal launched from a menu has no TERM: programs would fall back to
     // something dumb and look broken. Set it explicitly, the way every terminal
     // emulator does. The rest of the environment is inherited, so PATH and the
-    // agents' own configuration come along.
-    let envv = ["TERM=xterm-256color", "COLORTERM=truecolor"];
+    // agents' own configuration come along — plus whatever this launch adds
+    // (an agent's `RADAR_AGENT`, the name it claims board work under).
+    let mut envv: Vec<String> = vec![
+        "TERM=xterm-256color".to_string(),
+        "COLORTERM=truecolor".to_string(),
+    ];
+    envv.extend(extra_env);
+    let env_refs: Vec<&str> = envv.iter().map(String::as_str).collect();
     terminal.spawn_async(
         vte4::PtyFlags::DEFAULT,
         // Deliberately None: the wrapper cds. See above.
         None,
         &argv_refs,
-        &envv,
+        &env_refs,
         glib::SpawnFlags::DEFAULT,
         || {},
         SPAWN_TIMEOUT_MS,
@@ -539,6 +561,7 @@ fn try_spawn(
                             try_spawn(
                                 terminal_for_retry,
                                 argv_for_retry,
+                                extra_env_for_retry,
                                 cwd_for_retry,
                                 problem_for_retry,
                                 fallback_for_retry,
@@ -562,6 +585,7 @@ fn try_spawn(
                         let spec = CommandSpec {
                             argv: argv_for_retry.clone(),
                             env_unset: Vec::new(),
+                            env_set: Vec::new(),
                         };
                         let cwd = std::path::PathBuf::from(&cwd_for_retry);
                         let toasts: Option<gtk::Widget> = None;

@@ -347,7 +347,10 @@ pub fn add_card(
     }
 }
 
-/// Move the first card titled `title` to the end of `to_column`.
+/// Move the first card titled `title` to the end of `to_column`. The claim
+/// does not survive the move: a claim means "someone is on this", and a card
+/// handed to another column — Review above all — is by definition no longer
+/// the worker's. Dragging in the GUI and `card move` behave the same.
 pub fn move_card(project: &Path, title: &str, to_column: &str) -> Result<bool> {
     let target = to_column.to_string();
     let title = title.to_string();
@@ -359,7 +362,8 @@ pub fn move_card(project: &Path, title: &str, to_column: &str) -> Result<bool> {
             return Ok(None);
         };
         if from != to {
-            let card = board.columns[from].cards.remove(at);
+            let mut card = board.columns[from].cards.remove(at);
+            card.claimed_by = None;
             board.columns[to].cards.push(card);
         }
         Ok(Some(true))
@@ -441,11 +445,24 @@ pub fn remove_card(project: &Path, title: &str) -> Result<bool> {
 
 /// The work primitive: claim the first unclaimed card and return it. Columns
 /// are scanned in file order, so "next" means "top of the leftmost column that
-/// still has unclaimed cards".
-pub fn next_card(project: &Path, who: &str) -> Result<Option<Card>> {
+/// still has unclaimed cards". A `column` name narrows the scan to that one
+/// column — how a reviewer asks for review work — and an unknown name is an
+/// error, so `--in Review` on a board without it fails loudly instead of
+/// reading as "no work".
+pub fn next_card(project: &Path, who: &str, column: Option<&str>) -> Result<Option<Card>> {
     let who = who.to_string();
+    let column = column.map(str::to_string);
     edit(project, move |board| {
-        for column in &mut board.columns {
+        let columns: &mut [Column] = match &column {
+            Some(name) => {
+                let Some(at) = board.column_named(name) else {
+                    anyhow::bail!("no column named “{}”", name);
+                };
+                &mut board.columns[at..at + 1]
+            }
+            None => &mut board.columns[..],
+        };
+        for column in columns {
             if let Some(card) = column.cards.iter_mut().find(|card| {
                 !card.done && card.claimed_by.is_none() && !card.title.is_empty()
             }) {
@@ -455,6 +472,17 @@ pub fn next_card(project: &Path, who: &str) -> Result<Option<Card>> {
         }
         Ok(None)
     })
+}
+
+/// Does `who` hold a live claim — any card they have claimed that is not yet
+/// done? The guard's question: an agent with a claim may edit project files.
+pub fn holds_claim(project: &Path, who: &str) -> Result<bool> {
+    Ok(load(project)?.columns.iter().any(|column| {
+        column
+            .cards
+            .iter()
+            .any(|card| !card.done && card.claimed_by.as_deref() == Some(who))
+    }))
 }
 
 fn default_header(project_name: &str) -> String {
@@ -632,7 +660,7 @@ mod tests {
     fn add_move_and_finish_cards_through_the_file() {
         let (_dir, project) = project();
         ensure_file(&project).unwrap();
-        add_card(&project, None, "first task", "with a note", None).unwrap();
+        add_card(&project, None, "first task", "with a note", Some("claude")).unwrap();
         add_card(&project, Some("review"), "second task", "", None).unwrap();
 
         let board = load(&project).unwrap();
@@ -643,8 +671,10 @@ mod tests {
         assert!(move_card(&project, "first task", "In progress").unwrap());
         let board = load(&project).unwrap();
         assert_eq!(board.columns[1].cards[0].title, "first task");
-        // Notes travel with the card.
+        // Notes travel with the card; the claim does not — moving a card is
+        // handing it over.
         assert_eq!(board.columns[1].cards[0].body, vec!["with a note"]);
+        assert_eq!(board.columns[1].cards[0].claimed_by, None);
         assert!(!move_card(&project, "no such card", "Done").unwrap());
 
         assert!(finish_card(&project, "first task").unwrap());
@@ -682,12 +712,12 @@ mod tests {
         add_card(&project, None, "one", "", None).unwrap();
         add_card(&project, None, "two", "", None).unwrap();
 
-        let first = next_card(&project, "claude").unwrap().unwrap();
+        let first = next_card(&project, "claude", None).unwrap().unwrap();
         assert_eq!(first.title, "one");
         // The claimed card is not handed out twice.
-        let second = next_card(&project, "codex").unwrap().unwrap();
+        let second = next_card(&project, "codex", None).unwrap().unwrap();
         assert_eq!(second.title, "two");
-        assert!(next_card(&project, "droid").unwrap().is_none());
+        assert!(next_card(&project, "droid", None).unwrap().is_none());
 
         let board = load(&project).unwrap();
         assert_eq!(board.columns[0].cards[0].claimed_by.as_deref(), Some("claude"));
@@ -700,7 +730,48 @@ mod tests {
         ensure_file(&project).unwrap();
         add_card(&project, None, "only", "", None).unwrap();
         finish_card(&project, "only").unwrap();
-        assert!(next_card(&project, "claude").unwrap().is_none());
+        assert!(next_card(&project, "claude", None).unwrap().is_none());
+    }
+
+    #[test]
+    fn next_card_in_a_column_takes_only_from_there() {
+        let (_dir, project) = project();
+        ensure_file(&project).unwrap();
+        add_card(&project, None, "backlog work", "", None).unwrap();
+        add_card(&project, Some("Review"), "review work", "", None).unwrap();
+
+        // The reviewer is handed the Review card, not the first in the file.
+        let card = next_card(&project, "codex", Some("review")).unwrap().unwrap();
+        assert_eq!(card.title, "review work");
+        // And the backlog card stays unclaimed.
+        let board = load(&project).unwrap();
+        assert_eq!(board.columns[0].cards[0].claimed_by, None);
+
+        // When the column runs dry, that is all it is — no work there.
+        assert!(next_card(&project, "droid", Some("review")).unwrap().is_none());
+        // A column that does not exist is an error, not "no work".
+        let err = next_card(&project, "codex", Some("nope")).unwrap_err();
+        assert!(err.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn holds_claim_sees_a_live_claim_only() {
+        let (_dir, project) = project();
+        ensure_file(&project).unwrap();
+        add_card(&project, None, "task", "", None).unwrap();
+        assert!(!holds_claim(&project, "claude").unwrap());
+        claim_card(&project, "task", Some("claude")).unwrap();
+        assert!(holds_claim(&project, "claude").unwrap());
+        assert!(!holds_claim(&project, "codex").unwrap());
+        // A done card is a handed-over card, not a held one.
+        finish_card(&project, "task").unwrap();
+        assert!(!holds_claim(&project, "claude").unwrap());
+    }
+
+    #[test]
+    fn a_board_that_does_not_exist_holds_no_claim() {
+        let (_dir, fresh) = project();
+        assert!(!holds_claim(&fresh, "claude").unwrap());
     }
 
     #[test]

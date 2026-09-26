@@ -106,6 +106,11 @@ enum Command {
         #[command(subcommand)]
         action: CardAction,
     },
+    /// Wiring for agent-harness hooks (the board as a requirement)
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
     /// Open the native app (needs a build with --features gui)
     Gui,
 }
@@ -175,6 +180,26 @@ enum CardAction {
         /// Who is asking
         #[arg(long)]
         by: String,
+        /// Only look in this column — how a reviewer picks up review work
+        #[arg(long = "in")]
+        in_column: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum HookAction {
+    /// Judge one edit the way an agent harness's pre-edit hook would: deny
+    /// (exit 2) unless the project's BOARD.md shows a live claim by
+    /// $RADAR_AGENT. The tool call's JSON is read from stdin when piped, so
+    /// the same command serves a hook and a human checking by hand.
+    Guard {
+        /// The file the agent wants to edit (default: from the hook's stdin
+        /// JSON, `tool_input.file_path`)
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// The project directory (default: the current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
 }
 
@@ -267,7 +292,14 @@ fn main() -> Result<()> {
             CardAction::Release { path, title } => card_claim(&db, path, &title, None, cli.json),
             CardAction::Move { path, title, to } => card_move(&db, path, &title, &to, cli.json),
             CardAction::Done { path, title } => card_done(&db, path, &title, cli.json),
-            CardAction::Next { path, by } => card_next(&db, path, &by, cli.json),
+            CardAction::Next {
+                path,
+                by,
+                in_column,
+            } => card_next(&db, path, &by, in_column.as_deref(), cli.json),
+        },
+        Some(Command::Hook { action }) => match action {
+            HookAction::Guard { file, path } => hook_guard(&db, file, path),
         },
     }
 }
@@ -410,11 +442,23 @@ fn card_done(db: &Db, path: Option<PathBuf>, title: &str, json: bool) -> Result<
 }
 
 /// The work primitive: hand the agent the next unclaimed card, claimed in its
-/// name. An agent's whole loop is `card next` → do it → `card done`.
-fn card_next(db: &Db, path: Option<PathBuf>, by: &str, json: bool) -> Result<()> {
+/// name. An agent's whole loop is `card next` → do it → move to Review. This
+/// is also where an agent meets the convention: the skill that teaches the
+/// loop is installed into the project here, so the first `card next` from a
+/// fresh clone sets the board up on its own.
+fn card_next(
+    db: &Db,
+    path: Option<PathBuf>,
+    by: &str,
+    in_column: Option<&str>,
+    json: bool,
+) -> Result<()> {
     let dir = board_dir(path)?;
     let _ = board::ensure_file(&dir);
-    let Some(card) = board::next_card(&dir, by)? else {
+    if let Err(error) = radar::skill::install(&dir) {
+        eprintln!("radar: could not install the board skill: {error}");
+    }
+    let Some(card) = board::next_card(&dir, by, in_column)? else {
         anyhow::bail!("no unclaimed cards");
     };
     log_board(
@@ -432,6 +476,46 @@ fn card_next(db: &Db, path: Option<PathBuf>, by: &str, json: bool) -> Result<()>
         }
     }
     Ok(())
+}
+
+/// The hook half of the convention: an agent harness asks, before an edit
+/// lands, whether the agent holds a board claim. Denied calls come back to
+/// the model as a tool error whose text is the remedy — claim work, then
+/// retry — so the guard enforces without stranding the agent.
+///
+/// Claude Code's PreToolUse hook is a subprocess: it pipes the tool call as
+/// JSON and reads the exit code (2 denies, stderr goes to the model). The
+/// opencode plugin calls the same check in-process. `--file` covers both and
+/// the human running it by hand.
+fn hook_guard(_db: &Db, file: Option<PathBuf>, path: Option<PathBuf>) -> Result<()> {
+    use std::io::IsTerminal;
+
+    let mut input = String::new();
+    if !std::io::stdin().is_terminal() {
+        let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+    }
+    let file = file.or_else(|| hook_file(&input));
+
+    let dir = board_dir(path)?;
+    let who = std::env::var("RADAR_AGENT").ok().filter(|s| !s.is_empty());
+    match radar::skill::guard_decision(&dir, who.as_deref(), file.as_deref()) {
+        radar::skill::GuardDecision::Allow => Ok(()),
+        radar::skill::GuardDecision::Deny(reason) => {
+            eprintln!("{reason}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// The file a harness's tool-call JSON wants to edit: `tool_input.file_path`
+/// in Claude Code's pre-tool-use payload.
+fn hook_file(input: &str) -> Option<PathBuf> {
+    let value: serde_json::Value = serde_json::from_str(input).ok()?;
+    value
+        .get("tool_input")?
+        .get("file_path")?
+        .as_str()
+        .map(PathBuf::from)
 }
 
 /// Print one card's current state, for `--json` answers.
@@ -643,6 +727,7 @@ fn launch_options(preferences: &Preferences, safe: bool) -> LaunchOptions {
         safe: safe || !preferences.agent_auto_flags,
         extra_args: Vec::new(),
         prompt: None,
+        agent_instance: None,
     }
 }
 

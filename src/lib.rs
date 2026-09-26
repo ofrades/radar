@@ -17,6 +17,7 @@ pub mod git;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod programs;
+pub mod skill;
 
 pub use config::Paths;
 pub use db::Db;
