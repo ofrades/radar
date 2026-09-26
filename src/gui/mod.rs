@@ -67,7 +67,7 @@ pub fn run(paths: Paths, db: Db) -> Result<()> {
     let db = Rc::new(db);
     let window = Rc::new(RefCell::new(None::<adw::ApplicationWindow>));
 
-    app.connect_startup(|_| style::install());
+    app.connect_startup(|_| style::install(&Theme::load()));
     let window_for_activate = window.clone();
     app.connect_activate(move |app| {
         if let Some(window) = window_for_activate.borrow().as_ref() {
@@ -202,6 +202,10 @@ struct App {
     find_tx: std::sync::mpsc::Sender<(PathBuf, Vec<Candidate>)>,
     find_rx: RefCell<std::sync::mpsc::Receiver<(PathBuf, Vec<Candidate>)>>,
     find_root_button: gtk::Button,
+    /// Last real pointer movement over the window, in milliseconds of the
+    /// glib monotonic clock. Enter events a mapped widget synthesizes under a
+    /// parked pointer must not read as mouse intent.
+    pointer_motion_ms: Cell<i64>,
 }
 
 type SharedApp = Rc<App>;
@@ -217,7 +221,8 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     // ---- sidebar ----
     let sidebar_list = gtk::ListBox::new();
     sidebar_list.set_selection_mode(gtk::SelectionMode::Single);
-    sidebar_list.add_css_class("navigation-sidebar");
+    // No `navigation-sidebar`: its own row padding and radii would fight the
+    // stylesheet. This sidebar styles its rows itself.
     sidebar_list.set_show_separators(false);
 
     let sidebar_scroll = gtk::ScrolledWindow::builder()
@@ -227,11 +232,13 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         .build();
 
     // The dock: one toggle per primitive, along the bottom of the sidebar.
+    // It spans the sidebar's full inset width like the search above, so all
+    // three floating surfaces read as one family.
     let toggles = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     toggles.add_css_class("dock");
-    toggles.set_halign(gtk::Align::Center);
+    toggles.set_halign(gtk::Align::Fill);
     toggles.set_margin_top(6);
-    toggles.set_margin_bottom(6);
+    toggles.set_margin_bottom(8);
 
     // One toggle per primitive, in the order they are named: agent, changes,
     // project, editor, commands. The project toggle is the sidebar.
@@ -250,6 +257,11 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
             })
             .build();
         button.add_css_class("flat");
+        button.set_hexpand(true);
+        // Smaller icon than the default: the dock is a compact control strip.
+        if let Some(image) = button.child().and_downcast::<gtk::Image>() {
+            image.set_pixel_size(16);
+        }
         if project {
             button.set_action_name(Some("win.toggle-sidebar"));
         } else {
@@ -290,13 +302,13 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     workspace_menu.add_css_class("flat");
 
     // The sidebar's own header, matching the panes: icon, name, actions.
-    let sidebar_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    // Full-bleed like a pane header — the strip's surface reaches the
+    // sidebar's edges, and the stylesheet's padding insets the content.
+    let sidebar_header = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     sidebar_header.add_css_class("group-header");
-    sidebar_header.set_margin_start(6);
-    sidebar_header.set_margin_end(4);
-    sidebar_header.set_margin_top(2);
-    sidebar_header.set_margin_bottom(2);
-    sidebar_header.append(&gtk::Image::from_icon_name(primitive::PROJECTS_ICON));
+    let header_icon = gtk::Image::from_icon_name(primitive::PROJECTS_ICON);
+    header_icon.set_pixel_size(16);
+    sidebar_header.append(&header_icon);
     let sidebar_title = gtk::Label::new(Some(primitive::PROJECTS_LABEL));
     sidebar_title.add_css_class("caption-heading");
     sidebar_title.set_xalign(0.0);
@@ -312,7 +324,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     find_root_button.add_css_class("flat");
     find_root_button.add_css_class("caption");
     find_root_button.set_halign(gtk::Align::Start);
-    find_root_button.set_margin_start(10);
+    find_root_button.set_margin_start(8);
     find_root_button.set_margin_bottom(2);
     find_root_button.set_tooltip_text(Some("Choose another directory to scan"));
     find_root_button.set_visible(false);
@@ -366,6 +378,11 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     // one keystroke away (Ctrl+Shift+K).
     let hud = hud::Hud::new();
     let root = gtk::Overlay::new();
+    // The frame: the panel hairline around the whole app, so the outer edge
+    // reads as drawn rather than cut off. Where a pane is flush with the
+    // window its own border paints the same line, so the edge stays one
+    // uniform hairline all the way round.
+    root.add_css_class("app-frame");
     root.set_child(Some(&toasts));
     root.add_overlay(hud.widget());
     window.set_content(Some(&root));
@@ -404,6 +421,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         find_tx,
         find_rx: RefCell::new(find_rx),
         find_root_button: find_root_button.clone(),
+        pointer_motion_ms: Cell::new(0),
     });
 
     register_actions(&state, app, &workspace_menu);
@@ -561,8 +579,20 @@ fn connect_widgets(app: &SharedApp) {
         let app = app.clone();
         list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
-            if let Some(id) = app.id_for_row(row) {
-                app.select_project(id);
+            let Some(id) = app.id_for_row(row) else { return };
+            // Switching projects must not take the keys out of the sidebar:
+            // keyboard selection keeps them on the row, and a mouse click
+            // brings them here. The switch itself can pull them away — the
+            // pane holding the window's focus is hidden, and the stack hands
+            // focus to the pane it just showed — so land them back on the row
+            // afterwards. Rows not yet mapped (startup) have nothing to grab.
+            app.select_project(id);
+            let on_row = app
+                .window
+                .focus_widget()
+                .is_some_and(|focus| focus == row.clone().upcast::<gtk::Widget>());
+            if !on_row && row.is_mapped() {
+                row.grab_focus();
             }
         });
     }
@@ -589,6 +619,58 @@ fn connect_widgets(app: &SharedApp) {
                 *pending.borrow_mut() = Some(id);
             }
         });
+    }
+    {
+        // Real pointer motion, anywhere over the window: the clock hover-focus
+        // checks. Capture phase, so primitives that consume motion (the
+        // terminal among them) cannot starve the clock. Enter events a mapped
+        // widget synthesizes under a parked pointer carry no motion, so they
+        // never read as mouse intent.
+        let app_for_motion = app.clone();
+        let controller = gtk::EventControllerMotion::new();
+        controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+        controller.connect_motion(move |_, _, _| {
+            app_for_motion.pointer_motion_ms.set(glib::monotonic_time() / 1000);
+        });
+        app.window.add_controller(controller);
+    }
+    {
+        // Hover is focus for the sidebar as a whole, matching the panes:
+        // the pointer entering the projects panel puts the keys on its
+        // selected row — the same ring a pane wears. Same gate as the panes:
+        // the sidebar mapping under a parked pointer must not grab.
+        let app_for_hover = app.clone();
+        let controller = gtk::EventControllerMotion::new();
+        controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+        controller.connect_enter(move |_, _, _| {
+            let app = &app_for_hover;
+            if !app.pointer_is_live() {
+                return;
+            }
+            if let Some(row) = keynav::sidebar_focus_row(&app.sidebar_list) {
+                row.grab_focus();
+            }
+        });
+        app.sidebar.add_controller(controller);
+    }
+    {
+        // Inside the panel, walking the rows with the pointer keeps the keys
+        // on the row under it — the row the user would arrow from.
+        let app_for_hover = app.clone();
+        let controller = gtk::EventControllerMotion::new();
+        controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+        controller.connect_enter(move |_, _, y| {
+            let app = &app_for_hover;
+            if !app.pointer_is_live() {
+                return;
+            }
+            if let Some(row) = app.sidebar_list.row_at_y(y as i32) {
+                if app.id_for_row(&row).is_some() {
+                    row.grab_focus();
+                }
+            }
+        });
+        app.sidebar_list.add_controller(controller);
     }
     {
         // Esc empties the search, the way a browser's address bar does.
@@ -1386,6 +1468,9 @@ impl App {
 
     fn reload_theme(&self) {
         let theme = Theme::load();
+        // Accent and pane roundness live in the stylesheet: re-render it so a
+        // theme switch recolours radar's own chrome, not just the panes.
+        style::refresh(&theme);
         if let Ok(manager) = adw::StyleManager::default().downcast::<adw::StyleManager>() {
             manager.set_color_scheme(if theme.dark {
                 adw::ColorScheme::ForceDark
@@ -1465,6 +1550,7 @@ impl App {
         app.filter_sidebar(&app.sidebar_search.text());
         // Candidate directories for the query go under the project rows.
         App::show_candidates(app, &app.sidebar_search.text());
+        app.apply_status_labels();
         app.refresh_status();
 
         if let Some(id) = selected {
@@ -1491,6 +1577,8 @@ impl App {
             "folder-symbolic"
         });
         icon.add_css_class("row-icon");
+        icon.set_pixel_size(16);
+        icon.set_valign(gtk::Align::Center);
         if missing {
             icon.add_css_class("missing");
         }
@@ -1556,19 +1644,13 @@ impl App {
         }));
 
         let status = self.status.borrow().get(&project.id).cloned();
-        let (text, count) = match (&status, missing) {
-            (_, true) => ("missing".to_string(), None),
-            (Some(status), _) => (
-                status.summary(),
-                (status.changed > 0).then_some(status.changed),
-            ),
-            (None, _) => ("…".to_string(), None),
+        let text = match (&status, missing) {
+            (_, true) => "missing".to_string(),
+            (Some(status), _) => status.summary(),
+            (None, _) => "…".to_string(),
         };
         summary.set_text(&format!("{text}  ·  {parent}"));
-        if let Some(changed) = count {
-            badge.set_text(&changed.to_string());
-            badge.set_visible(true);
-        }
+        badge.set_tooltip_text(Some("Active embedded tools in this project"));
         (row, summary, badge)
     }
 
@@ -1591,15 +1673,24 @@ impl App {
             match self.status.borrow().get(id) {
                 Some(status) => {
                     summary.set_text(&format!("{}  ·  {parent}", status.summary()));
-                    if status.changed > 0 {
-                        badge.set_text(&status.changed.to_string());
-                        badge.set_visible(true);
-                    } else {
-                        badge.set_visible(false);
-                    }
                 }
                 None => summary.set_text(&format!("…  ·  {parent}")),
             }
+            let count = self.workspaces.borrow().get(id).map_or(0, |workspace| {
+                workspace
+                    .primitives
+                    .borrow()
+                    .values()
+                    .filter(|primitive| {
+                        primitive
+                            .pane
+                            .as_ref()
+                            .is_some_and(|pane| pane.is_live())
+                    })
+                    .count()
+            });
+            badge.set_text(&count.to_string());
+            badge.set_visible(count > 0);
         }
     }
 
@@ -2019,6 +2110,7 @@ impl App {
         self.sync_toggles();
         self.refresh_workspace_menus(workspace);
         self.persist_primitives(workspace);
+        self.apply_status_labels();
     }
 
     /// Close every primitive in a pane while leaving their programs available
@@ -2037,6 +2129,7 @@ impl App {
         self.sync_toggles();
         self.refresh_workspace_menus(workspace);
         self.persist_primitives(workspace);
+        self.apply_status_labels();
     }
 
     /// Leave zoom mode before changing the visible pane set.
@@ -2079,6 +2172,15 @@ impl App {
     /// Hovering a member selects its content and moves keyboard focus into that
     /// primitive, the same focus-follows-pointer behavior as hovering a pane.
     fn hover_primitive(&self, workspace: &Rc<Workspace>, slot: Slot) {
+        // Hover is mouse intent: a pane mapped under a parked pointer
+        // synthesizes an enter the moment it appears — project switches and
+        // resizes produce those by the dozen — and acting on one would yank
+        // the keys out of whatever the user is navigating, the sidebar while
+        // picking a project. Focus follows a moving mouse, not an appearing
+        // pane.
+        if !self.pointer_is_live() {
+            return;
+        }
         let Some(group) = workspace.group_of(slot) else {
             return;
         };
@@ -2095,6 +2197,16 @@ impl App {
                 primitive.focus();
             }
         }
+    }
+
+    /// True while the pointer is actually moving. A pane mapped under a parked
+    /// pointer synthesizes an enter event the moment it appears — switching
+    /// projects or resizes produce those by the dozen — and acting on it would
+    /// yank the keys out of whatever the user is navigating, the sidebar while
+    /// picking a project. Focus follows a moving mouse, not a appearing pane.
+    fn pointer_is_live(&self) -> bool {
+        const MOTION_WINDOW_MS: i64 = 300;
+        glib::monotonic_time() / 1000 - self.pointer_motion_ms.get() < MOTION_WINDOW_MS
     }
 
     /// Drop one primitive onto another's header: they share that header.
@@ -2327,6 +2439,7 @@ impl App {
             self.persist_primitives(workspace);
         }
         self.toast(&format!("{} → {}", label_for(slot), program.name));
+        self.apply_status_labels();
     }
 
     /// Arrange the panes: agent on the left, changes and editor stacked beside

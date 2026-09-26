@@ -1,11 +1,12 @@
-//! Reading omarchy's theme so panes look like the user's terminal.
+//! Reading omarchy's theme so panes look like the user's desktop.
 //!
 //! omarchy writes the active theme to
 //! `~/.local/state/omarchy/current/theme/`, with a `colors.toml` that carries
-//! the sixteen ANSI colours (plus background/foreground) and a per-app config
-//! for each terminal it supports. We read colours from there and the font from
-//! the user's own alacritty/ghostty config, falling back to something sane so
-//! radar is usable on any machine.
+//! the sixteen ANSI colours (plus background/foreground/accent) and a per-app
+//! config for each terminal it supports. We read colours from there, the
+//! panel roundness from Hyprland's live `decoration:rounding`, and the font
+//! from the user's own alacritty/ghostty config, falling back to something
+//! sane so radar is usable on any machine.
 
 use std::path::{Path, PathBuf};
 
@@ -18,6 +19,12 @@ pub struct Theme {
     pub foreground: gdk::RGBA,
     /// The sixteen ANSI colours, normal then bright.
     pub palette: Vec<gdk::RGBA>,
+    /// The theme's own highlight (`accent` in colors.toml). Radar's controls
+    /// key off it, so switching omarchy themes recolours the whole app.
+    pub accent: gdk::RGBA,
+    /// Hyprland's live `decoration:rounding` — the same number omarchy's own
+    /// shell uses for panel corners. Panes match it so radar blends in.
+    pub panel_radius: i32,
     pub font_family: String,
     pub font_size: f64,
 }
@@ -32,6 +39,9 @@ impl Default for Theme {
                 .iter()
                 .map(|hex| gdk::RGBA::parse(*hex).unwrap_or(gdk::RGBA::BLACK))
                 .collect(),
+            // Only used when omarchy (or a colors.toml) is absent entirely.
+            accent: gdk::RGBA::parse("#ff7958").unwrap_or(gdk::RGBA::BLACK),
+            panel_radius: 8,
             font_family: "monospace".to_string(),
             font_size: 11.0,
         }
@@ -56,7 +66,11 @@ impl Theme {
             theme.foreground = color(&colors, &["foreground"])
                 .unwrap_or(theme.foreground)
                 .with_alpha(1.0);
+            theme.accent = color(&colors, &["accent"]).unwrap_or(theme.accent).with_alpha(1.0);
             theme.palette = ansi_palette(&colors);
+        }
+        if let Some(radius) = hyprland_panel_radius() {
+            theme.panel_radius = radius;
         }
         if let Some((family, size)) = terminal_font() {
             theme.font_family = family;
@@ -79,6 +93,34 @@ fn omarchy_colors() -> Option<std::collections::HashMap<String, String>> {
     let path = omarchy_theme_dir()?.join("colors.toml");
     let text = std::fs::read_to_string(path).ok()?;
     Some(parse_toml_scalars(&text))
+}
+
+/// Hyprland's live panel roundness: the same `hyprctl` query omarchy's shell
+/// runs, so whatever set `decoration:rounding` (theme, user config) wins.
+fn hyprland_panel_radius() -> Option<i32> {
+    let output = std::process::Command::new("hyprctl")
+        .args(["-j", "getoption", "decoration:rounding"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let json = String::from_utf8(output.stdout).ok()?;
+    parse_hyprctl_int(&json).filter(|radius| (0..=64).contains(radius))
+}
+
+/// The `"int": 8` out of hyprctl's JSON for a scalar option.
+fn parse_hyprctl_int(json: &str) -> Option<i32> {
+    let after_key = json.split("\"int\"").nth(1)?;
+    let after_colon = after_key.split_once(':')?.1.trim_start();
+    let digits: usize = after_colon
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .count();
+    if digits == 0 {
+        return None;
+    }
+    after_colon[..digits].parse().ok()
 }
 
 fn ansi_palette(colors: &std::collections::HashMap<String, String>) -> Vec<gdk::RGBA> {
@@ -308,8 +350,20 @@ size = 8.0
     fn default_theme_is_usable_without_omarchy() {
         let theme = Theme::default();
         assert_eq!(theme.palette.len(), 16);
+        assert!(theme.accent.alpha() > 0.0);
+        assert!((0..=64).contains(&theme.panel_radius));
         assert!(theme.font_size > 0.0);
         assert!(!theme.font_family.is_empty());
+    }
+
+    #[test]
+    fn hyprctl_json_is_parsed() {
+        // The exact shape hyprctl emits for a scalar option.
+        let json = r#"{"option": "decoration:rounding", "int": 12, "set": true }"#;
+        assert_eq!(parse_hyprctl_int(json), Some(12));
+        assert_eq!(parse_hyprctl_int(r#"{"int": 0, "set": true}"#), Some(0));
+        assert_eq!(parse_hyprctl_int("no int here"), None);
+        assert_eq!(parse_hyprctl_int(r#"{"int": }"#), None);
     }
 
     #[test]
@@ -319,5 +373,7 @@ size = 8.0
         let theme = Theme::load();
         assert_eq!(theme.palette.len(), 16);
         assert!(theme.foreground.alpha() > 0.0);
+        assert!(theme.accent.alpha() > 0.0);
+        assert!((0..=64).contains(&theme.panel_radius));
     }
 }

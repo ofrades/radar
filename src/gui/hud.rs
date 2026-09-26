@@ -256,6 +256,7 @@ impl Hud {
         if let Some(icon) = icon {
             let image = gtk::Image::from_icon_name(icon);
             image.add_css_class("dim-label");
+            image.set_pixel_size(16);
             box_.append(&image);
         }
         let text = gtk::Label::new(Some(label));

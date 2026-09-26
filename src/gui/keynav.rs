@@ -286,13 +286,46 @@ fn cycle_focus(app: &SharedApp, backwards: bool) {
     focus_target(app, &workspace, &targets[next].0);
 }
 
+/// The row the keys should land on in the sidebar: the current selection if
+/// the filter still shows it, else the first visible selectable row. The
+/// empty-list hint row is skipped — it is not selectable.
+pub(super) fn sidebar_focus_row(list: &gtk::ListBox) -> Option<gtk::ListBoxRow> {
+    if let Some(row) = list.selected_row() {
+        if row.get_visible() {
+            return Some(row);
+        }
+    }
+    let mut child = list.first_child();
+    while let Some(widget) = child {
+        if let Some(row) = widget.downcast_ref::<gtk::ListBoxRow>() {
+            if row.get_visible() && row.is_selectable() {
+                return Some(row.clone());
+            }
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
 /// Give the keys to a target: the primitive that is showing in the pane, or
 /// the project list. Arrow keys inside the sidebar switch projects — the
 /// list's own selection change does that.
 fn focus_target(app: &SharedApp, workspace: &Rc<super::Workspace>, target: &Target) {
     match target {
         Target::Sidebar => {
-            app.sidebar_list.grab_focus();
+            // grab_focus on the list itself would park the keys on the bare
+            // list, which keeps no cursor row: arrows would be dead and no
+            // row would look focused. Focus a row instead — the list's cursor
+            // follows it, so plain arrows then walk the projects and the
+            // selection change switches them.
+            match sidebar_focus_row(&app.sidebar_list) {
+                Some(row) => {
+                    row.grab_focus();
+                }
+                None => {
+                    app.sidebar_list.grab_focus();
+                }
+            }
         }
         Target::Pane(group) => {
             if let Some(slot) = group.active_slot() {

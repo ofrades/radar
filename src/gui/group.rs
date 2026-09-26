@@ -115,11 +115,9 @@ pub struct Group {
 impl Group {
     pub fn new() -> Rc<Group> {
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        // The strip spans the pane's full width; chips are inset by CSS
+        // padding so the surface itself reaches the pane's edges.
         header.add_css_class("group-header");
-        header.set_margin_start(6);
-        header.set_margin_end(4);
-        header.set_margin_top(2);
-        header.set_margin_bottom(2);
 
         let menu_button = gtk::MenuButton::builder()
             .icon_name("view-more-symbolic")
@@ -160,14 +158,38 @@ impl Group {
         widget.add_overlay(&edge);
 
         // A secondary click anywhere in a pane opens the same menu as the
-        // three-dot button and the Menu key.
+        // three-dot button and the Menu key — but at the pointer, like any
+        // context menu, not anchored up at the button.
         let context_menu = menu_button.clone();
+        let menu_origin = widget.clone();
+        let pointing_wired = std::cell::Cell::new(false);
         let context_click = gtk::GestureClick::new();
         context_click.set_button(3);
         context_click.set_propagation_phase(gtk::PropagationPhase::Capture);
-        context_click.connect_pressed(move |gesture, _, _, _| {
+        context_click.connect_pressed(move |gesture, _, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
             context_menu.grab_focus();
+            // Point the popover at the pointer. The rect is in the menu
+            // button's coordinate space, because the button parents the
+            // popover — and the popover only exists once a menu model has
+            // been set. If either widget is not on screen yet, fall through
+            // and the menu opens at the button as before.
+            if let Some(popover) = context_menu.popover() {
+                if let Some((x, y)) = menu_origin.translate_coordinates(&context_menu, x, y) {
+                    popover.set_pointing_to(Some(&gdk::Rectangle::new(
+                        x.round() as i32,
+                        y.round() as i32,
+                        1,
+                        1,
+                    )));
+                    if !pointing_wired.get() {
+                        pointing_wired.set(true);
+                        // Hand the anchor back once the menu closes, so the
+                        // button itself and the Menu key open at the button.
+                        popover.connect_closed(|popover| popover.set_pointing_to(None));
+                    }
+                }
+            }
             context_menu.popup();
         });
         widget.add_controller(context_click);
@@ -199,21 +221,20 @@ impl Group {
     fn accept_drags(group: &Rc<Group>) {
         use gtk::PropagationPhase;
 
-        // Hovering a pane activates its current primitive through the same
-        // window action used by chip hover and keyboard focus.
+        // Hovering a pane is focusing it: the motion controller forwards the
+        // enter to `hover_primitive`, which (only for a pointer that is really
+        // moving) focuses the pane's primitive — and the ring that follows
+        // keyboard focus marks it. No separate hover highlight.
         let hover = gtk::EventControllerMotion::new();
         hover.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let pane_on_enter = group.widget.clone();
         let group_on_enter = group.clone();
         hover.connect_enter(move |_, _, _| {
-            pane_on_enter.add_css_class("pointer-hover");
             if let Some(slot) = group_on_enter.active_slot() {
-                let _ = pane_on_enter
+                let _ = group_on_enter
+                    .widget
                     .activate_action("win.primitive-hover", Some(&slot.as_str().to_variant()));
             }
         });
-        let pane_on_leave = group.widget.clone();
-        hover.connect_leave(move |_| pane_on_leave.remove_css_class("pointer-hover"));
         group.widget.add_controller(hover);
 
         // ---- drag a pane by its header ----
@@ -466,7 +487,11 @@ impl Group {
             }
 
             let inner = gtk::Box::new(gtk::Orientation::Horizontal, 5);
-            inner.append(&gtk::Image::from_icon_name(icon_name(*slot)));
+            let image = gtk::Image::from_icon_name(icon_name(*slot));
+            // Chips are the most compact headers: their icons follow the
+            // small caption text.
+            image.set_pixel_size(14);
+            inner.append(&image);
             let label = gtk::Label::new(Some(label_for(*slot)));
             label.add_css_class("caption-heading");
             inner.append(&label);
