@@ -37,6 +37,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Run the persistent session daemon (foreground; independent of the GUI)
+    Serve,
+    /// Control daemon-owned sessions without a GUI
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
     /// List projects with their git status
     List,
     /// Add one or more project directories
@@ -58,7 +65,11 @@ enum Command {
     /// Mark a project as opened and show what its tabs resolve to
     Open { path: PathBuf },
     /// Pin or unpin a project
-    Pin { path: PathBuf, #[arg(long)] off: bool },
+    Pin {
+        path: PathBuf,
+        #[arg(long)]
+        off: bool,
+    },
     /// Move a project up or down in the sidebar
     Move {
         path: PathBuf,
@@ -113,6 +124,63 @@ enum Command {
     },
     /// Open the native app (needs a build with --features gui)
     Gui,
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionAction {
+    /// Create a session, or return the existing session with this ID
+    Spawn {
+        id: String,
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        #[arg(long, default_value_t = 80)]
+        cols: u16,
+        #[arg(long, default_value_t = 24)]
+        rows: u16,
+        #[arg(required = true, trailing_var_arg = true)]
+        argv: Vec<String>,
+    },
+    List,
+    /// Print an authoritative display snapshot as JSON
+    Snapshot {
+        id: String,
+    },
+    /// Snapshot then sequenced raw output frames as JSON (not a terminal renderer)
+    Stream {
+        id: String,
+    },
+    /// Status then lifecycle/title/bell feedback, independent of terminal output
+    Watch {
+        id: String,
+    },
+    /// Send literal input (use shell quoting for newline/control characters)
+    Input {
+        id: String,
+        text: String,
+    },
+    Resize {
+        id: String,
+        cols: u16,
+        rows: u16,
+    },
+    Stop {
+        id: String,
+    },
+    /// Release an ended session's retained screen/history and ID
+    Forget {
+        id: String,
+    },
+    /// Fetch up to 200 scrollback rows at a snapshot's sequence, newest first
+    History {
+        id: String,
+        sequence: u64,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Stop all sessions and shut down the daemon
+    Shutdown,
 }
 
 #[derive(Subcommand, Debug)]
@@ -207,17 +275,115 @@ enum HookAction {
     },
 }
 
+fn session_command(paths: &Paths, action: SessionAction) -> Result<()> {
+    use radar::session::daemon::{Client, Command as Request, Response};
+    use radar::session::registry::{Feedback, Lifecycle, Output, Spawn};
+    use radar::session::Dims;
+    let streaming = matches!(
+        action,
+        SessionAction::Stream { .. } | SessionAction::Watch { .. }
+    );
+    let request = match action {
+        SessionAction::Spawn {
+            id,
+            cwd,
+            cols,
+            rows,
+            argv,
+        } => Request::Create(Spawn {
+            id,
+            cwd: cwd.canonicalize()?,
+            argv,
+            dims: Dims { cols, rows },
+            env: Vec::new(),
+            env_remove: Vec::new(),
+        }),
+        SessionAction::List => Request::List,
+        SessionAction::Snapshot { id } | SessionAction::Stream { id } => Request::Attach { id },
+        SessionAction::Watch { id } => Request::Watch { id },
+        SessionAction::Input { id, text } => Request::Input {
+            id,
+            bytes: text.into_bytes(),
+        },
+        SessionAction::Resize { id, cols, rows } => Request::Resize {
+            id,
+            dims: Dims { cols, rows },
+        },
+        SessionAction::Stop { id } => Request::Stop { id },
+        SessionAction::Forget { id } => Request::Forget { id },
+        SessionAction::History {
+            id,
+            sequence,
+            offset,
+            limit,
+        } => Request::History {
+            id,
+            sequence,
+            offset,
+            limit,
+        },
+        SessionAction::Shutdown => Request::Shutdown,
+    };
+    let mut client = Client::connect(&paths.data_dir, request)?;
+    let mut stream_closed = false;
+    let mut process_ended = false;
+    loop {
+        let response = client.receive()?;
+        let resync = matches!(response, Response::ResyncRequired);
+        let complete = match &response {
+            Response::Snapshot(snapshot) => snapshot.status.stream_closed,
+            Response::Output(event) => matches!(event.event, Output::Closed),
+            Response::Watching { status, .. } => {
+                stream_closed = status.stream_closed;
+                process_ended = !matches!(status.lifecycle, Lifecycle::Running);
+                stream_closed && process_ended
+            }
+            Response::Feedback(event) => {
+                match &event.event {
+                    Feedback::StreamClosed => stream_closed = true,
+                    Feedback::Lifecycle(lifecycle) => {
+                        process_ended = !matches!(lifecycle, Lifecycle::Running)
+                    }
+                    _ => {}
+                }
+                stream_closed && process_ended
+            }
+            _ => false,
+        };
+        println!("{}", serde_json::to_string(&response)?);
+        if resync {
+            anyhow::bail!("stream lagged; attach again for a fresh snapshot");
+        }
+        if !streaming || complete {
+            break;
+        }
+        client.set_read_timeout(None)?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = match &cli.home {
         Some(root) => Paths::with_root(root),
         None => Paths::resolve(),
     };
+    // The daemon/session API has no database or GTK initialization dependency.
+    match cli.command {
+        Some(Command::Serve) => {
+            return radar::session::daemon::Server::bind(&paths.data_dir)?.run()
+        }
+        Some(Command::Session { action }) => return session_command(&paths, action),
+        _ => {}
+    }
     let db = Db::open(&paths)?;
 
     match cli.command {
         // No subcommand: this is the app.
         None | Some(Command::Gui) => run_gui(paths, db),
+        Some(Command::Serve | Command::Session { .. }) => {
+            unreachable!("handled before opening the database")
+        }
         Some(Command::List) => list(&db, cli.json),
         Some(Command::Add {
             paths: to_add,
@@ -289,7 +455,14 @@ fn main() -> Result<()> {
                 column,
                 body,
                 by,
-            } => card_add(&db, path, &title, column.as_deref(), body.as_deref(), by.as_deref()),
+            } => card_add(
+                &db,
+                path,
+                &title,
+                column.as_deref(),
+                body.as_deref(),
+                by.as_deref(),
+            ),
             CardAction::Claim { path, title, by } => {
                 card_claim(&db, path, &title, Some(&by), cli.json)
             }
@@ -303,11 +476,7 @@ fn main() -> Result<()> {
             } => card_next(&db, path, &by, in_column.as_deref(), cli.json),
         },
         Some(Command::Hook { action }) => match action {
-            HookAction::Guard {
-                file,
-                commit,
-                path,
-            } => {
+            HookAction::Guard { file, commit, path } => {
                 if commit {
                     hook_commit_guard(&db, path)
                 } else {
@@ -512,7 +681,11 @@ fn hook_guard(_db: &Db, file: Option<PathBuf>, path: Option<PathBuf>) -> Result<
 
     let dir = board_dir(path)?;
     let who = std::env::var("RADAR_AGENT").ok().filter(|s| !s.is_empty());
-    guard_exit(radar::skill::guard_decision(&dir, who.as_deref(), file.as_deref()))
+    guard_exit(radar::skill::guard_decision(
+        &dir,
+        who.as_deref(),
+        file.as_deref(),
+    ))
 }
 
 /// The commit gate: the git pre-commit hook's half of the convention. No file
@@ -768,7 +941,11 @@ fn prefs(db: &Db, slot: Option<String>, program: Option<String>, json: bool) -> 
                 "shell" => Slot::Shell,
                 other => anyhow::bail!("unknown slot {other} (editor, agent, diff, shell)"),
             };
-            let program = if program == "none" { None } else { Some(program) };
+            let program = if program == "none" {
+                None
+            } else {
+                Some(program)
+            };
             if let Some(id) = program.as_deref() {
                 anyhow::ensure!(
                     programs::by_id(id).is_some(),
@@ -806,7 +983,9 @@ fn prefs(db: &Db, slot: Option<String>, program: Option<String>, json: bool) -> 
                 println!(
                     "{}: {}",
                     slot.as_str(),
-                    resolved.map(|p| p.name).unwrap_or_else(|| "nothing installed".into())
+                    resolved
+                        .map(|p| p.name)
+                        .unwrap_or_else(|| "nothing installed".into())
                 );
             }
             return Ok(());
@@ -884,7 +1063,11 @@ fn show_agents(db: &Db, json: bool) -> Result<()> {
             "{mark} {:<18} {:<16} {}",
             row["id"].as_str().unwrap_or(""),
             row["name"].as_str().unwrap_or(""),
-            if row["installed"] == true { "installed" } else { "not installed" }
+            if row["installed"] == true {
+                "installed"
+            } else {
+                "not installed"
+            }
         );
     }
     Ok(())
@@ -932,7 +1115,11 @@ fn show_programs(kind: Option<String>, json: bool) -> Result<()> {
                 "  {:<16} {:<18} {:<12} {}",
                 program.id,
                 program.name,
-                if program.installed() { "installed" } else { "missing" },
+                if program.installed() {
+                    "installed"
+                } else {
+                    "missing"
+                },
                 program.detail()
             );
         }
@@ -955,7 +1142,11 @@ fn find(db: &Db, query: &str, root: PathBuf, depth: usize, limit: usize, json: b
         println!("nothing matches {query:?} under {}", root.display());
         return Ok(());
     }
-    let width = hits.iter().map(|c| c.name.chars().count()).max().unwrap_or(4);
+    let width = hits
+        .iter()
+        .map(|c| c.name.chars().count())
+        .max()
+        .unwrap_or(4);
     for candidate in hits {
         println!(
             "{marker} {name:width$}  {path}{known}",
@@ -963,7 +1154,11 @@ fn find(db: &Db, query: &str, root: PathBuf, depth: usize, limit: usize, json: b
             name = candidate.name,
             width = width,
             path = candidate.display_path(),
-            known = if candidate.known { "  (already added)" } else { "" },
+            known = if candidate.known {
+                "  (already added)"
+            } else {
+                ""
+            },
         );
     }
     Ok(())
@@ -992,17 +1187,42 @@ fn doctor(paths: &Paths, db: &Db) -> Result<()> {
 
     // name, present, what it gives us, how to get it when missing
     let checks: [(&str, bool, &str, &str); 8] = [
-        ("git", radar::config::have("git"), "project status", "pacman -S git"),
-        ("fd", radar::config::have("fd"), "fast directory scanning", "pacman -S fd"),
-        ("rg", radar::config::have("rg"), "searching", "pacman -S ripgrep"),
-        ("fzf", radar::config::have("fzf"), "external fuzzy picking", "pacman -S fzf"),
+        (
+            "git",
+            radar::config::have("git"),
+            "project status",
+            "pacman -S git",
+        ),
+        (
+            "fd",
+            radar::config::have("fd"),
+            "fast directory scanning",
+            "pacman -S fd",
+        ),
+        (
+            "rg",
+            radar::config::have("rg"),
+            "searching",
+            "pacman -S ripgrep",
+        ),
+        (
+            "fzf",
+            radar::config::have("fzf"),
+            "external fuzzy picking",
+            "pacman -S fzf",
+        ),
         (
             "omarchy",
             radar::config::have("omarchy"),
             "default agent + agent flags",
             "part of omarchy",
         ),
-        ("lazygit", radar::config::have("lazygit"), "diff tabs", "pacman -S lazygit"),
+        (
+            "lazygit",
+            radar::config::have("lazygit"),
+            "diff tabs",
+            "pacman -S lazygit",
+        ),
         (
             "libvte-2.91-gtk4",
             vte_available(),
@@ -1047,13 +1267,18 @@ fn doctor(paths: &Paths, db: &Db) -> Result<()> {
 
 /// Is the GTK4 VTE development file present, which is what the build needs?
 fn vte_available() -> bool {
-    ["/usr/lib/pkgconfig/vte-2.91-gtk4.pc", "/usr/lib64/pkgconfig/vte-2.91-gtk4.pc"]
-        .iter()
-        .any(|path| std::path::Path::new(path).exists())
+    [
+        "/usr/lib/pkgconfig/vte-2.91-gtk4.pc",
+        "/usr/lib64/pkgconfig/vte-2.91-gtk4.pc",
+    ]
+    .iter()
+    .any(|path| std::path::Path::new(path).exists())
         || std::env::var("PKG_CONFIG_PATH")
-            .map(|paths| paths.split(':').any(|dir| {
-                std::path::Path::new(dir).join("vte-2.91-gtk4.pc").exists()
-            }))
+            .map(|paths| {
+                paths
+                    .split(':')
+                    .any(|dir| std::path::Path::new(dir).join("vte-2.91-gtk4.pc").exists())
+            })
             .unwrap_or(false)
 }
 

@@ -144,6 +144,18 @@ radar hook guard            # the board's pre-edit check, for harness hooks
 radar doctor                # environment check
 ```
 
+## Persistent session daemon (client/server groundwork)
+
+`radar serve` runs a GTK-free session daemon; `radar session spawn`, `list`,
+`snapshot`, `stream`, `watch`, `input`, `resize`, `stop`, and `forget` expose its
+client API. Daemon sessions survive client exits. Terminal output and lifecycle
+feedback have separate bounded streams with explicit resync on overload.
+
+See [the daemon guide](docs/session-daemon.md) for commands and protocol details.
+The v1 snapshot is for display/inspection; complete terminal-state import and
+GUI attachment are the next integration step. The GUI currently uses the local
+VTE bridge.
+
 ## The board
 
 Every project has a kanban, and the kanban is a file: `BOARD.md` in the project
