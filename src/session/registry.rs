@@ -16,8 +16,11 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Grid};
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::{cell::Cell, Config, Term};
-use alacritty_terminal::vte::ansi::{Processor, Rgb};
+use alacritty_terminal::term::{
+    cell::{Cell, Flags, LineLength},
+    Config, Term, TermMode,
+};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use anyhow::{anyhow, bail, Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
@@ -28,6 +31,9 @@ const QUEUE_CAPACITY: usize = 32;
 const CHUNK: usize = 8192;
 const INPUT_LIMIT: usize = 64 * 1024;
 const POLL_MS: i32 = 20;
+/// A compatibility replay seeds the visible VTE renderer. Oldest scrollback
+/// rows are omitted rather than making initial attachment an unbounded frame.
+const SNAPSHOT_REPLAY_LIMIT: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Spawn {
@@ -56,8 +62,8 @@ pub struct Status {
     pub stream_closed: bool,
 }
 
-/// A display snapshot, not a serialized parser. Consumers importing it must
-/// understand this schema; a VTE ANSI rehydration adapter is a separate concern.
+/// A display snapshot plus a bounded ANSI replay for a renderer with compatible
+/// terminal semantics. It does not encode Alacritty's private parser internals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub status: Status,
@@ -70,6 +76,9 @@ pub struct Snapshot {
     /// history before showing the current screen.
     pub history_lines: usize,
     pub mode: u32,
+    /// Bounded ANSI rehydration for a compatible interactive renderer. The
+    /// authoritative raw stream starts immediately after `sequence`.
+    pub replay: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,6 +350,7 @@ impl ManagedSession {
             history_lines: source.history_size(),
             grid,
             mode: state.term.mode().bits(),
+            replay: replay_term(&state.term, state.status.title.as_deref()),
         };
         (snapshot, state.output.subscribe())
     }
@@ -527,6 +537,212 @@ fn validate_dims(dims: Dims) -> Result<()> {
         bail!("terminal dimensions must be 2..500 columns and 1..300 rows");
     }
     Ok(())
+}
+
+/// Rebuild the visible screen and the newest scrollback in a fresh ANSI renderer.
+/// The replay is made under the same lock/watermark as the raw stream, so no
+/// output can fall between the display image and its first stream sequence.
+fn replay_term(term: &Term<ParserEvents>, title: Option<&str>) -> Vec<u8> {
+    let mode = term.mode();
+    let grid = term.grid();
+    let mut out = Vec::with_capacity(1024);
+    out.extend_from_slice(b"\x1bc");
+
+    // When the application is on the alternate screen, recreate that screen
+    // first; primary scrollback remains available to the daemon's history API.
+    if mode.contains(TermMode::ALT_SCREEN) {
+        out.extend_from_slice(b"\x1b[?1049h");
+    } else {
+        let mut history = Vec::new();
+        let mut used = 0;
+        for index in 1..=grid.history_size() {
+            let (row, soft_wrap) = encode_row(&grid[Line(-(index as i32))]);
+            if used + row.len() > SNAPSHOT_REPLAY_LIMIT / 2 {
+                break;
+            }
+            used += row.len();
+            history.push((row, soft_wrap));
+        }
+        for (row, soft_wrap) in history.iter().rev() {
+            out.extend_from_slice(row);
+            if !soft_wrap {
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+    }
+
+    // Painting the last column would otherwise leave a pending wrap, which
+    // can spuriously scroll one blank row when the replay moves its cursor.
+    out.extend_from_slice(b"\x1b[?7l\x1b[0m\x1b[2J\x1b[H");
+    for row in 0..grid.screen_lines() {
+        out.extend_from_slice(format!("\x1b[{};1H", row + 1).as_bytes());
+        out.extend_from_slice(&encode_row(&grid[Line(row as i32)]).0);
+    }
+    out.extend_from_slice(b"\x1b[0m");
+
+    // Restore the common DEC modes that govern subsequent raw input/output.
+    for (flag, sequence) in [
+        (TermMode::APP_CURSOR, b"\x1b[?1h".as_slice()),
+        (TermMode::ORIGIN, b"\x1b[?6h".as_slice()),
+        (TermMode::LINE_WRAP, b"\x1b[?7h".as_slice()),
+        (TermMode::MOUSE_REPORT_CLICK, b"\x1b[?1000h".as_slice()),
+        (TermMode::MOUSE_DRAG, b"\x1b[?1002h".as_slice()),
+        (TermMode::MOUSE_MOTION, b"\x1b[?1003h".as_slice()),
+        (TermMode::FOCUS_IN_OUT, b"\x1b[?1004h".as_slice()),
+        (TermMode::UTF8_MOUSE, b"\x1b[?1005h".as_slice()),
+        (TermMode::SGR_MOUSE, b"\x1b[?1006h".as_slice()),
+        (TermMode::ALTERNATE_SCROLL, b"\x1b[?1007h".as_slice()),
+        (TermMode::BRACKETED_PASTE, b"\x1b[?2004h".as_slice()),
+        (TermMode::LINE_FEED_NEW_LINE, b"\x1b[20h".as_slice()),
+        (TermMode::INSERT, b"\x1b[4h".as_slice()),
+    ] {
+        if mode.contains(flag) {
+            out.extend_from_slice(sequence);
+        }
+    }
+    if mode.contains(TermMode::APP_KEYPAD) {
+        out.extend_from_slice(b"\x1b=");
+    }
+    if !mode.contains(TermMode::LINE_WRAP) {
+        out.extend_from_slice(b"\x1b[?7l");
+    }
+    if !mode.contains(TermMode::SHOW_CURSOR) {
+        out.extend_from_slice(b"\x1b[?25l");
+    }
+    let kitty = ((mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) as u8)
+        | ((mode.contains(TermMode::REPORT_EVENT_TYPES) as u8) << 1)
+        | ((mode.contains(TermMode::REPORT_ALTERNATE_KEYS) as u8) << 2)
+        | ((mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) as u8) << 3)
+        | ((mode.contains(TermMode::REPORT_ASSOCIATED_TEXT) as u8) << 4)) as u32;
+    if kitty != 0 {
+        out.extend_from_slice(format!("\x1b[>{kitty}u").as_bytes());
+    }
+    if let Some(title) = title {
+        // OSC content must not be allowed to inject a terminator.
+        let safe = title.replace(['\x1b', '\x07'], "�");
+        out.extend_from_slice(format!("\x1b]0;{safe}\x07").as_bytes());
+    }
+    let cursor = grid.cursor.point;
+    out.extend_from_slice(
+        format!(
+            "\x1b[{};{}H",
+            cursor.line.0.max(0) as usize + 1,
+            cursor.column.0 + 1
+        )
+        .as_bytes(),
+    );
+    if out.len() > SNAPSHOT_REPLAY_LIMIT {
+        // Screen dimensions are capped and should fit comfortably. Defensive
+        // truncation leaves a reset prefix and a bounded message if not.
+        out.truncate(SNAPSHOT_REPLAY_LIMIT);
+    }
+    out
+}
+
+fn encode_row(row: &alacritty_terminal::grid::Row<Cell>) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    let mut previous: Option<Vec<u16>> = None;
+    for cell in row[..].iter().take(row.line_length().0) {
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            continue;
+        }
+        let sgr = cell_sgr(cell);
+        if previous.as_ref() != Some(&sgr) {
+            out.extend_from_slice(b"\x1b[");
+            for (index, code) in sgr.iter().enumerate() {
+                if index > 0 {
+                    out.push(b';');
+                }
+                out.extend_from_slice(code.to_string().as_bytes());
+            }
+            out.push(b'm');
+            previous = Some(sgr);
+        }
+        let mut utf8 = [0; 4];
+        out.extend_from_slice(cell.c.encode_utf8(&mut utf8).as_bytes());
+        if let Some(extra) = cell.zerowidth() {
+            for character in extra {
+                let mut utf8 = [0; 4];
+                out.extend_from_slice(character.encode_utf8(&mut utf8).as_bytes());
+            }
+        }
+    }
+    let soft_wrap = row
+        .last()
+        .is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE));
+    (out, soft_wrap)
+}
+
+fn cell_sgr(cell: &Cell) -> Vec<u16> {
+    let mut codes = vec![0];
+    for (flag, code) in [
+        (Flags::BOLD, 1),
+        (Flags::DIM, 2),
+        (Flags::ITALIC, 3),
+        (Flags::UNDERLINE, 4),
+        (Flags::INVERSE, 7),
+        (Flags::HIDDEN, 8),
+        (Flags::STRIKEOUT, 9),
+    ] {
+        if cell.flags.contains(flag) {
+            codes.push(code);
+        }
+    }
+    codes.extend(color_sgr(cell.fg, true));
+    codes.extend(color_sgr(cell.bg, false));
+    codes
+}
+
+fn color_sgr(color: Color, foreground: bool) -> Vec<u16> {
+    match color {
+        Color::Spec(Rgb { r, g, b }) => vec![
+            if foreground { 38 } else { 48 },
+            2,
+            r as u16,
+            g as u16,
+            b as u16,
+        ],
+        Color::Indexed(index) => vec![if foreground { 38 } else { 48 }, 5, index as u16],
+        Color::Named(named) => {
+            let base = if foreground { 30 } else { 40 };
+            let bright = if foreground { 90 } else { 100 };
+            match named {
+                NamedColor::Black => vec![base],
+                NamedColor::Red => vec![base + 1],
+                NamedColor::Green => vec![base + 2],
+                NamedColor::Yellow => vec![base + 3],
+                NamedColor::Blue => vec![base + 4],
+                NamedColor::Magenta => vec![base + 5],
+                NamedColor::Cyan => vec![base + 6],
+                NamedColor::White => vec![base + 7],
+                NamedColor::BrightBlack => vec![bright],
+                NamedColor::BrightRed => vec![bright + 1],
+                NamedColor::BrightGreen => vec![bright + 2],
+                NamedColor::BrightYellow => vec![bright + 3],
+                NamedColor::BrightBlue => vec![bright + 4],
+                NamedColor::BrightMagenta => vec![bright + 5],
+                NamedColor::BrightCyan => vec![bright + 6],
+                NamedColor::BrightWhite => vec![bright + 7],
+                NamedColor::DimBlack => vec![2, base],
+                NamedColor::DimRed => vec![2, base + 1],
+                NamedColor::DimGreen => vec![2, base + 2],
+                NamedColor::DimYellow => vec![2, base + 3],
+                NamedColor::DimBlue => vec![2, base + 4],
+                NamedColor::DimMagenta => vec![2, base + 5],
+                NamedColor::DimCyan => vec![2, base + 6],
+                NamedColor::DimWhite => vec![2, base + 7],
+                NamedColor::Foreground | NamedColor::DimForeground => {
+                    vec![if foreground { 39 } else { 49 }]
+                }
+                NamedColor::Background => vec![if foreground { 39 } else { 49 }],
+                NamedColor::BrightForeground => vec![if foreground { 97 } else { 107 }],
+                NamedColor::Cursor => vec![if foreground { 39 } else { 49 }],
+            }
+        }
+    }
 }
 
 fn pty_size(dims: Dims) -> PtySize {
@@ -1031,5 +1247,76 @@ mod tests {
         });
         until(|| registry.forget("blocked-input").is_ok());
         assert!(registry.list().is_empty());
+    }
+
+    #[test]
+    fn ansi_replay_reconstructs_scrollback_visible_cells_attributes_cursor_and_modes() {
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let dims = Dims { cols: 12, rows: 4 };
+        let source_events = ParserEvents(Arc::new(Mutex::new(Vec::new())));
+        let mut source = Term::new(
+            Config {
+                scrolling_history: 40,
+                ..Config::default()
+            },
+            &dims,
+            source_events,
+        );
+        let mut source_parser: Processor = Processor::new();
+        source_parser.advance(
+            &mut source,
+            b"old-one\r\nold-two\r\nline-three\r\nline-four\r\n\x1b[31;1mred\x1b[0m\r\nactive\x1b[?1h\x1b[?2004h",
+        );
+        let replay = replay_term(&source, Some("snapshot title"));
+
+        let target_events = ParserEvents(Arc::new(Mutex::new(Vec::new())));
+        let mut target = Term::new(
+            Config {
+                scrolling_history: 40,
+                ..Config::default()
+            },
+            &dims,
+            target_events.clone(),
+        );
+        let mut target_parser: Processor = Processor::new();
+        target_parser.advance(&mut target, &replay);
+
+        // ANSI replay can leave one empty sentinel row in Alacritty's history;
+        // visible content and the source history lines remain intact.
+        assert!(target.grid().history_size() >= source.grid().history_size());
+        for line in 0..source.grid().screen_lines() as i32 {
+            for column in 0..dims.cols as usize {
+                let before = &source.grid()[Line(line)][Column(column)];
+                let after = &target.grid()[Line(line)][Column(column)];
+                assert_eq!(after.c, before.c, "cell differs at {line}:{column}");
+                assert_eq!(after.fg, before.fg, "foreground differs at {line}:{column}");
+                assert_eq!(after.bg, before.bg, "background differs at {line}:{column}");
+                assert_eq!(
+                    after.flags.bits() & !Flags::WRAPLINE.bits(),
+                    before.flags.bits() & !Flags::WRAPLINE.bits()
+                );
+            }
+        }
+        for offset in 1..=source.grid().history_size() {
+            for column in 0..dims.cols as usize {
+                assert_eq!(
+                    target.grid()[Line(-(offset as i32))][Column(column)].c,
+                    source.grid()[Line(-(offset as i32))][Column(column)].c,
+                    "scrollback differs at row -{offset}, column {column}",
+                );
+            }
+        }
+        assert_eq!(target.grid().cursor.point, source.grid().cursor.point);
+        assert_eq!(
+            target.mode().bits() & (TermMode::APP_CURSOR | TermMode::BRACKETED_PASTE).bits(),
+            (TermMode::APP_CURSOR | TermMode::BRACKETED_PASTE).bits()
+        );
+        assert!(target_events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, Event::Title(title) if title == "snapshot title")));
     }
 }

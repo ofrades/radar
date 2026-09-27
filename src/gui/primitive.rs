@@ -1,8 +1,9 @@
 //! A primitive: one of the things a project workspace is made of.
 //!
 //! Editor, agent, diff, terminal — and the board, radar's one built-in. No
-//! tabs, no tab strips. A pane is a small header (icon, program, menu) over a
-//! terminal running that program, and hiding a pane does not stop its program:
+//! tabs, no tab strips. A pane is a small header over a terminal running that
+//! program — the header carries the live info, the program dropdown and the
+//! close right on the chip — and hiding a pane does not stop its program:
 //! the widget is detached, the process and its pty keep going, so an agent
 //! never dies because you looked away.
 

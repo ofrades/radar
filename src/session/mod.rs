@@ -1,9 +1,10 @@
 //! A program in a pty, owned away from any particular view.
 //!
 //! [`registry`] and [`daemon`] implement the daemon-owned runtime and local
-//! snapshot/stream API. The `Session` bridge below remains the phase-1 VTE
-//! compatibility path until the GUI has a complete terminal-state importer;
-//! its widget-owned lifetime is not the daemon's lifetime model.
+//! snapshot/stream API; [`client`] attaches a VTE renderer through a local PTY
+//! adapter. The `Session` bridge below remains as the phase-1 compatibility
+//! implementation used by probes and its original unit tests, not the GUI's
+//! process owner.
 //!
 //! This is the seam for the client/server split: everything here is
 //! GTK-free, so a session can outlive the widget that renders it — which
@@ -54,6 +55,9 @@ use alacritty_terminal::vte::ansi::{self, Processor};
 use anyhow::{anyhow, bail, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
+pub mod activity;
+#[cfg(feature = "vte")]
+pub mod client;
 pub mod daemon;
 pub mod registry;
 
@@ -240,7 +244,8 @@ impl Session {
         let (fake_master, fake_slave) = open_pty_pair(dims)?;
         for fd in [fake_master, fake_slave] {
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
+            if flags == -1
+                || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
             {
                 bail!("fcntl on bridge pty: {}", std::io::Error::last_os_error());
             }
@@ -281,9 +286,7 @@ impl Session {
             .as_raw_fd()
             .ok_or_else(|| anyhow!("pty master has no descriptor"))?;
 
-        let proxy = Proxy {
-            emit: emit.clone(),
-        };
+        let proxy = Proxy { emit: emit.clone() };
         let config = Config {
             scrolling_history: SCROLLBACK_LINES,
             ..Config::default()
@@ -331,6 +334,17 @@ impl Session {
     /// The device name of the program's tty, when the kernel knows it.
     pub fn tty_name(&self) -> Option<std::path::PathBuf> {
         self.master.as_ref().and_then(|master| master.tty_name())
+    }
+
+    /// The running program's process id, while it lives. How a board
+    /// claim is matched to the exact tab that owns it: the child's own
+    /// `RADAR_AGENT` environment tells the instances of a program apart.
+    pub fn process_id(&self) -> Option<u32> {
+        self.inner
+            .child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .process_id()
     }
 
     /// Bytes a client writes on its own behalf: keystrokes for a
@@ -519,7 +533,13 @@ fn open_pty_pair(dims: Dims) -> Result<(libc::c_int, libc::c_int)> {
     };
     let result = unsafe {
         #[allow(clippy::unnecessary_mut_passed)]
-        libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &mut winsize)
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &mut winsize,
+        )
     };
     if result != 0 {
         bail!("openpty: {}", std::io::Error::last_os_error());
@@ -677,11 +697,7 @@ mod tests {
             ws_ypixel: 0,
         };
         unsafe {
-            libc::ioctl(
-                session.session.client_fd(),
-                libc::TIOCSWINSZ,
-                &winsize,
-            );
+            libc::ioctl(session.session.client_fd(), libc::TIOCSWINSZ, &winsize);
         }
         // The mirror notices within one poll heartbeat.
         std::thread::sleep(Duration::from_millis(300));
@@ -700,7 +716,10 @@ mod tests {
         // stable once set.
         let session = TestSession::spawn(&["sleep", "5"], &scratch("resize"));
         std::thread::sleep(Duration::from_millis(300));
-        session.session.resize(Dims { cols: 100, rows: 30 });
+        session.session.resize(Dims {
+            cols: 100,
+            rows: 30,
+        });
         let term = session.session.screen();
         assert_eq!(term.columns(), 100);
         assert_eq!(term.screen_lines(), 30);
@@ -708,12 +727,12 @@ mod tests {
 
     #[test]
     fn title_and_bell_arrive_as_events() {
-        let session = TestSession::spawn(
-            &["printf", "\\033]0;my title\\007\\007"],
-            &scratch("title"),
-        );
+        let session =
+            TestSession::spawn(&["printf", "\\033]0;my title\\007\\007"], &scratch("title"));
         session.wait_for("title and bell", |events| {
-            events.iter().any(|e| matches!(e, SessionEvent::Title(t) if t == "my title"))
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Title(t) if t == "my title"))
                 && events.iter().any(|e| matches!(e, SessionEvent::Bell))
         });
     }

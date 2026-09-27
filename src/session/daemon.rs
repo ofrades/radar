@@ -15,6 +15,11 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+use super::activity::{
+    ActivityEvent, ActivityJournal, ActivityReceiveError, ActivitySnapshot, ActivitySubscription,
+    Attention, AttentionMutationResult, ChangeAttention, CreateAttention, CreateAttentionResult,
+    PublishActivity, WatchResult,
+};
 use super::registry::{
     Feedback, History, Lifecycle, Output, ReceiveError, Registry, Sequenced, Snapshot, Spawn,
     Status, Subscription,
@@ -64,21 +69,52 @@ pub enum Command {
         id: String,
     },
     Shutdown,
+    PublishActivity(PublishActivity),
+    CreateAttention(CreateAttention),
+    ChangeAttention(ChangeAttention),
+    AttentionStatus {
+        project_id: i64,
+        request_id: String,
+    },
+    ActivitySnapshot {
+        project_id: i64,
+        after_sequence: Option<u64>,
+        limit: usize,
+    },
+    WatchActivity {
+        project_id: i64,
+        after_sequence: u64,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
-    Hello { version: u32 },
+    Hello {
+        version: u32,
+    },
     Ok,
     Error(String),
     Status(Status),
     Sessions(Vec<Status>),
     Snapshot(Box<Snapshot>),
     History(History),
-    Watching { status: Status, sequence: u64 },
+    Watching {
+        status: Status,
+        sequence: u64,
+    },
     Output(Sequenced<Output>),
     Feedback(Sequenced<Feedback>),
     ResyncRequired,
+    Activity(ActivityEvent),
+    ActivityPublished(ActivityEvent),
+    ActivitySnapshot(ActivitySnapshot),
+    ActivityWatching {
+        after_sequence: u64,
+        snapshot: ActivitySnapshot,
+    },
+    AttentionCreated(CreateAttentionResult),
+    AttentionChanged(AttentionMutationResult),
+    AttentionStatus(Attention),
 }
 
 /// Socket directory is private even when the surrounding RADAR_HOME is shared.
@@ -91,6 +127,7 @@ pub struct Server {
     path: PathBuf,
     _lock: File,
     registry: Arc<Registry>,
+    activity: Arc<ActivityJournal>,
     stopping: Arc<AtomicBool>,
 }
 
@@ -112,6 +149,7 @@ impl Server {
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             bail!("session daemon is already running");
         }
+        let activity = Arc::new(ActivityJournal::open(&directory.join("activity.sqlite"))?);
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -125,6 +163,7 @@ impl Server {
             path,
             _lock: lock,
             registry: Arc::new(Registry::default()),
+            activity,
             stopping: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -143,10 +182,11 @@ impl Server {
                     stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
                     stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
                     let registry = self.registry.clone();
+                    let activity = self.activity.clone();
                     let stopping = self.stopping.clone();
                     workers.push(std::thread::spawn(move || {
                         let mut stream = stream;
-                        if let Err(error) = serve(&mut stream, registry, stopping) {
+                        if let Err(error) = serve(&mut stream, registry, activity, stopping) {
                             let _ = write_frame(
                                 &mut stream,
                                 &Response::Error(error.to_string()),
@@ -180,6 +220,7 @@ impl Drop for Server {
 fn serve(
     stream: &mut UnixStream,
     registry: Arc<Registry>,
+    activity: Arc<ActivityJournal>,
     stopping: Arc<AtomicBool>,
 ) -> Result<()> {
     let request: Request = read_frame(stream, MAX_REQUEST)?;
@@ -223,6 +264,39 @@ fn serve(
             stopping.store(true, Ordering::Release);
             Response::Ok
         }
+        Command::PublishActivity(input) => Response::ActivityPublished(activity.publish(input)?),
+        Command::CreateAttention(input) => {
+            Response::AttentionCreated(activity.create_attention(input)?)
+        }
+        Command::ChangeAttention(input) => {
+            Response::AttentionChanged(activity.change_attention(input)?)
+        }
+        Command::AttentionStatus {
+            project_id,
+            request_id,
+        } => Response::AttentionStatus(activity.attention(project_id, &request_id)?),
+        Command::ActivitySnapshot {
+            project_id,
+            after_sequence,
+            limit,
+        } => Response::ActivitySnapshot(activity.snapshot(project_id, after_sequence, limit)?),
+        Command::WatchActivity {
+            project_id,
+            after_sequence,
+        } => match activity.watch(project_id, after_sequence)? {
+            WatchResult::Ready(snapshot, subscription) => {
+                write_frame(
+                    stream,
+                    &Response::ActivityWatching {
+                        after_sequence,
+                        snapshot,
+                    },
+                    MAX_RESPONSE,
+                )?;
+                return stream_activity(stream, subscription, stopping);
+            }
+            WatchResult::ResyncRequired => Response::ResyncRequired,
+        },
         Command::Attach { id } => {
             let (snapshot, subscription) = registry.get(&id)?.attach();
             let closed = snapshot.status.stream_closed;
@@ -324,6 +398,49 @@ fn stream_events<T>(
     Ok(())
 }
 
+fn stream_activity(
+    stream: &mut UnixStream,
+    subscription: ActivitySubscription,
+    stopping: Arc<AtomicBool>,
+) -> Result<()> {
+    while !stopping.load(Ordering::Acquire) {
+        match subscription.try_recv() {
+            Ok(event) => write_frame(stream, &Response::Activity(event), MAX_RESPONSE)?,
+            Err(ActivityReceiveError::ResyncRequired) => {
+                write_frame(stream, &Response::ResyncRequired, MAX_RESPONSE)?;
+                return Ok(());
+            }
+            Err(ActivityReceiveError::Closed) => return Ok(()),
+            Err(ActivityReceiveError::Empty) => {
+                let mut byte = [0_u8];
+                let n = unsafe {
+                    libc::recv(
+                        stream.as_raw_fd(),
+                        byte.as_mut_ptr().cast(),
+                        1,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    )
+                };
+                if n == 0 {
+                    return Ok(());
+                }
+                if n > 0 {
+                    bail!("activity watch connections are read-only after attachment");
+                }
+                let error = std::io::Error::last_os_error();
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) {
+                    return Err(error.into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A disconnected socket, truncated frame, sequence gap, or ResyncRequired all
 /// require a new attachment. Never continue an old stream after any of them.
 pub struct Client {
@@ -382,8 +499,26 @@ impl Client {
                 self.next_sequence = Some(sequence + 1);
                 None
             }
+            Response::ActivityWatching {
+                after_sequence,
+                snapshot,
+            } => {
+                let mut expected = after_sequence + 1;
+                for event in &snapshot.events {
+                    if event.sequence != expected {
+                        bail!("project activity replay has a sequence gap; resnapshot");
+                    }
+                    expected += 1;
+                }
+                if snapshot.watermark + 1 != expected {
+                    bail!("project activity replay does not reach its watermark; resnapshot");
+                }
+                self.next_sequence = Some(expected);
+                None
+            }
             Response::Output(event) => Some(event.sequence),
             Response::Feedback(event) => Some(event.sequence),
+            Response::Activity(event) => Some(event.sequence),
             _ => None,
         };
         if let Some(sequence) = sequence {
@@ -403,6 +538,50 @@ impl Client {
         self.stream.set_read_timeout(timeout)?;
         Ok(())
     }
+
+    /// A handle used only to interrupt a blocked receive during client drop.
+    pub fn interrupt_handle(&self) -> Result<UnixStream> {
+        Ok(self.stream.try_clone()?)
+    }
+}
+
+/// Ensure the local daemon is running. A detached reaper owns any child handle;
+/// dropping the GUI client never kills the daemon or its sessions.
+pub fn ensure_running(home: &Path) -> Result<()> {
+    if matches!(Client::request(home, Command::Ping), Ok(Response::Hello { version }) if version == VERSION)
+    {
+        return Ok(());
+    }
+    let executable = std::env::current_exe().context("locate radar executable")?;
+    let child = std::process::Command::new(executable)
+        .arg("--home")
+        .arg(home)
+        .arg("serve")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("start session daemon")?;
+    std::thread::Builder::new()
+        .name("radar-daemon-reaper".into())
+        .spawn(move || {
+            let mut child = child;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(250)),
+                }
+            }
+        })?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if matches!(Client::request(home, Command::Ping), Ok(Response::Hello { version }) if version == VERSION)
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    bail!("session daemon did not start within three seconds")
 }
 
 fn write_frame(writer: &mut impl Write, value: &impl Serialize, limit: usize) -> Result<()> {
@@ -492,8 +671,13 @@ mod tests {
         )
         .unwrap();
         let stopping = Arc::new(AtomicBool::new(false));
-        let error =
-            serve(&mut server, Arc::new(Registry::default()), stopping.clone()).unwrap_err();
+        let error = serve(
+            &mut server,
+            Arc::new(Registry::default()),
+            Arc::new(ActivityJournal::open_in_memory().unwrap()),
+            stopping.clone(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("unsupported session protocol"));
         assert!(!stopping.load(Ordering::Acquire));
     }
@@ -514,6 +698,7 @@ mod tests {
         serve(
             &mut server,
             registry.clone(),
+            Arc::new(ActivityJournal::open_in_memory().unwrap()),
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap();

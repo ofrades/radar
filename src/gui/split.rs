@@ -134,7 +134,11 @@ impl<L> Node<L> {
                     *group = Rc::clone(first);
                 }
                 Node::Leaf(_) => {}
-                Node::Split { first: a, second: b, .. } => {
+                Node::Split {
+                    first: a,
+                    second: b,
+                    ..
+                } => {
                     walk(a, first, second);
                     walk(b, first, second);
                 }
@@ -153,16 +157,18 @@ impl<L> Node<L> {
                 .iter()
                 .any(|a| Rc::ptr_eq(a, &g))
                 .then(|| Node::Leaf(g)),
-            Node::Split { axis, ratio, key, first, second } => {
-                match (first.prune(alive), second.prune(alive)) {
-                    (Some(f), Some(s)) => {
-                        Some(Node::split(axis, ratio, key, f, s))
-                    }
-                    (Some(f), None) => Some(f),
-                    (None, Some(s)) => Some(s),
-                    (None, None) => None,
-                }
-            }
+            Node::Split {
+                axis,
+                ratio,
+                key,
+                first,
+                second,
+            } => match (first.prune(alive), second.prune(alive)) {
+                (Some(f), Some(s)) => Some(Node::split(axis, ratio, key, f, s)),
+                (Some(f), None) => Some(f),
+                (None, Some(s)) => Some(s),
+                (None, None) => None,
+            },
         }
     }
 
@@ -172,14 +178,18 @@ impl<L> Node<L> {
     pub fn take_leaf(self, group: &Rc<L>) -> Option<Node<L>> {
         match self {
             Node::Leaf(g) => (!Rc::ptr_eq(&g, group)).then(|| Node::Leaf(g)),
-            Node::Split { axis, ratio, key, first, second } => {
-                match (first.take_leaf(group), second.take_leaf(group)) {
-                    (Some(f), Some(s)) => Some(Node::split(axis, ratio, key, f, s)),
-                    (Some(f), None) => Some(f),
-                    (None, Some(s)) => Some(s),
-                    (None, None) => None,
-                }
-            }
+            Node::Split {
+                axis,
+                ratio,
+                key,
+                first,
+                second,
+            } => match (first.take_leaf(group), second.take_leaf(group)) {
+                (Some(f), Some(s)) => Some(Node::split(axis, ratio, key, f, s)),
+                (Some(f), None) => Some(f),
+                (None, Some(s)) => Some(s),
+                (None, None) => None,
+            },
         }
     }
 
@@ -216,7 +226,13 @@ mod tests {
             Axis::Vertical,
             0.68,
             "outer",
-            Node::split(Axis::Horizontal, 0.42, "main", Node::leaf(&one), Node::leaf(&two)),
+            Node::split(
+                Axis::Horizontal,
+                0.42,
+                "main",
+                Node::leaf(&one),
+                Node::leaf(&two),
+            ),
             Node::leaf(&three),
         );
         (t, vec![one, two, three])
@@ -239,7 +255,10 @@ mod tests {
         assert!(t.replace(&handles[1], Node::leaf(&replacement)));
         assert_eq!(ids(&t), vec![1, 9, 3]);
         let stranger = Rc::new(42);
-        assert!(!t.replace(&stranger, Node::leaf(&Rc::new(0))), "absent target");
+        assert!(
+            !t.replace(&stranger, Node::leaf(&Rc::new(0))),
+            "absent target"
+        );
     }
 
     #[test]

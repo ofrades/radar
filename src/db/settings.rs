@@ -61,6 +61,47 @@ impl Preferences {
     }
 }
 
+/// What a brand-new workspace opens with, before it has stored panes of its
+/// own. The agent leads in every preset; the rest is scope. Picked on the
+/// home panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NewWorkspaceLayout {
+    Agent,
+    AgentChanges,
+    Classic,
+    Everything,
+}
+
+impl NewWorkspaceLayout {
+    pub const ALL: [NewWorkspaceLayout; 4] = [
+        NewWorkspaceLayout::Agent,
+        NewWorkspaceLayout::AgentChanges,
+        NewWorkspaceLayout::Classic,
+        NewWorkspaceLayout::Everything,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            NewWorkspaceLayout::Agent => "Agent",
+            NewWorkspaceLayout::AgentChanges => "Agent + Changes",
+            NewWorkspaceLayout::Classic => "Agent + Changes + Commands",
+            NewWorkspaceLayout::Everything => "Everything",
+        }
+    }
+
+    /// The primitives the preset opens, in layout order.
+    pub fn slots(self) -> &'static [Slot] {
+        use Slot::{Agent, Board, Diff, Editor, Shell};
+        match self {
+            NewWorkspaceLayout::Agent => &[Agent],
+            NewWorkspaceLayout::AgentChanges => &[Agent, Diff],
+            NewWorkspaceLayout::Classic => &[Agent, Diff, Shell],
+            NewWorkspaceLayout::Everything => &[Agent, Diff, Board, Shell, Editor],
+        }
+    }
+}
+
 /// Window and session preferences.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -72,6 +113,8 @@ pub struct UiPrefs {
     pub add_root: Option<PathBuf>,
     /// Reopen the tabs a project had last time.
     pub restore_tabs: bool,
+    /// Primitives a brand-new workspace opens with.
+    pub layout: Option<NewWorkspaceLayout>,
 }
 
 impl Default for UiPrefs {
@@ -81,6 +124,7 @@ impl Default for UiPrefs {
             last_project: None,
             add_root: None,
             restore_tabs: true,
+            layout: Some(NewWorkspaceLayout::Agent),
         }
     }
 }
@@ -202,8 +246,24 @@ mod tests {
     }
 
     #[test]
-    fn remember_last_project_updates_only_that_field() {
+    fn the_layout_preset_defaults_to_the_agent_and_round_trips() {
         let db = Db::open_in_memory().unwrap();
+        let prefs = db.ui_prefs().unwrap();
+        assert_eq!(prefs.layout, Some(NewWorkspaceLayout::Agent));
+        assert_eq!(prefs.layout.unwrap().slots(), &[Slot::Agent][..]);
+
+        let mut prefs = prefs;
+        prefs.layout = Some(NewWorkspaceLayout::Classic);
+        db.set_ui_prefs(&prefs).unwrap();
+        assert_eq!(
+            db.ui_prefs().unwrap().layout,
+            Some(NewWorkspaceLayout::Classic),
+            "the layout must survive a round trip"
+        );
+    }
+
+    #[test]
+    fn remember_last_project_updates_only_that_field() {        let db = Db::open_in_memory().unwrap();
         let prefs = crate::db::UiPrefs {
             sidebar_width: 360,
             ..Default::default()

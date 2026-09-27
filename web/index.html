@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#111311" />
+    <title>Radar Remote</title>
+    <link rel="stylesheet" href="/assets/xterm.css" />
+    <link rel="stylesheet" href="/assets/app.css" />
+    <script type="module" src="/assets/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Radar home">
+          <span class="brand-mark">◉</span>
+          <span>radar</span>
+          <span class="remote-tag">REMOTE</span>
+        </a>
+        <div class="top-actions">
+          <span class="connection-dot" id="server-state" aria-label="Checking server"></span>
+          <button class="icon-button" id="refresh-button" type="button" aria-label="Refresh workspace" title="Refresh">↻</button>
+        </div>
+      </header>
+
+      <main class="main-content">
+        <section id="dashboard" class="dashboard">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">YOUR WORKSPACE</p>
+              <h1>Pick up where you left off.</h1>
+              <p class="subheading">Your projects and agents, wherever you are.</p>
+            </div>
+          </div>
+
+          <section class="project-picker surface" aria-labelledby="project-heading">
+            <label class="section-label" id="project-heading" for="project-select">PROJECT</label>
+            <div class="project-select-wrap">
+              <select id="project-select" aria-label="Choose project"></select>
+              <span class="select-chevron">⌄</span>
+            </div>
+            <p class="project-path" id="project-path"></p>
+          </section>
+
+          <section class="attention-section" id="attention-section">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">INBOX</p>
+                <h2>Needs your attention</h2>
+              </div>
+              <span class="count-badge hidden" id="attention-count">0</span>
+            </div>
+            <div class="attention-list" id="attention-list"></div>
+            <div class="empty-card hidden" id="attention-empty">Nothing waiting on you.</div>
+          </section>
+
+          <section class="sessions-section">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">LIVE SESSIONS</p>
+                <h2>Agents & terminals</h2>
+              </div>
+              <button class="primary-button compact" id="new-shell-button" type="button">
+                <span>＋</span> New terminal
+              </button>
+            </div>
+            <div class="session-list" id="session-list"></div>
+            <div class="empty-card hidden" id="sessions-empty">
+              <strong>No sessions in this project yet.</strong>
+              <span>Start a terminal here, or open an agent in Radar on your computer.</span>
+            </div>
+          </section>
+
+          <section class="activity-section">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">RECENT</p>
+                <h2>Project activity</h2>
+              </div>
+            </div>
+            <div class="activity-list" id="activity-list"></div>
+            <div class="empty-card hidden" id="activity-empty">Agent updates will show up here.</div>
+          </section>
+          <div class="page-error hidden" id="page-error" role="status"></div>
+        </section>
+
+        <section id="terminal-view" class="terminal-view hidden" aria-label="Remote terminal">
+          <div class="terminal-toolbar">
+            <button class="back-button" id="back-button" type="button"><span>‹</span> Workspace</button>
+            <div class="terminal-heading">
+              <strong id="terminal-title">Terminal</strong>
+              <span id="terminal-connection">Connecting…</span>
+            </div>
+            <button class="icon-button" id="reconnect-button" type="button" aria-label="Reconnect terminal" title="Reconnect">↻</button>
+            <button class="icon-button" id="detach-button" type="button" aria-label="Detach terminal" title="Detach">⤢</button>
+          </div>
+          <div class="terminal-frame">
+            <div id="terminal" class="terminal"></div>
+          </div>
+          <nav class="terminal-keys" aria-label="Terminal keys">
+            <button type="button" data-key="esc">Esc</button>
+            <button type="button" data-key="tab">Tab</button>
+            <button type="button" data-key="ctrl-c">Ctrl+C</button>
+            <button type="button" data-key="ctrl-d">Ctrl+D</button>
+            <button type="button" data-key="up" aria-label="Up">↑</button>
+            <button type="button" data-key="down" aria-label="Down">↓</button>
+            <button type="button" data-key="left" aria-label="Left">←</button>
+            <button type="button" data-key="right" aria-label="Right">→</button>
+          </nav>
+        </section>
+      </main>
+
+      <div class="toast hidden" id="toast" role="status"></div>
+    </div>
+  </body>
+</html>

@@ -9,8 +9,10 @@
 //! changes it, just like the theme monitor re-applies colours.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::mpsc::SyncSender;
 
 use adw::prelude::*;
 use gtk::gdk;
@@ -18,6 +20,11 @@ use gtk::gio;
 use gtk::glib;
 
 use crate::board::{self, Board, Card, Column};
+use crate::session::activity::{
+    ActivityEvent, ActivityKind, ActivityPayload, ActivitySnapshot, Attention, AttentionActionKind,
+    AttentionChange, AttentionResponse, ChangeAttention, PublishActivity,
+};
+use crate::session::daemon::{Client, Command, Response};
 
 /// How long to wait for the file to stop changing before re-reading it. A
 /// single write can fire several monitor events; one rebuild is enough.
@@ -28,8 +35,18 @@ type BoardObserver = Box<dyn Fn(Option<String>)>;
 
 pub struct BoardPane {
     project: PathBuf,
-    widget: gtk::ScrolledWindow,
+    project_id: i64,
+    session_home: PathBuf,
+    activity_tx: SyncSender<super::ActivityNotice>,
+    widget: gtk::Box,
     columns_box: gtk::Box,
+    activity_items: gtk::Box,
+    activity_status: gtk::Label,
+    activity_feedback: gtk::Label,
+    activity_snapshot: RefCell<ActivitySnapshot>,
+    activity_online: Cell<bool>,
+    pending_attention: Rc<RefCell<HashSet<String>>>,
+    last_board: RefCell<Option<Board>>,
     dialog_parent: gtk::Window,
     /// Guards against scheduling two reloads for one burst of file events.
     pending_reload: Cell<Option<glib::SourceId>>,
@@ -40,7 +57,13 @@ pub struct BoardPane {
 }
 
 impl BoardPane {
-    pub fn new(project: &Path, parent: &impl IsA<gtk::Window>) -> Rc<BoardPane> {
+    pub fn new(
+        project: &Path,
+        project_id: i64,
+        session_home: &Path,
+        activity_tx: SyncSender<super::ActivityNotice>,
+        parent: &impl IsA<gtk::Window>,
+    ) -> Rc<BoardPane> {
         // Opening the pane opens the board: if the project has no file yet,
         // the default one is created, the same file an agent will find.
         let _ = board::ensure_file(project);
@@ -51,25 +74,81 @@ impl BoardPane {
         columns_box.set_margin_start(8);
         columns_box.set_margin_end(8);
         columns_box.set_valign(gtk::Align::Fill);
+        columns_box.set_hexpand(true);
+        columns_box.set_vexpand(true);
 
-        let widget = gtk::ScrolledWindow::builder()
+        let work_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Automatic)
             .vscrollbar_policy(gtk::PolicyType::Never)
             .child(&columns_box)
             .build();
+        work_scroll.add_css_class("board-work-scroll");
+        work_scroll.set_hexpand(true);
+        work_scroll.set_vexpand(true);
+
+        let activity_panel = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        activity_panel.add_css_class("board-activity-panel");
+        activity_panel.set_size_request(310, -1);
+        activity_panel.set_vexpand(true);
+        let heading = gtk::Label::new(Some("Project activity"));
+        heading.set_xalign(0.0);
+        heading.add_css_class("caption-heading");
+        activity_panel.append(&heading);
+        let activity_status = gtk::Label::new(Some("Connecting…"));
+        activity_status.set_xalign(0.0);
+        activity_status.add_css_class("caption");
+        activity_status.add_css_class("dim-label");
+        activity_panel.append(&activity_status);
+        let activity_feedback = gtk::Label::new(None);
+        activity_feedback.set_xalign(0.0);
+        activity_feedback.set_wrap(true);
+        activity_feedback.add_css_class("caption");
+        activity_feedback.set_visible(false);
+        activity_panel.append(&activity_feedback);
+        let activity_items = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let activity_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .vexpand(true)
+            .child(&activity_items)
+            .build();
+        activity_panel.append(&activity_scroll);
+
+        let widget = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         widget.add_css_class("board-pane");
+        widget.set_hexpand(true);
+        widget.set_vexpand(true);
         widget.set_focusable(true);
+        widget.append(&work_scroll);
+        widget.append(&activity_panel);
 
         let pane = Rc::new(BoardPane {
             project: project.to_path_buf(),
+            project_id,
+            session_home: session_home.to_path_buf(),
+            activity_tx,
             widget,
             columns_box,
+            activity_items,
+            activity_status,
+            activity_feedback,
+            activity_snapshot: RefCell::new(ActivitySnapshot {
+                project_id,
+                watermark: 0,
+                events: Vec::new(),
+                attention: Vec::new(),
+                has_more: false,
+            }),
+            activity_online: Cell::new(false),
+            pending_attention: Rc::new(RefCell::new(HashSet::new())),
+            last_board: RefCell::new(None),
             dialog_parent: parent.clone().upcast(),
             pending_reload: Cell::new(None),
             observer: RefCell::new(None),
             last_stats: RefCell::new(None),
         });
         pane.reload();
+        pane.render_activity();
         pane.watch();
         pane
     }
@@ -77,6 +156,282 @@ impl BoardPane {
     /// The board pane as a widget, the way primitives are mounted.
     pub fn widget(&self) -> &gtk::Widget {
         self.widget.upcast_ref()
+    }
+
+    pub fn set_activity_state(&self, snapshot: ActivitySnapshot, online: bool) {
+        *self.activity_snapshot.borrow_mut() = snapshot;
+        self.activity_online.set(online);
+        self.activity_status.set_text(if online {
+            "Live · sequenced project feed"
+        } else {
+            "Reconnecting · saved requests remain available"
+        });
+        self.render_activity();
+    }
+
+    pub fn finish_attention_change(
+        &self,
+        request_id: &str,
+        result: std::result::Result<Attention, String>,
+    ) {
+        self.pending_attention.borrow_mut().remove(request_id);
+        match result {
+            Ok(_) => {
+                self.activity_feedback.set_text("Response saved.");
+                self.activity_feedback.remove_css_class("error");
+                self.activity_feedback.set_visible(true);
+            }
+            Err(error) => {
+                self.activity_feedback
+                    .set_text(&format!("Response not applied: {error}"));
+                self.activity_feedback.add_css_class("error");
+                self.activity_feedback.set_visible(true);
+            }
+        }
+        self.render_activity();
+    }
+
+    fn render_activity(&self) {
+        while let Some(child) = self.activity_items.first_child() {
+            self.activity_items.remove(&child);
+        }
+        let snapshot = self.activity_snapshot.borrow().clone();
+        let board = board::load(&self.project).ok();
+
+        append_activity_heading(&self.activity_items, "Needs attention");
+        let mut attention = snapshot.attention.clone();
+        attention.sort_by_key(|item| std::cmp::Reverse(item.created_at_millis));
+        if attention.is_empty() {
+            let empty = activity_label("No unresolved requests", true);
+            self.activity_items.append(&empty);
+        } else {
+            for request in attention {
+                self.render_attention(&request, board.as_ref());
+            }
+        }
+
+        append_activity_heading(&self.activity_items, "Agent states");
+        let mut states: Vec<(String, String, i64)> = Vec::new();
+        for event in &snapshot.events {
+            let (Some(session_id), ActivityPayload::AgentState { state, message }) =
+                (&event.session_id, &event.payload)
+            else {
+                continue;
+            };
+            states.retain(|(session, _, _)| session != session_id);
+            let state_name = agent_state_label(*state);
+            let text = message
+                .as_ref()
+                .map(|message| format!("{state_name} · {message}"))
+                .unwrap_or(state_name.to_string());
+            states.push((session_id.clone(), text, event.at_millis));
+        }
+        states.sort_by_key(|(_, _, at)| std::cmp::Reverse(*at));
+        if states.is_empty() {
+            self.activity_items
+                .append(&activity_label("No explicit agent state yet", true));
+        } else {
+            for (session_id, state, at) in states.into_iter().take(6) {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                row.add_css_class("activity-row");
+                let label =
+                    activity_label(&format!("{state}\n{}", short_session(&session_id)), false);
+                label.set_hexpand(true);
+                row.append(&label);
+                let open = self.session_button(&session_id, "Open");
+                row.append(&open);
+                let age = activity_label(&relative_age(at), true);
+                row.append(&age);
+                self.activity_items.append(&row);
+            }
+        }
+
+        append_activity_heading(&self.activity_items, "Recent activity");
+        if snapshot.has_more {
+            self.activity_items
+                .append(&activity_label("Showing the latest 200 events", true));
+        }
+        if snapshot.events.is_empty() {
+            self.activity_items
+                .append(&activity_label("No project activity yet", true));
+        } else {
+            let mut latest_states: Vec<(String, crate::session::activity::AgentState)> = Vec::new();
+            let mut rendered = 0;
+            for event in snapshot.events.iter().rev() {
+                if let (Some(session_id), ActivityPayload::AgentState { state, .. }) =
+                    (&event.session_id, &event.payload)
+                {
+                    if let Some((_, previous)) = latest_states
+                        .iter_mut()
+                        .find(|(session, _)| session == session_id)
+                    {
+                        if previous == state {
+                            continue;
+                        }
+                        *previous = *state;
+                    } else {
+                        latest_states.push((session_id.clone(), *state));
+                    }
+                }
+                if rendered >= 24 {
+                    break;
+                }
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                row.add_css_class("activity-row");
+                let label = activity_label(&activity_event_text(event), false);
+                label.set_hexpand(true);
+                row.append(&label);
+                if let Some(session_id) = event.session_id.as_deref() {
+                    row.append(&self.session_button(session_id, "Open"));
+                }
+                let age = activity_label(&relative_age(event.at_millis), true);
+                row.append(&age);
+                self.activity_items.append(&row);
+                rendered += 1;
+            }
+        }
+    }
+
+    fn render_attention(&self, attention: &Attention, board: Option<&Board>) {
+        let frame = gtk::Frame::new(None);
+        frame.add_css_class("attention-card");
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        body.set_margin_top(8);
+        body.set_margin_bottom(8);
+        body.set_margin_start(8);
+        body.set_margin_end(8);
+
+        let title = gtk::Label::new(Some(&format!(
+            "{} · {}",
+            attention_kind_label(attention.kind),
+            relative_age(attention.created_at_millis)
+        )));
+        title.set_xalign(0.0);
+        title.add_css_class("caption-heading");
+        body.append(&title);
+        let reason = activity_label(&attention.reason, false);
+        reason.set_selectable(true);
+        body.append(&reason);
+
+        let mut target = Vec::new();
+        if let Some(card_id) = &attention.card_id {
+            let card_title = board
+                .and_then(|board| {
+                    board
+                        .find_id(card_id)
+                        .map(|(column, card)| board.columns[column].cards[card].title.clone())
+                })
+                .unwrap_or_else(|| card_id.clone());
+            target.push(format!("Card: {card_title}"));
+        }
+        if let Some(session_id) = &attention.session_id {
+            target.push(format!("Agent: {}", short_session(session_id)));
+        }
+        if !target.is_empty() {
+            body.append(&activity_label(&target.join("\n"), true));
+        }
+
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        buttons.set_homogeneous(false);
+        if let Some(session_id) = &attention.session_id {
+            buttons.append(&self.session_button(session_id, "Open session"));
+        }
+        if attention.seen_at_millis.is_none() {
+            buttons.append(&self.attention_change_button(
+                attention,
+                "Mark seen",
+                AttentionChange::MarkSeen,
+            ));
+        }
+        if attention.acknowledged_at_millis.is_none() {
+            buttons.append(&self.attention_change_button(
+                attention,
+                "Acknowledge",
+                AttentionChange::Acknowledge,
+            ));
+        }
+        for action in &attention.allowed_actions {
+            match action {
+                AttentionActionKind::Answer => {
+                    let button = gtk::Button::with_label("Answer");
+                    let parent = self.dialog_parent.clone();
+                    let attention = attention.clone();
+                    let project_id = self.project_id;
+                    let home = self.session_home.clone();
+                    let tx = self.activity_tx.clone();
+                    let pending = self.pending_attention.clone();
+                    let feedback = self.activity_feedback.clone();
+                    button.connect_clicked(move |_| {
+                        answer_dialog(
+                            &parent, project_id, &home, &tx, &pending, &feedback, &attention,
+                        );
+                    });
+                    buttons.append(&button);
+                }
+                AttentionActionKind::Approve => buttons.append(&self.attention_change_button(
+                    attention,
+                    "Approve",
+                    AttentionChange::Respond(AttentionResponse::Approve),
+                )),
+                AttentionActionKind::Deny => buttons.append(&self.attention_change_button(
+                    attention,
+                    "Deny",
+                    AttentionChange::Respond(AttentionResponse::Deny),
+                )),
+                AttentionActionKind::Dismiss => buttons.append(&self.attention_change_button(
+                    attention,
+                    "Dismiss",
+                    AttentionChange::Respond(AttentionResponse::Dismiss),
+                )),
+            }
+        }
+        body.append(&buttons);
+        frame.set_child(Some(&body));
+        self.activity_items.append(&frame);
+    }
+
+    fn session_button(&self, session_id: &str, title: &str) -> gtk::Button {
+        let button = gtk::Button::with_label(title);
+        button.add_css_class("flat");
+        let parent = self.dialog_parent.clone();
+        let project_id = self.project_id;
+        let session_id = session_id.to_string();
+        button.connect_clicked(move |_| {
+            let _ = gtk::prelude::WidgetExt::activate_action(
+                &parent,
+                "win.activity-session-open",
+                Some(&(project_id, session_id.clone()).to_variant()),
+            );
+        });
+        button
+    }
+
+    fn attention_change_button(
+        &self,
+        attention: &Attention,
+        title: &str,
+        change: AttentionChange,
+    ) -> gtk::Button {
+        let button = gtk::Button::with_label(title);
+        let project_id = self.project_id;
+        let home = self.session_home.clone();
+        let tx = self.activity_tx.clone();
+        let pending = self.pending_attention.clone();
+        let feedback = self.activity_feedback.clone();
+        let attention = attention.clone();
+        button.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            submit_attention_change(
+                project_id,
+                &home,
+                &tx,
+                &pending,
+                &feedback,
+                &attention,
+                change.clone(),
+            );
+        });
+        button
     }
 
     /// Watch the board's live shape: card and column counts after every read
@@ -95,9 +450,15 @@ impl BoardPane {
     /// Re-read BOARD.md and rebuild the columns. Cheap: a board is a page of
     /// text, and an agent move is one line.
     fn reload(&self) {
+        if let Err(error) = board::ensure_file(&self.project) {
+            eprintln!("radar: could not ensure stable board IDs: {error}");
+        }
         let Ok(b) = board::load(&self.project) else {
             return;
         };
+        if let Some(previous) = self.last_board.borrow_mut().replace(b.clone()) {
+            self.publish_board_changes(&previous, &b);
+        }
         while let Some(child) = self.columns_box.first_child() {
             self.columns_box.remove(&child);
         }
@@ -115,6 +476,90 @@ impl BoardPane {
         if let Some(emit) = self.observer.borrow().as_ref() {
             emit(Some(stats));
         }
+    }
+
+    fn publish_board_changes(&self, previous: &Board, current: &Board) {
+        let before: HashMap<&str, (usize, &Card)> = previous
+            .columns
+            .iter()
+            .enumerate()
+            .flat_map(|(column, value)| {
+                value
+                    .cards
+                    .iter()
+                    .map(move |card| (card.id.as_str(), (column, card)))
+            })
+            .collect();
+        let after: HashMap<&str, (usize, &Card)> = current
+            .columns
+            .iter()
+            .enumerate()
+            .flat_map(|(column, value)| {
+                value
+                    .cards
+                    .iter()
+                    .map(move |card| (card.id.as_str(), (column, card)))
+            })
+            .collect();
+
+        for (id, (_, card)) in &before {
+            if !after.contains_key(id) {
+                self.publish_board_event("removed", Some((*id).to_string()), &card.title);
+            }
+        }
+        for (id, (column, card)) in &after {
+            let Some((old_column, old)) = before.get(id).copied() else {
+                self.publish_board_event("added", Some((*id).to_string()), &card.title);
+                continue;
+            };
+            let action = if old_column != *column {
+                Some("moved")
+            } else if old.claimed_by != card.claimed_by {
+                Some(if card.claimed_by.is_some() {
+                    "claimed"
+                } else {
+                    "released"
+                })
+            } else if old.done != card.done {
+                Some(if card.done { "completed" } else { "reopened" })
+            } else if old.title != card.title {
+                Some("renamed")
+            } else if old.body != card.body {
+                Some("updated")
+            } else {
+                None
+            };
+            if let Some(action) = action {
+                self.publish_board_event(action, Some((*id).to_string()), &card.title);
+            }
+        }
+    }
+
+    fn publish_board_event(&self, action: &str, card_id: Option<String>, title: &str) {
+        let project_id = self.project_id;
+        let home = self.session_home.clone();
+        let action = action.to_string();
+        let title = title.to_string();
+        std::thread::spawn(move || {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let event_card_id = card_id.clone();
+            let request = Command::PublishActivity(PublishActivity {
+                project_id,
+                command_id: format!("board-{}-{now:x}", std::process::id()),
+                session_id: None,
+                card_id,
+                kind: ActivityKind::BoardChanged,
+                payload: ActivityPayload::BoardChanged {
+                    action,
+                    card_id: event_card_id,
+                    title: Some(title),
+                },
+            });
+            let _ = Client::request(&home, request);
+        });
     }
 
     /// Follow the file: anything that writes BOARD.md — an agent, the CLI,
@@ -140,7 +585,8 @@ impl BoardPane {
                     glib::ControlFlow::Break
                 },
             );
-            pane.pending_reload.set(Some(id));        });
+            pane.pending_reload.set(Some(id));
+        });
         // The widget comes and goes with the workspace; the monitor itself is
         // kept alive for the app's lifetime, exactly like the theme monitor.
         std::mem::forget(monitor);
@@ -150,6 +596,8 @@ impl BoardPane {
         let column_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
         column_box.add_css_class("board-column");
         column_box.set_width_request(230);
+        column_box.set_hexpand(true);
+        column_box.set_vexpand(true);
 
         // Header: the column name, how many cards, and a way to add one.
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -261,22 +709,55 @@ impl BoardPane {
             card_box.append(&notes);
         }
 
+        let mut claim_button: Option<gtk::Button> = None;
         if let Some(who) = &card.claimed_by {
-            let claim = gtk::Label::new(Some(&format!("@{who}")));
-            claim.set_xalign(0.0);
-            claim.add_css_class("board-claim");
-            claim.add_css_class("caption");
+            // The claim is a link: clicking it opens that agent's session.
+            // The win.session-open action resolves the name to the agent tab
+            // it runs in; a card's own click (edit) never fires — see the
+            // pick guard on the card's gesture below.
+            let claim = gtk::Button::new();
+            let label = gtk::Label::new(Some(&format!("@{who}")));
+            label.set_xalign(0.0);
+            label.add_css_class("board-claim");
+            label.add_css_class("caption");
+            claim.set_child(Some(&label));
+            claim.add_css_class("board-claim-button");
+            claim.add_css_class("flat");
+            claim.set_cursor(gdk::Cursor::from_name("pointer", None).as_ref());
+            claim.set_tooltip_text(Some(&format!("Jump to @{who}'s session")));
+            let parent = self.dialog_parent.clone();
+            let who_for_click = who.clone();
+            claim.connect_clicked(move |_| {
+                let _ = gtk::prelude::WidgetExt::activate_action(
+                    &parent,
+                    "win.session-open",
+                    Some(&who_for_click.to_variant()),
+                );
+            });
             card_box.append(&claim);
+            claim_button = Some(claim);
         }
 
-        // Click to edit; drag to move between columns.
+        // Click to edit; drag to move between columns. The @claim link is
+        // its own click target: a release that lands on it opens the
+        // session, not this dialog — the pick says where the release
+        // landed, whichever gesture would have won the press.
         let click = gtk::GestureClick::new();
         click.set_button(1);
         let project = self.project.clone();
         let parent = self.dialog_parent.clone();
         let title_for_edit = card.title.clone();
-        click.connect_released(move |gesture, _, _, _| {
+        let card_for_pick = card_box.clone();
+        let claim_for_pick = claim_button;
+        click.connect_released(move |gesture, _, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
+            if let Some(claim) = claim_for_pick.as_ref() {
+                if let Some(picked) = card_for_pick.pick(x, y, gtk::PickFlags::DEFAULT) {
+                    if picked.is_ancestor(claim) {
+                        return;
+                    }
+                }
+            }
             let project = project.clone();
             let parent = parent.clone();
             let title = title_for_edit.clone();
@@ -292,9 +773,7 @@ impl BoardPane {
         // The drag payload is `card:<title>`: the board operations find a card
         // by title, and the `card:` prefix keeps the pane headers (which drop
         // strings too, for grouping) from ever mistaking a card for a slot.
-        let content = gdk::ContentProvider::for_value(
-            &format!("card:{}", card.title).to_value(),
-        );
+        let content = gdk::ContentProvider::for_value(&format!("card:{}", card.title).to_value());
         let source = gtk::DragSource::builder()
             .actions(gdk::DragAction::MOVE)
             .content(&content)
@@ -303,6 +782,217 @@ impl BoardPane {
 
         card_box.upcast()
     }
+}
+
+fn activity_label(text: &str, muted: bool) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    if muted {
+        label.add_css_class("caption");
+        label.add_css_class("dim-label");
+    }
+    label
+}
+
+fn append_activity_heading(parent: &gtk::Box, text: &str) {
+    let heading = gtk::Label::new(Some(text));
+    heading.set_xalign(0.0);
+    heading.add_css_class("caption-heading");
+    heading.add_css_class("activity-section-heading");
+    parent.append(&heading);
+}
+
+fn agent_state_label(state: crate::session::activity::AgentState) -> &'static str {
+    use crate::session::activity::AgentState;
+    match state {
+        AgentState::Unknown => "Unknown",
+        AgentState::Working => "Working",
+        AgentState::WaitingForInput => "Waiting for input",
+        AgentState::WaitingForApproval => "Waiting for approval",
+        AgentState::Idle => "Idle",
+    }
+}
+
+fn attention_kind_label(kind: crate::session::activity::AttentionKind) -> &'static str {
+    use crate::session::activity::AttentionKind;
+    match kind {
+        AttentionKind::Question => "Question",
+        AttentionKind::Approval => "Approval",
+        AttentionKind::Failure => "Failure",
+        AttentionKind::Review => "Review",
+    }
+}
+
+fn short_session(session_id: &str) -> String {
+    let mut parts: Vec<&str> = session_id.rsplit('-').take(3).collect();
+    parts.reverse();
+    parts.join("-")
+}
+
+fn relative_age(at_millis: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(at_millis);
+    let seconds = now.saturating_sub(at_millis).max(0) / 1000;
+    match seconds {
+        0..=4 => "just now".to_string(),
+        5..=59 => format!("{seconds}s ago"),
+        60..=3599 => format!("{}m ago", seconds / 60),
+        3600..=86399 => format!("{}h ago", seconds / 3600),
+        _ => format!("{}d ago", seconds / 86400),
+    }
+}
+
+fn activity_event_text(event: &ActivityEvent) -> String {
+    match &event.payload {
+        ActivityPayload::AgentState { state, message } => message.as_ref().map_or_else(
+            || format!("Agent is {}", agent_state_label(*state).to_lowercase()),
+            |message| format!("{} · {message}", agent_state_label(*state)),
+        ),
+        ActivityPayload::Message { text } => text.clone(),
+        ActivityPayload::AttentionRequested {
+            attention_kind,
+            reason,
+            ..
+        } => format!("{}: {reason}", attention_kind_label(*attention_kind)),
+        ActivityPayload::AttentionSeen { .. } => "Request marked seen".to_string(),
+        ActivityPayload::AttentionAcknowledged { .. } => "Request acknowledged".to_string(),
+        ActivityPayload::AttentionResolved { response, .. } => match response {
+            AttentionResponse::Answer(answer) => format!("Answered: {answer}"),
+            AttentionResponse::Approve => "Approved".to_string(),
+            AttentionResponse::Deny => "Denied".to_string(),
+            AttentionResponse::Dismiss => "Request dismissed".to_string(),
+        },
+        ActivityPayload::BoardChanged { action, title, .. } => title
+            .as_ref()
+            .map_or_else(|| action.clone(), |title| format!("{action}: {title}")),
+        ActivityPayload::SessionLifecycle { state, detail } => detail.as_ref().map_or_else(
+            || format!("Session {state}"),
+            |detail| format!("{state}: {detail}"),
+        ),
+        ActivityPayload::CommandResult { ok, detail, .. } => detail.as_ref().map_or_else(
+            || {
+                if *ok {
+                    "Command completed".to_string()
+                } else {
+                    "Command failed".to_string()
+                }
+            },
+            Clone::clone,
+        ),
+    }
+}
+
+fn submit_attention_change(
+    project_id: i64,
+    home: &Path,
+    tx: &SyncSender<super::ActivityNotice>,
+    pending: &Rc<RefCell<HashSet<String>>>,
+    feedback: &gtk::Label,
+    attention: &Attention,
+    change: AttentionChange,
+) {
+    let request_id = attention.id.clone();
+    if !pending.borrow_mut().insert(request_id.clone()) {
+        return;
+    }
+    feedback.set_text("Sending response…");
+    feedback.remove_css_class("error");
+    feedback.set_visible(true);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let command = Command::ChangeAttention(ChangeAttention {
+        project_id,
+        request_id: request_id.clone(),
+        command_id: format!("gui-{}-{now:x}", std::process::id()),
+        expected_revision: attention.revision,
+        change,
+    });
+    let home = home.to_path_buf();
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let result = match Client::request(&home, command) {
+            Ok(Response::AttentionChanged(result)) => Ok(Box::new(result)),
+            Ok(other) => Err(format!("unexpected server response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        };
+        let _ = tx.send(super::ActivityNotice::Mutation {
+            project_id,
+            request_id,
+            result,
+        });
+    });
+}
+
+fn answer_dialog(
+    parent: &gtk::Window,
+    project_id: i64,
+    home: &Path,
+    tx: &SyncSender<super::ActivityNotice>,
+    pending: &Rc<RefCell<HashSet<String>>>,
+    feedback: &gtk::Label,
+    attention: &Attention,
+) {
+    let window = gtk::Window::builder()
+        .title("Answer question")
+        .transient_for(parent)
+        .modal(true)
+        .resizable(false)
+        .default_width(420)
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    content.set_margin_top(14);
+    content.set_margin_bottom(14);
+    content.set_margin_start(14);
+    content.set_margin_end(14);
+    let prompt = activity_label(&attention.reason, false);
+    content.append(&prompt);
+    let answer = gtk::Entry::new();
+    answer.set_placeholder_text(Some("Your answer"));
+    content.append(&answer);
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+    buttons.append(&cancel);
+    let submit = gtk::Button::with_label("Send answer");
+    submit.add_css_class("suggested-action");
+    let window_for_submit = window.clone();
+    let answer_for_submit = answer.clone();
+    let home = home.to_path_buf();
+    let tx = tx.clone();
+    let pending = pending.clone();
+    let feedback = feedback.clone();
+    let attention = attention.clone();
+    submit.connect_clicked(move |_| {
+        let text = answer_for_submit.text().trim().to_string();
+        if text.is_empty() {
+            answer_for_submit.grab_focus();
+            return;
+        }
+        submit_attention_change(
+            project_id,
+            &home,
+            &tx,
+            &pending,
+            &feedback,
+            &attention,
+            AttentionChange::Respond(AttentionResponse::Answer(text)),
+        );
+        window_for_submit.close();
+    });
+    buttons.append(&submit);
+    content.append(&buttons);
+    window.set_child(Some(&content));
+    window.present();
+    answer.grab_focus();
 }
 
 /// The add/edit dialog. `existing` is the card's current column and content,
@@ -389,7 +1079,9 @@ fn card_dialog(
     buttons.set_halign(gtk::Align::End);
 
     if let Some((old_column, _)) = &existing {
-        let old_title = existing.map(|(_, card)| card.title.clone()).unwrap_or_default();
+        let old_title = existing
+            .map(|(_, card)| card.title.clone())
+            .unwrap_or_default();
         let window_for_delete = window.clone();
         let project = project.to_path_buf();
         let delete = gtk::Button::with_label("Delete");
@@ -425,14 +1117,22 @@ fn card_dialog(
         }
         let body: Vec<String> = notes
             .buffer()
-            .text(&notes.buffer().start_iter(), &notes.buffer().end_iter(), true)
+            .text(
+                &notes.buffer().start_iter(),
+                &notes.buffer().end_iter(),
+                true,
+            )
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .map(str::to_string)
             .collect();
         let claim = {
-            let text = claim_entry.text().trim().trim_start_matches('@').to_string();
+            let text = claim_entry
+                .text()
+                .trim()
+                .trim_start_matches('@')
+                .to_string();
             (!text.is_empty()).then_some(text)
         };
         let column = columns_for_save
@@ -445,7 +1145,14 @@ fn card_dialog(
 
         let result = match &old_title {
             Some(old) => board::update_card(&project, old, card, Some(&column)),
-            None => board::add_card(&project, Some(&column), &title, &card.body.join("\n"), card.claimed_by.as_deref()).map(|_| true),
+            None => board::add_card(
+                &project,
+                Some(&column),
+                &title,
+                &card.body.join("\n"),
+                card.claimed_by.as_deref(),
+            )
+            .map(|_| true),
         };
         match result {
             Ok(true) => window_for_save.close(),

@@ -209,10 +209,30 @@ impl AgentDef {
             description: self.description.to_string(),
             args: self.args.iter().map(|s| s.to_string()).collect(),
             auto_args: self.auto.iter().map(|s| s.to_string()).collect(),
+            resume_args: Vec::new(),
+            resume_session: String::new(),
             env_unset: self.env_unset.iter().map(|s| s.to_string()).collect(),
             external: false,
             omarchy: self.omarchy,
             priority,
+        };
+        // How to reopen the agent's own last conversation — CLI-specific,
+        // and radar's own knowledge: omarchy's wrapper always starts fresh.
+        // A resumed launch reopens the project's last conversation, which
+        // is the session a claimed card's agent was working in.
+        let resume: &[&str] = match self.id {
+            "opencode" | "claude" => &["--continue"],
+            "codex" => &["resume", "--last"],
+            _ => &[],
+        };
+        program.resume_args = resume.iter().map(|s| s.to_string()).collect();
+        // How to reopen one exact conversation, when radar has stored the
+        // session id a claim's agent had (db::agent_sessions).
+        program.resume_session = match self.id {
+            "opencode" => "--session {id}".to_string(),
+            "claude" => "--resume {id}".to_string(),
+            "codex" => "resume {id}".to_string(),
+            _ => String::new(),
         };
         // omarchy's default agent is the one users expect first everywhere.
         if omarchy_default().as_deref() == Some(self.id) {

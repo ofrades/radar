@@ -19,6 +19,7 @@ pub mod gui;
 pub mod programs;
 pub mod session;
 pub mod skill;
+pub mod web;
 
 pub use config::Paths;
 pub use db::Db;

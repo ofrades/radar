@@ -6,15 +6,15 @@ use anyhow::Result;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use super::{now, Db, Slot};
+use super::{now, Db, Slot, TabKey};
 
-/// A pane group: one pane can show several primitives as chips.
+/// A pane group: one pane can show several tabs as chips.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceGroup {
     /// Members in header order.
-    pub slots: Vec<Slot>,
+    pub slots: Vec<TabKey>,
     /// The chip that was active when the workspace was saved.
-    pub active: Slot,
+    pub active: TabKey,
 }
 
 /// The direction a split divides its region.
@@ -25,12 +25,12 @@ pub enum WorkspaceAxis {
     Vertical,
 }
 
-/// A leaf refers to a group by its stable id; splits preserve the user's tree.
+/// A leaf refers to a group by its anchor tab; splits preserve the user's tree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkspaceLayout {
     Pane {
-        group: Slot,
+        group: TabKey,
     },
     Split {
         axis: WorkspaceAxis,
@@ -53,7 +53,7 @@ pub struct WorkspaceState {
     /// Divider positions are in pixels, matching GTK's paned widget.
     pub positions: HashMap<String, i32>,
     /// The pane being shown full-screen by the zoom action, if any.
-    pub zoomed: Option<Slot>,
+    pub zoomed: Option<TabKey>,
 }
 
 impl Db {
@@ -95,27 +95,27 @@ mod tests {
         let state = WorkspaceState {
             groups: vec![
                 WorkspaceGroup {
-                    slots: vec![Slot::Agent, Slot::Diff],
-                    active: Slot::Diff,
+                    slots: vec![TabKey::first(Slot::Agent), TabKey::first(Slot::Diff)],
+                    active: TabKey::first(Slot::Diff),
                 },
                 WorkspaceGroup {
-                    slots: vec![Slot::Shell],
-                    active: Slot::Shell,
+                    slots: vec![TabKey::first(Slot::Shell)],
+                    active: TabKey::first(Slot::Shell),
                 },
             ],
             layout: Some(WorkspaceLayout::Split {
                 axis: WorkspaceAxis::Horizontal,
                 ratio: 0.42,
                 key: "main".to_string(),
-                first: Box::new(WorkspaceLayout::Pane { group: Slot::Agent }),
-                second: Box::new(WorkspaceLayout::Pane { group: Slot::Shell }),
+                first: Box::new(WorkspaceLayout::Pane { group: TabKey::first(Slot::Agent) }),
+                second: Box::new(WorkspaceLayout::Pane { group: TabKey::first(Slot::Shell) }),
             }),
             programs: HashMap::from([
                 (Slot::Agent, "claude".to_string()),
                 (Slot::Shell, "fish".to_string()),
             ]),
             positions: HashMap::from([("main".to_string(), 640)]),
-            zoomed: Some(Slot::Agent),
+            zoomed: Some(TabKey::first(Slot::Agent)),
         };
 
         db.set_workspace_state(first.id, &state).unwrap();

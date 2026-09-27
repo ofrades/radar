@@ -13,7 +13,7 @@ use super::{now, Db};
 
 /// The role a tab plays. The first four have a user preference attached, which
 /// is how "my preferred editor/agent/diff" works.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Slot {
     Editor,
@@ -24,6 +24,75 @@ pub enum Slot {
     Board,
     /// Anything else: any program the registry knows about.
     Custom,
+}
+
+/// A tab's identity: which primitive it is, and which instance of that
+/// primitive — radar can run two agent tabs side by side, each its own
+/// process and its own chip.
+///
+/// The first instance spells itself as the bare slot string (`agent`), so
+/// stored tabs, saved layouts, the dock, the chords and the HUD — everything
+/// that talks about a primitive by kind — keep working unchanged; only a
+/// second instance writes a suffix (`agent·2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TabKey {
+    pub slot: Slot,
+    pub instance: u32,
+}
+
+impl TabKey {
+    /// The tab a primitive kind means when nothing more specific is said:
+    /// the dock, Alt+1–4 and the HUD all aim at this one.
+    pub const fn first(slot: Slot) -> Self {
+        TabKey { slot, instance: 0 }
+    }
+
+    /// The tab after this one, when a ＋ adds another of the same primitive.
+    pub const fn next_instance(self) -> Self {
+        TabKey { slot: self.slot, instance: self.instance + 1 }
+    }
+
+    pub fn as_str(self) -> String {
+        if self.instance == 0 {
+            self.slot.as_str().to_string()
+        } else {
+            format!("{}·{}", self.slot.as_str(), self.instance + 1)
+        }
+    }
+
+    /// The inverse of `as_str`. An unknown name is a `Custom` tab, the same
+    /// fallback `Slot::parse` uses.
+    pub fn parse(text: &str) -> Self {
+        match text.split_once('·') {
+            Some((slot, tail)) => TabKey {
+                slot: Slot::parse(slot),
+                instance: tail.trim().parse::<u32>().map(|n| n.saturating_sub(1)).unwrap_or(0),
+            },
+            None => TabKey { slot: Slot::parse(text), instance: 0 },
+        }
+    }
+
+    /// What a chip calls the tab: the primitive's name, numbered from the
+    /// second instance on.
+    pub fn label(self) -> String {
+        if self.instance == 0 {
+            self.slot.label().to_string()
+        } else {
+            format!("{} {}", self.slot.label(), self.instance + 1)
+        }
+    }
+}
+
+impl Serialize for TabKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TabKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(TabKey::parse(&String::deserialize(deserializer)?))
+    }
 }
 
 impl Slot {
@@ -274,6 +343,32 @@ mod tests {
             assert_eq!(Slot::parse(slot.as_str()), slot);
         }
         assert_eq!(Slot::parse("nonsense"), Slot::Custom);
+    }
+
+    #[test]
+    fn tab_keys_spell_the_first_instance_as_the_bare_slot() {
+        // Instance 0 must stay the bare slot string: stored tabs, saved
+        // layouts, the dock and the chords all use it.
+        assert_eq!(TabKey::first(Slot::Agent).as_str(), "agent");
+        assert_eq!(TabKey::parse("agent"), TabKey::first(Slot::Agent));
+        assert_eq!(TabKey::parse("nonsense"), TabKey::first(Slot::Custom));
+
+        // Later instances number from two, like the chip label.
+        let second = TabKey::first(Slot::Agent).next_instance();
+        assert_eq!(second.as_str(), "agent·2");
+        assert_eq!(TabKey::parse("agent·2"), second);
+        assert_eq!(second.label(), "Agent 2");
+        assert_eq!(TabKey::first(Slot::Agent).label(), "Agent");
+
+        // The saved-state JSON round-trips through the string form.
+        let json = serde_json::to_string(&second).unwrap();
+        assert_eq!(json, "\"agent·2\"");
+        assert_eq!(serde_json::from_str::<TabKey>(&json).unwrap(), second);
+        // A state saved before per-tab identity parses as instance 0.
+        assert_eq!(
+            serde_json::from_str::<TabKey>("\"agent\"").unwrap(),
+            TabKey::first(Slot::Agent)
+        );
     }
 
     #[test]

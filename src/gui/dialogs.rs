@@ -123,7 +123,10 @@ pub fn preferences<F: Fn() + 'static>(
     note.set_xalign(0.0);
     page.append(&note);
 
-    let scroll = gtk::ScrolledWindow::builder().vexpand(true).child(&page).build();
+    let scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .child(&page)
+        .build();
     dialog.set_child(Some(&scroll));
     dialog.present();
 }

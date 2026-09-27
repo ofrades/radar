@@ -15,7 +15,7 @@ use gtk::glib;
 
 use super::primitive::label_for;
 use super::{accel_hint, icon_name, primitive, SharedApp};
-use crate::db::Slot;
+use crate::db::{Slot, TabKey};
 use crate::programs::{self, Program};
 
 /// The keymap, in one place: this panel renders it, the README quotes it.
@@ -296,14 +296,17 @@ impl Hud {
     fn rebuild(&self, app: &SharedApp) {
         self.clear_rows();
 
-        let slots = app
+        // A primitive is "on screen" when any tab of that kind is: the HUD
+        // speaks in kinds, and activating a row lands on the tab of the kind
+        // that exists.
+        let kinds = app
             .current_workspace()
-            .map(|workspace| workspace.visible_slots())
+            .map(|workspace| workspace.visible_kinds())
             .unwrap_or_default();
 
         self.section("Primitives");
         for slot in super::PRIMITIVES {
-            let on = slots.contains(&slot);
+            let on = kinds.contains(&slot);
             let row = self.row_widget(
                 Some(icon_name(slot)),
                 label_for(slot),
@@ -330,6 +333,7 @@ impl Hud {
 
         self.section("Actions");
         for (label, keys, action, extra) in [
+            ("Go home", "Alt+Home", "win.show-home", "empty state setup"),
             ("Search projects", "Alt+N", "win.find-projects", "find add"),
             ("Preferences…", "Alt+,", "win.preferences", "settings prefs"),
             (
@@ -358,7 +362,7 @@ impl Hud {
         self.clear_rows();
         let current = app.current_workspace().and_then(|workspace| {
             workspace
-                .primitive(slot)
+                .tab(workspace.resolve_tab(TabKey::first(slot)))
                 .map(|primitive| primitive.program_id.clone())
                 .or_else(|| workspace.programs.borrow().get(&slot).cloned())
         });
@@ -404,10 +408,8 @@ impl Hud {
         let mut focus_program = None;
         match kind {
             Kind::Primitive(slot) => {
-                let _ = row.activate_action(
-                    "win.primitive-activate",
-                    Some(&slot.as_str().to_variant()),
-                );
+                let _ = row
+                    .activate_action("win.primitive-activate", Some(&slot.as_str().to_variant()));
             }
             Kind::Program(slot, program) => {
                 if let Some(workspace) = app.current_workspace() {
@@ -422,7 +424,10 @@ impl Hud {
         }
         self.close(app);
         if let Some((workspace, slot)) = focus_program {
-            if let Some(primitive) = workspace.primitive(slot) {
+            // The choice landed on the kind's tab that exists — resolve the
+            // same way the action did before focusing it.
+            let key = workspace.resolve_tab(TabKey::first(slot));
+            if let Some(primitive) = workspace.tab(key) {
                 primitive.focus();
             }
         }
@@ -442,7 +447,10 @@ impl Hud {
                 if !matches!(rows[index].2, Kind::Section) {
                     continue;
                 }
-                let any = rows.iter().skip(index + 1).take_while(|(_, _, kind)| !matches!(kind, Kind::Section))
+                let any = rows
+                    .iter()
+                    .skip(index + 1)
+                    .take_while(|(_, _, kind)| !matches!(kind, Kind::Section))
                     .any(|(row, _, _)| row.is_visible());
                 rows[index].0.set_visible(any);
             }
@@ -495,7 +503,10 @@ impl Hud {
             return;
         };
         let bottom = top + row.height() as f64;
-        let (view_top, view_bottom) = (adjustment.value(), adjustment.value() + adjustment.page_size());
+        let (view_top, view_bottom) = (
+            adjustment.value(),
+            adjustment.value() + adjustment.page_size(),
+        );
         if top < view_top {
             adjustment.set_value(top);
         } else if bottom > view_bottom {

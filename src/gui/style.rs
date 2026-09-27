@@ -23,14 +23,22 @@ thread_local! {
 const TEMPLATE: &str = r#"
 @define-color radar_accent {accent};
 @define-color radar_accent_soft alpha(@radar_accent, 0.15);
-@define-color radar_hairline alpha(@window_fg_color, 0.085);
-@define-color radar_surface alpha(@window_fg_color, 0.045);
-@define-color radar_surface_hover alpha(@window_fg_color, 0.085);
+@define-color radar_bg {bg};
+@define-color radar_fg {fg};
+@define-color radar_muted {muted};
+@define-color radar_warning {warning};
+@define-color radar_hairline alpha(@radar_fg, 0.085);
+@define-color radar_surface alpha(@radar_fg, 0.045);
+@define-color radar_surface_hover alpha(@radar_fg, 0.085);
 
-/* Let the chosen GTK theme own the canvas; keep its separators understated. */
+/* The omarchy theme owns the canvas: its background and foreground colour
+   every surface below, and its font (the system mono, `omarchy font set`)
+   is the app's UI face — omarchy's own shell dresses bar and menus in it.
+   Terminals keep the explicit vte font. */
 window {
-  color: @window_fg_color;
-  background-color: @window_bg_color;
+  font-family: "{font_family}";
+  color: @radar_fg;
+  background-color: @radar_bg;
 }
 /* One hairline around the whole app, matching the panel separators. */
 .app-frame {
@@ -52,7 +60,7 @@ paned > separator:hover {
 
 /* Sidebar: one calm surface, with a softly inset search and compact rows. */
 .projects-sidebar {
-  background-color: alpha(@window_fg_color, 0.025);
+  background-color: alpha(@radar_fg, 0.025);
   /* The focus ring recolors this edge exactly like a pane's; the transparent
      border only reserves it, so gaining focus never shifts the layout. */
   border: 1px solid transparent;
@@ -99,7 +107,7 @@ paned > separator:hover {
   background-color: @radar_surface_hover;
 }
 .projects-sidebar list > row:selected {
-  color: @window_fg_color;
+  color: @radar_fg;
   background-color: @radar_accent_soft;
 }
 .projects-sidebar list > row:selected:hover {
@@ -111,16 +119,16 @@ paned > separator:hover {
 
 /* Icons and metadata stay quiet until they carry useful state. */
 .projects-sidebar row .row-icon {
-  color: alpha(@window_fg_color, 0.55);
+  color: @radar_muted;
 }
 .projects-sidebar row:selected .row-icon {
   color: @radar_accent;
 }
 .projects-sidebar row .row-icon.missing {
-  color: @warning_color;
+  color: @radar_warning;
 }
 .projects-sidebar row .pin-icon {
-  color: alpha(@window_fg_color, 0.45);
+  color: @radar_muted;
 }
 .projects-sidebar row .badge {
   min-width: 12px;
@@ -130,6 +138,10 @@ paned > separator:hover {
   font-weight: 700;
   color: @radar_accent;
   background-color: @radar_accent_soft;
+}
+.projects-sidebar row .attention-badge {
+  color: @radar_warning;
+  background-color: alpha(@radar_warning, 0.16);
 }
 
 /* Pane framing is intentionally thin; the running tool remains the focal point.
@@ -156,30 +168,53 @@ paned > separator:hover {
 .group-header.dragging {
   opacity: 0.55;
 }
-/* Members read as plain text, not buttons: the active one is accented.
-   They stay buttons underneath — drag, hover, and keyboard focus still work.
-   Horizontal padding comes from the shared button.flat rule below. */
-.group-header button.group-chip {
+/* Chips are mini panel-headers, not buttons: icon, name, the program's live
+   info, a program dropdown and a close each. The switch reads as plain text;
+   the active member is accented, and a bell (an agent asking for attention)
+   turns its whole chip accent until it is looked at. They stay buttons
+   underneath — drag, hover, and keyboard focus still work. */
+.group-header .group-chip {
+  border-radius: {control_radius};
+}
+.group-header .group-chip button.chip-main {
   min-height: 26px;
   background: none;
   border: none;
-  color: alpha(@window_fg_color, 0.6);
+  color: alpha(@radar_fg, 0.6);
 }
-.group-header button.group-chip:hover {
-  color: @window_fg_color;
+.group-header .group-chip button.chip-main:hover {
+  color: @radar_fg;
   background: none;
 }
-.group-header button.group-chip.active {
+.group-header .group-chip.active button.chip-main {
   color: @radar_accent;
   background: none;
 }
-/* Live info from the active member's program: dim text at the header's
-   right edge. A bell (an agent asking for attention) turns it accented. */
+.group-header .group-chip.attention button.chip-main,
+.group-header .group-chip.attention label.pane-info {
+  color: @radar_accent;
+}
+/* Live info from the member's program, dim beside its label. */
 .group-header label.pane-info {
-  margin: 0 6px;
+  margin: 0 2px;
 }
-.group-header label.pane-info.attention {
-  color: @radar_accent;
+/* A chip's own controls sit quiet until hovered. */
+.group-header .group-chip button.chip-menu,
+.group-header .group-chip button.chip-close {
+  min-width: 22px;
+  min-height: 22px;
+  padding: 0;
+  border-radius: {control_radius};
+  color: alpha(@radar_fg, 0.45);
+}
+.group-header .group-chip button.chip-menu:hover,
+.group-header .group-chip button.chip-close:hover {
+  color: @radar_fg;
+  background-color: @radar_surface_hover;
+}
+.group-header .group-chip button.chip-menu:checked {
+  color: @radar_fg;
+  background-color: @radar_surface_hover;
 }
 .group-header button.flat,
 .projects-sidebar button.flat {
@@ -223,7 +258,40 @@ paned > separator:hover {
   background-color: @radar_accent_soft;
 }
 
+/* Home: the empty state with something to do — brand, setup rows, ways forward. */
+.home > image.home-logo {
+  opacity: 0.9;
+}
+/* The setup list reads as one card over the window's canvas, not a surface. */
+.home list {
+  background: none;
+}
+
 /* Board: quiet columns, lightly outlined cards, and a single warm claim marker. */
+.board-pane {
+  background-color: @radar_bg;
+}
+.board-activity-panel {
+  min-width: 290px;
+  padding: 12px;
+  border-left: 1px solid @radar_hairline;
+  background-color: alpha(@radar_fg, 0.025);
+}
+.board-activity-panel .activity-section-heading {
+  margin-top: 10px;
+}
+.board-activity-panel .attention-card {
+  border: 1px solid alpha(@radar_warning, 0.32);
+  border-radius: {control_radius};
+  background-color: alpha(@radar_warning, 0.06);
+}
+.board-activity-panel .activity-row {
+  padding: 4px 0;
+  border-bottom: 1px solid @radar_hairline;
+}
+.board-activity-panel .error {
+  color: @radar_warning;
+}
 .board-column {
   border: 1px solid @radar_hairline;
   border-radius: {panel_radius_inner};
@@ -235,18 +303,18 @@ paned > separator:hover {
   background-color: @radar_accent_soft;
 }
 .board-card {
-  border: 1px solid alpha(@window_fg_color, 0.06);
+  border: 1px solid alpha(@radar_fg, 0.06);
   border-radius: {control_radius};
-  background-color: alpha(@window_fg_color, 0.055);
+  background-color: alpha(@radar_fg, 0.055);
   padding: 8px 9px;
 }
 .board-card:hover {
   border-color: alpha(@radar_accent, 0.35);
-  background-color: alpha(@window_fg_color, 0.09);
+  background-color: alpha(@radar_fg, 0.09);
 }
 .board-card-done {
   text-decoration: line-through;
-  color: alpha(@window_fg_color, 0.55);
+  color: alpha(@radar_fg, 0.55);
 }
 .board-claim {
   color: @radar_accent;
@@ -254,6 +322,12 @@ paned > separator:hover {
   background-color: @radar_accent_soft;
   border-radius: 999px;
   padding: 1px 6px;
+}
+
+/* The @claim is a link: the button vanishes, the pill stays. */
+button.board-claim-button {
+  padding: 0;
+  min-height: 0;
 }
 
 /* Row actions stay out of the way until needed. */
@@ -307,12 +381,33 @@ toast {
   border-color: alpha(@radar_accent, 0.82);
   box-shadow: inset 0 0 0 1px alpha(@radar_accent, 0.7);
 }
+/* Menus follow the omarchy menu card: the theme's canvas and panel
+   roundness, a quiet border, and rows that highlight like the sidebar's.
+   Chip dropdowns and context menus (gtk MenuButton / PopoverMenu) all
+   render through `popover`. */
+popover {
+  background-color: @radar_bg;
+  border-radius: {panel_radius};
+  border: 1px solid alpha(@radar_fg, 0.12);
+  box-shadow: 0 10px 32px alpha(black, 0.35);
+  padding: 4px;
+}
+popover modelbutton {
+  border-radius: {control_radius};
+}
+popover modelbutton:hover {
+  background-color: @radar_surface_hover;
+}
+
 .hud-root {
   background: alpha(black, 0.45);
 }
 .hud-card {
-  background-color: @window_bg_color;
-  border-radius: 12px;
+  background-color: @radar_bg;
+  border-radius: {panel_radius};
+  /* Omarchy's menu cards carry the accent on their edge; radar's floating
+     HUD does too, at a whisper. */
+  border: 1px solid alpha(@radar_accent, 0.55);
   padding: 12px 12px 14px;
   box-shadow: 0 12px 40px alpha(black, 0.55);
 }
@@ -326,7 +421,7 @@ toast {
   background: none;
 }
 .hud-list row {
-  border-radius: 8px;
+  border-radius: {control_radius};
   background: none;
 }
 .hud-list row:hover {
@@ -352,13 +447,19 @@ toast {
 }
 "#;
 
-/// Render the stylesheet for a theme: omarchy's accent and Hyprland's panel
-/// rounding in, everything else derived from those.
+/// Render the stylesheet for a theme: omarchy's palette, font, and Hyprland's
+/// panel rounding in, everything else derived from those. No GTK theme colour
+/// tokens survive — radar conforms to omarchy, not to Adwaita.
 fn stylesheet(theme: &Theme) -> String {
     let accent = sober(&theme.accent, &theme.foreground, &theme.background);
     let radius = |steps_down: i32| format!("{}px", (theme.panel_radius - steps_down).max(0));
     TEMPLATE
         .replace("{accent}", &hex_color(&accent))
+        .replace("{bg}", &hex_color(&theme.background))
+        .replace("{fg}", &hex_color(&theme.foreground))
+        .replace("{muted}", &hex_color(&theme.muted))
+        .replace("{warning}", &hex_color(&theme.warning))
+        .replace("{font_family}", &theme.font_family)
         .replace("{pane_bg}", &hex_color(&theme.background))
         .replace("{accent_text}", &hex_color(&readable_on(&accent)))
         .replace(
@@ -454,6 +555,11 @@ mod tests {
         let css = stylesheet(&Theme::load());
         for token in [
             "{accent}",
+            "{bg}",
+            "{fg}",
+            "{muted}",
+            "{warning}",
+            "{font_family}",
             "{pane_bg}",
             "{accent_text}",
             "{accent_hover}",
@@ -467,13 +573,49 @@ mod tests {
     }
 
     #[test]
+    fn the_sheet_is_omarchy_keyed_not_gtk_keyed() {
+        // Every surface takes the omarchy theme's colours; the GTK theme's
+        // tokens must not leak into the rendered sheet.
+        let css = stylesheet(&Theme::load());
+        assert!(!css.contains("@window_bg_color"));
+        assert!(!css.contains("@window_fg_color"));
+        assert!(!css.contains("@warning_color"));
+        assert!(css.contains("@radar_bg"));
+        assert!(css.contains("@radar_fg"));
+    }
+
+    #[test]
+    fn the_ui_wears_the_omarchy_font() {
+        let theme = Theme {
+            font_family: "JetBrainsMono Nerd Font".to_string(),
+            ..Theme::default()
+        };
+        let css = stylesheet(&theme);
+        assert!(css.contains("font-family: \"JetBrainsMono Nerd Font\";"));
+    }
+
+    #[test]
+    fn menus_and_popovers_follow_the_panel_roundness() {
+        let theme = Theme {
+            panel_radius: 8,
+            ..Theme::default()
+        };
+        let css = stylesheet(&theme);
+        assert!(css.contains("popover {\n  background-color: @radar_bg;\n  border-radius: 8px;"));
+        // The HUD card rounds with the panel instead of a hardcoded 12px.
+        assert!(css.contains(".hud-card {\n  background-color: @radar_bg;\n  border-radius: 8px;"));
+    }
+
+    #[test]
     fn radii_scale_down_from_the_panel() {
         let theme = Theme {
             panel_radius: 8,
             ..Theme::default()
         };
         let css = stylesheet(&theme);
-        assert!(css.contains(".group-pane {\n  border: 1px solid @radar_hairline;\n  border-radius: 8px;"));
+        assert!(css.contains(
+            ".group-pane {\n  border: 1px solid @radar_hairline;\n  border-radius: 8px;"
+        ));
         assert!(css.contains("border-radius: 8px 8px 0 0;\n  background-color: #111111;"));
         assert!(css.contains("border-radius: 6px;\n}"));
         // Square panels square everything off too, and nothing goes negative.
@@ -520,6 +662,9 @@ mod tests {
         let raw = chroma(&accent);
         let calm_chroma = chroma(&calm);
         assert!(calm_chroma < raw * 0.75, "sobering must desaturate");
-        assert!(calm_chroma > raw * 0.3, "sobering must not grey out the accent");
+        assert!(
+            calm_chroma > raw * 0.3,
+            "sobering must not grey out the accent"
+        );
     }
 }

@@ -281,7 +281,9 @@ fn cycle_focus(app: &SharedApp, backwards: bool) {
     let focus = app.window.focus_widget();
     let count = targets.len() as i32;
     let next = match current_index(app, &targets, focus.as_ref()) {
-        Some(current) => (current as i32 + if backwards { -1 } else { 1 }).rem_euclid(count) as usize,
+        Some(current) => {
+            (current as i32 + if backwards { -1 } else { 1 }).rem_euclid(count) as usize
+        }
         // Nothing has the keys yet: forwards starts at the first pane,
         // backwards at the last.
         None => (if backwards { count - 1 } else { 0 }) as usize,
@@ -331,9 +333,9 @@ fn focus_target(app: &SharedApp, workspace: &Rc<super::Workspace>, target: &Targ
             }
         }
         Target::Pane(group) => {
-            if let Some(slot) = group.active_slot() {
-                group.activate(slot);
-                if let Some(primitive) = workspace.primitive(slot) {
+            if let Some(key) = group.active_key() {
+                group.activate(key);
+                if let Some(primitive) = workspace.tab(key) {
                     primitive.focus();
                 }
             }
@@ -368,9 +370,9 @@ fn install_ring(app: &SharedApp) {
         let workspace = app.current_workspace();
         if let (Some(workspace), Some(focus)) = (&workspace, focus.as_ref()) {
             for group in workspace.groups() {
-                if let Some(slot) = group.slot_for_focus(focus) {
-                    if group.active_slot() != Some(slot) {
-                        group.activate(slot);
+                if let Some(key) = group.key_for_focus(focus) {
+                    if group.active_key() != Some(key) {
+                        group.activate(key);
                         app.refresh_group_menu(&group);
                         app.persist_primitives(workspace);
                     }
@@ -425,7 +427,11 @@ mod tests {
     }
 
     fn candidates(rects: &[Rect]) -> Vec<(usize, Rect)> {
-        rects.iter().enumerate().map(|(index, rect)| (index, *rect)).collect()
+        rects
+            .iter()
+            .enumerate()
+            .map(|(index, rect)| (index, *rect))
+            .collect()
     }
 
     #[test]
@@ -469,10 +475,7 @@ mod tests {
     #[test]
     fn arrow_focus_from_a_divider_moves_to_a_panel_on_that_side() {
         let divider = rect(296.0, 0.0, 8.0, 600.0);
-        let panels = candidates(&[
-            rect(0.0, 0.0, 296.0, 600.0),
-            rect(304.0, 0.0, 300.0, 600.0),
-        ]);
+        let panels = candidates(&[rect(0.0, 0.0, 296.0, 600.0), rect(304.0, 0.0, 300.0, 600.0)]);
         assert_eq!(pick(&divider, &panels, Direction::Left), Some(0));
         assert_eq!(pick(&divider, &panels, Direction::Right), Some(1));
     }

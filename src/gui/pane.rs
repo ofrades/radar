@@ -1,11 +1,12 @@
 //! One tab's content: a program running in a terminal.
 //!
-//! With the `vte` feature the program runs inside a VTE terminal, which is the
-//! whole point of the app: the agent's TUI gets a real terminal, so its mouse,
-//! clipboard and keyboard behaviour are the real thing. Without it we degrade
-//! to a card that can launch the same command in a separate terminal window.
+//! With the `vte` feature the daemon owns the program, PTY, scrollback and
+//! authoritative terminal state. The pane attaches VTE through a local PTY
+//! adapter: VTE renders the snapshot replay and raw stream, while its input is
+//! forwarded to the daemon. Without the feature we degrade to a card that can
+//! launch the same command in a separate terminal window.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -17,10 +18,19 @@ use vte4::prelude::*;
 
 use super::theme::Theme;
 use crate::programs::CommandSpec;
+#[cfg(feature = "vte")]
+use crate::session::{
+    client::{ClientEvent, RemoteSession},
+    Dims, ExitInfo,
+};
+#[cfg(feature = "vte")]
+use std::os::fd::{FromRawFd, OwnedFd as OwnedFdT};
 
 /// Who a pane's live signals talk to: the header routing in mod.rs.
 type InfoObserver = Box<dyn Fn(Option<String>)>;
 type BellObserver = Box<dyn Fn()>;
+/// Who to tell when the program has exited, after the header was told.
+type ExitHandler = Box<dyn Fn()>;
 
 /// What Shift+Enter should send to a program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,11 +67,39 @@ impl ShiftEnter {
     }
 }
 
+/// What a re-launch needs: the handles the first spawn used. The widget
+/// and its session slot live on the pane; the rest is per pane, kept so
+/// [`Pane::respawn`] can run an exited program again exactly as the
+/// spawn-on-first-map path would.
+#[cfg(feature = "vte")]
+#[derive(Clone)]
+struct Relaunch {
+    cwd: std::path::PathBuf,
+    title: String,
+    session_home: std::path::PathBuf,
+    session_id: String,
+    problem: gtk::Label,
+    fallback: gtk::Button,
+    trouble: gtk::Box,
+    events: async_channel::Sender<ClientEvent>,
+    /// The spawn-on-first-map guard: a respawn pre-empts it.
+    spawned: Rc<Cell<bool>>,
+}
+
 /// A running (or launchable) program in a tab.
 pub struct Pane {
     widget: gtk::Widget,
     #[cfg(feature = "vte")]
     terminal: Option<vte4::Terminal>,
+    /// The session behind the terminal: the pty, the child, the
+    /// authoritative state. `None` until the pane's first map spawns
+    /// it — and forever when the spawn failed.
+    #[cfg(feature = "vte")]
+    session: Rc<RefCell<Option<RemoteSession>>>,
+    /// What a re-launch needs: the handles the first spawn used, so an
+    /// exited program can run again over the same widget.
+    #[cfg(feature = "vte")]
+    relaunch: RefCell<Option<Relaunch>>,
     command: String,
     /// This pane's font zoom, 1.0 = the theme's size. Alt+= and Alt+-
     /// change it, Alt+0 resets it, and a theme reload keeps it.
@@ -76,6 +114,9 @@ pub struct Pane {
     observer: Rc<RefCell<Option<InfoObserver>>>,
     /// Who to tell when the program rings the terminal bell.
     bells: Rc<RefCell<Option<BellObserver>>>,
+    /// Who to tell when the program has exited, after the header was
+    /// told. How an agent's conversation gets bound to its board claim.
+    exit_hook: Rc<RefCell<Option<ExitHandler>>>,
 }
 
 impl Pane {
@@ -108,17 +149,70 @@ impl Pane {
         *self.bells.borrow_mut() = Some(Box::new(bell));
     }
 
+    /// Watch for the program's exit, once the header has been told. How
+    /// radar binds the conversation an agent had to its board claim: the
+    /// CLI's session store is asked while the record is fresh.
+    pub fn set_exit_handler(&self, handler: impl Fn() + 'static) {
+        *self.exit_hook.borrow_mut() = Some(Box::new(handler));
+    }
+
     /// Does this pane hold a live terminal?
     #[allow(dead_code)]
     pub fn is_live(&self) -> bool {
         #[cfg(feature = "vte")]
         {
-            self.terminal.is_some()
+            self.session.borrow().is_some()
         }
         #[cfg(not(feature = "vte"))]
         {
             false
         }
+    }
+
+    /// The running program's process id, when one runs. How the board's
+    /// @claims find the exact tab: the child's own `RADAR_AGENT` names it.
+    pub fn session_pid(&self) -> Option<u32> {
+        #[cfg(feature = "vte")]
+        {
+            self.session
+                .borrow()
+                .as_ref()
+                .and_then(RemoteSession::process_id)
+        }
+        #[cfg(not(feature = "vte"))]
+        {
+            None
+        }
+    }
+
+    /// Run the program again in this pane: a fresh session over the same
+    /// widget, whose scrollback survives. How a claimed card's agent
+    /// re-opens — the tab keeps its place, the program comes back with
+    /// its own resume flags and a fresh claim stamp.
+    #[cfg(feature = "vte")]
+    pub fn respawn(&self, spec: &CommandSpec) {
+        let Some(launch) = self.relaunch.borrow().clone() else {
+            return;
+        };
+        launch.spawned.set(true); // the on-map first spawn never fires
+        launch.trouble.set_visible(false);
+        let Some(terminal) = self.terminal.as_ref() else {
+            return;
+        };
+        start_session(
+            terminal.clone(),
+            Rc::clone(&self.session),
+            spec,
+            &launch.cwd,
+            launch.events,
+            launch.problem,
+            launch.fallback,
+            launch.trouble,
+            launch.title,
+            &launch.session_home,
+            &launch.session_id,
+            true,
+        );
     }
 
     /// Apply a freshly loaded theme (used when omarchy switches themes).
@@ -145,14 +239,25 @@ impl Pane {
         theme: &Theme,
         title: &str,
         shift_enter: ShiftEnter,
+        session_home: &Path,
+        session_id: &str,
     ) -> Pane {
         #[cfg(feature = "vte")]
         {
-            Pane::spawn_embedded(spec, cwd, theme, title, shift_enter)
+            Pane::spawn_embedded(
+                spec,
+                cwd,
+                theme,
+                title,
+                shift_enter,
+                session_home,
+                session_id,
+            )
         }
         #[cfg(not(feature = "vte"))]
         {
             let _ = shift_enter;
+            let _ = (session_home, session_id);
             Pane::spawn_external(spec, cwd, theme, title)
         }
     }
@@ -164,6 +269,8 @@ impl Pane {
         theme: &Theme,
         title: &str,
         shift_enter: ShiftEnter,
+        session_home: &Path,
+        session_id: &str,
     ) -> Pane {
         let terminal = vte4::Terminal::new();
         // The pane's own zoom state: 1.0 until Alt+= / Alt+- touch it. The
@@ -242,11 +349,21 @@ impl Pane {
                     gtk::gdk::Key::plus | gtk::gdk::Key::equal | gtk::gdk::Key::KP_Add
                 )
             {
-                zoom_step(&terminal_for_keys, &base_font_for_keys, &scale_for_keys, 1.0);
+                zoom_step(
+                    &terminal_for_keys,
+                    &base_font_for_keys,
+                    &scale_for_keys,
+                    1.0,
+                );
                 return glib::Propagation::Stop;
             }
             if alt && matches!(key, gtk::gdk::Key::minus | gtk::gdk::Key::KP_Subtract) {
-                zoom_step(&terminal_for_keys, &base_font_for_keys, &scale_for_keys, -1.0);
+                zoom_step(
+                    &terminal_for_keys,
+                    &base_font_for_keys,
+                    &scale_for_keys,
+                    -1.0,
+                );
                 return glib::Propagation::Stop;
             }
             if alt && matches!(key, gtk::gdk::Key::_0 | gtk::gdk::Key::KP_0) {
@@ -321,11 +438,13 @@ impl Pane {
         });
         terminal.add_controller(scroll);
 
-        // Live signals for the pane header: what the program says it is (the
-        // window title TUIs broadcast), when it is gone (child exit), and the
-        // bell agent CLIs ring when they finish. The observers are installed
-        // later, once the header that wants this exists; these handles let
-        // the already-connected signals reach them.
+        // Live signals for the pane header: what the program says it is
+        // (the window title TUIs broadcast) and the bell agent CLIs ring
+        // when they finish. Both come from the widget's parse of the
+        // stream, unchanged. Exit comes from the session instead: the
+        // session owns the child now. The observers are installed
+        // later, once the header that wants this exists; these handles
+        // let the already-connected signals reach them.
         let observer: Rc<RefCell<Option<InfoObserver>>> = Rc::new(RefCell::new(None));
         let bells: Rc<RefCell<Option<BellObserver>>> = Rc::new(RefCell::new(None));
         let observer_for_title = observer.clone();
@@ -335,12 +454,6 @@ impl Pane {
                 emit(text);
             }
         });
-        let observer_for_exit = observer.clone();
-        terminal.connect_child_exited(move |_, status| {
-            if let Some(emit) = observer_for_exit.borrow().as_ref() {
-                emit(Some(exit_text(status)));
-            }
-        });
         let bells_for_bell = bells.clone();
         terminal.connect_bell(move |_| {
             if let Some(ring) = bells_for_bell.borrow().as_ref() {
@@ -348,46 +461,98 @@ impl Pane {
             }
         });
 
-        // Spawn on first map, not at construction. Two reasons: the pty is sized
-        // from a widget that now has its real size, and tabs that are never
-        // opened do not start a process at all.
+        // Session lifecycle events arrive independently of the byte stream.
+        let exit_hook: Rc<RefCell<Option<ExitHandler>>> = Rc::new(RefCell::new(None));
+        let (event_sender, event_receiver) = async_channel::unbounded::<ClientEvent>();
+        let observer_for_exit = observer.clone();
+        let hook_for_exit = exit_hook.clone();
+        let problem_for_event = problem.clone();
+        let trouble_for_event = trouble.clone();
+        let fallback_for_event = fallback.clone();
+        let fallback_spec = spec.clone();
+        let fallback_cwd = cwd.to_path_buf();
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(event) = event_receiver.recv().await {
+                match event {
+                    ClientEvent::Exit(info) => {
+                        if let Some(emit) = observer_for_exit.borrow().as_ref() {
+                            emit(Some(exit_text(info)));
+                        }
+                        if let Some(hook) = hook_for_exit.borrow().as_ref() {
+                            hook();
+                        }
+                    }
+                    ClientEvent::Failed(message) => {
+                        problem_for_event.set_text(&message);
+                        let spec = fallback_spec.clone();
+                        let cwd = fallback_cwd.clone();
+                        fallback_for_event.connect_clicked(move |_| {
+                            if let Err(error) = spawn_external_window(&spec, &cwd) {
+                                eprintln!("radar: could not open a terminal: {error}");
+                            }
+                        });
+                        fallback_for_event.set_visible(true);
+                        trouble_for_event.set_visible(true);
+                    }
+                }
+            }
+        });
+
+        // Spawn on first map, not at construction. Two reasons: the
+        // grid is sized from a widget that now has its real size, and
+        // tabs that are never opened do not start a process at all.
         let spawned = std::rc::Rc::new(std::cell::Cell::new(false));
         let spec_for_spawn = spec.clone();
         let cwd = cwd.to_path_buf();
         let title = title.to_string();
+        let session_home = session_home.to_path_buf();
+        let session_id = session_id.to_string();
+        let session_slot: Rc<RefCell<Option<RemoteSession>>> = Rc::new(RefCell::new(None));
         let terminal_for_spawn: vte4::Terminal = terminal.clone();
+        let session_for_map = session_slot.clone();
+        let relaunch = Relaunch {
+            cwd: cwd.clone(),
+            title: title.clone(),
+            session_home: session_home.clone(),
+            session_id: session_id.clone(),
+            problem: problem.clone(),
+            fallback: fallback.clone(),
+            trouble: trouble.clone(),
+            events: event_sender.clone(),
+            spawned: spawned.clone(),
+        };
         terminal.connect_map(move |_widget| {
             if spawned.get() {
                 return;
             }
             spawned.set(true);
-            // The signal handler is `Fn`, so everything the spawn needs is cloned
-            // here rather than moved out of the captures.
+            // The signal handler is `Fn`, so everything the spawn needs
+            // is cloned here rather than moved out of the captures.
             let terminal = terminal_for_spawn.clone();
-            let argv = spec_for_spawn.argv.clone();
-            let extra_env: Vec<String> = spec_for_spawn
-                .env_set
-                .iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect();
-            let command = spec_for_spawn.display();
-            let cwd_string = cwd.to_string_lossy().to_string();
+            let spec = spec_for_spawn.clone();
+            let cwd = cwd.clone();
+            let title = title.clone();
+            let session_home = session_home.clone();
+            let session_id = session_id.clone();
             let problem = problem.clone();
             let fallback = fallback.clone();
             let trouble = trouble.clone();
-            let title = title.clone();
+            let events = event_sender.clone();
+            let slot = session_for_map.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
-                try_spawn(
+                start_session(
                     terminal,
-                    argv,
-                    extra_env,
-                    cwd_string,
+                    slot,
+                    &spec,
+                    &cwd,
+                    events,
                     problem,
                     fallback,
                     trouble,
                     title,
-                    command,
-                    0,
+                    &session_home,
+                    &session_id,
+                    false,
                 );
             });
         });
@@ -395,11 +560,14 @@ impl Pane {
         Pane {
             widget: container.upcast(),
             terminal: Some(terminal),
+            session: session_slot,
+            relaunch: RefCell::new(Some(relaunch)),
             command: spec.display(),
             font_scale,
             base_font,
             observer,
             bells,
+            exit_hook,
         }
     }
 
@@ -456,151 +624,128 @@ impl Pane {
             widget: outer.upcast(),
             #[cfg(feature = "vte")]
             terminal: None,
+            #[cfg(feature = "vte")]
+            session: Rc::new(RefCell::new(None)),
             command: spec.display(),
             observer: Rc::new(RefCell::new(None)),
             bells: Rc::new(RefCell::new(None)),
+            exit_hook: Rc::new(RefCell::new(None)),
         }
     }
 }
 
-/// What a pane's header says once its program is gone. `status` is the
-/// waitpid status VTE reports: exit code in the high byte, signal in the low
-/// one.
+/// What a pane's header says once its program is gone.
 #[cfg(feature = "vte")]
-fn exit_text(status: i32) -> String {
-    use std::os::unix::process::ExitStatusExt;
-    let status = std::process::ExitStatus::from_raw(status);
-    match status.code() {
-        Some(0) => "exited".to_string(),
-        Some(code) => format!("exited ({code})"),
-        None => match status.signal() {
-            Some(signal) => format!("killed by signal {signal}"),
-            None => "exited".to_string(),
+fn exit_text(info: ExitInfo) -> String {
+    match info.signal {
+        // strsignal's own words: "Terminated", "Killed", "Segmentation fault".
+        Some(signal) => signal,
+        None => match info.code {
+            0 => "exited".to_string(),
+            code => format!("exited ({code})"),
         },
     }
 }
 
-/// Start a program in a VTE terminal, retrying once.
+/// Start the session behind a terminal pane, and hand the widget its
+/// end of the bridge.
 ///
-/// VTE spawns through a helper process and waits for it while the main loop
-/// runs. A main loop that is busy — a synchronous `git status`, say — can make
-/// that handshake time out, which looked like "the terminal does not work". A
-/// roomy timeout plus one retry makes the pane reliable without hiding real
-/// failures: the retry only happens for `Operation timed out`, and anything
-/// else is reported immediately.
+/// Failure is visible, not fatal: if the program cannot be started, the
+/// pane says so and offers the same command in the user's own terminal,
+/// which always works.
 #[cfg(feature = "vte")]
 #[allow(clippy::too_many_arguments)]
-fn try_spawn(
+fn start_session(
     terminal: vte4::Terminal,
-    argv: Vec<String>,
-    extra_env: Vec<String>,
-    cwd: String,
+    slot: Rc<RefCell<Option<RemoteSession>>>,
+    spec: &CommandSpec,
+    cwd: &Path,
+    events: async_channel::Sender<ClientEvent>,
     problem: gtk::Label,
     fallback: gtk::Button,
     trouble: gtk::Box,
     title: String,
-    command: String,
-    attempt: u8,
+    session_home: &Path,
+    session_id: &str,
+    replace_existing: bool,
 ) {
-    const SPAWN_TIMEOUT_MS: i32 = 8_000;
-    // The callback owns these, while the call itself borrows argv and cwd, so the
-    // values it needs for a retry are cloned up front.
-    let terminal_for_retry = terminal.clone();
-    let argv_for_retry = argv.clone();
-    let extra_env_for_retry = extra_env.clone();
-    let cwd_for_retry = cwd.clone();
-    let problem_for_retry = problem.clone();
-    let fallback_for_retry = fallback.clone();
-    let trouble_for_retry = trouble.clone();
-    let title_for_retry = title.clone();
-    let command_for_retry = command.clone();
-    // Start through a shell that moves into the project and `exec`s the program.
-    //
-    // VTE's own working-directory handling is the one difference between a
-    // spawn that works and this one that timed out, and `exec` means the shell
-    // is replaced by the program: same single process, same pty, no extra layer.
-    let wrapped: Vec<String> = std::iter::once("/bin/sh".to_string())
-        .chain([
-            "-c".to_string(),
-            "cd \"$1\" || exit 126; shift; exec \"$@\"".to_string(),
-            "radar".to_string(),
-            cwd.clone(),
-        ])
-        .chain(argv.iter().cloned())
-        .collect();
-    let argv_refs: Vec<&str> = wrapped.iter().map(String::as_str).collect();
-    // A terminal launched from a menu has no TERM: programs would fall back to
-    // something dumb and look broken. Set it explicitly, the way every terminal
-    // emulator does. The rest of the environment is inherited, so PATH and the
-    // agents' own configuration come along — plus whatever this launch adds
-    // (an agent's `RADAR_AGENT`, the name it claims board work under).
-    let mut envv: Vec<String> = vec![
-        "TERM=xterm-256color".to_string(),
-        "COLORTERM=truecolor".to_string(),
-    ];
-    envv.extend(extra_env);
-    let env_refs: Vec<&str> = envv.iter().map(String::as_str).collect();
-    terminal.spawn_async(
-        vte4::PtyFlags::DEFAULT,
-        // Deliberately None: the wrapper cds. See above.
-        None,
-        &argv_refs,
-        &env_refs,
-        glib::SpawnFlags::DEFAULT,
-        || {},
-        SPAWN_TIMEOUT_MS,
-        None::<&gtk::gio::Cancellable>,
-        move |result| match result {
-            Ok(_pid) => {}
-            Err(error) => {
-                let timed_out = error.to_string().contains("timed out");
-                if timed_out && attempt < 2 {
-                    glib::timeout_add_local_once(
-                        std::time::Duration::from_millis(400),
-                        move || {
-                            try_spawn(
-                                terminal_for_retry,
-                                argv_for_retry,
-                                extra_env_for_retry,
-                                cwd_for_retry,
-                                problem_for_retry,
-                                fallback_for_retry,
-                                trouble_for_retry,
-                                title_for_retry,
-                                command_for_retry,
-                                attempt + 1,
-                            );
-                        },
-                    );
-                } else {
-                    // Only the clones are used here: the call still borrows the
-                    // originals while this callback runs.
-                    problem_for_retry.set_text(&format!(
-                        "Could not start {title_for_retry} inside radar: {error}\n\
-                         The same program in your own terminal:\n  cd {cwd_for_retry}\n  {command_for_retry}"
-                    ));
-                    // Wire the fallback once, then show it.
-                    if !fallback_for_retry.has_css_class("wired") {
-                        fallback_for_retry.add_css_class("wired");
-                        let spec = CommandSpec {
-                            argv: argv_for_retry.clone(),
-                            env_unset: Vec::new(),
-                            env_set: Vec::new(),
-                        };
-                        let cwd = std::path::PathBuf::from(&cwd_for_retry);
-                        let toasts: Option<gtk::Widget> = None;
-                        let _ = toasts;
-                        fallback_for_retry.connect_clicked(move |_| {
-                            if let Err(error) = spawn_external_window(&spec, &cwd) {
-                                eprintln!("radar: could not open a terminal: {error}");
-                            }
-                        });
+    // A re-launch detaches the prior view first; Stop/Forget/Create happens
+    // through the daemon connection and never depends on widget ownership.
+    slot.borrow_mut().take();
+    terminal.set_pty(None::<&vte4::Pty>);
+    terminal.reset(true, true);
+    let cols = terminal.column_count();
+    let rows = terminal.row_count();
+    let dims = if cols > 0 && rows > 0 {
+        Dims {
+            cols: cols as u16,
+            rows: rows as u16,
+        }
+    } else {
+        Dims { cols: 80, rows: 24 }
+    };
+
+    let command = spec.display();
+    let cwd_string = cwd.to_string_lossy().to_string();
+    let spawn = crate::session::registry::Spawn {
+        id: session_id.to_string(),
+        argv: spec.argv.clone(),
+        cwd: cwd.to_path_buf(),
+        env: spec.env_set.clone(),
+        env_remove: spec.env_unset.clone(),
+        dims,
+    };
+    let mut failure = None;
+    match RemoteSession::attach(
+        session_home,
+        session_id.to_string(),
+        spawn,
+        replace_existing,
+        move |event| {
+            let _ = events.try_send(event);
+        },
+    ) {
+        Ok(session) => {
+            let raw_fd = unsafe { libc::dup(session.client_fd()) };
+            if raw_fd < 0 {
+                failure = Some(format!(
+                    "could not duplicate renderer PTY: {}",
+                    std::io::Error::last_os_error()
+                ));
+            } else {
+                let fd = unsafe { OwnedFdT::from_raw_fd(raw_fd) };
+                match vte4::Pty::foreign_sync(fd, None::<&gtk::gio::Cancellable>) {
+                    Ok(pty) => {
+                        terminal.set_pty(Some(&pty));
+                        slot.borrow_mut().replace(session);
                     }
-                    trouble_for_retry.set_visible(true);
+                    Err(error) => {
+                        failure = Some(format!(
+                            "the terminal widget refused the daemon attachment: {error}"
+                        ))
+                    }
                 }
             }
-        },
-    );
+        }
+        Err(error) => failure = Some(error.to_string()),
+    }
+
+    if let Some(reason) = failure {
+        problem.set_text(&format!(
+            "Could not start {title} inside radar: {reason}\n\
+             The same program in your own terminal:\n  cd {cwd_string}\n  {command}"
+        ));
+        fallback.connect_clicked({
+            let spec = spec.clone();
+            let cwd = cwd.to_path_buf();
+            move |_| {
+                if let Err(error) = spawn_external_window(&spec, &cwd) {
+                    eprintln!("radar: could not open a terminal: {error}");
+                }
+            }
+        });
+        trouble.set_visible(true);
+    }
 }
 
 /// Launch a program in its own terminal window, the way omarchy does.
@@ -613,27 +758,39 @@ pub fn spawn_external_window(spec: &CommandSpec, cwd: &Path) -> std::io::Result<
     // omarchy's launcher knows the user's terminal, its flags and its window
     // rules, so prefer it over guessing.
     if crate::config::have("omarchy-launch-tui") {
-        return Command::new("omarchy-launch-tui")
-            .args(&spec.argv)
-            .current_dir(&cwd)
-            .spawn()
-            .map(|_| ());
+        let mut command = Command::new("omarchy-launch-tui");
+        command.args(&spec.argv).current_dir(&cwd);
+        apply_command_environment(&mut command, spec);
+        return command.spawn().map(|_| ());
     }
-    for (program, flag) in [("alacritty", "-e"), ("foot", "-e"), ("kitty", "-e"), ("ghostty", "-e")] {
+    for (program, flag) in [
+        ("alacritty", "-e"),
+        ("foot", "-e"),
+        ("kitty", "-e"),
+        ("ghostty", "-e"),
+    ] {
         if crate::config::have(program) {
-            return Command::new(program)
+            let mut command = Command::new(program);
+            command
                 .arg("--working-directory")
                 .arg(&cwd)
                 .arg(flag)
-                .args(&spec.argv)
-                .spawn()
-                .map(|_| ());
+                .args(&spec.argv);
+            apply_command_environment(&mut command, spec);
+            return command.spawn().map(|_| ());
         }
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
         "no terminal emulator found (looked for omarchy-launch-tui, alacritty, foot, kitty, ghostty)",
     ))
+}
+
+fn apply_command_environment(command: &mut std::process::Command, spec: &CommandSpec) {
+    for name in &spec.env_unset {
+        command.env_remove(name);
+    }
+    command.envs(spec.env_set.iter().map(|(name, value)| (name, value)));
 }
 
 #[cfg(feature = "vte")]
@@ -694,10 +851,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn external_launch_environment_preserves_radar_session_identity() {
+        let spec = CommandSpec {
+            argv: vec!["agent".into()],
+            env_unset: vec!["COLORTERM".into()],
+            env_set: vec![
+                ("RADAR_PROJECT_ID".into(), "12".into()),
+                ("RADAR_SESSION_ID".into(), "project-12-agent-0-agent".into()),
+            ],
+        };
+        let mut command = std::process::Command::new("agent");
+        apply_command_environment(&mut command, &spec);
+        let environment: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(|value| value.to_os_string())))
+            .collect();
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("COLORTERM")),
+            Some(&None)
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("RADAR_PROJECT_ID")),
+            Some(&Some("12".into()))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("RADAR_SESSION_ID")),
+            Some(&Some("project-12-agent-0-agent".into()))
+        );
+    }
+
+    #[test]
     fn exit_text_reads_exit_codes_and_signals() {
-        assert_eq!(exit_text(0 << 8), "exited");
-        assert_eq!(exit_text(1 << 8), "exited (1)");
-        assert_eq!(exit_text(9), "killed by signal 9");
+        let exit = |code: u32, signal: Option<&str>| ExitInfo {
+            code,
+            signal: signal.map(str::to_string),
+        };
+        assert_eq!(exit_text(exit(0, None)), "exited");
+        assert_eq!(exit_text(exit(1, None)), "exited (1)");
+        assert_eq!(exit_text(exit(1, Some("Killed"))), "Killed");
     }
 
     #[test]

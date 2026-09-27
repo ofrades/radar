@@ -15,6 +15,12 @@ pub struct LaunchOptions {
     pub extra_args: Vec<String>,
     /// An initial prompt, for agents that take one.
     pub prompt: Option<String>,
+    /// Reopen the program's own last conversation instead of starting
+    /// fresh — the agent's resume flags, when the registry knows them.
+    pub resume: bool,
+    /// Reopen one exact conversation by the CLI's own session id, when
+    /// radar has a binding for it (see `db::agent_sessions`).
+    pub session: Option<String>,
     /// A unique instance name for an agent launch, folded into `RADAR_AGENT`
     /// (see [`command_spec`]). Irrelevant for non-agents.
     pub agent_instance: Option<String>,
@@ -57,9 +63,38 @@ pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
         _ => Vec::new(),
     };
 
-    // omarchy's wrapper knows how its default agent wants to be started, and
-    // keeps working when those flags change. Only used when the user has not
-    // asked for safe mode.
+    // A resumed launch bypasses the omarchy wrapper (it always starts a
+    // fresh agent) and the permission flags: the conversation being
+    // reopened had its own. An exact session id wins over "the last one".
+    let resumed_argv = || {
+        let mut argv = vec![program.command.clone()];
+        argv.extend(program.args.iter().cloned());
+        if let Some(id) = &options.session {
+            if !program.resume_session.is_empty() {
+                argv.extend(
+                    program
+                        .resume_session
+                        .replace("{id}", id)
+                        .split_whitespace()
+                        .map(str::to_string),
+                );
+                return Some(argv);
+            }
+            return None;
+        }
+        if options.resume && !program.resume_args.is_empty() {
+            argv.extend(program.resume_args.iter().cloned());
+            return Some(argv);
+        }
+        None
+    };
+    if let Some(argv) = resumed_argv() {
+        return CommandSpec {
+            argv,
+            env_unset: Vec::new(),
+            env_set,
+        };
+    }
     if agents::use_omarchy_launcher(program, options) {
         let mut argv = vec!["omarchy".to_string(), "agent".to_string(), "--inline".to_string()];
         if let Some(prompt) = options.prompt.as_deref() {
@@ -108,14 +143,32 @@ pub fn instance_stamp(millis: u128) -> String {
     stamp.iter().rev().collect()
 }
 
+/// Milliseconds since the epoch, saturating rather than panicking.
+pub fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 /// The stamp for *now*.
 pub fn now_stamp() -> String {
-    instance_stamp(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0),
-    )
+    instance_stamp(now_millis())
+}
+
+/// The `RADAR_AGENT` a process carries, read from `/proc/<pid>/environ`:
+/// how a board claim is matched to the exact agent tab that owns it —
+/// two instances of the same program are told apart by their stamps.
+/// Linux only, and only while the process lives; `None` otherwise.
+pub fn radar_agent_of(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/environ"))
+        .ok()
+        .and_then(|environ| {
+            environ
+                .split('\0')
+                .find_map(|entry| entry.strip_prefix("RADAR_AGENT="))
+                .map(str::to_string)
+        })
 }
 
 #[cfg(test)]
@@ -132,6 +185,8 @@ mod tests {
             description: String::new(),
             args: Vec::new(),
             auto_args: Vec::new(),
+            resume_args: Vec::new(),
+            resume_session: String::new(),
             env_unset: Vec::new(),
             external: false,
             omarchy: false,
@@ -252,5 +307,61 @@ mod tests {
             },
         );
         assert_eq!(spec.display(), "hunk --watch");
+    }
+
+    #[test]
+    fn a_live_process_read_s_its_own_agent_name() {
+        // This very process: whatever the environment says, the /proc read
+        // must agree — an agent launched by radar carries its claim name,
+        // a test run by hand carries none.
+        assert_eq!(
+            radar_agent_of(std::process::id()),
+            std::env::var("RADAR_AGENT").ok()
+        );
+        // A pid that cannot exist: no environ, no claim.
+        assert_eq!(radar_agent_of(u32::MAX - 1), None);
+    }
+
+    #[test]
+    fn a_resume_launch_reopens_the_last_conversation() {
+        let mut opencode = program("opencode", "opencode");
+        opencode.resume_args = vec!["--continue".into()];
+        let options = LaunchOptions {
+            resume: true,
+            agent_instance: Some("mx7k2b1f".into()),
+            ..Default::default()
+        };
+        let spec = command_spec(&opencode, &options);
+        // No auto flags, no omarchy wrapper: the resumed conversation had
+        // its own permission context, and the wrapper cannot carry resume.
+        assert_eq!(spec.argv, vec!["opencode", "--continue"]);
+        // The relaunch is still a radar agent with its own claim name.
+        assert_eq!(
+            spec.env_set,
+            vec![("RADAR_AGENT".to_string(), "opencode-mx7k2b1f".to_string())]
+        );
+
+        // Without resume knowledge, a resume launch is just a fresh start
+        // with the program's own arguments.
+        let fresh = command_spec(&program("crush", "crush"), &options);
+        assert_eq!(fresh.argv, vec!["crush"]);
+    }
+
+    #[test]
+    fn a_stored_session_reopens_that_exact_conversation() {
+        let mut opencode = program("opencode", "opencode");
+        opencode.resume_session = "--session {id}".to_string();
+        let options = LaunchOptions {
+            session: Some("ses_abc123".into()),
+            ..Default::default()
+        };
+        let spec = command_spec(&opencode, &options);
+        assert_eq!(spec.argv, vec!["opencode", "--session", "ses_abc123"]);
+
+        // A program with no template for ids starts fresh instead of
+        // resuming some other conversation by accident.
+        let mut crush = program("crush", "crush");
+        crush.resume_session = String::new();
+        assert_eq!(command_spec(&crush, &options).argv, vec!["crush"]);
     }
 }

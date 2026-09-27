@@ -22,6 +22,10 @@ pub struct Theme {
     /// The theme's own highlight (`accent` in colors.toml). Radar's controls
     /// key off it, so switching omarchy themes recolours the whole app.
     pub accent: gdk::RGBA,
+    /// Secondary text and quiet chrome (colors.toml `muted`).
+    pub muted: gdk::RGBA,
+    /// Destructive and attention colour (colors.toml `red`).
+    pub warning: gdk::RGBA,
     /// Hyprland's live `decoration:rounding` — the same number omarchy's own
     /// shell uses for panel corners. Panes match it so radar blends in.
     pub panel_radius: i32,
@@ -41,6 +45,8 @@ impl Default for Theme {
                 .collect(),
             // Only used when omarchy (or a colors.toml) is absent entirely.
             accent: gdk::RGBA::parse("#ff7958").unwrap_or(gdk::RGBA::BLACK),
+            muted: gdk::RGBA::parse("#808080").unwrap_or(gdk::RGBA::BLACK),
+            warning: gdk::RGBA::parse("#cc0000").unwrap_or(gdk::RGBA::BLACK),
             panel_radius: 8,
             font_family: "monospace".to_string(),
             font_size: 11.0,
@@ -50,8 +56,8 @@ impl Default for Theme {
 
 /// A decent fallback: the classic xterm palette.
 const DEFAULT_PALETTE: [&str; 16] = [
-    "#000000", "#cd0000", "#00cd00", "#cdcd00", "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5", "#7f7f7f",
-    "#ff0000", "#00ff00", "#ffff00", "#5c5cff", "#ff00ff", "#00ffff", "#ffffff",
+    "#000000", "#cd0000", "#00cd00", "#cdcd00", "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
+    "#7f7f7f", "#ff0000", "#00ff00", "#ffff00", "#5c5cff", "#ff00ff", "#00ffff", "#ffffff",
 ];
 
 impl Theme {
@@ -66,7 +72,15 @@ impl Theme {
             theme.foreground = color(&colors, &["foreground"])
                 .unwrap_or(theme.foreground)
                 .with_alpha(1.0);
-            theme.accent = color(&colors, &["accent"]).unwrap_or(theme.accent).with_alpha(1.0);
+            theme.accent = color(&colors, &["accent"])
+                .unwrap_or(theme.accent)
+                .with_alpha(1.0);
+            theme.muted = color(&colors, &["muted"])
+                .unwrap_or(theme.muted)
+                .with_alpha(1.0);
+            theme.warning = color(&colors, &["red", "bright_red"])
+                .unwrap_or(theme.warning)
+                .with_alpha(1.0);
             theme.palette = ansi_palette(&colors);
         }
         if let Some(radius) = hyprland_panel_radius() {
@@ -148,7 +162,8 @@ fn ansi_palette(colors: &std::collections::HashMap<String, String>) -> Vec<gdk::
     let mut palette = Vec::with_capacity(16);
     for (index, key) in normal.iter().enumerate() {
         palette.push(
-            color(colors, &[key, "background"]).unwrap_or_else(|| fallback.get(index).cloned().unwrap_or(gdk::RGBA::BLACK)),
+            color(colors, &[key, "background"])
+                .unwrap_or_else(|| fallback.get(index).cloned().unwrap_or(gdk::RGBA::BLACK)),
         );
     }
     for (index, key) in bright.iter().enumerate() {
@@ -176,7 +191,9 @@ fn terminal_font() -> Option<(String, f64)> {
     let home = dirs::home_dir()?;
     let candidates = [
         home.join(".config/alacritty/alacritty.toml"),
-        omarchy_theme_dir().unwrap_or_default().join("alacritty.toml"),
+        omarchy_theme_dir()
+            .unwrap_or_default()
+            .join("alacritty.toml"),
         home.join(".config/ghostty/config"),
         home.join(".config/kitty/kitty.conf"),
     ];
@@ -309,7 +326,11 @@ mod tests {
 normal = { family = "JetBrainsMono Nerd Font" }
 size = 8.0
 "#;
-        let (family, size) = font_from_config(Path::new("/home/u/.config/alacritty/alacritty.toml"), config).unwrap();
+        let (family, size) = font_from_config(
+            Path::new("/home/u/.config/alacritty/alacritty.toml"),
+            config,
+        )
+        .unwrap();
         assert_eq!(family, "JetBrainsMono Nerd Font");
         assert_eq!(size, 8.0);
     }
@@ -318,8 +339,11 @@ size = 8.0
     fn alacritty_inline_tables_are_read() {
         // The shape omarchy and most alacritty users have.
         let config = "[font]\nnormal = { family = \"JetBrainsMono Nerd Font\" }\nsize = 8\n";
-        let (family, size) =
-            font_from_config(Path::new("/home/u/.config/alacritty/alacritty.toml"), config).unwrap();
+        let (family, size) = font_from_config(
+            Path::new("/home/u/.config/alacritty/alacritty.toml"),
+            config,
+        )
+        .unwrap();
         assert_eq!(family, "JetBrainsMono Nerd Font");
         assert_eq!(size, 8.0);
     }
@@ -327,13 +351,18 @@ size = 8.0
     #[test]
     fn a_config_without_a_font_is_not_a_match() {
         let config = "[colors]\nbackground = \"#000000\"\n";
-        assert!(font_from_config(Path::new("/home/u/.config/alacritty/alacritty.toml"), config).is_none());
+        assert!(font_from_config(
+            Path::new("/home/u/.config/alacritty/alacritty.toml"),
+            config
+        )
+        .is_none());
     }
 
     #[test]
     fn ghostty_font_is_read() {
         let config = "font-family = JetBrainsMono Nerd Font\nfont-size = 11\n";
-        let (family, size) = font_from_config(Path::new("/home/u/.config/ghostty/config"), config).unwrap();
+        let (family, size) =
+            font_from_config(Path::new("/home/u/.config/ghostty/config"), config).unwrap();
         assert_eq!(family, "JetBrainsMono Nerd Font");
         assert_eq!(size, 11.0);
     }
@@ -341,7 +370,8 @@ size = 8.0
     #[test]
     fn kitty_font_is_read() {
         let config = "font_family JetBrainsMono Nerd Font\nfont_size 13\n";
-        let (family, size) = font_from_config(Path::new("/home/u/.config/kitty/kitty.conf"), config).unwrap();
+        let (family, size) =
+            font_from_config(Path::new("/home/u/.config/kitty/kitty.conf"), config).unwrap();
         assert_eq!(family, "JetBrainsMono Nerd Font");
         assert_eq!(size, 13.0);
     }
@@ -374,6 +404,8 @@ size = 8.0
         assert_eq!(theme.palette.len(), 16);
         assert!(theme.foreground.alpha() > 0.0);
         assert!(theme.accent.alpha() > 0.0);
+        assert!(theme.muted.alpha() > 0.0);
+        assert!(theme.warning.alpha() > 0.0);
         assert!((0..=64).contains(&theme.panel_radius));
     }
 }

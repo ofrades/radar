@@ -7,6 +7,7 @@
 
 pub mod agents;
 pub mod launch;
+pub mod sessions;
 
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +77,14 @@ pub struct Program {
     pub args: Vec<String>,
     /// Arguments that skip a tool's permission prompts (agents only).
     pub auto_args: Vec<String>,
+    /// Arguments that reopen the agent's own last conversation (agents
+    /// only, e.g. `["--continue"]`). Empty when the CLI has none radar
+    /// knows — a resumed launch then just starts fresh.
+    pub resume_args: Vec<String>,
+    /// How to reopen one exact conversation: a tiny template with `{id}`
+    /// where the session id goes (e.g. `"--session {id}"`). Empty when
+    /// the CLI has no such flag radar knows.
+    pub resume_session: String,
     /// Environment variables to remove for this program.
     pub env_unset: Vec<String>,
     /// GUI program: launch it externally instead of embedding it.
@@ -96,6 +105,8 @@ impl Program {
             description: description.to_string(),
             args: Vec::new(),
             auto_args: Vec::new(),
+            resume_args: Vec::new(),
+            resume_session: String::new(),
             env_unset: Vec::new(),
             external: false,
             omarchy: false,

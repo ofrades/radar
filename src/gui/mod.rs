@@ -30,8 +30,11 @@ mod theme;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -41,14 +44,14 @@ use gtk::glib;
 
 use crate::config::Paths;
 use crate::db::{
-    Db, NewWorkspaceLayout, Project, Slot, WorkspaceAxis, WorkspaceGroup, WorkspaceLayout,
+    Db, NewWorkspaceLayout, Project, Slot, TabKey, WorkspaceAxis, WorkspaceGroup, WorkspaceLayout,
     WorkspaceState,
 };
 use crate::discover::{self, Candidate};
 use crate::programs::{self, CommandSpec, Kind, LaunchOptions, Program};
 
-use pane::Pane;
 use group::Group;
+use pane::Pane;
 use primitive::{label_for, Primitive};
 pub use theme::Theme;
 
@@ -56,12 +59,19 @@ type SharedDb = Rc<Db>;
 
 /// The four content primitives, in layout order: the agent leads, because that
 /// is what the workspace is for.
-const PRIMITIVES: [Slot; 5] = [Slot::Agent, Slot::Diff, Slot::Board, Slot::Shell, Slot::Editor];
+const PRIMITIVES: [Slot; 5] = [
+    Slot::Agent,
+    Slot::Diff,
+    Slot::Board,
+    Slot::Shell,
+    Slot::Editor,
+];
 
 type ZoomState = (Vec<Rc<Group>>, Option<split::Node<Group>>);
 
 /// Open the app.
 pub fn run(paths: Paths, db: Db) -> Result<()> {
+    crate::session::daemon::ensure_running(&paths.data_dir)?;
     let app = adw::Application::builder()
         .application_id("dev.omarchy.Radar")
         .build();
@@ -90,18 +100,21 @@ pub fn run(paths: Paths, db: Db) -> Result<()> {
     Ok(())
 }
 
-/// A project's workspace: its primitives, arranged into groups.
+/// A project's workspace: its tabs, arranged into groups.
 ///
-/// A group is a pane with one header. It holds one primitive by default; drag a
-/// header onto another and they share a header, with a chip each to switch. Drag
-/// one out again and it becomes its own pane. The layout places groups by what
-/// they lead with: agent on the left, changes and editor stacked beside it,
-/// commands along the bottom.
+/// A group is a pane with one header. It holds one tab by default; drag a
+/// header onto another and they share a header, with a chip each to switch.
+/// Drag one out again and it becomes its own pane. Tabs are per-key — radar
+/// can run two agent tabs side by side — while the dock, the chords and the
+/// HUD keep aiming at a primitive's first tab. The layout places groups by
+/// what they lead with: agent on the left, changes and editor stacked beside
+/// it, commands along the bottom.
 struct Workspace {
     project: Project,
-    /// Opened primitives, by slot.
-    primitives: RefCell<HashMap<Slot, Rc<Primitive>>>,
-    /// Which program each slot uses, even before it is opened.
+    /// Open tabs, by key.
+    tabs: RefCell<HashMap<TabKey, Rc<Primitive>>>,
+    /// The default program per primitive kind, used when a tab of that kind
+    /// opens and remembered when one changes, even before it is opened.
     programs: RefCell<HashMap<Slot, String>>,
     /// The panes, in layout order.
     groups: RefCell<Vec<Rc<Group>>>,
@@ -122,8 +135,43 @@ struct Workspace {
 }
 
 impl Workspace {
-    fn primitive(&self, slot: Slot) -> Option<Rc<Primitive>> {
-        self.primitives.borrow().get(&slot).cloned()
+    fn tab(&self, key: TabKey) -> Option<Rc<Primitive>> {
+        self.tabs.borrow().get(&key).cloned()
+    }
+
+    /// The tab a key means: itself when it exists, else the first open tab of
+    /// that primitive, else the key itself — the caller may be about to
+    /// create it. The dock, the chords and the HUD speak in bare kinds, so
+    /// they land on whatever tab of the kind exists.
+    fn resolve_tab(&self, key: TabKey) -> TabKey {
+        if self.tabs.borrow().contains_key(&key) {
+            return key;
+        }
+        self.tabs_of_kind(key.slot)
+            .into_iter()
+            .next()
+            .unwrap_or(key)
+    }
+
+    /// Every open tab of one primitive kind, oldest instance first.
+    fn tabs_of_kind(&self, slot: Slot) -> Vec<TabKey> {
+        let mut keys: Vec<TabKey> = self
+            .tabs
+            .borrow()
+            .keys()
+            .filter(|key| key.slot == slot)
+            .copied()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// The next free key for a kind: one past the highest open instance.
+    fn next_key(&self, slot: Slot) -> TabKey {
+        self.tabs_of_kind(slot)
+            .last()
+            .map(|key| key.next_instance())
+            .unwrap_or_else(|| TabKey::first(slot))
     }
 
     fn groups(&self) -> Vec<Rc<Group>> {
@@ -134,34 +182,51 @@ impl Workspace {
         self.dividers.borrow().clone()
     }
 
-    /// Which pane holds a primitive.
-    fn group_of(&self, slot: Slot) -> Option<Rc<Group>> {
-        self.groups.borrow().iter().find(|group| group.contains(slot)).cloned()
+    /// Which pane holds a tab.
+    fn group_of(&self, key: TabKey) -> Option<Rc<Group>> {
+        self.groups
+            .borrow()
+            .iter()
+            .find(|group| group.contains(key))
+            .cloned()
     }
 
-    fn is_visible(&self, slot: Slot) -> bool {
-        self.group_of(slot).is_some()
+    fn is_visible(&self, key: TabKey) -> bool {
+        self.group_of(key).is_some()
     }
 
-    /// Every primitive on screen, in layout order.
-    fn visible_slots(&self) -> Vec<Slot> {
-        let mut all: Vec<Slot> = self
+    /// Which primitive kinds have a tab on screen — what the dock and the
+    /// HUD's "on screen" marks show.
+    fn visible_kinds(&self) -> Vec<Slot> {
+        let mut kinds: Vec<Slot> = self
             .groups
             .borrow()
             .iter()
-            .flat_map(|group| group.slots())
+            .flat_map(|group| group.tabs())
+            .map(|key| key.slot)
             .collect();
-        all.sort_by_key(|slot| PRIMITIVES.iter().position(|other| other == slot).unwrap_or(9));
-        all.dedup();
-        all
+        kinds.sort_by_key(|slot| {
+            PRIMITIVES
+                .iter()
+                .position(|other| other == slot)
+                .unwrap_or(9)
+        });
+        kinds.dedup();
+        kinds
     }
 
-    /// The primitive a pane leads with: the first one in `PRIMITIVES` it holds.
-    fn anchor(group: &Rc<Group>) -> Option<Slot> {
-        group
-            .slots()
-            .into_iter()
-            .min_by_key(|slot| PRIMITIVES.iter().position(|other| other == slot).unwrap_or(9))
+    /// The tab a pane leads with: the first one in `PRIMITIVES` it holds,
+    /// oldest instance first.
+    fn anchor(group: &Rc<Group>) -> Option<TabKey> {
+        group.tabs().into_iter().min_by_key(|key| {
+            (
+                PRIMITIVES
+                    .iter()
+                    .position(|other| other == &key.slot)
+                    .unwrap_or(9),
+                key.instance,
+            )
+        })
     }
 
     fn push_group(&self, group: Rc<Group>) {
@@ -169,12 +234,15 @@ impl Workspace {
     }
 
     fn forget_group(&self, group: &Rc<Group>) {
-        self.groups.borrow_mut().retain(|other| !Rc::ptr_eq(other, group));
+        self.groups
+            .borrow_mut()
+            .retain(|other| !Rc::ptr_eq(other, group));
     }
 }
 
 struct App {
     db: SharedDb,
+    session_home: PathBuf,
     theme: RefCell<Theme>,
     window: adw::ApplicationWindow,
     sidebar: gtk::Widget,
@@ -184,6 +252,11 @@ struct App {
     sidebar_search: gtk::SearchEntry,
     toggles: RefCell<HashMap<Slot, gtk::ToggleButton>>,
     projects_toggle: gtk::ToggleButton,
+    /// Home leads the dock; it is checked while the home panel shows.
+    home_toggle: gtk::ToggleButton,
+    /// True while the home panel is on screen instead of a project's
+    /// workspace — the empty state, or the user's explicit "go home".
+    home_shown: Cell<bool>,
     stack: gtk::Stack,
     toasts: adw::ToastOverlay,
     /// The keyboard's own surface: primitives, actions and the keymap,
@@ -191,13 +264,19 @@ struct App {
     hud: Rc<hud::Hud>,
     workspaces: RefCell<HashMap<i64, Rc<Workspace>>>,
     projects: RefCell<Vec<Project>>,
-    rows: RefCell<Vec<(i64, gtk::ListBoxRow, gtk::Label, gtk::Label)>>,
+    rows: RefCell<Vec<ProjectRow>>,
     status: RefCell<HashMap<i64, crate::git::Status>>,
     status_tx: std::sync::mpsc::Sender<Vec<(i64, crate::git::Status)>>,
     status_rx: RefCell<std::sync::mpsc::Receiver<Vec<(i64, crate::git::Status)>>>,
+    activity: RefCell<HashMap<i64, ProjectActivity>>,
+    activity_online: RefCell<HashMap<i64, bool>>,
+    activity_watchers: RefCell<HashMap<i64, ActivityWatcher>>,
+    activity_tx: std::sync::mpsc::SyncSender<ActivityNotice>,
+    activity_rx: RefCell<std::sync::mpsc::Receiver<ActivityNotice>>,
+    board_panes: RefCell<HashMap<i64, std::rc::Weak<board::BoardPane>>>,
     /// What each pane's program last said about itself — its name and its own
-    /// live title, or its exit — keyed by (project, slot).
-    header_info: RefCell<HashMap<(i64, Slot), String>>,
+    /// live title, or its exit — keyed by (project, tab).
+    header_info: RefCell<HashMap<(i64, TabKey), String>>,
     current: RefCell<Option<i64>>,
     // The search box doubles as the add flow: candidates for the query show
     // under the projects, each with its own add button.
@@ -213,9 +292,301 @@ struct App {
     pointer_motion_ms: Cell<i64>,
 }
 
-type SharedApp = Rc<App>;
+#[derive(Debug)]
+enum ActivityNotice {
+    Snapshot {
+        project_id: i64,
+        snapshot: crate::session::activity::ActivitySnapshot,
+        replace_events: bool,
+    },
+    Event(crate::session::activity::ActivityEvent),
+    Connection {
+        project_id: i64,
+        online: bool,
+    },
+    Mutation {
+        project_id: i64,
+        request_id: String,
+        result: std::result::Result<Box<crate::session::activity::AttentionMutationResult>, String>,
+    },
+}
 
-fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw::ApplicationWindow {
+#[derive(Clone)]
+struct ProjectActivity {
+    snapshot: crate::session::activity::ActivitySnapshot,
+}
+
+impl ProjectActivity {
+    fn empty(project_id: i64) -> Self {
+        Self {
+            snapshot: crate::session::activity::ActivitySnapshot {
+                project_id,
+                watermark: 0,
+                events: Vec::new(),
+                attention: Vec::new(),
+                has_more: false,
+            },
+        }
+    }
+
+    fn merge_snapshot(
+        &mut self,
+        snapshot: crate::session::activity::ActivitySnapshot,
+        replace_events: bool,
+    ) {
+        let fresh = snapshot.watermark >= self.snapshot.watermark;
+        if replace_events && fresh {
+            self.snapshot.events = snapshot.events;
+        } else {
+            for event in snapshot.events {
+                self.insert_event(event);
+            }
+        }
+        self.snapshot.project_id = snapshot.project_id;
+        self.snapshot.watermark = self.snapshot.watermark.max(snapshot.watermark);
+        if fresh {
+            self.snapshot.attention = snapshot.attention;
+            self.snapshot.has_more = snapshot.has_more;
+        }
+    }
+
+    fn insert_event(&mut self, event: crate::session::activity::ActivityEvent) {
+        if !self
+            .snapshot
+            .events
+            .iter()
+            .any(|current| current.id == event.id)
+        {
+            self.snapshot.events.push(event);
+            self.snapshot.events.sort_by_key(|event| event.sequence);
+            if self.snapshot.events.len() > 200 {
+                let excess = self.snapshot.events.len() - 200;
+                self.snapshot.events.drain(..excess);
+            }
+        }
+    }
+
+    fn apply_event(&mut self, event: crate::session::activity::ActivityEvent) {
+        self.snapshot.watermark = self.snapshot.watermark.max(event.sequence);
+        if let crate::session::activity::ActivityPayload::AttentionRequested {
+            request_id,
+            attention_kind,
+            reason,
+            allowed_actions,
+        } = &event.payload
+        {
+            self.upsert_attention(crate::session::activity::Attention {
+                id: request_id.clone(),
+                source_event_id: event.id.clone(),
+                project_id: event.project_id,
+                session_id: event.session_id.clone(),
+                card_id: event.card_id.clone(),
+                kind: *attention_kind,
+                reason: reason.clone(),
+                allowed_actions: allowed_actions.clone(),
+                created_at_millis: event.at_millis,
+                seen_at_millis: None,
+                acknowledged_at_millis: None,
+                resolved_at_millis: None,
+                resolution: None,
+                revision: 1,
+            });
+        } else {
+            use crate::session::activity::ActivityPayload;
+            let changed = match &event.payload {
+                ActivityPayload::AttentionSeen {
+                    request_id,
+                    revision,
+                } => Some((
+                    request_id.as_str(),
+                    *revision,
+                    Some(event.at_millis),
+                    None,
+                    None,
+                )),
+                ActivityPayload::AttentionAcknowledged {
+                    request_id,
+                    revision,
+                } => Some((
+                    request_id.as_str(),
+                    *revision,
+                    None,
+                    Some(event.at_millis),
+                    None,
+                )),
+                ActivityPayload::AttentionResolved {
+                    request_id,
+                    revision,
+                    response,
+                } => Some((
+                    request_id.as_str(),
+                    *revision,
+                    None,
+                    None,
+                    Some((event.at_millis, response.clone())),
+                )),
+                _ => None,
+            };
+            if let Some((request_id, revision, seen, acknowledged, resolved)) = changed {
+                if let Some(attention) = self
+                    .snapshot
+                    .attention
+                    .iter_mut()
+                    .find(|attention| attention.id == request_id)
+                {
+                    if revision >= attention.revision {
+                        attention.revision = revision;
+                        if seen.is_some() {
+                            attention.seen_at_millis = seen;
+                        }
+                        if acknowledged.is_some() {
+                            attention.acknowledged_at_millis = acknowledged;
+                        }
+                        if let Some((at, response)) = resolved {
+                            attention.resolved_at_millis = Some(at);
+                            attention.resolution = Some(response);
+                        }
+                    }
+                }
+            }
+        }
+        self.insert_event(event);
+        self.snapshot
+            .attention
+            .retain(crate::session::activity::Attention::is_unresolved);
+    }
+
+    fn upsert_attention(&mut self, attention: crate::session::activity::Attention) {
+        if let Some(existing) = self
+            .snapshot
+            .attention
+            .iter_mut()
+            .find(|existing| existing.id == attention.id)
+        {
+            if attention.revision >= existing.revision {
+                *existing = attention;
+            }
+        } else if attention.is_unresolved() {
+            self.snapshot.attention.push(attention);
+        }
+        self.snapshot.attention.retain(|item| item.is_unresolved());
+    }
+}
+
+struct ActivityWatcher {
+    stop: Arc<AtomicBool>,
+    interrupt: Arc<Mutex<Option<UnixStream>>>,
+}
+
+impl ActivityWatcher {
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Ok(mut interrupt) = self.interrupt.lock() {
+            if let Some(stream) = interrupt.take() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
+impl Drop for ActivityWatcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+type SharedApp = Rc<App>;
+type ProjectRow = (i64, gtk::ListBoxRow, gtk::Label, gtk::Label, gtk::Label);
+
+/// How an agent tab's program starts: fresh, on the project's last
+/// conversation, or on one exact stored conversation (a board claim's
+/// bound session).
+enum Resume {
+    No,
+    Last,
+    Session(String),
+}
+
+fn stable_session_id(project_id: i64, key: TabKey, program_id: &str) -> String {
+    format!(
+        "project-{project_id}-{}-{}-{program_id}",
+        key.slot.as_str(),
+        key.instance
+    )
+}
+
+fn parse_stable_session_id(session_id: &str) -> Option<(i64, TabKey, String)> {
+    let mut parts = session_id.splitn(5, '-');
+    if parts.next()? != "project" {
+        return None;
+    }
+    let project_id = parts.next()?.parse().ok()?;
+    let slot = Slot::parse(parts.next()?);
+    let instance = parts.next()?.parse::<u32>().ok()?;
+    let program_id = parts.next()?.to_string();
+    if project_id <= 0 || program_id.is_empty() {
+        return None;
+    }
+    Some((project_id, TabKey { slot, instance }, program_id))
+}
+
+fn add_session_environment(
+    spec: &mut CommandSpec,
+    project_id: i64,
+    project_root: &std::path::Path,
+    home: &std::path::Path,
+    session_id: &str,
+) {
+    spec.env_set.extend([
+        ("RADAR_PROJECT_ID".to_string(), project_id.to_string()),
+        (
+            "RADAR_PROJECT_ROOT".to_string(),
+            project_root.to_string_lossy().into_owned(),
+        ),
+        (
+            "RADAR_HOME".to_string(),
+            home.to_string_lossy().into_owned(),
+        ),
+        ("RADAR_SESSION_ID".to_string(), session_id.to_string()),
+    ]);
+}
+
+fn publish_session_lifecycle(
+    home: &std::path::Path,
+    project_id: i64,
+    session_id: &str,
+    state: &str,
+) {
+    let home = home.to_path_buf();
+    let session_id = session_id.to_string();
+    let state = state.to_string();
+    std::thread::spawn(move || {
+        use crate::session::activity::{ActivityKind, ActivityPayload, PublishActivity};
+        use crate::session::daemon::{Client, Command};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let request = Command::PublishActivity(PublishActivity {
+            project_id,
+            command_id: format!("session-{}-{now:x}", std::process::id()),
+            session_id: Some(session_id),
+            card_id: None,
+            kind: ActivityKind::SessionLifecycle,
+            payload: ActivityPayload::SessionLifecycle {
+                state,
+                detail: None,
+            },
+        });
+        let _ = Client::request(&home, request);
+    });
+}
+
+fn build_window(
+    app: &adw::Application,
+    paths: &Rc<Paths>,
+    db: &SharedDb,
+) -> adw::ApplicationWindow {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Radar")
@@ -244,6 +615,20 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     toggles.set_halign(gtk::Align::Fill);
     toggles.set_margin_top(6);
     toggles.set_margin_bottom(8);
+
+    // Home leads the dock: the panel the dock returns to when nothing is
+    // open, and the empty state itself when there are no projects yet.
+    let home_toggle = gtk::ToggleButton::builder()
+        .icon_name("go-home-symbolic")
+        .tooltip_text("Home\tAlt+Home")
+        .build();
+    home_toggle.add_css_class("flat");
+    home_toggle.set_hexpand(true);
+    home_toggle.set_action_name(Some("win.show-home"));
+    if let Some(image) = home_toggle.child().and_downcast::<gtk::Image>() {
+        image.set_pixel_size(16);
+    }
+    toggles.append(&home_toggle);
 
     // One toggle per primitive, in the order they are named: agent, changes,
     // project, editor, commands. The project toggle is the sidebar.
@@ -312,6 +697,14 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     sidebar_title.set_xalign(0.0);
     sidebar_title.set_hexpand(true);
     sidebar_header.append(&sidebar_title);
+    // Home, by the logo: back to the panel that is there when nothing is.
+    let home_button = gtk::Button::builder()
+        .icon_name("go-home-symbolic")
+        .tooltip_text("Home\tAlt+Home")
+        .build();
+    home_button.add_css_class("flat");
+    home_button.set_action_name(Some("win.show-home"));
+    sidebar_header.append(&home_button);
 
     // The search goes straight into the sidebar box; its margins come from the
     // stylesheet, aligned with the row inset.
@@ -341,20 +734,10 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         .transition_type(gtk::StackTransitionType::Crossfade)
         .vexpand(true)
         .build();
-    let no_projects = status_page(
-        "folder-open-symbolic",
-        "No projects yet",
-        "Add a directory to get started. A project is an agent, live changes, commands and an editor.",
-        Some(("Find projects", "win.find-projects")),
-    );
-    stack.add_named(&no_projects, Some("_empty"));
-    let no_selection = status_page(
-        "view-list-symbolic",
-        "Nothing selected",
-        "Pick a project from the sidebar.",
-        None,
-    );
-    stack.add_named(&no_selection, Some("_none"));
+    // The home panel takes the empty states' place: it is what shows with no
+    // projects and no panes. It needs the finished app — its dropdowns write
+    // preferences and its new-project flow selects — so it joins the stack
+    // once the state exists, just before it can first be shown.
 
     let splitter = gtk::Paned::new(gtk::Orientation::Horizontal);
     splitter.set_start_child(Some(&sidebar_box));
@@ -387,8 +770,10 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
 
     let (status_tx, status_rx) = std::sync::mpsc::channel();
     let (find_tx, find_rx) = std::sync::mpsc::channel();
+    let (activity_tx, activity_rx) = std::sync::mpsc::sync_channel(512);
     let state = Rc::new(App {
         db: db.clone(),
+        session_home: paths.data_dir.clone(),
         theme: RefCell::new(Theme::load()),
         window: window.clone(),
         sidebar: sidebar_box.upcast(),
@@ -398,6 +783,8 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         sidebar_search: search.clone(),
         toggles: RefCell::new(toggle_buttons),
         projects_toggle: projects_toggle.clone(),
+        home_toggle: home_toggle.clone(),
+        home_shown: Cell::new(false),
         stack,
         toasts,
         hud: hud.clone(),
@@ -407,6 +794,12 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         status: RefCell::new(HashMap::new()),
         status_tx,
         status_rx: RefCell::new(status_rx),
+        activity: RefCell::new(HashMap::new()),
+        activity_online: RefCell::new(HashMap::new()),
+        activity_watchers: RefCell::new(HashMap::new()),
+        activity_tx,
+        activity_rx: RefCell::new(activity_rx),
+        board_panes: RefCell::new(HashMap::new()),
         header_info: RefCell::new(HashMap::new()),
         current: RefCell::new(None),
         find_root: RefCell::new(
@@ -427,6 +820,9 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
     // The overlay panel and radar's own chords (Alt+Arrows and friends).
     hud.wire(&state);
     keynav::install(&state);
+    // The home panel reads the app's preferences and fires its actions, so it
+    // can only be built now — before the first refresh can show it.
+    state.stack.add_named(&home::panel(&state), Some("_home"));
     let state_for_close = Rc::downgrade(&state);
     window.connect_close_request(move |window| {
         if let Some(state) = state_for_close.upgrade() {
@@ -436,6 +832,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         glib::Propagation::Stop
     });
     start_status_drainer(&state);
+    start_activity_drainer(&state);
     start_find_drainer(&state);
     wire_sidebar_drop(&state);
     watch_theme(&state);
@@ -444,6 +841,11 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         crate::db::abbreviate(&state.find_root.borrow())
     ));
     App::refresh_projects(&state);
+    // Development aid: exercise the new-project flow — folder, git init, add,
+    // open — without the file chooser. RADAR_NEW_PROJECT=/some/path.
+    if let Ok(path) = std::env::var("RADAR_NEW_PROJECT") {
+        home::create_project(&state, PathBuf::from(path));
+    }
     // Seed the candidate cache, so the first search is instant.
     state.rescan_find();
     if let Ok(prefs) = state.db.ui_prefs() {
@@ -461,8 +863,12 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         let state_for_group = state.clone();
         glib::timeout_add_local_once(Duration::from_millis(1400), move || {
             if let Some(workspace) = state_for_group.current_workspace() {
-                state_for_group.show_primitive(&workspace, Slot::Diff);
-                state_for_group.group_into(&workspace, Slot::Diff, Slot::Agent);
+                state_for_group.show_primitive(&workspace, TabKey::first(Slot::Diff));
+                state_for_group.group_into(
+                    &workspace,
+                    TabKey::first(Slot::Diff),
+                    TabKey::first(Slot::Agent),
+                );
             }
         });
     }
@@ -471,7 +877,7 @@ fn build_window(app: &adw::Application, paths: &Rc<Paths>, db: &SharedDb) -> adw
         glib::timeout_add_local_once(Duration::from_millis(1200), move || {
             if let Some(workspace) = state_for_all.current_workspace() {
                 for slot in PRIMITIVES {
-                    state_for_all.show_primitive(&workspace, slot);
+                    state_for_all.show_primitive(&workspace, TabKey::first(slot));
                 }
             }
         });
@@ -577,7 +983,9 @@ fn connect_widgets(app: &SharedApp) {
         let app = app.clone();
         list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
-            let Some(id) = app.id_for_row(row) else { return };
+            let Some(id) = app.id_for_row(row) else {
+                return;
+            };
             // Switching projects must not take the keys out of the sidebar:
             // keyboard selection keeps them on the row, and a mouse click
             // brings them here. The switch itself can pull them away — the
@@ -628,7 +1036,9 @@ fn connect_widgets(app: &SharedApp) {
         let controller = gtk::EventControllerMotion::new();
         controller.set_propagation_phase(gtk::PropagationPhase::Capture);
         controller.connect_motion(move |_, _, _| {
-            app_for_motion.pointer_motion_ms.set(glib::monotonic_time() / 1000);
+            app_for_motion
+                .pointer_motion_ms
+                .set(glib::monotonic_time() / 1000);
         });
         app.window.add_controller(controller);
     }
@@ -712,10 +1122,8 @@ fn connect_widgets(app: &SharedApp) {
                             eprintln!("radar: could not store the scan root: {error}");
                         }
                         *app.find_root.borrow_mut() = path.clone();
-                        app.find_root_button.set_label(&format!(
-                            "from {}",
-                            crate::db::abbreviate(&path)
-                        ));
+                        app.find_root_button
+                            .set_label(&format!("from {}", crate::db::abbreviate(&path)));
                         app.rescan_find();
                     }
                 }
@@ -803,12 +1211,237 @@ fn start_status_drainer(app: &SharedApp) {
     });
 }
 
+fn send_activity_notice(
+    tx: &std::sync::mpsc::SyncSender<ActivityNotice>,
+    mut notice: ActivityNotice,
+    stop: &AtomicBool,
+) -> bool {
+    loop {
+        match tx.try_send(notice) {
+            Ok(()) => return true,
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                if stop.load(Ordering::Acquire) {
+                    return false;
+                }
+                notice = returned;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+fn start_activity_watcher(
+    home: PathBuf,
+    project_id: i64,
+    tx: std::sync::mpsc::SyncSender<ActivityNotice>,
+    stop: Arc<AtomicBool>,
+    interrupt: Arc<Mutex<Option<UnixStream>>>,
+) {
+    let _ = std::thread::Builder::new()
+        .name(format!("radar-activity-{project_id}"))
+        .spawn(move || {
+            use crate::session::daemon::{Client, Command, Response};
+            let mut cursor = 0;
+            while !stop.load(Ordering::Acquire) {
+                let mut client = match Client::connect(
+                    &home,
+                    Command::WatchActivity {
+                        project_id,
+                        after_sequence: cursor,
+                    },
+                ) {
+                    Ok(client) => client,
+                    Err(_) => {
+                        let _ = send_activity_notice(
+                            &tx,
+                            ActivityNotice::Connection {
+                                project_id,
+                                online: false,
+                            },
+                            &stop,
+                        );
+                        activity_retry(&stop);
+                        continue;
+                    }
+                };
+                let _ = client.set_read_timeout(None);
+                if let Ok(stream) = client.interrupt_handle() {
+                    if let Ok(mut current) = interrupt.lock() {
+                        *current = Some(stream);
+                    }
+                    if stop.load(Ordering::Acquire) {
+                        if let Ok(mut current) = interrupt.lock() {
+                            if let Some(stream) = current.take() {
+                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                let mut resync = false;
+                let mut disconnected = false;
+                match client.receive() {
+                    Ok(Response::ActivityWatching { snapshot, .. }) => {
+                        let watermark = snapshot.watermark;
+                        if !send_activity_notice(
+                            &tx,
+                            ActivityNotice::Snapshot {
+                                project_id,
+                                snapshot,
+                                replace_events: false,
+                            },
+                            &stop,
+                        ) {
+                            break;
+                        }
+                        cursor = watermark;
+                        let _ = send_activity_notice(
+                            &tx,
+                            ActivityNotice::Connection {
+                                project_id,
+                                online: true,
+                            },
+                            &stop,
+                        );
+                        loop {
+                            if stop.load(Ordering::Acquire) {
+                                break;
+                            }
+                            match client.receive() {
+                                Ok(Response::Activity(event)) => {
+                                    if event.sequence <= cursor {
+                                        continue;
+                                    }
+                                    let sequence = event.sequence;
+                                    if !send_activity_notice(
+                                        &tx,
+                                        ActivityNotice::Event(event),
+                                        &stop,
+                                    ) {
+                                        disconnected = true;
+                                        break;
+                                    }
+                                    cursor = sequence;
+                                }
+                                Ok(Response::ResyncRequired) => {
+                                    resync = true;
+                                    break;
+                                }
+                                Ok(_) | Err(_) => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(Response::ResyncRequired) => resync = true,
+                    Ok(_) | Err(_) => disconnected = true,
+                }
+                if let Ok(mut current) = interrupt.lock() {
+                    current.take();
+                }
+                drop(client);
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+
+                if resync {
+                    match Client::request(
+                        &home,
+                        Command::ActivitySnapshot {
+                            project_id,
+                            after_sequence: None,
+                            limit: 200,
+                        },
+                    ) {
+                        Ok(Response::ActivitySnapshot(snapshot)) => {
+                            let watermark = snapshot.watermark;
+                            if send_activity_notice(
+                                &tx,
+                                ActivityNotice::Snapshot {
+                                    project_id,
+                                    snapshot,
+                                    replace_events: true,
+                                },
+                                &stop,
+                            ) {
+                                cursor = watermark;
+                                let _ = send_activity_notice(
+                                    &tx,
+                                    ActivityNotice::Connection {
+                                        project_id,
+                                        online: true,
+                                    },
+                                    &stop,
+                                );
+                                continue;
+                            }
+                            break;
+                        }
+                        _ => disconnected = true,
+                    }
+                }
+                if disconnected {
+                    let _ = send_activity_notice(
+                        &tx,
+                        ActivityNotice::Connection {
+                            project_id,
+                            online: false,
+                        },
+                        &stop,
+                    );
+                    activity_retry(&stop);
+                }
+            }
+            if let Ok(mut current) = interrupt.lock() {
+                current.take();
+            }
+        });
+}
+
+fn activity_retry(stop: &AtomicBool) {
+    for _ in 0..10 {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn start_activity_drainer(app: &SharedApp) {
+    let app = app.clone();
+    glib::timeout_add_local(Duration::from_millis(80), move || {
+        let notices: Vec<ActivityNotice> = {
+            let rx = app.activity_rx.borrow();
+            let mut notices = Vec::new();
+            while let Ok(notice) = rx.try_recv() {
+                notices.push(notice);
+            }
+            notices
+        };
+        let mut changed_projects = HashSet::new();
+        for notice in notices {
+            changed_projects.insert(app.apply_activity_notice(notice));
+        }
+        for project_id in &changed_projects {
+            app.refresh_activity_pane(*project_id);
+        }
+        if !changed_projects.is_empty() {
+            app.apply_status_labels();
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
 fn watch_theme(app: &SharedApp) {
     let Some(dir) = theme::omarchy_theme_dir() else {
         return;
     };
     let file = gio::File::for_path(dir.join("colors.toml"));
-    let Ok(monitor) = file.monitor_file(gio::FileMonitorFlags::NONE, None::<&gio::Cancellable>) else {
+    let Ok(monitor) = file.monitor_file(gio::FileMonitorFlags::NONE, None::<&gio::Cancellable>)
+    else {
         return;
     };
     let app = app.clone();
@@ -831,7 +1464,10 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
     {
         // The search is the add flow; this action just puts the keys there.
         let app = app.clone();
-        add("find-projects", Box::new(move || app.focus_projects_search()));
+        add(
+            "find-projects",
+            Box::new(move || app.focus_projects_search()),
+        );
     }
     {
         // Takes a project id, so a row's own button can call it.
@@ -919,7 +1555,9 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         add(
             "project-rename",
             Box::new(move || {
-                let Some(project) = app.current_project() else { return };
+                let Some(project) = app.current_project() else {
+                    return;
+                };
                 let entry = gtk::Entry::new();
                 entry.set_text(&project.name);
                 let dialog = gtk::Window::builder()
@@ -963,7 +1601,9 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         add(
             "project-pin",
             Box::new(move || {
-                let Some(project) = app.current_project() else { return };
+                let Some(project) = app.current_project() else {
+                    return;
+                };
                 if let Err(error) = app.db.set_pinned(project.id, !project.pinned) {
                     eprintln!("radar: {error}");
                 }
@@ -976,7 +1616,9 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         add(
             name,
             Box::new(move || {
-                let Some(project) = app.current_project() else { return };
+                let Some(project) = app.current_project() else {
+                    return;
+                };
                 if let Err(error) = app.db.move_project(project.id, delta) {
                     eprintln!("radar: {error}");
                 }
@@ -991,7 +1633,9 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         add(
             &name,
             Box::new(move || {
-                let Some(project) = app.current_project() else { return };
+                let Some(project) = app.current_project() else {
+                    return;
+                };
                 let spec = CommandSpec {
                     argv: program.command_spec(&LaunchOptions::default()).argv,
                     env_unset: Vec::new(),
@@ -1007,6 +1651,8 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
 
     // ---- primitives: the only content there is ----
     {
+        // The dock and the Alt-chords toggle by kind; the key resolves to
+        // the tab of that kind that exists, or opens the first.
         let action = gio::SimpleAction::new("primitive-toggle", Some(glib::VariantTy::STRING));
         let app_for_action = app.clone();
         action.connect_activate(move |_, parameter| {
@@ -1017,7 +1663,8 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
                 app_for_action.toast("Select a project first");
                 return;
             };
-            app_for_action.toggle_primitive(&workspace, Slot::parse(&name));
+            let key = workspace.resolve_tab(TabKey::parse(&name));
+            app_for_action.toggle_primitive(&workspace, key);
         });
         app.window.add_action(&action);
     }
@@ -1032,7 +1679,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             let Some(workspace) = app_for_action.current_workspace() else {
                 return;
             };
-            app_for_action.activate_primitive(&workspace, Slot::parse(&name));
+            app_for_action.activate_primitive(&workspace, TabKey::parse(&name));
         });
         app.window.add_action(&action);
     }
@@ -1048,7 +1695,41 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             let Some(workspace) = app_for_action.current_workspace() else {
                 return;
             };
-            app_for_action.hover_primitive(&workspace, Slot::parse(&name));
+            app_for_action.hover_primitive(&workspace, TabKey::parse(&name));
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // The board's @claim links: clicking one opens the named agent's
+        // session — the matching agent tab, activated and focused.
+        let action = gio::SimpleAction::new("session-open", Some(glib::VariantTy::STRING));
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some(claim) = parameter.and_then(|value| value.get::<String>()) else {
+                return;
+            };
+            let Some(workspace) = app_for_action.current_workspace() else {
+                return;
+            };
+            app_for_action.open_agent_session(&workspace, &claim);
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // Activity and attention records carry stable session IDs, so their
+        // navigation does not depend on a mutable board claim name.
+        let action = gio::SimpleAction::new(
+            "activity-session-open",
+            Some(glib::VariantTy::new("(xs)").expect("a project/session tuple")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((project_id, session_id)) =
+                parameter.and_then(|value| value.get::<(i64, String)>())
+            else {
+                return;
+            };
+            app_for_action.open_linked_session(project_id, &session_id);
         });
         app.window.add_action(&action);
     }
@@ -1066,7 +1747,29 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             let Some(workspace) = app_for_action.current_workspace() else {
                 return;
             };
-            app_for_action.group_into(&workspace, Slot::parse(&pair.0), Slot::parse(&pair.1));
+            app_for_action.group_into(&workspace, TabKey::parse(&pair.0), TabKey::parse(&pair.1));
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // The chip's ＋: another tab of the same primitive, grouped under the
+        // same header, running the program the item named.
+        let action = gio::SimpleAction::new(
+            "primitive-add",
+            Some(glib::VariantTy::new("(ss)").expect("a tuple type")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some(pair) = parameter.and_then(|value| value.get::<(String, String)>()) else {
+                return;
+            };
+            let Some(workspace) = app_for_action.current_workspace() else {
+                return;
+            };
+            let Some(program) = programs::by_id(&pair.1) else {
+                return;
+            };
+            app_for_action.add_tab(&workspace, TabKey::parse(&pair.0), &program);
         });
         app.window.add_action(&action);
     }
@@ -1081,7 +1784,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             let Some(workspace) = app_for_action.current_workspace() else {
                 return;
             };
-            app_for_action.split_out(&workspace, Slot::parse(&name));
+            app_for_action.split_out(&workspace, TabKey::parse(&name));
         });
         app.window.add_action(&action);
     }
@@ -1103,8 +1806,8 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             };
             app_for_action.nest_split(
                 &workspace,
-                Slot::parse(&triple.0),
-                Slot::parse(&triple.1),
+                TabKey::parse(&triple.0),
+                TabKey::parse(&triple.1),
                 &triple.2,
             );
         });
@@ -1118,11 +1821,35 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             let Some(name) = parameter.and_then(|value| value.get::<String>()) else {
                 return;
             };
-            let slot = Slot::parse(&name);
+            let key = TabKey::parse(&name);
             if app_for_action.current_workspace().is_none() {
                 return;
             }
-            app_for_action.hud.present_programs(&app_for_action, slot);
+            app_for_action
+                .hud
+                .present_programs(&app_for_action, key.slot);
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // The chip dropdown's pick: one program, one click, straight to the
+        // same replace-and-relaunch the HUD choice takes.
+        let action = gio::SimpleAction::new(
+            "primitive-program-set",
+            Some(glib::VariantTy::new("(ss)").expect("a tuple type")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some(pair) = parameter.and_then(|value| value.get::<(String, String)>()) else {
+                return;
+            };
+            let Some(workspace) = app_for_action.current_workspace() else {
+                return;
+            };
+            let Some(program) = programs::by_id(&pair.1) else {
+                return;
+            };
+            app_for_action.set_tab_program(&workspace, TabKey::parse(&pair.0), program, true);
         });
         app.window.add_action(&action);
     }
@@ -1135,13 +1862,13 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
                 let Some(workspace) = app.current_workspace() else {
                     return;
                 };
-                let Some(slot) = app
+                let Some(key) = app
                     .focused_group(&workspace)
-                    .and_then(|group| group.active_slot())
+                    .and_then(|group| group.active_key())
                 else {
                     return;
                 };
-                app.hud.present_programs(&app, slot);
+                app.hud.present_programs(&app, key.slot);
             }),
         );
     }
@@ -1155,7 +1882,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             let Some(workspace) = app_for_action.current_workspace() else {
                 return;
             };
-            app_for_action.close_pane(&workspace, Slot::parse(&name));
+            app_for_action.close_pane(&workspace, TabKey::parse(&name));
         });
         app.window.add_action(&action);
     }
@@ -1169,9 +1896,9 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             let Some(workspace) = app_for_action.current_workspace() else {
                 return;
             };
-            let slot = Slot::parse(&name);
-            if workspace.is_visible(slot) {
-                app_for_action.toggle_primitive(&workspace, slot);
+            let key = workspace.resolve_tab(TabKey::parse(&name));
+            if workspace.is_visible(key) {
+                app_for_action.toggle_primitive(&workspace, key);
             }
         });
         app.window.add_action(&action);
@@ -1186,7 +1913,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             let Some(workspace) = app_for_action.current_workspace() else {
                 return;
             };
-            app_for_action.move_pane(&workspace, Slot::parse(&name), delta);
+            app_for_action.move_pane(&workspace, TabKey::parse(&name), delta);
         });
         app.window.add_action(&action);
     }
@@ -1197,7 +1924,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             let Some(name) = parameter.and_then(|value| value.get::<String>()) else {
                 return;
             };
-            app_for_action.toggle_zoom(Some(Slot::parse(&name)));
+            app_for_action.toggle_zoom(Some(TabKey::parse(&name)));
         });
         app.window.add_action(&action);
     }
@@ -1208,9 +1935,9 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             let Some(name) = parameter.and_then(|value| value.get::<String>()) else {
                 return;
             };
-            let slot = Slot::parse(&name);
+            let key = TabKey::parse(&name);
             if let Some(workspace) = app_for_action.current_workspace() {
-                app_for_action.activate_primitive(&workspace, slot);
+                app_for_action.activate_primitive(&workspace, key);
             }
         });
         app.window.add_action(&action);
@@ -1219,10 +1946,8 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         // A pane's program reported live state — its own title, or its exit.
         // Aim it at the pane's header, wherever the pane is grouped today.
         // Empty text clears: the header goes back to just the chips.
-        let action = gio::SimpleAction::new(
-            "pane-info",
-            Some(glib::VariantTy::new("(xss)").unwrap()),
-        );
+        let action =
+            gio::SimpleAction::new("pane-info", Some(glib::VariantTy::new("(xss)").unwrap()));
         let app_for_action = app.clone();
         action.connect_activate(move |_, parameter| {
             let Some((project_id, slot, text)) =
@@ -1231,31 +1956,28 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
                 return;
             };
             let text = if text.is_empty() { None } else { Some(text) };
-            app_for_action.store_header_info(project_id, Slot::parse(&slot), text);
+            app_for_action.store_header_info(project_id, TabKey::parse(&slot), text);
         });
         app.window.add_action(&action);
     }
     {
         // The terminal bell — how agent CLIs ask for attention. The pane's
         // header marks it until that pane is looked at.
-        let action = gio::SimpleAction::new(
-            "pane-bell",
-            Some(glib::VariantTy::new("(xs)").unwrap()),
-        );
+        let action =
+            gio::SimpleAction::new("pane-bell", Some(glib::VariantTy::new("(xs)").unwrap()));
         let app_for_action = app.clone();
         action.connect_activate(move |_, parameter| {
-            let Some((project_id, slot)) =
-                parameter.and_then(|value| value.get::<(i64, String)>())
+            let Some((project_id, slot)) = parameter.and_then(|value| value.get::<(i64, String)>())
             else {
                 return;
             };
-            let slot = Slot::parse(&slot);
+            let key = TabKey::parse(&slot);
             for workspace in app_for_action.workspaces.borrow().values() {
                 if workspace.project.id != project_id {
                     continue;
                 }
-                if let Some(group) = workspace.group_of(slot) {
-                    group.set_attention(slot);
+                if let Some(group) = workspace.group_of(key) {
+                    group.set_attention(key);
                 }
             }
         });
@@ -1269,12 +1991,19 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         let app = app.clone();
         add("toggle-sidebar", Box::new(move || app.toggle_sidebar()));
     }
+    {
+        // The home panel: the empty state, plus setup and the new-project
+        // flow. Workspaces stay alive behind it — going home never stops a
+        // program, it only looks away.
+        let app = app.clone();
+        add("show-home", Box::new(move || app.show_home()));
+    }
 
     // ---- keyboard ----
     // Alt is radar's only modifier, so every Ctrl chord reaches the programs
     // in the panels the way their authors wrote them. The one exception is
     // cycling: the window manager owns Alt+Tab, so the cycle stays on Ctrl.
-    let accels: [(&str, &[&str]); 17] = [
+    let accels: [(&str, &[&str]); 18] = [
         ("win.find-projects", &["<Alt>n"]),
         ("win.preferences", &["<Alt>comma"]),
         ("win.refresh", &["<Alt>r"]),
@@ -1282,6 +2011,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         ("win.toggle-sidebar", &["<Alt>b"]),
         ("win.zoom", &["<Alt>f"]),
         ("win.hud", &["<Alt>h"]),
+        ("win.show-home", &["<Alt>Home"]),
         ("win.primitive-toggle::editor", &["<Alt>e"]),
         ("win.primitive-toggle::agent", &["<Alt>a"]),
         ("win.primitive-toggle::diff", &["<Alt>g"]),
@@ -1309,55 +2039,50 @@ impl App {
             let first = workspace
                 .groups()
                 .first()
-                .and_then(|group| group.active_slot());
-            if let Some(primitive) = first.and_then(|slot| workspace.primitive(slot)) {
+                .and_then(|group| group.active_key());
+            if let Some(primitive) = first.and_then(|key| workspace.tab(key)) {
                 primitive.focus();
             }
         }
     }
 
     /// A pane's own menu: only operations that act on this pane or its active
-    /// primitive. Other primitives are opened from the dock or the HUD.
-    fn primitive_menu_model(&self, slot: Slot) -> gio::Menu {
+    /// tab. Other tabs are opened from the dock or the HUD.
+    fn primitive_menu_model(&self, workspace: &Rc<Workspace>, key: TabKey) -> gio::Menu {
         let menu = gio::Menu::new();
-        if slot != Slot::Board {
+        if key.slot != Slot::Board {
             let program = gio::Menu::new();
             program.append_item(&item(
-                &format!("Change {} program…", label_for(slot)),
-                &format!("win.primitive-program::{}", slot.as_str()),
+                &format!("Change {} program…", key.label()),
+                &format!("win.primitive-program::{}", key.as_str()),
             ));
             menu.append_section(None, &program);
         }
 
-        let Some(workspace) = self.current_workspace() else {
-            return menu;
-        };
-        let Some(group) = workspace.group_of(slot) else {
+        let Some(group) = workspace.group_of(key) else {
             return menu;
         };
 
         let group_actions = gio::Menu::new();
-        let others: Vec<Slot> = workspace
-                .visible_slots()
-                .into_iter()
-                .filter(|other| *other != slot && *other != Slot::Custom)
-                .collect();
+        let held_kinds: Vec<Slot> = group.tabs().iter().map(|member| member.slot).collect();
+        let others: Vec<Slot> = PRIMITIVES
+            .iter()
+            .filter(|other| !held_kinds.contains(other) && **other != Slot::Custom)
+            .copied()
+            .collect();
         for other in others {
-            let entry = gio::MenuItem::new(
-                Some(&format!("Group with {}", label_for(other))),
-                None,
-            );
+            let entry = gio::MenuItem::new(Some(&format!("Group with {}", label_for(other))), None);
             entry.set_action_and_target_value(
                 Some("win.primitive-group"),
-                Some(&(slot.as_str().to_string(), other.as_str().to_string()).to_variant()),
+                Some(&(key.as_str(), TabKey::first(other).as_str()).to_variant()),
             );
             group_actions.append_item(&entry);
         }
-        if group.slots().len() > 1 {
+        if group.tabs().len() > 1 {
             let entry = gio::MenuItem::new(Some("Split out into its own pane"), None);
             entry.set_action_and_target_value(
                 Some("win.primitive-split-out"),
-                Some(&slot.as_str().to_variant()),
+                Some(&key.as_str().to_variant()),
             );
             group_actions.append_item(&entry);
         }
@@ -1367,45 +2092,95 @@ impl App {
 
         let panel = gio::Menu::new();
         let close = gio::MenuItem::new(Some("Close pane"), None);
-        close.set_action_and_target_value(
-            Some("win.pane-close"),
-            Some(&slot.as_str().to_variant()),
-        );
+        close.set_action_and_target_value(Some("win.pane-close"), Some(&key.as_str().to_variant()));
         panel.append_item(&close);
-        if group.slots().len() > 1 {
-            let close_primitive = gio::MenuItem::new(
-                Some(&format!("Close {}", label_for(slot))),
-                None,
-            );
-            close_primitive.set_action_and_target_value(
+        if group.tabs().len() > 1 {
+            let close_tab = gio::MenuItem::new(Some(&format!("Close {}", key.label())), None);
+            close_tab.set_action_and_target_value(
                 Some("win.primitive-close"),
-                Some(&slot.as_str().to_variant()),
+                Some(&key.as_str().to_variant()),
             );
-            panel.append_item(&close_primitive);
+            panel.append_item(&close_tab);
         }
 
-        let ordered = self.ordered_groups(&workspace);
-        if let Some(index) = ordered.iter().position(|candidate| Rc::ptr_eq(candidate, &group)) {
+        let ordered = self.ordered_groups(workspace);
+        if let Some(index) = ordered
+            .iter()
+            .position(|candidate| Rc::ptr_eq(candidate, &group))
+        {
             if index > 0 {
                 panel.append_item(&item(
                     "Move up",
-                    &format!("win.pane-move-up::{}", slot.as_str()),
+                    &format!("win.pane-move-up::{}", key.as_str()),
                 ));
             }
             if index + 1 < ordered.len() {
                 panel.append_item(&item(
                     "Move down",
-                    &format!("win.pane-move-down::{}", slot.as_str()),
+                    &format!("win.pane-move-down::{}", key.as_str()),
                 ));
             }
         }
         let zoom = gio::MenuItem::new(Some("Zoom pane (Alt+F)"), None);
-        zoom.set_action_and_target_value(
-            Some("win.pane-zoom"),
-            Some(&slot.as_str().to_variant()),
-        );
+        zoom.set_action_and_target_value(Some("win.pane-zoom"), Some(&key.as_str().to_variant()));
         panel.append_item(&zoom);
         menu.append_section(Some("Pane"), &panel);
+        menu
+    }
+
+    /// One chip's inline program dropdown: only programs of the chip's own
+    /// kind — an agent chip lists agents, an editor chip lists editors — with
+    /// the one running now marked. Each pick replaces this tab's program.
+    fn chip_program_menu(&self, workspace: &Rc<Workspace>, key: TabKey) -> gio::Menu {
+        let menu = gio::Menu::new();
+        let Some(kind) = programs::Kind::from_slot(key.slot) else {
+            return menu;
+        };
+        let current = workspace
+            .tab(key)
+            .map(|primitive| primitive.program_id.clone())
+            .or_else(|| workspace.programs.borrow().get(&key.slot).cloned());
+        let section = gio::Menu::new();
+        for program in programs::embeddable().iter().filter(|p| p.kind == kind) {
+            let is_current = current.as_deref() == Some(program.id.as_str());
+            let label = if is_current {
+                format!("✓ {}", program.name)
+            } else {
+                program.name.clone()
+            };
+            let entry = gio::MenuItem::new(Some(&label), None);
+            entry.set_action_and_target_value(
+                Some("win.primitive-program-set"),
+                Some(&(key.as_str(), program.id.clone()).to_variant()),
+            );
+            section.append_item(&entry);
+        }
+        if section.n_items() > 0 {
+            menu.append_section(None, &section);
+        }
+        menu
+    }
+
+    /// The chip's ＋: the same kind-filtered list as the dropdown, but each
+    /// pick adds another tab of this primitive — grouped under this header as
+    /// a new chip, running the program the item names.
+    fn chip_add_menu(&self, key: TabKey) -> gio::Menu {
+        let menu = gio::Menu::new();
+        let Some(kind) = programs::Kind::from_slot(key.slot) else {
+            return menu;
+        };
+        let section = gio::Menu::new();
+        for program in programs::embeddable().iter().filter(|p| p.kind == kind) {
+            let entry = gio::MenuItem::new(Some(&format!("New {} tab", program.name)), None);
+            entry.set_action_and_target_value(
+                Some("win.primitive-add"),
+                Some(&(key.as_str(), program.id.clone()).to_variant()),
+            );
+            section.append_item(&entry);
+        }
+        if section.n_items() > 0 {
+            menu.append_section(None, &section);
+        }
         menu
     }
 
@@ -1414,8 +2189,8 @@ impl App {
         self.rows
             .borrow()
             .iter()
-            .find(|(_, widget, _, _)| widget == row)
-            .map(|(id, _, _, _)| *id)
+            .find(|(_, widget, _, _, _)| widget == row)
+            .map(|(id, _, _, _, _)| *id)
     }
 
     fn current_project(&self) -> Option<Project> {
@@ -1463,18 +2238,22 @@ impl App {
             .build();
         // The callback outlives this borrow, so it works from an owned handle.
         let app = self.clone();
-        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |result| {
-            if result != Ok(1) {
-                return;
-            }
-            if let Err(error) = app.db.remove_project(project.id) {
-                eprintln!("radar: {error}");
-            }
-            // Rebuild the sidebar from a fresh read; this also drops the
-            // selection of the removed project.
-            App::refresh_projects(&app);
-            app.toasts.add_toast(adw::Toast::new("Project removed"));
-        });
+        dialog.choose(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                if result != Ok(1) {
+                    return;
+                }
+                if let Err(error) = app.db.remove_project(project.id) {
+                    eprintln!("radar: {error}");
+                }
+                // Rebuild the sidebar from a fresh read; this also drops the
+                // selection of the removed project.
+                App::refresh_projects(&app);
+                app.toasts.add_toast(adw::Toast::new("Project removed"));
+            },
+        );
     }
 
     fn reload_theme(&self) {
@@ -1490,7 +2269,7 @@ impl App {
             });
         }
         for workspace in self.workspaces.borrow().values() {
-            for primitive in workspace.primitives.borrow().values() {
+            for primitive in workspace.tabs.borrow().values() {
                 if let Some(pane) = &primitive.pane {
                     pane.apply_theme(&theme);
                 }
@@ -1505,16 +2284,151 @@ impl App {
             safe: !preferences.agent_auto_flags,
             extra_args: Vec::new(),
             prompt: None,
+            resume: false,
+            session: None,
             agent_instance: None,
         }
     }
 
     // ---- projects ----
 
+    fn reconcile_activity_watchers(&self, projects: &[Project]) {
+        let wanted: HashSet<i64> = projects.iter().map(|project| project.id).collect();
+        let mut watchers = self.activity_watchers.borrow_mut();
+        let removed: Vec<i64> = watchers
+            .keys()
+            .filter(|project_id| !wanted.contains(project_id))
+            .copied()
+            .collect();
+        for project_id in removed {
+            if let Some(watcher) = watchers.remove(&project_id) {
+                watcher.stop();
+            }
+            self.activity_online.borrow_mut().remove(&project_id);
+            self.board_panes.borrow_mut().remove(&project_id);
+        }
+        for project_id in wanted {
+            if watchers.contains_key(&project_id) {
+                continue;
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            let interrupt = Arc::new(Mutex::new(None));
+            start_activity_watcher(
+                self.session_home.clone(),
+                project_id,
+                self.activity_tx.clone(),
+                stop.clone(),
+                interrupt.clone(),
+            );
+            watchers.insert(project_id, ActivityWatcher { stop, interrupt });
+        }
+    }
+
+    fn apply_activity_notice(&self, notice: ActivityNotice) -> i64 {
+        let project_id = match notice {
+            ActivityNotice::Snapshot {
+                project_id,
+                snapshot,
+                replace_events,
+            } => {
+                self.activity
+                    .borrow_mut()
+                    .entry(project_id)
+                    .or_insert_with(|| ProjectActivity::empty(project_id))
+                    .merge_snapshot(snapshot, replace_events);
+                project_id
+            }
+            ActivityNotice::Event(event) => {
+                let project_id = event.project_id;
+                self.activity
+                    .borrow_mut()
+                    .entry(project_id)
+                    .or_insert_with(|| ProjectActivity::empty(project_id))
+                    .apply_event(event);
+                project_id
+            }
+            ActivityNotice::Connection { project_id, online } => {
+                self.activity_online.borrow_mut().insert(project_id, online);
+                project_id
+            }
+            ActivityNotice::Mutation {
+                project_id,
+                request_id,
+                result,
+            } => {
+                match result {
+                    Ok(result) => {
+                        let result = *result;
+                        let attention = result.attention;
+                        let mut activity = self.activity.borrow_mut();
+                        let project = activity
+                            .entry(project_id)
+                            .or_insert_with(|| ProjectActivity::empty(project_id));
+                        if let Some(event) = result.event {
+                            project.apply_event(event);
+                        }
+                        project.upsert_attention(attention.clone());
+                        drop(activity);
+                        if let Some(pane) = self
+                            .board_panes
+                            .borrow()
+                            .get(&project_id)
+                            .and_then(std::rc::Weak::upgrade)
+                        {
+                            pane.finish_attention_change(&request_id, Ok(attention));
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(pane) = self
+                            .board_panes
+                            .borrow()
+                            .get(&project_id)
+                            .and_then(std::rc::Weak::upgrade)
+                        {
+                            pane.finish_attention_change(&request_id, Err(error));
+                        }
+                    }
+                }
+                project_id
+            }
+        };
+
+        project_id
+    }
+
+    fn refresh_activity_pane(&self, project_id: i64) {
+        if let Some(pane) = self
+            .board_panes
+            .borrow()
+            .get(&project_id)
+            .and_then(std::rc::Weak::upgrade)
+        {
+            let activity = self.activity.borrow();
+            let snapshot = activity
+                .get(&project_id)
+                .map(|activity| activity.snapshot.clone())
+                .unwrap_or_else(|| crate::session::activity::ActivitySnapshot {
+                    project_id,
+                    watermark: 0,
+                    events: Vec::new(),
+                    attention: Vec::new(),
+                    has_more: false,
+                });
+            let online = self
+                .activity_online
+                .borrow()
+                .get(&project_id)
+                .copied()
+                .unwrap_or(false);
+            pane.set_activity_state(snapshot, online);
+        }
+    }
+
     fn refresh_projects(app: &SharedApp) {
         let projects = app.db.projects().unwrap_or_default();
         let selected = *app.current.borrow();
         *app.projects.borrow_mut() = projects.clone();
+        app.reconcile_activity_watchers(&projects);
 
         while let Some(child) = app.sidebar_list.first_child() {
             app.sidebar_list.remove(&child);
@@ -1548,15 +2462,15 @@ impl App {
             app.sidebar_list.append(&empty);
             // Even with no projects, a search can already offer directories.
             App::show_candidates(app, &app.sidebar_search.text());
-            app.show_placeholder();
+            app.show_home();
             return;
         }
 
         for project in &projects {
-            let (row, summary, badge) = app.build_project_row(project);
+            let (row, summary, badge, attention_badge) = app.build_project_row(project);
             app.rows
                 .borrow_mut()
-                .push((project.id, row.clone(), summary, badge));
+                .push((project.id, row.clone(), summary, badge, attention_badge));
             app.sidebar_list.append(&row);
         }
         app.filter_sidebar(&app.sidebar_search.text());
@@ -1568,14 +2482,22 @@ impl App {
         if let Some(id) = selected {
             app.select_row_for(id);
         }
-        if selected.is_none() || selected.is_some_and(|id| !projects.iter().any(|p| p.id == id)) {
+        // Nothing selected picks the first project — unless the user is on
+        // the home panel on purpose, which a refresh must not disturb.
+        if !app.home_shown.get()
+            && (selected.is_none()
+                || selected.is_some_and(|id| !projects.iter().any(|p| p.id == id)))
+        {
             if let Some(first) = projects.first() {
                 app.select_project(first.id);
             }
         }
     }
 
-    fn build_project_row(&self, project: &Project) -> (gtk::ListBoxRow, gtk::Label, gtk::Label) {
+    fn build_project_row(
+        &self,
+        project: &Project,
+    ) -> (gtk::ListBoxRow, gtk::Label, gtk::Label, gtk::Label) {
         let row = gtk::ListBoxRow::new();
 
         // Inset and rounded corners come from the stylesheet; the row only lays
@@ -1635,6 +2557,13 @@ impl App {
         badge.set_visible(false);
         box_.append(&badge);
 
+        let attention_badge = gtk::Label::new(None);
+        attention_badge.add_css_class("badge");
+        attention_badge.add_css_class("attention-badge");
+        attention_badge.set_valign(gtk::Align::Center);
+        attention_badge.set_visible(false);
+        box_.append(&attention_badge);
+
         // Remove, per row: the id travels with the action so no state is
         // needed. The stylesheet reveals it on hover or keyboard focus.
         let remove = gtk::Button::builder()
@@ -1663,12 +2592,13 @@ impl App {
         };
         summary.set_text(&format!("{text}  ·  {parent}"));
         badge.set_tooltip_text(Some("Active embedded tools in this project"));
-        (row, summary, badge)
+        attention_badge.set_tooltip_text(Some("Unresolved requests for human attention"));
+        (row, summary, badge, attention_badge)
     }
 
     fn apply_status_labels(&self) {
         let projects = self.projects.borrow();
-        for (id, _row, summary, badge) in self.rows.borrow().iter() {
+        for (id, _row, summary, badge, attention_badge) in self.rows.borrow().iter() {
             let Some(project) = projects.iter().find(|p| p.id == *id) else {
                 continue;
             };
@@ -1677,6 +2607,13 @@ impl App {
                 .parent()
                 .map(crate::db::abbreviate)
                 .unwrap_or_else(|| project.display_path());
+            let attention_count = self
+                .activity
+                .borrow()
+                .get(id)
+                .map_or(0, |activity| activity.snapshot.attention.len());
+            attention_badge.set_text(&attention_count.to_string());
+            attention_badge.set_visible(attention_count > 0);
             if project.is_missing() {
                 summary.set_text(&format!("missing  ·  {parent}"));
                 badge.set_visible(false);
@@ -1690,15 +2627,10 @@ impl App {
             }
             let count = self.workspaces.borrow().get(id).map_or(0, |workspace| {
                 workspace
-                    .primitives
+                    .tabs
                     .borrow()
                     .values()
-                    .filter(|primitive| {
-                        primitive
-                            .pane
-                            .as_ref()
-                            .is_some_and(|pane| pane.is_live())
-                    })
+                    .filter(|primitive| primitive.pane.as_ref().is_some_and(|pane| pane.is_live()))
                     .count()
             });
             badge.set_text(&count.to_string());
@@ -1731,8 +2663,8 @@ impl App {
             .rows
             .borrow()
             .iter()
-            .find(|(row_id, _, _, _)| *row_id == id)
-            .map(|(_, row, _, _)| row.clone());
+            .find(|(row_id, _, _, _, _)| *row_id == id)
+            .map(|(_, row, _, _, _)| row.clone());
         if let Some(row) = target {
             self.sidebar_list.select_row(Some(&row));
         }
@@ -1742,24 +2674,34 @@ impl App {
         let matcher = fuzzy_matcher::skim::SkimMatcherV2::default().ignore_case();
         use fuzzy_matcher::FuzzyMatcher;
         let projects = self.projects.borrow();
-        for (id, row, _, _) in self.rows.borrow().iter() {
+        for (id, row, _, _, _) in self.rows.borrow().iter() {
             let Some(project) = projects.iter().find(|p| p.id == *id) else {
                 continue;
             };
             let visible = query.trim().is_empty()
                 || matcher.fuzzy_match(&project.name, query).is_some()
-                || matcher.fuzzy_match(&project.display_path(), query).is_some();
+                || matcher
+                    .fuzzy_match(&project.display_path(), query)
+                    .is_some();
             row.set_visible(visible);
         }
     }
 
-    fn show_placeholder(&self) {
-        let name = if self.projects.borrow().is_empty() {
-            "_empty"
-        } else {
-            "_none"
-        };
-        self.stack.set_visible_child_name(name);
+    /// The home panel: the empty state, rebuilt so its dropdowns say what the
+    /// preferences say right now. Workspaces stay alive behind it — going
+    /// home looks away, it never stops anything.
+    fn show_home(self: &Rc<Self>) {
+        self.home_shown.set(true);
+        *self.current.borrow_mut() = None;
+        // The sidebar's selection stops meaning anything: no project is on
+        // screen. None is ignored by the row-selected handler.
+        self.sidebar_list.select_row(None::<&gtk::ListBoxRow>);
+        while let Some(child) = self.stack.child_by_name("_home") {
+            self.stack.remove(&child);
+        }
+        self.stack.add_named(&home::panel(self), Some("_home"));
+        self.stack.set_visible_child_name("_home");
+        let _ = self.db.remember_last_project(None);
         self.sync_toggles();
     }
 
@@ -1811,8 +2753,11 @@ impl App {
             .collect();
 
         for candidate in matches {
-            let (item, add) =
-                candidate_row(&candidate.name, &candidate.display_path(), candidate.is_repo);
+            let (item, add) = candidate_row(
+                &candidate.name,
+                &candidate.display_path(),
+                candidate.is_repo,
+            );
             let path = candidate.path.clone();
             let db = app.db.clone();
             let app_for_add = app.clone();
@@ -1844,6 +2789,7 @@ impl App {
             return;
         };
         *self.current.borrow_mut() = Some(id);
+        self.home_shown.set(false);
         self.workspace_for(&project);
         self.stack.set_visible_child_name(&format!("project-{id}"));
         let _ = self.db.touch_project(id);
@@ -1867,7 +2813,7 @@ impl App {
 
         let workspace = Rc::new(Workspace {
             project: project.clone(),
-            primitives: RefCell::new(HashMap::new()),
+            tabs: RefCell::new(HashMap::new()),
             programs: RefCell::new(HashMap::new()),
             groups: RefCell::new(Vec::new()),
             positions: RefCell::new(HashMap::new()),
@@ -1899,9 +2845,9 @@ impl App {
         }
 
         // Which primitives were on screen last time, and which program each ran.
-        let restore = self
-            .db
-            .ui_prefs()
+        let ui_prefs = self.db.ui_prefs().ok();
+        let restore = ui_prefs
+            .as_ref()
             .map(|prefs| prefs.restore_tabs)
             .unwrap_or(true);
         let stored = if restore {
@@ -1921,31 +2867,53 @@ impl App {
                 .extend(state.programs.clone());
         }
         let preferences = self.db.preferences().unwrap_or_default();
-        let mut wanted: Vec<Slot> = Vec::new();
+        // Tabs to open, and the program each was running. Stored rows map to
+        // tab keys in order — the second `agent` row becomes the second agent
+        // tab — so a saved workspace with same-primitive tabs comes back with
+        // all of them.
+        let mut wanted: Vec<TabKey> = Vec::new();
+        let mut key_programs: HashMap<TabKey, String> = HashMap::new();
         if stored.is_empty() {
             if saved_state.is_none() {
-                // The agent is the point of a new workspace; everything else
-                // is one keystroke away. An empty saved snapshot means the user
-                // intentionally hid every primitive.
-                wanted.push(Slot::Agent);
-                if let Some(program) = programs::for_slot(Slot::Agent, &preferences) {
-                    workspace
-                        .programs
-                        .borrow_mut()
-                        .insert(Slot::Agent, program.id.clone());
+                // A fresh workspace opens with the home panel's layout
+                // preset — the agent leads, and the rest is scope. An empty
+                // saved snapshot means the user intentionally hid every
+                // primitive, so nothing is opened.
+                let layout = ui_prefs
+                    .as_ref()
+                    .and_then(|prefs| prefs.layout)
+                    .unwrap_or(NewWorkspaceLayout::Agent);
+                for slot in layout.slots() {
+                    let key = workspace.next_key(*slot);
+                    wanted.push(key);
+                    if let Some(program) = programs::for_slot(*slot, &preferences) {
+                        workspace
+                            .programs
+                            .borrow_mut()
+                            .insert(*slot, program.id.clone());
+                    }
                 }
             }
         } else {
             for tab in &stored {
+                let key = workspace.next_key(tab.slot);
+                wanted.push(key);
+                key_programs.insert(key, tab.program_id.clone());
                 workspace
                     .programs
                     .borrow_mut()
                     .insert(tab.slot, tab.program_id.clone());
-                wanted.push(tab.slot);
             }
         }
-        wanted.sort_by_key(|slot| PRIMITIVES.iter().position(|other| other == slot).unwrap_or(9));
-        wanted.dedup();
+        wanted.sort_by_key(|key| {
+            (
+                PRIMITIVES
+                    .iter()
+                    .position(|other| other == &key.slot)
+                    .unwrap_or(9),
+                key.instance,
+            )
+        });
 
         if let Some(state) = &saved_state {
             *workspace.positions.borrow_mut() = state.positions.clone();
@@ -1953,34 +2921,39 @@ impl App {
 
         // Create each visible primitive before rebuilding the groups that refer
         // to it. VTE starts a child only when its terminal is mapped.
-        for slot in &wanted {
-            let _ = self.ensure_primitive(&workspace, *slot);
+        for key in &wanted {
+            let _ = self.ensure_primitive(
+                &workspace,
+                *key,
+                key_programs.get(key).map(String::as_str),
+                Resume::No,
+            );
         }
 
         let mut groups = Vec::new();
         let mut assigned = HashSet::new();
         if let Some(state) = &saved_state {
             for saved_group in &state.groups {
-                let slots: Vec<Slot> = saved_group
+                let keys: Vec<TabKey> = saved_group
                     .slots
                     .iter()
                     .copied()
-                    .filter(|slot| {
-                        wanted.contains(slot)
-                            && workspace.primitive(*slot).is_some()
-                            && assigned.insert(*slot)
+                    .filter(|key| {
+                        wanted.contains(key)
+                            && workspace.tab(*key).is_some()
+                            && assigned.insert(*key)
                     })
                     .collect();
-                if slots.is_empty() {
+                if keys.is_empty() {
                     continue;
                 }
                 let group = Group::new();
-                for slot in &slots {
-                    if let Some(primitive) = workspace.primitive(*slot) {
-                        group.insert(*slot, &primitive.widget, false);
+                for key in &keys {
+                    if let Some(primitive) = workspace.tab(*key) {
+                        group.insert(*key, &primitive.widget, false);
                     }
                 }
-                if slots.contains(&saved_group.active) {
+                if keys.contains(&saved_group.active) {
                     group.activate(saved_group.active);
                 }
                 group.rebuild_header();
@@ -1988,13 +2961,13 @@ impl App {
                 groups.push(group);
             }
         }
-        for slot in wanted {
-            if assigned.insert(slot) {
-                let Some(primitive) = workspace.primitive(slot) else {
+        for key in wanted {
+            if assigned.insert(key) {
+                let Some(primitive) = workspace.tab(key) else {
                     continue;
                 };
                 let group = Group::new();
-                group.insert(slot, &primitive.widget, true);
+                group.insert(key, &primitive.widget, true);
                 group.rebuild_header();
                 self.refresh_group_menu(&group);
                 groups.push(group);
@@ -2014,9 +2987,7 @@ impl App {
             }
             if let Some(zoomed) = state.zoomed {
                 if groups.len() > 1 {
-                    if let Some(group) = groups
-                        .iter()
-                        .find(|group| group_id(group) == Some(zoomed))
+                    if let Some(group) = groups.iter().find(|group| group_id(group) == Some(zoomed))
                     {
                         let tree = workspace.tree.borrow_mut().take();
                         *workspace.zoom.borrow_mut() = Some((groups.clone(), tree));
@@ -2032,24 +3003,61 @@ impl App {
         workspace
     }
 
-    /// Open a primitive's program if it is not open yet.
-    fn ensure_primitive(&self, workspace: &Rc<Workspace>, slot: Slot) -> Option<Rc<Primitive>> {
-        if let Some(existing) = workspace.primitive(slot) {
+    /// Open a tab's program if it is not open yet. `program` overrides the
+    /// kind's default — how a ＋ opens its second tab running the program the
+    /// pick named. `resume` says how an agent starts: fresh, on its own last
+    /// conversation, or on one exact stored conversation — how a claimed
+    /// card re-opens its agent.
+    fn ensure_primitive(
+        &self,
+        workspace: &Rc<Workspace>,
+        key: TabKey,
+        program: Option<&str>,
+        resume: Resume,
+    ) -> Option<Rc<Primitive>> {
+        if let Some(existing) = workspace.tab(key) {
             return Some(existing);
         }
         // The board is the one primitive that runs nothing: the pane is
-        // radar's own widget over the project's BOARD.md.
-        if slot == Slot::Board {
-            let pane = board::BoardPane::new(&workspace.project.path, &self.window);
+        // radar's own widget over the project's BOARD.md. One per project —
+        // every board key resolves to the same pane.
+        if key.slot == Slot::Board {
+            let project_id = workspace.project.id;
+            let pane = board::BoardPane::new(
+                &workspace.project.path,
+                project_id,
+                &self.session_home,
+                self.activity_tx.clone(),
+                &self.window,
+            );
+            let snapshot = self
+                .activity
+                .borrow()
+                .get(&project_id)
+                .map(|activity| activity.snapshot.clone())
+                .unwrap_or_else(|| ProjectActivity::empty(project_id).snapshot);
+            let online = self
+                .activity_online
+                .borrow()
+                .get(&project_id)
+                .copied()
+                .unwrap_or(false);
+            pane.set_activity_state(snapshot, online);
+            self.board_panes
+                .borrow_mut()
+                .insert(project_id, Rc::downgrade(&pane));
             // The board's header lives on the board's own counts.
             let window = self.window.clone();
-            let project_id = workspace.project.id;
             pane.set_info_observer(move |text| {
                 let _ = gtk::prelude::WidgetExt::activate_action(
                     &window,
                     "win.pane-info",
                     Some(
-                        &(project_id, Slot::Board.as_str(), text.unwrap_or_default())
+                        &(
+                            project_id,
+                            TabKey::first(Slot::Board).as_str(),
+                            text.unwrap_or_default(),
+                        )
                             .to_variant(),
                     ),
                 );
@@ -2057,56 +3065,139 @@ impl App {
             workspace
                 .programs
                 .borrow_mut()
-                .insert(slot, "board".to_string());
+                .insert(key.slot, "board".to_string());
             let primitive = Primitive::builtin(
                 "board",
                 pane.widget().clone(),
                 "Board\nbuilt into radar — the project's BOARD.md",
             );
-            workspace
-                .primitives
-                .borrow_mut()
-                .insert(slot, primitive.clone());
+            workspace.tabs.borrow_mut().insert(key, primitive.clone());
             return Some(primitive);
         }
         let preferences = self.db.preferences().unwrap_or_default();
-        let wanted = workspace.programs.borrow().get(&slot).cloned();
+        let wanted = program
+            .map(|id| id.to_string())
+            .or_else(|| workspace.programs.borrow().get(&key.slot).cloned());
         let program = wanted
             .and_then(|id| programs::by_id(&id))
             .filter(|program| program.installed())
-            .or_else(|| programs::for_slot(slot, &preferences))?;
+            .or_else(|| programs::for_slot(key.slot, &preferences))?;
 
         workspace
             .programs
             .borrow_mut()
-            .insert(slot, program.id.clone());
+            .insert(key.slot, program.id.clone());
         let mut options = self.launch_options();
+        match &resume {
+            Resume::No => {}
+            Resume::Last => options.resume = true,
+            Resume::Session(id) => options.session = Some(id.clone()),
+        }
         // An agent meets the board at launch: the board file and the skill
         // that makes it the convention are both in place before the agent
         // draws its first frame, and the launch claims work under a name
         // unique to this instance — two agents of the same kind never hold
         // each other's cards.
+        let mut launch_record: Option<(String, u128)> = None;
         if program.kind == Kind::Agent {
             if let Err(error) = crate::board::ensure_file(&workspace.project.path)
                 .and_then(|_| crate::skill::install(&workspace.project.path))
             {
                 eprintln!("radar: setting up the board: {error}");
             }
-            options.agent_instance = Some(crate::programs::launch::now_stamp());
+            let stamp = crate::programs::launch::now_stamp();
+            options.agent_instance = Some(stamp.clone());
+            launch_record = Some((
+                format!("{}-{}", program.id, stamp),
+                crate::programs::launch::now_millis(),
+            ));
         }
-        let spec = program.command_spec(&options);
+        let session_id = stable_session_id(workspace.project.id, key, &program.id);
+        let mut spec = program.command_spec(&options);
+        add_session_environment(
+            &mut spec,
+            workspace.project.id,
+            &workspace.project.path,
+            &self.session_home,
+            &session_id,
+        );
         let theme = self.theme.borrow().clone();
         let pane = Rc::new(Pane::spawn(
             &spec,
             &workspace.project.path,
             &theme,
-            label_for(slot),
-            pane::ShiftEnter::for_slot(slot),
+            &key.label(),
+            pane::ShiftEnter::for_slot(key.slot),
+            &self.session_home,
+            &session_id,
         ));
+        publish_session_lifecycle(
+            &self.session_home,
+            workspace.project.id,
+            &session_id,
+            "attached",
+        );
+        // When a launched agent's program exits, ask the CLI's own session
+        // store which conversation that instance had, and bind it to the
+        // claim: clicking the claim later reopens exactly that
+        // conversation. The store read takes ~100ms, so it runs on a
+        // worker thread and the binding lands back on the main loop.
+        if let Some((claim, launched_ms)) = launch_record {
+            let (tx, rx) = async_channel::unbounded::<(i64, String, String, String)>();
+            let db_for_bindings = self.db.clone();
+            glib::MainContext::default().spawn_local(async move {
+                while let Ok((project_id, bound_claim, program_id, session)) = rx.recv().await {
+                    let _ = db_for_bindings.bind_session(
+                        project_id,
+                        &bound_claim,
+                        &program_id,
+                        &session,
+                    );
+                }
+            });
+            let tx_for_exit = tx;
+            let program_id = program.id.clone();
+            let cwd = workspace.project.path.clone();
+            let project_id = workspace.project.id;
+            let lifecycle_home = self.session_home.clone();
+            let lifecycle_session = session_id.clone();
+            pane.set_exit_handler(move || {
+                publish_session_lifecycle(
+                    &lifecycle_home,
+                    project_id,
+                    &lifecycle_session,
+                    "exited",
+                );
+                let tx = tx_for_exit.clone();
+                let program_id = program_id.clone();
+                let cwd = cwd.clone();
+                let claim = claim.clone();
+                std::thread::spawn(move || {
+                    if let Some(session) =
+                        crate::programs::sessions::newest_since(&program_id, &cwd, launched_ms)
+                    {
+                        let _ = tx.try_send((project_id, claim, program_id, session));
+                    }
+                });
+            });
+        } else {
+            let lifecycle_home = self.session_home.clone();
+            let lifecycle_session = session_id.clone();
+            let project_id = workspace.project.id;
+            pane.set_exit_handler(move || {
+                publish_session_lifecycle(
+                    &lifecycle_home,
+                    project_id,
+                    &lifecycle_session,
+                    "exited",
+                );
+            });
+        }
         // The pane's header wants the program's live self-description: its
         // name plus whatever it puts in the terminal title, and its exit when
         // it goes away. The window action routes it — the pane outlives any
         // one group, so the observer aims at the action, not at a header.
+        // The tab key rides along, so two tabs of one kind report apart.
         let window = self.window.clone();
         let project_id = workspace.project.id;
         let name = program.name.clone();
@@ -2115,7 +3206,7 @@ impl App {
             let _ = gtk::prelude::WidgetExt::activate_action(
                 &window,
                 "win.pane-info",
-                Some(&(project_id, slot.as_str(), info.unwrap_or_default()).to_variant()),
+                Some(&(project_id, key.as_str(), info.unwrap_or_default()).to_variant()),
             );
         });
         let window = self.window.clone();
@@ -2123,42 +3214,43 @@ impl App {
             let _ = gtk::prelude::WidgetExt::activate_action(
                 &window,
                 "win.pane-bell",
-                Some(&(project_id, slot.as_str()).to_variant()),
+                Some(&(project_id, key.as_str()).to_variant()),
             );
         });
         let primitive = Primitive::new(&program, pane);
-        workspace
-            .primitives
-            .borrow_mut()
-            .insert(slot, primitive.clone());
+        workspace.tabs.borrow_mut().insert(key, primitive.clone());
         Some(primitive)
     }
 
     /// Show or hide a primitive. Hiding never stops the program.
-    fn toggle_primitive(&self, workspace: &Rc<Workspace>, slot: Slot) {
-        if slot == Slot::Custom {
+    fn toggle_primitive(&self, workspace: &Rc<Workspace>, key: TabKey) {
+        if key.slot == Slot::Custom {
+            return;
+        }
+        if key.slot != Slot::Board && self.leave_board(workspace) && workspace.is_visible(key) {
+            self.activate_primitive(workspace, key);
             return;
         }
         self.restore_zoom(workspace);
-        let opening = workspace.group_of(slot).is_none();
-        if let Some(group) = workspace.group_of(slot) {
-            group.remove(slot);
+        let opening = workspace.group_of(key).is_none();
+        if let Some(group) = workspace.group_of(key) {
+            group.remove(key);
             if group.is_empty() {
                 workspace.forget_group(&group);
-            } else {
-                self.refresh_group_menu(&group);
             }
             group.rebuild_header();
+            // A no-op when the pane went away: an empty group has no header.
+            self.refresh_group_menu(&group);
         } else {
-            let Some(primitive) = self.ensure_primitive(workspace, slot) else {
+            let Some(primitive) = self.ensure_primitive(workspace, key, None, Resume::No) else {
                 self.toast(&format!(
                     "No {} installed — set one in Preferences",
-                    label_for(slot).to_lowercase()
+                    label_for(key.slot).to_lowercase()
                 ));
                 return;
             };
             let group = Group::new();
-            group.insert(slot, &primitive.widget, true);
+            group.insert(key, &primitive.widget, true);
             group.rebuild_header();
             self.refresh_group_menu(&group);
             workspace.push_group(group.clone());
@@ -2177,20 +3269,74 @@ impl App {
         // menu — every "open" lands the keys in the panel it opened, ready to
         // type into. Hiding goes quietly.
         if opening {
-            if let Some(primitive) = workspace.primitive(slot) {
+            if let Some(primitive) = workspace.tab(key) {
                 primitive.focus();
             }
         }
     }
 
-    /// Close every primitive in a pane while leaving their programs available
-    /// to reopen from the dock or the HUD.
-    fn close_pane(&self, workspace: &Rc<Workspace>, slot: Slot) {
-        self.restore_zoom(workspace);
-        let Some(group) = workspace.group_of(slot) else {
+    /// The chip's ＋: another tab of the same primitive, grouped under the
+    /// same header as a new chip, running `program`. The next free instance
+    /// of the kind takes the new process.
+    fn add_tab(&self, workspace: &Rc<Workspace>, source: TabKey, program: &Program) {
+        if source.slot == Slot::Custom {
+            return;
+        }
+        // The board is one per project: nothing to add, just look at it.
+        if source.slot == Slot::Board {
+            self.show_primitive(workspace, TabKey::first(Slot::Board));
+            return;
+        }
+        self.leave_board(workspace);
+        let key = workspace.next_key(source.slot);
+        let Some(primitive) = self.ensure_primitive(workspace, key, Some(&program.id), Resume::No)
+        else {
             return;
         };
-        for member in group.slots() {
+        // Beside the tab whose ＋ was pressed; a pane of its own when that
+        // tab has since gone.
+        match workspace.group_of(source) {
+            Some(group) => {
+                group.insert(key, &primitive.widget, true);
+                group.rebuild_header();
+                self.refresh_group_menu(&group);
+            }
+            None => {
+                let group = Group::new();
+                group.insert(key, &primitive.widget, true);
+                group.rebuild_header();
+                self.refresh_group_menu(&group);
+                workspace.push_group(group.clone());
+                if let Some(node) = workspace.tree.borrow_mut().as_mut() {
+                    node.append(&group);
+                }
+            }
+        }
+        *workspace.zoom.borrow_mut() = None;
+        self.layout(workspace);
+        self.sync_toggles();
+        self.refresh_workspace_menus(workspace);
+        self.persist_primitives(workspace);
+        self.apply_status_labels();
+        // A new tab is a claim: the keys land in it, ready to type into.
+        if let Some(primitive) = workspace.tab(key) {
+            primitive.focus();
+        }
+        self.toast(&format!(
+            "New {} tab → {}",
+            label_for(source.slot),
+            program.name
+        ));
+    }
+
+    /// Close every tab in a pane while leaving their programs available
+    /// to reopen from the dock or the HUD.
+    fn close_pane(&self, workspace: &Rc<Workspace>, key: TabKey) {
+        self.restore_zoom(workspace);
+        let Some(group) = workspace.group_of(key) else {
+            return;
+        };
+        for member in group.tabs() {
             group.remove(member);
         }
         workspace.forget_group(&group);
@@ -2210,38 +3356,203 @@ impl App {
         }
     }
 
-    /// Show a primitive without hiding it when it is already on screen.
-    fn show_primitive(&self, workspace: &Rc<Workspace>, slot: Slot) {
-        if !workspace.is_visible(slot) {
-            self.toggle_primitive(workspace, slot);
+    /// Show a tab without hiding it when it is already on screen.
+    fn show_primitive(&self, workspace: &Rc<Workspace>, key: TabKey) {
+        if !workspace.is_visible(key) {
+            self.toggle_primitive(workspace, key);
         }
     }
 
-    /// Clicking a chip: switch that pane to the primitive.
-    fn activate_primitive(&self, workspace: &Rc<Workspace>, slot: Slot) {
-        if let Some(group) = workspace.group_of(slot) {
-            group.activate(slot);
+    /// Clicking a chip: switch that pane to the tab.
+    fn activate_primitive(&self, workspace: &Rc<Workspace>, key: TabKey) {
+        let key = workspace.resolve_tab(key);
+        if key.slot != Slot::Board {
+            self.leave_board(workspace);
+        }
+        if let Some(group) = workspace.group_of(key) {
+            group.activate(key);
             self.refresh_group_menu(&group);
-            if let Some(primitive) = workspace.primitive(slot) {
+            if let Some(primitive) = workspace.tab(key) {
                 primitive.focus();
             }
             self.persist_primitives(workspace);
             return;
         }
-        self.show_primitive(workspace, slot);
-        if let Some(group) = workspace.group_of(slot) {
-            group.activate(slot);
+        self.show_primitive(workspace, key);
+        if let Some(group) = workspace.group_of(key) {
+            group.activate(key);
             self.refresh_group_menu(&group);
-            if let Some(primitive) = workspace.primitive(slot) {
+            if let Some(primitive) = workspace.tab(key) {
                 primitive.focus();
             }
             self.persist_primitives(workspace);
         }
     }
 
+    /// The board's @claim links: the named agent's session, opened. The
+    /// exact match is the tab whose program carries the claim as its own
+    /// `RADAR_AGENT`, read from /proc — two tabs running the same program
+    /// are told apart by their stamps. When that cannot be read, the
+    /// claim's leading program (`program-stamp`) still picks a tab, and
+    /// any agent tab takes the rest: an agent radar did not launch works
+    /// in the agent panel all the same. A program that has exited — or a
+    /// tab not yet opened — runs again, resuming the project's last
+    /// conversation with the agent's own resume flags.
+    fn open_agent_session(&self, workspace: &Rc<Workspace>, claim: &str) {
+        let wanted = claim.rsplit_once('-').map(|(program, _)| program);
+        let mut candidates: Vec<(TabKey, bool, bool)> = workspace
+            .tabs
+            .borrow()
+            .keys()
+            .filter(|key| key.slot == Slot::Agent)
+            .map(|key| {
+                let primitive = workspace.tab(*key);
+                let exact = primitive
+                    .as_ref()
+                    .and_then(|p| p.pane.as_ref())
+                    .and_then(|pane| pane.session_pid())
+                    .and_then(programs::launch::radar_agent_of)
+                    .is_some_and(|agent| agent == claim);
+                let program = primitive
+                    .as_ref()
+                    .is_some_and(|p| Some(p.program_id.as_str()) == wanted);
+                (*key, exact, program)
+            })
+            .collect();
+        // Best first: the exact claim, then the claim's program, then the
+        // first agent tab of the kind.
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
+        if let Some((key, true, _)) = candidates.first() {
+            // The claimed conversation is this one, running: never
+            // disturb a live agent that already is what was asked for.
+            self.activate_primitive(workspace, *key);
+            return;
+        }
+        // The stored binding: what the claim's agent ran last, and the
+        // conversation it had — captured when its program exited.
+        if let Ok(Some((program_id, session_id))) =
+            self.db.bound_session(workspace.project.id, claim)
+        {
+            let bound = workspace
+                .tabs
+                .borrow()
+                .keys()
+                .filter(|key| key.slot == Slot::Agent)
+                .copied()
+                .find(|key| {
+                    workspace
+                        .tab(*key)
+                        .is_some_and(|p| p.program_id == program_id)
+                });
+            let key = bound.unwrap_or_else(|| workspace.resolve_tab(TabKey::first(Slot::Agent)));
+            if bound.is_none() {
+                // No tab of that program: open one on that conversation.
+                if self
+                    .ensure_primitive(
+                        workspace,
+                        key,
+                        Some(&program_id),
+                        Resume::Session(session_id),
+                    )
+                    .is_some()
+                {
+                    self.activate_primitive(workspace, key);
+                } else {
+                    self.toast("No agent installed — set one in Preferences");
+                }
+                return;
+            }
+            self.relaunch_agent(workspace, key, Resume::Session(session_id));
+            return;
+        }
+        // No binding: the claim's program, then any agent tab, then a new
+        // one — each reopened on the project's last conversation.
+        let key = candidates
+            .first()
+            .map(|(key, ..)| *key)
+            .unwrap_or_else(|| workspace.resolve_tab(TabKey::first(Slot::Agent)));
+        match workspace.tab(key) {
+            Some(_) => self.relaunch_agent(workspace, key, Resume::Last),
+            None => {
+                if self
+                    .ensure_primitive(workspace, key, None, Resume::Last)
+                    .is_some()
+                {
+                    self.activate_primitive(workspace, key);
+                } else {
+                    self.toast("No agent installed — set one in Preferences");
+                }
+            }
+        }
+    }
+
+    fn open_linked_session(&self, project_id: i64, session_id: &str) {
+        let Some((id, key, program_id)) = parse_stable_session_id(session_id) else {
+            self.toast("This activity item has no stable Radar session link");
+            return;
+        };
+        if id != project_id {
+            self.toast("The session link belongs to a different project");
+            return;
+        }
+        if self.current.borrow().as_ref() != Some(&project_id) {
+            self.select_project(project_id);
+        }
+        let Some(workspace) = self.current_workspace() else {
+            return;
+        };
+        let Some(primitive) = self.ensure_primitive(&workspace, key, Some(&program_id), Resume::No)
+        else {
+            self.toast("The linked program is not installed");
+            return;
+        };
+        if primitive.program_id != program_id {
+            self.toast("The linked tab is open with a different program");
+            return;
+        }
+        self.activate_primitive(&workspace, key);
+    }
+
+    /// Run a tab's agent again on `resume`'s conversation, in its own
+    /// pane — same widget, same scrollback, fresh claim stamp. A live
+    /// instance of a different claim is displaced: the click named the
+    /// conversation to see, and the displaced one stays in the CLI's own
+    /// session store.
+    fn relaunch_agent(&self, workspace: &Rc<Workspace>, key: TabKey, resume: Resume) {
+        let Some(primitive) = workspace.tab(key) else {
+            return;
+        };
+        let Some(program) = programs::by_id(&primitive.program_id) else {
+            self.activate_primitive(workspace, key);
+            return;
+        };
+        let mut options = self.launch_options();
+        match &resume {
+            Resume::No => {}
+            Resume::Last => options.resume = true,
+            Resume::Session(id) => options.session = Some(id.clone()),
+        }
+        options.agent_instance = Some(programs::launch::now_stamp());
+        let session_id = stable_session_id(workspace.project.id, key, &program.id);
+        let mut spec = program.command_spec(&options);
+        add_session_environment(
+            &mut spec,
+            workspace.project.id,
+            &workspace.project.path,
+            &self.session_home,
+            &session_id,
+        );
+        #[cfg(feature = "vte")]
+        if let Some(pane) = primitive.pane.as_ref() {
+            pane.respawn(&spec);
+        }
+        self.activate_primitive(workspace, key);
+    }
+
     /// Hovering a member selects its content and moves keyboard focus into that
-    /// primitive, the same focus-follows-pointer behavior as hovering a pane.
-    fn hover_primitive(&self, workspace: &Rc<Workspace>, slot: Slot) {
+    /// tab, the same focus-follows-pointer behavior as hovering a pane.
+    fn hover_primitive(&self, workspace: &Rc<Workspace>, key: TabKey) {
+        let key = workspace.resolve_tab(key);
         // Hover is mouse intent: a pane mapped under a parked pointer
         // synthesizes an enter the moment it appears — project switches and
         // resizes produce those by the dozen — and acting on one would yank
@@ -2251,15 +3562,15 @@ impl App {
         if !self.pointer_is_live() {
             return;
         }
-        let Some(group) = workspace.group_of(slot) else {
+        let Some(group) = workspace.group_of(key) else {
             return;
         };
-        if group.active_slot() != Some(slot) {
-            group.activate(slot);
+        if group.active_key() != Some(key) {
+            group.activate(key);
             self.refresh_group_menu(&group);
             self.persist_primitives(workspace);
         }
-        if let Some(primitive) = workspace.primitive(slot) {
+        if let Some(primitive) = workspace.tab(key) {
             let focused_here = self.window.focus_widget().is_some_and(|focus| {
                 focus == primitive.widget || focus.is_ancestor(&primitive.widget)
             });
@@ -2279,12 +3590,20 @@ impl App {
         glib::monotonic_time() / 1000 - self.pointer_motion_ms.get() < MOTION_WINDOW_MS
     }
 
-    /// Drop one primitive onto another's header: they share that header.
-    fn group_into(&self, workspace: &Rc<Workspace>, source: Slot, target: Slot) {
-        if source == target || source == Slot::Custom {
+    /// Drop one tab onto another's header: they share that header.
+    fn group_into(&self, workspace: &Rc<Workspace>, source: TabKey, target: TabKey) {
+        // Kinds resolve to the tab of that kind that exists — the menu's
+        // "Group with Editor" and the dock speak in kinds, chips in keys.
+        let source = workspace.resolve_tab(source);
+        let target = workspace.resolve_tab(target);
+        if source.slot == Slot::Board || target.slot == Slot::Board {
+            self.toast("The board has its own full-workspace panel");
             return;
         }
-        let Some(primitive) = self.ensure_primitive(workspace, source) else {
+        if source == target || source.slot == Slot::Custom {
+            return;
+        }
+        let Some(primitive) = self.ensure_primitive(workspace, source, None, Resume::No) else {
             return;
         };
         let Some(target_group) = workspace.group_of(target) else {
@@ -2317,21 +3636,23 @@ impl App {
         ));
     }
 
-    /// Pull a primitive out of a shared header into its own pane.
-    fn split_out(&self, workspace: &Rc<Workspace>, slot: Slot) {
-        let Some(group) = workspace.group_of(slot) else {
+    /// Pull a tab out of a shared header into its own pane.
+    fn split_out(&self, workspace: &Rc<Workspace>, key: TabKey) {
+        let key = workspace.resolve_tab(key);
+        let Some(group) = workspace.group_of(key) else {
             return;
         };
-        if group.slots().len() < 2 {
+        if group.tabs().len() < 2 {
             return; // already its own pane
         }
-        let Some(primitive) = self.ensure_primitive(workspace, slot) else {
+        let Some(primitive) = self.ensure_primitive(workspace, key, None, Resume::No) else {
             return;
         };
-        group.remove(slot);
+        group.remove(key);
         group.rebuild_header();
+        self.refresh_group_menu(&group);
         let own = Group::new();
-        own.insert(slot, &primitive.widget, true);
+        own.insert(key, &primitive.widget, true);
         own.rebuild_header();
         self.refresh_group_menu(&own);
         workspace.push_group(own.clone());
@@ -2342,7 +3663,7 @@ impl App {
                 split::Node::split(
                     split::Axis::Horizontal,
                     0.5,
-                    format!("tree-split-{}", slot.as_str()),
+                    format!("tree-split-{}", key.as_str()),
                     split::Node::leaf(&group),
                     split::Node::leaf(&own),
                 ),
@@ -2353,17 +3674,20 @@ impl App {
         self.sync_toggles();
         self.refresh_workspace_menus(workspace);
         self.persist_primitives(workspace);
-        trace(&format!("split out: {}", slot.as_str()));
+        trace(&format!("split out: {}", key.as_str()));
     }
 
     /// Move a pane one place in the visible arrangement while preserving the
     /// existing divider shape and sizes.
-    fn move_pane(&self, workspace: &Rc<Workspace>, slot: Slot, delta: isize) {
-        let Some(group) = workspace.group_of(slot) else {
+    fn move_pane(&self, workspace: &Rc<Workspace>, key: TabKey, delta: isize) {
+        let Some(group) = workspace.group_of(key) else {
             return;
         };
         let ordered = self.ordered_groups(workspace);
-        let Some(index) = ordered.iter().position(|candidate| Rc::ptr_eq(candidate, &group)) else {
+        let Some(index) = ordered
+            .iter()
+            .position(|candidate| Rc::ptr_eq(candidate, &group))
+        else {
             return;
         };
         let Some(target_index) = index.checked_add_signed(delta) else {
@@ -2396,14 +3720,20 @@ impl App {
     /// Drop pane A onto pane B's body: B's region divides in two and A takes
     /// half — a real, nested split, the way a tiling manager does it. The
     /// zone (left/right/top/bottom/center) says which half A takes.
-    fn nest_split(&self, workspace: &Rc<Workspace>, dragged: Slot, target: Slot, zone: &str) {
-        if dragged == target || dragged == Slot::Custom {
+    fn nest_split(&self, workspace: &Rc<Workspace>, dragged: TabKey, target: TabKey, zone: &str) {
+        let dragged = workspace.resolve_tab(dragged);
+        let target = workspace.resolve_tab(target);
+        if dragged.slot == Slot::Board || target.slot == Slot::Board {
+            self.toast("The board has its own full-workspace panel");
             return;
         }
-        // The dragged primitive must lead its own pane before it can take a
+        if dragged == target || dragged.slot == Slot::Custom {
+            return;
+        }
+        // The dragged tab must lead its own pane before it can take a
         // half of someone else's.
         if let Some(group) = workspace.group_of(dragged) {
-            if group.slots().len() >= 2 {
+            if group.tabs().len() >= 2 {
                 self.split_out(workspace, dragged);
             }
         }
@@ -2444,9 +3774,15 @@ impl App {
             }
             .or_else(|| auto_node(&others));
             let (first, second) = if dragged_first {
-                (split::Node::leaf(&dragged_group), split::Node::leaf(&target_group))
+                (
+                    split::Node::leaf(&dragged_group),
+                    split::Node::leaf(&target_group),
+                )
             } else {
-                (split::Node::leaf(&target_group), split::Node::leaf(&dragged_group))
+                (
+                    split::Node::leaf(&target_group),
+                    split::Node::leaf(&dragged_group),
+                )
             };
             let key = format!("tree-{}-{}", dragged.as_str(), target.as_str());
             let ok = match tree.as_mut() {
@@ -2477,7 +3813,48 @@ impl App {
         ));
     }
 
-    /// Replace the program behind a primitive.
+    /// Replace the program behind one tab, and remember the choice as the
+    /// kind's default. The HUD speaks in kinds (`set_primitive_program`); the
+    /// chip dropdown names the exact tab.
+    fn set_tab_program(
+        &self,
+        workspace: &Rc<Workspace>,
+        key: TabKey,
+        program: Program,
+        visible: bool,
+    ) {
+        // Drop the old pane: its process belongs to the program being replaced.
+        if let Some(old) = workspace.tabs.borrow_mut().remove(&key) {
+            old.widget.unparent();
+            if let Some(group) = workspace.group_of(key) {
+                group.remove(key);
+                if group.is_empty() {
+                    workspace.forget_group(&group);
+                }
+                group.rebuild_header();
+                // The group may have other members left; their chip controls
+                // need their models back after the rebuild.
+                self.refresh_group_menu(&group);
+            }
+        }
+        workspace
+            .programs
+            .borrow_mut()
+            .insert(key.slot, program.id.clone());
+        if visible {
+            self.show_primitive(workspace, key);
+        } else {
+            self.layout(workspace);
+            self.sync_toggles();
+            self.refresh_workspace_menus(workspace);
+            self.persist_primitives(workspace);
+        }
+        self.toast(&format!("{} → {}", key.label(), program.name));
+        self.apply_status_labels();
+    }
+
+    /// The HUD's kind-level program choice: land on the kind's tab that
+    /// exists, or open the first one.
     fn set_primitive_program(
         &self,
         workspace: &Rc<Workspace>,
@@ -2485,37 +3862,53 @@ impl App {
         program: Program,
         visible: bool,
     ) {
-        // Drop the old pane: its process belongs to the program being replaced.
-        if let Some(old) = workspace.primitives.borrow_mut().remove(&slot) {
-            old.widget.unparent();
-            if let Some(group) = workspace.group_of(slot) {
-                group.remove(slot);
-                if group.is_empty() {
-                    workspace.forget_group(&group);
-                }
-                group.rebuild_header();
-            }
+        let key = workspace.resolve_tab(TabKey::first(slot));
+        self.set_tab_program(workspace, key, program, visible);
+    }
+
+    /// Return from the board to the saved tool arrangement.
+    fn leave_board(&self, workspace: &Rc<Workspace>) -> bool {
+        let key = TabKey::first(Slot::Board);
+        if workspace.group_of(key).is_none() {
+            return false;
         }
-        workspace
-            .programs
-            .borrow_mut()
-            .insert(slot, program.id.clone());
-        if visible {
-            self.show_primitive(workspace, slot);
-        } else {
-            self.layout(workspace);
-            self.sync_toggles();
-            self.refresh_workspace_menus(workspace);
-            self.persist_primitives(workspace);
-        }
-        self.toast(&format!("{} → {}", label_for(slot), program.name));
-        self.apply_status_labels();
+        self.toggle_primitive(workspace, key);
+        true
     }
 
     /// Arrange the panes: agent on the left, changes and editor stacked beside
     /// it, commands along the bottom. Whatever is not open is not there.
     fn layout(&self, workspace: &Rc<Workspace>) {
         workspace.dividers.borrow_mut().clear();
+        // The board is an attention surface, never a tile. Reuse zoom's saved
+        // arrangement so closing it restores the tools and their divider tree.
+        // Also migrate older layouts where the board shared a tab group.
+        let board_key = TabKey::first(Slot::Board);
+        if let Some(mut group) = workspace.group_of(board_key) {
+            if group.tabs().len() > 1 {
+                if let Some(primitive) = workspace.tab(board_key) {
+                    group.remove(board_key);
+                    group.rebuild_header();
+                    self.refresh_group_menu(&group);
+                    let own = Group::new();
+                    own.insert(board_key, &primitive.widget, true);
+                    own.rebuild_header();
+                    self.refresh_group_menu(&own);
+                    workspace.push_group(own.clone());
+                    group = own;
+                }
+            }
+            let groups = workspace.groups();
+            if groups.len() > 1 {
+                let tree = workspace.tree.borrow_mut().take();
+                *workspace.zoom.borrow_mut() = Some((groups.clone(), tree));
+                // Unmount the tool widgets without stopping their sessions.
+                for previous in &groups {
+                    previous.widget.unparent();
+                }
+                *workspace.groups.borrow_mut() = vec![group];
+            }
+        }
         let groups = workspace.groups();
 
         for group in &groups {
@@ -2583,9 +3976,9 @@ impl App {
             groups
                 .iter()
                 .map(|group| group
-                    .slots()
+                    .tabs()
                     .iter()
-                    .map(|slot| slot.as_str())
+                    .map(|key| key.as_str())
                     .collect::<Vec<_>>()
                     .join("+"))
                 .collect::<Vec<_>>()
@@ -2596,7 +3989,13 @@ impl App {
     fn build_tree(&self, workspace: &Rc<Workspace>, node: &split::Node<Group>) -> gtk::Widget {
         match node {
             split::Node::Leaf(group) => group.widget.clone().upcast::<gtk::Widget>(),
-            split::Node::Split { axis, ratio, key, first, second } => {
+            split::Node::Split {
+                axis,
+                ratio,
+                key,
+                first,
+                second,
+            } => {
                 let gtk_axis = match axis {
                     split::Axis::Horizontal => gtk::Orientation::Horizontal,
                     split::Axis::Vertical => gtk::Orientation::Vertical,
@@ -2683,10 +4082,13 @@ impl App {
     }
 
     /// Zoom the focused pane to the whole window, and back.
-    fn toggle_zoom(&self, slot: Option<Slot>) {
+    fn toggle_zoom(&self, key: Option<TabKey>) {
         let Some(workspace) = self.current_workspace() else {
             return;
         };
+        if self.leave_board(&workspace) {
+            return;
+        }
         let previous_zoom = workspace.zoom.borrow_mut().take();
         if let Some((groups, tree)) = previous_zoom {
             *workspace.groups.borrow_mut() = groups;
@@ -2702,8 +4104,8 @@ impl App {
             self.toast("Only one pane is showing");
             return;
         }
-        let target = slot
-            .and_then(|slot| workspace.group_of(slot))
+        let target = key
+            .and_then(|key| workspace.group_of(key))
             .or_else(|| self.focused_group(&workspace))
             .unwrap_or_else(|| groups[0].clone());
         // The arrangement waits in the zoom slot while the single pane shows.
@@ -2745,14 +4147,16 @@ impl App {
         }
     }
 
-    /// Make the dock match the layout.
+    /// Make the dock match the layout. The dock speaks in kinds: a toggle is
+    /// on while any tab of that kind is on screen.
     fn sync_toggles(&self) {
         let visible = self
             .current_workspace()
-            .map(|workspace| workspace.visible_slots())
+            .map(|workspace| workspace.visible_kinds())
             .unwrap_or_default();
         let preferences = self.db.preferences().unwrap_or_default();
         self.projects_toggle.set_active(self.sidebar_shown.get());
+        self.home_toggle.set_active(self.home_shown.get());
         for (slot, button) in self.toggles.borrow().iter() {
             button.set_active(visible.contains(slot));
             let available = *slot == Slot::Shell
@@ -2762,22 +4166,33 @@ impl App {
         }
     }
 
-    /// The pane menu belongs to whichever primitive its header is showing.
+    /// The pane menu belongs to whichever tab its header is showing — and so
+    /// do the chips' program dropdowns and ＋ menus, which is why every
+    /// header rebuild comes back here.
     fn refresh_group_menu(&self, group: &Rc<Group>) {
-        let Some(slot) = group.active_slot() else {
+        let Some(key) = group.active_key() else {
+            return;
+        };
+        let Some(workspace) = self.current_workspace() else {
             return;
         };
         group
             .menu_button
-            .set_menu_model(Some(&self.primitive_menu_model(slot)));
+            .set_menu_model(Some(&self.primitive_menu_model(&workspace, key)));
+        for (member, program_button, add_button) in group.chip_controls() {
+            program_button.set_menu_model(Some(&self.chip_program_menu(&workspace, member)));
+            add_button.set_menu_model(Some(&self.chip_add_menu(member)));
+        }
         // A pane rebuilt into a new group starts with a blank header; restore
         // whatever each member's program has said so far.
         for workspace in self.workspaces.borrow().values() {
-            for member in group.slots() {
+            for member in group.tabs() {
                 let home = workspace.group_of(member);
                 if home.is_some_and(|home| Rc::ptr_eq(&home, group)) {
-                    if let Some(text) =
-                        self.header_info.borrow().get(&(workspace.project.id, member))
+                    if let Some(text) = self
+                        .header_info
+                        .borrow()
+                        .get(&(workspace.project.id, member))
                     {
                         group.set_member_info(member, text);
                     }
@@ -2788,15 +4203,15 @@ impl App {
 
     /// Remember what a pane's program said and aim it at the pane's header,
     /// wherever that pane is grouped today. `None` clears.
-    fn store_header_info(&self, project_id: i64, slot: Slot, text: Option<String>) {
+    fn store_header_info(&self, project_id: i64, key: TabKey, text: Option<String>) {
         {
             let mut info = self.header_info.borrow_mut();
             match &text {
                 Some(entry) => {
-                    info.insert((project_id, slot), entry.clone());
+                    info.insert((project_id, key), entry.clone());
                 }
                 None => {
-                    info.remove(&(project_id, slot));
+                    info.remove(&(project_id, key));
                 }
             }
         }
@@ -2805,8 +4220,8 @@ impl App {
             if workspace.project.id != project_id {
                 continue;
             }
-            if let Some(group) = workspace.group_of(slot) {
-                group.set_member_info(slot, &shown);
+            if let Some(group) = workspace.group_of(key) {
+                group.set_member_info(key, &shown);
             }
         }
     }
@@ -2825,7 +4240,7 @@ impl App {
     }
 }
 
-/// Save one project's primitives and presentation state to SQLite.
+/// Save one project's tabs and presentation state to SQLite.
 fn persist_workspace(db: &Db, workspace: &Workspace) {
     let zoom = workspace.zoom.borrow();
     let (groups, tree) = match zoom.as_ref() {
@@ -2836,25 +4251,29 @@ fn persist_workspace(db: &Db, workspace: &Workspace) {
         .as_ref()
         .and_then(|_| workspace.groups().first().and_then(group_id));
 
-    let mut slots: Vec<Slot> = groups.iter().flat_map(|group| group.slots()).collect();
-    slots.sort_by_key(|slot| {
-        PRIMITIVES
-            .iter()
-            .position(|other| other == slot)
-            .unwrap_or(9)
+    // One row per tab, same-primitive tabs included: the second agent tab is
+    // a second `agent` row, and its key comes back the same way on restore.
+    let mut keys: Vec<TabKey> = groups.iter().flat_map(|group| group.tabs()).collect();
+    keys.sort_by_key(|key| {
+        (
+            PRIMITIVES
+                .iter()
+                .position(|other| other == &key.slot)
+                .unwrap_or(9),
+            key.instance,
+        )
     });
-    slots.dedup();
 
     let mut tabs = Vec::new();
-    for (index, slot) in slots.iter().enumerate() {
+    for (index, key) in keys.iter().enumerate() {
         let program_id = workspace
-            .primitive(*slot)
+            .tab(*key)
             .map(|primitive| primitive.program_id.clone())
-            .or_else(|| workspace.programs.borrow().get(slot).cloned());
+            .or_else(|| workspace.programs.borrow().get(&key.slot).cloned());
         let Some(program_id) = program_id else {
             continue;
         };
-        let mut tab = crate::db::Tab::new(*slot, program_id);
+        let mut tab = crate::db::Tab::new(key.slot, program_id);
         tab.sort_order = index as i64;
         tabs.push(tab);
     }
@@ -2862,10 +4281,10 @@ fn persist_workspace(db: &Db, workspace: &Workspace) {
     let saved_groups = groups
         .iter()
         .filter_map(|group| {
-            let slots = group.slots();
+            let tabs = group.tabs();
             Some(WorkspaceGroup {
-                active: group.active_slot()?,
-                slots,
+                active: group.active_key()?,
+                slots: tabs,
             })
         })
         .collect();
@@ -2897,8 +4316,14 @@ fn schedule_workspace_save(db: SharedDb, workspace: Rc<Workspace>) {
     *workspace.save_timeout.borrow_mut() = Some(source);
 }
 
-fn group_id(group: &Rc<Group>) -> Option<Slot> {
-    group.slots().first().copied()
+/// The kind a pane leads with — auto layout places panes by kind, however
+/// many instances a kind has grown.
+fn anchor_kind(group: &Rc<Group>) -> Option<Slot> {
+    Workspace::anchor(group).map(|key| key.slot)
+}
+
+fn group_id(group: &Rc<Group>) -> Option<TabKey> {
+    group.tabs().first().copied()
 }
 
 fn save_layout(node: &split::Node<Group>) -> Option<WorkspaceLayout> {
@@ -2970,7 +4395,7 @@ fn layout_covers(node: &split::Node<Group>, groups: &[Rc<Group>]) -> bool {
 fn auto_node(groups: &[Rc<Group>]) -> Option<split::Node<Group>> {
     let bottom: Vec<Rc<Group>> = groups
         .iter()
-        .filter(|group| Workspace::anchor(group) == Some(Slot::Shell))
+        .filter(|group| anchor_kind(group) == Some(Slot::Shell))
         .cloned()
         .collect();
     let rest: Vec<Rc<Group>> = groups
@@ -2980,7 +4405,7 @@ fn auto_node(groups: &[Rc<Group>]) -> Option<split::Node<Group>> {
         .collect();
     let main_left = rest
         .iter()
-        .find(|group| Workspace::anchor(group) == Some(Slot::Agent))
+        .find(|group| anchor_kind(group) == Some(Slot::Agent))
         .cloned()
         .or_else(|| rest.first().cloned());
     let side: Vec<Rc<Group>> = rest
@@ -3007,9 +4432,13 @@ fn auto_node(groups: &[Rc<Group>]) -> Option<split::Node<Group>> {
     };
     let bottom_node = fold_nodes(&bottom, split::Axis::Horizontal, 0.55, "bottom");
     match (main, bottom_node) {
-        (Some(main), Some(bottom)) => {
-            Some(split::Node::split(split::Axis::Vertical, 0.68, "outer", main, bottom))
-        }
+        (Some(main), Some(bottom)) => Some(split::Node::split(
+            split::Axis::Vertical,
+            0.68,
+            "outer",
+            main,
+            bottom,
+        )),
         (Some(main), None) => Some(main),
         (None, Some(bottom)) => Some(bottom),
         (None, None) => None,
@@ -3028,9 +4457,21 @@ fn fold_nodes(
     let mut acc = split::Node::leaf(iter.next()?);
     for (index, group) in iter.enumerate() {
         acc = if index % 2 == 0 {
-            split::Node::split(axis, ratio, format!("{key}{index}"), split::Node::leaf(group), acc)
+            split::Node::split(
+                axis,
+                ratio,
+                format!("{key}{index}"),
+                split::Node::leaf(group),
+                acc,
+            )
         } else {
-            split::Node::split(axis, ratio, format!("{key}{index}"), acc, split::Node::leaf(group))
+            split::Node::split(
+                axis,
+                ratio,
+                format!("{key}{index}"),
+                acc,
+                split::Node::leaf(group),
+            )
         };
     }
     Some(acc)
@@ -3039,10 +4480,7 @@ fn fold_nodes(
 /// Dropping a pane on the project list pulls that primitive into a pane of its
 /// own: the natural counter-gesture to dropping it onto another pane.
 fn wire_sidebar_drop(app: &SharedApp) {
-    let target = gtk::DropTarget::new(
-        glib::types::Type::STRING,
-        gtk::gdk::DragAction::MOVE,
-    );
+    let target = gtk::DropTarget::new(glib::types::Type::STRING, gtk::gdk::DragAction::MOVE);
     target.set_propagation_phase(gtk::PropagationPhase::Capture);
     let list = app.sidebar_list.clone();
     target.connect_drop(move |_, value, _, _| {
@@ -3077,5 +4515,130 @@ fn trace(message: &str) {
         .open(path)
     {
         let _ = writeln!(file, "{message}");
+    }
+}
+
+#[cfg(test)]
+mod activity_ui_tests {
+    use super::*;
+    use crate::session::activity::{
+        ActivityEvent, ActivityKind, AttentionActionKind, AttentionKind, AttentionResponse,
+    };
+
+    fn event(sequence: u64, payload: crate::session::activity::ActivityPayload) -> ActivityEvent {
+        ActivityEvent {
+            id: format!("event-{sequence}"),
+            project_id: 73,
+            sequence,
+            at_millis: sequence as i64 * 100,
+            session_id: Some("project-73-agent-0-opencode".to_string()),
+            card_id: Some("card-1".to_string()),
+            kind: match &payload {
+                crate::session::activity::ActivityPayload::AttentionRequested { .. } => {
+                    ActivityKind::AttentionRequested
+                }
+                crate::session::activity::ActivityPayload::AttentionAcknowledged { .. } => {
+                    ActivityKind::AttentionAcknowledged
+                }
+                crate::session::activity::ActivityPayload::AttentionResolved { .. } => {
+                    ActivityKind::AttentionResolved
+                }
+                _ => ActivityKind::Reported,
+            },
+            payload,
+        }
+    }
+
+    #[test]
+    fn activity_replay_deduplicates_and_resolution_removes_attention_badge() {
+        let mut activity = ProjectActivity::empty(73);
+        let requested = event(
+            1,
+            crate::session::activity::ActivityPayload::AttentionRequested {
+                request_id: "attention-73-1".to_string(),
+                attention_kind: AttentionKind::Approval,
+                reason: "Deploy this change?".to_string(),
+                allowed_actions: vec![AttentionActionKind::Approve, AttentionActionKind::Deny],
+            },
+        );
+        activity.apply_event(requested.clone());
+        activity.apply_event(requested);
+        assert_eq!(activity.snapshot.events.len(), 1);
+        assert_eq!(activity.snapshot.attention.len(), 1);
+
+        activity.apply_event(event(
+            2,
+            crate::session::activity::ActivityPayload::AttentionAcknowledged {
+                request_id: "attention-73-1".to_string(),
+                revision: 2,
+            },
+        ));
+        assert_eq!(activity.snapshot.attention[0].revision, 2);
+
+        activity.apply_event(event(
+            3,
+            crate::session::activity::ActivityPayload::AttentionResolved {
+                request_id: "attention-73-1".to_string(),
+                revision: 3,
+                response: AttentionResponse::Approve,
+            },
+        ));
+        assert!(activity.snapshot.attention.is_empty());
+        assert_eq!(activity.snapshot.watermark, 3);
+
+        activity.merge_snapshot(
+            crate::session::activity::ActivitySnapshot {
+                project_id: 73,
+                watermark: 1,
+                events: vec![event(
+                    1,
+                    crate::session::activity::ActivityPayload::AttentionRequested {
+                        request_id: "attention-73-1".to_string(),
+                        attention_kind: AttentionKind::Approval,
+                        reason: "Deploy this change?".to_string(),
+                        allowed_actions: vec![
+                            AttentionActionKind::Approve,
+                            AttentionActionKind::Deny,
+                        ],
+                    },
+                )],
+                attention: vec![crate::session::activity::Attention {
+                    id: "attention-73-1".to_string(),
+                    source_event_id: "event-1".to_string(),
+                    project_id: 73,
+                    session_id: Some("project-73-agent-0-opencode".to_string()),
+                    card_id: Some("card-1".to_string()),
+                    kind: AttentionKind::Approval,
+                    reason: "Deploy this change?".to_string(),
+                    allowed_actions: vec![AttentionActionKind::Approve, AttentionActionKind::Deny],
+                    created_at_millis: 100,
+                    seen_at_millis: None,
+                    acknowledged_at_millis: None,
+                    resolved_at_millis: None,
+                    resolution: None,
+                    revision: 1,
+                }],
+                has_more: false,
+            },
+            true,
+        );
+        assert!(activity.snapshot.attention.is_empty());
+        assert_eq!(activity.snapshot.events.len(), 3);
+    }
+
+    #[test]
+    fn stable_session_links_keep_project_tab_instance_and_hyphenated_program() {
+        let (project_id, key, program_id) =
+            parse_stable_session_id("project-73-agent-2-claude-code").unwrap();
+        assert_eq!(project_id, 73);
+        assert_eq!(
+            key,
+            TabKey {
+                slot: Slot::Agent,
+                instance: 2
+            }
+        );
+        assert_eq!(program_id, "claude-code");
+        assert!(parse_stable_session_id("random-session-id").is_none());
     }
 }

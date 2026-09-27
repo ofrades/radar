@@ -1,8 +1,8 @@
-//! A group: one header, one or more primitives underneath.
+//! A group: one header, one or more tabs underneath.
 //!
-//! A pane starts as a single primitive. Drag one header onto another and they
-//! group under one header, with a small chip per member to switch between them —
-//! the same gesture as dropping a view into a tab group elsewhere, but opt-in:
+//! A pane starts as a single tab. Drag one header onto another and they group
+//! under one header, with a small chip per tab to switch between them — the
+//! same gesture as dropping a view into a tab group elsewhere, but opt-in:
 //! nothing is grouped unless you group it.
 //!
 //! Chips are draggable, and the header accepts a drop. Both sides talk to the
@@ -18,31 +18,31 @@ use gtk::glib;
 
 use super::icon_name;
 use super::primitive::label_for;
-use crate::db::Slot;
+use crate::db::{Slot, TabKey};
 
 /// What a drop should do, decided by where it landed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropIntent {
     /// Landed on a pane's header: join that pane, sharing its header.
     Group,
-    /// Landed on a pane's body: this primitive gets a pane of its own.
+    /// Landed on a pane's body: this tab gets a pane of its own.
     SplitOut,
-    /// Nothing to do — dropping a primitive onto its own header, say.
+    /// Nothing to do — dropping a tab onto its own header, say.
     Ignore,
 }
 
 /// Where a drop landed.
 pub fn drop_intent(
     over_header: bool,
-    dragged: Slot,
-    members: &[Slot],
-    active: Option<Slot>,
+    dragged: TabKey,
+    members: &[TabKey],
+    active: Option<TabKey>,
 ) -> DropIntent {
-    if dragged == Slot::Custom {
+    if dragged.slot == Slot::Custom {
         return DropIntent::Ignore;
     }
     if over_header {
-        // Joining this pane is pointless if it is already the primitive shown.
+        // Joining this pane is pointless if it is already the tab shown.
         if active == Some(dragged) {
             return DropIntent::Ignore;
         }
@@ -92,6 +92,26 @@ fn edge_margins(zone: &str, width: i32, height: i32, pad: i32) -> (i32, i32, i32
     }
 }
 
+/// One tab's controls in the header. A chip is a small panel header: the
+/// switch that shows it, its program's live info, a program dropdown, a ＋
+/// that adds another tab of the same primitive, and a close of its own. A
+/// header carries several only when tabs are grouped.
+struct Chip {
+    /// The cluster as one unit — main, dropdown, ＋ and close — which is
+    /// what drags hit-test and focus lookups walk.
+    widget: gtk::Box,
+    /// The tab's live info, dim, beside its label; accented while it wants
+    /// attention.
+    info: gtk::Label,
+    /// The inline program dropdown. Its model is attached by the window
+    /// (`refresh_group_menu`), which knows the registry and what runs now.
+    program_button: gtk::MenuButton,
+    /// The ＋: add another tab of this same primitive, grouped under this
+    /// header. Its model is attached by the window too — the same list of
+    /// this kind's programs, each item adding a tab that runs it.
+    add_button: gtk::MenuButton,
+}
+
 pub struct Group {
     /// The pane as the arrangement tree sees it: the body with the drop-edge
     /// indicator floating over it.
@@ -105,19 +125,17 @@ pub struct Group {
     /// dropped pane. Invisible until a drag hovers.
     edge: gtk::Box,
     /// Members, in header order.
-    pub members: RefCell<Vec<Slot>>,
+    pub members: RefCell<Vec<TabKey>>,
     /// The member whose widget is showing.
-    pub active: RefCell<Option<Slot>>,
+    pub active: RefCell<Option<TabKey>>,
     /// The header's chips, so a drag can carry the chip that was grabbed rather
     /// than always the active member.
-    chips: RefCell<Vec<(Slot, gtk::Button)>>,
+    chips: RefCell<Vec<(TabKey, Chip)>>,
     /// Live info each member's program reports — its name, and whatever the
     /// program says it is doing — keyed by member.
-    info: RefCell<HashMap<Slot, String>>,
+    info: RefCell<HashMap<TabKey, String>>,
     /// Members that rang the terminal bell and have not been looked at since.
-    attention: RefCell<HashSet<Slot>>,
-    /// The active member's info, dim, at the header's right edge.
-    info_label: gtk::Label,
+    attention: RefCell<HashSet<TabKey>>,
 }
 
 impl Group {
@@ -135,16 +153,6 @@ impl Group {
         menu_button.set_valign(gtk::Align::Center);
         menu_button.set_halign(gtk::Align::End);
         menu_button.set_hexpand(true);
-
-        // Live info from the active member's program: dim text at the right
-        // edge, invisible until a program has something to say.
-        let info_label = gtk::Label::new(None);
-        info_label.add_css_class("dim-label");
-        info_label.add_css_class("caption");
-        info_label.add_css_class("pane-info");
-        info_label.set_valign(gtk::Align::Center);
-        info_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-        info_label.set_visible(false);
 
         let content = gtk::Stack::builder()
             .transition_type(gtk::StackTransitionType::Crossfade)
@@ -224,7 +232,6 @@ impl Group {
             chips: RefCell::new(Vec::new()),
             info: RefCell::new(HashMap::new()),
             attention: RefCell::new(HashSet::new()),
-            info_label,
         });
         Group::accept_drags(&group);
         group
@@ -238,22 +245,22 @@ impl Group {
     /// phase so this one always sees the event first.
     ///
     /// Dropping another pane here joins them; dropping one of *this* pane's own
-    /// primitives here pulls it out into a pane of its own.
+    /// tabs here pulls it out into a pane of its own.
     fn accept_drags(group: &Rc<Group>) {
         use gtk::PropagationPhase;
 
         // Hovering a pane is focusing it: the motion controller forwards the
         // enter to `hover_primitive`, which (only for a pointer that is really
-        // moving) focuses the pane's primitive — and the ring that follows
+        // moving) focuses the pane's tab — and the ring that follows
         // keyboard focus marks it. No separate hover highlight.
         let hover = gtk::EventControllerMotion::new();
         hover.set_propagation_phase(gtk::PropagationPhase::Capture);
         let group_on_enter = group.clone();
         hover.connect_enter(move |_, _, _| {
-            if let Some(slot) = group_on_enter.active_slot() {
+            if let Some(key) = group_on_enter.active_key() {
                 let _ = group_on_enter
                     .widget
-                    .activate_action("win.primitive-hover", Some(&slot.as_str().to_variant()));
+                    .activate_action("win.primitive-hover", Some(&key.as_str().to_variant()));
             }
         });
         group.widget.add_controller(hover);
@@ -272,21 +279,25 @@ impl Group {
             // The chip under the pointer, if any: grabbing "Changes" out of an
             // agent+changes header must drag Changes, not whatever is showing.
             // Coordinates and chip allocations are both relative to the header.
-            let grabbed = group_for_drag.chips.borrow().iter().find_map(|(slot, chip)| {
-                let alloc = chip.allocation();
-                (x >= alloc.x() as f64
-                    && x < (alloc.x() + alloc.width()) as f64
-                    && y >= alloc.y() as f64
-                    && y < (alloc.y() + alloc.height()) as f64)
-                    .then_some(*slot)
-            });
-            let slot = grabbed.or_else(|| group_for_drag.active_slot());
+            let grabbed = group_for_drag
+                .chips
+                .borrow()
+                .iter()
+                .find_map(|(key, chip)| {
+                    let alloc = chip.widget.allocation();
+                    (x >= alloc.x() as f64
+                        && x < (alloc.x() + alloc.width()) as f64
+                        && y >= alloc.y() as f64
+                        && y < (alloc.y() + alloc.height()) as f64)
+                        .then_some(*key)
+                });
+            let key = grabbed.or_else(|| group_for_drag.active_key());
             super::trace(&format!(
                 "drag: prepare at ({x:.0},{y:.0}) grabbed={:?} active={:?}",
-                grabbed.map(|slot| slot.as_str()),
-                group_for_drag.active_slot().map(|slot| slot.as_str())
+                grabbed.map(|key| key.as_str()),
+                group_for_drag.active_key().map(|key| key.as_str())
             ));
-            slot.map(|slot| gdk::ContentProvider::for_value(&slot.as_str().to_value()))
+            key.map(|key| gdk::ContentProvider::for_value(&key.as_str().to_value()))
         });
         let header_for_drag = group.header.clone();
         source.connect_drag_begin(move |_, _| {
@@ -350,10 +361,10 @@ impl Group {
                 super::trace("drop: payload was not a string");
                 return false;
             };
-            let dragged = Slot::parse(&payload);
+            let dragged = TabKey::parse(&payload);
             let over_header = y <= header.height() as f64 + 2.0;
-            let members = group_for_drop.slots();
-            let intent = drop_intent(over_header, dragged, &members, group_for_drop.active_slot());
+            let members = group_for_drop.tabs();
+            let intent = drop_intent(over_header, dragged, &members, group_for_drop.active_key());
             edge.set_visible(false);
             header.remove_css_class("drop-header");
             super::trace(&format!(
@@ -362,7 +373,7 @@ impl Group {
             match intent {
                 DropIntent::Ignore => false,
                 DropIntent::Group => {
-                    let Some(target_slot) = group_for_drop.active_slot() else {
+                    let Some(target_key) = group_for_drop.active_key() else {
                         return false;
                     };
                     // Full action name, prefix included: without "win." the lookup
@@ -372,8 +383,7 @@ impl Group {
                     // — every pane gone, only the sidebar left. After the idle
                     // the drag is fully over and the relayout sticks.
                     let widget = widget.clone();
-                    let variant =
-                        (payload, target_slot.as_str().to_string()).to_variant();
+                    let variant = (dragged.as_str(), target_key.as_str()).to_variant();
                     glib::idle_add_local_once(move || {
                         let _ = widget.activate_action("win.primitive-group", Some(&variant));
                     });
@@ -384,7 +394,7 @@ impl Group {
                     if members.contains(&dragged) {
                         // This pane's own member, back on its body: out it
                         // comes into a pane of its own.
-                        let variant = payload.to_variant();
+                        let variant = dragged.as_str().to_variant();
                         glib::idle_add_local_once(move || {
                             let _ = widget
                                 .activate_action("win.primitive-split-out", Some(&variant));
@@ -392,13 +402,13 @@ impl Group {
                     } else {
                         // Another pane dropped on this body: the body's region
                         // divides and the visitor takes the dropped half.
-                        let Some(target_slot) = group_for_drop.active_slot() else {
+                        let Some(target_key) = group_for_drop.active_key() else {
                             return false;
                         };
                         let zone = drop_zone(widget.width(), widget.height(), x, y);
                         let variant = (
-                            payload,
-                            target_slot.as_str().to_string(),
+                            dragged.as_str(),
+                            target_key.as_str(),
                             zone.to_string(),
                         )
                             .to_variant();
@@ -415,41 +425,42 @@ impl Group {
     }
 
     /// Show a member's widget, adding it if this group has not seen it before.
-    pub fn insert(&self, slot: Slot, widget: &gtk::Widget, activate: bool) {
+    pub fn insert(&self, key: TabKey, widget: &gtk::Widget, activate: bool) {
         // A primitive's widget always has a parent — its old pane's stack — and
         // GTK refuses, silently, to add a widget that already has one. Detach it
         // first or the pane comes up empty.
         if widget.parent().is_some() {
             widget.unparent();
         }
-        let name = slot.as_str();
-        if self.content.child_by_name(name).is_none() {
-            self.content.add_named(widget, Some(name));
+        let name = key.as_str();
+        if self.content.child_by_name(&name).is_none() {
+            self.content.add_named(widget, Some(&name));
         }
-        if !self.members.borrow().contains(&slot) {
-            self.members.borrow_mut().push(slot);
+        if !self.members.borrow().contains(&key) {
+            self.members.borrow_mut().push(key);
         }
         if activate || self.active.borrow().is_none() {
-            *self.active.borrow_mut() = Some(slot);
+            *self.active.borrow_mut() = Some(key);
         }
         self.content
-            .set_visible_child_name(self.active.borrow().unwrap_or(slot).as_str());
+            .set_visible_child_name(self.active.borrow().unwrap_or(key).as_str().as_str());
     }
 
     /// Take a member out of this group. Returns true when the group is empty.
-    pub fn remove(&self, slot: Slot) -> bool {
-        self.members.borrow_mut().retain(|other| *other != slot);
-        if let Some(widget) = self.content.child_by_name(slot.as_str()) {
+    pub fn remove(&self, key: TabKey) -> bool {
+        self.members.borrow_mut().retain(|other| *other != key);
+        if let Some(widget) = self.content.child_by_name(key.as_str().as_str()) {
             self.content.remove(&widget);
         }
-        if self.active.borrow().as_ref() == Some(&slot) {
+        if self.active.borrow().as_ref() == Some(&key) {
             *self.active.borrow_mut() = self.members.borrow().first().copied();
         }
         if let Some(active) = *self.active.borrow() {
-            self.content.set_visible_child_name(active.as_str());
+            self.content
+                .set_visible_child_name(active.as_str().as_str());
         }
-        self.info.borrow_mut().remove(&slot);
-        self.attention.borrow_mut().remove(&slot);
+        self.info.borrow_mut().remove(&key);
+        self.attention.borrow_mut().remove(&key);
         self.apply_info();
         self.is_empty()
     }
@@ -458,126 +469,206 @@ impl Group {
         self.members.borrow().is_empty()
     }
 
-    pub fn contains(&self, slot: Slot) -> bool {
-        self.members.borrow().contains(&slot)
+    pub fn contains(&self, key: TabKey) -> bool {
+        self.members.borrow().contains(&key)
     }
 
-    pub fn slots(&self) -> Vec<Slot> {
+    pub fn tabs(&self) -> Vec<TabKey> {
         self.members.borrow().clone()
     }
 
     /// Switch to a member.
-    pub fn activate(&self, slot: Slot) {
-        if !self.contains(slot) {
+    pub fn activate(&self, key: TabKey) {
+        if !self.contains(key) {
             return;
         }
-        *self.active.borrow_mut() = Some(slot);
-        self.content.set_visible_child_name(slot.as_str());
-        for (member, chip) in self.chips.borrow().iter() {
-            if *member == slot {
-                chip.add_css_class("active");
-            } else {
-                chip.remove_css_class("active");
-            }
-        }
-        // Looking at a member answers its bell.
-        self.attention.borrow_mut().remove(&slot);
+        *self.active.borrow_mut() = Some(key);
+        self.content.set_visible_child_name(key.as_str().as_str());
+        // Looking at a member answers its bell; apply_info also repaints the
+        // chips' active and attention marks.
+        self.attention.borrow_mut().remove(&key);
         self.apply_info();
     }
 
-    /// The chip whose button (or child) currently holds keyboard focus.
-    pub fn slot_for_focus(&self, focus: &gtk::Widget) -> Option<Slot> {
-        self.chips.borrow().iter().find_map(|(slot, chip)| {
-            (focus == chip.upcast_ref::<gtk::Widget>() || focus.is_ancestor(chip)).then_some(*slot)
+    /// The chip whose controls currently hold keyboard focus.
+    pub fn key_for_focus(&self, focus: &gtk::Widget) -> Option<TabKey> {
+        self.chips.borrow().iter().find_map(|(key, chip)| {
+            (focus == chip.widget.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&chip.widget))
+                .then_some(*key)
         })
     }
 
-    pub fn active_slot(&self) -> Option<Slot> {
-        self.active.borrow().or_else(|| self.members.borrow().first().copied())
+    pub fn active_key(&self) -> Option<TabKey> {
+        self.active
+            .borrow()
+            .or_else(|| self.members.borrow().first().copied())
     }
 
     /// Live info a member's program reported — its name, its own title, its
-    /// exit. Empty text clears: the header goes back to just the chips.
-    pub fn set_member_info(&self, slot: Slot, text: &str) {
+    /// exit. Empty text clears: the chip goes back to just the label.
+    pub fn set_member_info(&self, key: TabKey, text: &str) {
         if text.is_empty() {
-            self.info.borrow_mut().remove(&slot);
+            self.info.borrow_mut().remove(&key);
         } else {
-            self.info.borrow_mut().insert(slot, text.to_string());
+            self.info.borrow_mut().insert(key, text.to_string());
         }
-        if self.active_slot() == Some(slot) {
+        if self.active_key() == Some(key) {
             self.apply_info();
         }
     }
 
     /// A member rang the terminal bell — an agent asking for attention. The
     /// header marks it until that member is looked at.
-    pub fn set_attention(&self, slot: Slot) {
-        self.attention.borrow_mut().insert(slot);
-        if self.active_slot() == Some(slot) {
+    pub fn set_attention(&self, key: TabKey) {
+        self.attention.borrow_mut().insert(key);
+        if self.active_key() == Some(key) {
             self.apply_info();
         }
     }
 
-    /// Push the active member's info onto the header label.
+    /// Push each member's info onto its own chip: live text beside the label,
+    /// dim until the program wants attention. A chip with nothing to say is
+    /// just its label, as before.
     fn apply_info(&self) {
-        let active = self.active_slot();
-        let text = active.and_then(|slot| self.info.borrow().get(&slot).cloned());
-        self.info_label.set_visible(text.is_some());
-        self.info_label.set_text(text.as_deref().unwrap_or(""));
-        self.info_label.set_tooltip_text(text.as_deref());
-        let wants_attention =
-            active.is_some_and(|slot| self.attention.borrow().contains(&slot));
-        if wants_attention {
-            self.info_label.add_css_class("attention");
-        } else {
-            self.info_label.remove_css_class("attention");
+        let active = self.active_key();
+        for (key, chip) in self.chips.borrow().iter() {
+            let text = self.info.borrow().get(key).cloned();
+            chip.info.set_visible(text.is_some());
+            chip.info.set_text(text.as_deref().unwrap_or(""));
+            chip.info.set_tooltip_text(text.as_deref());
+            if active == Some(*key) {
+                chip.widget.add_css_class("active");
+            } else {
+                chip.widget.remove_css_class("active");
+            }
+            if self.attention.borrow().contains(key) {
+                chip.widget.add_css_class("attention");
+            } else {
+                chip.widget.remove_css_class("attention");
+            }
         }
     }
 
-    /// A chip per member, showing which one is active.
+    /// A chip per member, each a small panel header of its own: switch, live
+    /// info, program dropdown, ＋, close. The header ends with the pane menu.
     pub fn rebuild_header(&self) {
         while let Some(child) = self.header.first_child() {
             self.header.remove(&child);
         }
         self.chips.borrow_mut().clear();
-        let active = self.active_slot();
-        for slot in self.members.borrow().iter() {
-            let chip = gtk::Button::builder()
-                .tooltip_text(format!("{}\tclick to switch — drag the header to move it", label_for(*slot)))
-                .build();
-            chip.add_css_class("flat");
-            chip.add_css_class("group-chip");
-            if Some(*slot) == active {
-                chip.add_css_class("active");
+        let active = self.active_key();
+        for key in self.members.borrow().iter() {
+            let cluster = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            cluster.add_css_class("group-chip");
+            cluster.set_valign(gtk::Align::Center);
+            if Some(*key) == active {
+                cluster.add_css_class("active");
             }
 
+            // The switch: icon, name, and whatever the program says it is
+            // doing. Still a button under the plain-text look, so click,
+            // hover and keyboard focus all work.
+            let main = gtk::Button::builder()
+                .tooltip_text(format!(
+                    "{}\tclick to switch — drag the header to move it",
+                    key.label()
+                ))
+                .build();
+            main.add_css_class("flat");
+            main.add_css_class("chip-main");
+
             let inner = gtk::Box::new(gtk::Orientation::Horizontal, 5);
-            let image = gtk::Image::from_icon_name(icon_name(*slot));
+            let image = gtk::Image::from_icon_name(icon_name(key.slot));
             // Chips are the most compact headers: their icons follow the
             // small caption text.
             image.set_pixel_size(14);
             inner.append(&image);
-            let label = gtk::Label::new(Some(label_for(*slot)));
+            let label = gtk::Label::new(Some(&key.label()));
             label.add_css_class("caption-heading");
             inner.append(&label);
-            chip.set_child(Some(&inner));
-            chip.set_action_name(Some("win.primitive-activate"));
-            chip.set_action_target_value(Some(&slot.as_str().to_variant()));
+            let info = gtk::Label::new(None);
+            info.add_css_class("dim-label");
+            info.add_css_class("caption");
+            info.add_css_class("pane-info");
+            info.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            info.set_visible(false);
+            inner.append(&info);
+            main.set_child(Some(&inner));
+            main.set_action_name(Some("win.primitive-activate"));
+            main.set_action_target_value(Some(&key.as_str().to_variant()));
+            cluster.append(&main);
+
+            // This tab's program dropdown. The window attaches the model —
+            // it knows the registry and which program runs — on the next
+            // refresh after this rebuild. Same primitive kind only: an agent
+            // chip lists agents, an editor chip lists editors.
+            let program_button = gtk::MenuButton::builder()
+                .icon_name("pan-down-symbolic")
+                .tooltip_text(format!("Change {} program…", key.label()))
+                .build();
+            program_button.add_css_class("flat");
+            program_button.add_css_class("chip-menu");
+            program_button.set_valign(gtk::Align::Center);
+            cluster.append(&program_button);
+
+            // The ＋: another tab of this same primitive, grouped under this
+            // header as a new chip. Same list of this kind's programs; the
+            // one the new tab runs is the pick.
+            let add_button = gtk::MenuButton::builder()
+                .icon_name("list-add-symbolic")
+                .tooltip_text(format!("Add another {} tab", label_for(key.slot)))
+                .build();
+            add_button.add_css_class("flat");
+            add_button.add_css_class("chip-add");
+            add_button.set_valign(gtk::Align::Center);
+            cluster.append(&add_button);
+
+            // Closing the chip hides the tab; its program keeps running,
+            // and the dock or the HUD brings it back. The last member to
+            // close takes the pane with it.
+            let close = gtk::Button::builder()
+                .icon_name("window-close-symbolic")
+                .tooltip_text(format!("Close {} — its program keeps running", key.label()))
+                .build();
+            close.add_css_class("flat");
+            close.add_css_class("chip-close");
+            close.set_valign(gtk::Align::Center);
+            close.set_action_name(Some("win.primitive-close"));
+            close.set_action_target_value(Some(&key.as_str().to_variant()));
+            cluster.append(&close);
 
             let hover = gtk::EventControllerMotion::new();
-            let chip_for_hover = chip.clone();
-            let target = slot.as_str().to_variant();
+            let chip_for_hover = cluster.clone();
+            let target = key.as_str().to_variant();
             hover.connect_enter(move |_, _, _| {
                 let _ = chip_for_hover.activate_action("win.primitive-hover", Some(&target));
             });
-            chip.add_controller(hover);
+            cluster.add_controller(hover);
 
-            self.chips.borrow_mut().push((*slot, chip.clone()));
-            self.header.append(&chip);
+            self.chips.borrow_mut().push((
+                *key,
+                Chip {
+                    widget: cluster.clone(),
+                    info,
+                    program_button,
+                    add_button,
+                },
+            ));
+            self.header.append(&cluster);
         }
-        self.header.append(&self.info_label);
         self.header.append(&self.menu_button);
         self.apply_info();
+    }
+
+    /// The chips' program dropdowns and ＋ menus, for the window to attach
+    /// models to — it knows the registry, the preferences and what each tab
+    /// runs.
+    pub fn chip_controls(&self) -> Vec<(TabKey, gtk::MenuButton, gtk::MenuButton)> {
+        self.chips
+            .borrow()
+            .iter()
+            .map(|(key, chip)| (*key, chip.program_button.clone(), chip.add_button.clone()))
+            .collect()
     }
 }
 
@@ -587,14 +678,24 @@ mod tests {
 
     #[test]
     fn header_drops_group_and_body_drops_split() {
-        let members = [Slot::Agent];
+        let members = [TabKey::first(Slot::Agent)];
         assert_eq!(
-            drop_intent(true, Slot::Diff, &members, Some(Slot::Agent)),
+            drop_intent(
+                true,
+                TabKey::first(Slot::Diff),
+                &members,
+                Some(TabKey::first(Slot::Agent))
+            ),
             DropIntent::Group,
             "onto another pane's header: join it"
         );
         assert_eq!(
-            drop_intent(false, Slot::Diff, &members, Some(Slot::Agent)),
+            drop_intent(
+                false,
+                TabKey::first(Slot::Diff),
+                &members,
+                Some(TabKey::first(Slot::Agent))
+            ),
             DropIntent::SplitOut,
             "onto another pane's body: a pane of its own"
         );
@@ -603,19 +704,29 @@ mod tests {
     #[test]
     fn dropping_a_primitive_on_its_own_pane_does_nothing() {
         assert_eq!(
-            drop_intent(true, Slot::Agent, &[Slot::Agent], Some(Slot::Agent)),
-            DropIntent::Ignore
-        );
-        assert_eq!(
-            drop_intent(false, Slot::Agent, &[Slot::Agent], Some(Slot::Agent)),
+            drop_intent(
+                true,
+                TabKey::first(Slot::Agent),
+                &[TabKey::first(Slot::Agent)],
+                Some(TabKey::first(Slot::Agent))
+            ),
             DropIntent::Ignore
         );
         assert_eq!(
             drop_intent(
                 false,
-                Slot::Diff,
-                &[Slot::Agent, Slot::Diff],
-                Some(Slot::Agent)
+                TabKey::first(Slot::Agent),
+                &[TabKey::first(Slot::Agent)],
+                Some(TabKey::first(Slot::Agent))
+            ),
+            DropIntent::Ignore
+        );
+        assert_eq!(
+            drop_intent(
+                false,
+                TabKey::first(Slot::Diff),
+                &[TabKey::first(Slot::Agent), TabKey::first(Slot::Diff)],
+                Some(TabKey::first(Slot::Agent))
             ),
             DropIntent::SplitOut,
             "a member of this pane, dropped on the body: out it comes"
@@ -625,11 +736,21 @@ mod tests {
     #[test]
     fn a_non_primitive_payload_is_ignored() {
         assert_eq!(
-            drop_intent(true, Slot::Custom, &[Slot::Agent], Some(Slot::Agent)),
+            drop_intent(
+                true,
+                TabKey::first(Slot::Custom),
+                &[TabKey::first(Slot::Agent)],
+                Some(TabKey::first(Slot::Agent))
+            ),
             DropIntent::Ignore
         );
         assert_eq!(
-            drop_intent(false, Slot::Custom, &[Slot::Agent], Some(Slot::Agent)),
+            drop_intent(
+                false,
+                TabKey::first(Slot::Custom),
+                &[TabKey::first(Slot::Agent)],
+                Some(TabKey::first(Slot::Agent))
+            ),
             DropIntent::Ignore
         );
     }

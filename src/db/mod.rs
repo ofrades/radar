@@ -4,6 +4,7 @@
 //! shell widget) goes through the same `Db` type, so nothing can disagree
 //! about what a project is.
 
+mod agent_sessions;
 mod events;
 mod projects;
 mod settings;
@@ -17,14 +18,14 @@ use rusqlite::Connection;
 
 pub use events::Event;
 pub use projects::Project;
-pub use settings::{Preferences, UiPrefs};
-pub use tabs::{Slot, Tab};
+pub use settings::{NewWorkspaceLayout, Preferences, UiPrefs};
+pub use tabs::{Slot, Tab, TabKey};
 pub use workspace::{WorkspaceAxis, WorkspaceGroup, WorkspaceLayout, WorkspaceState};
 
 use crate::config::Paths;
 
 /// Current schema version; bump with a migration below when changing tables.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 pub struct Db {
     conn: Connection,
@@ -113,6 +114,20 @@ impl Db {
                     project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
                     state      TEXT    NOT NULL,
                     updated_at INTEGER NOT NULL
+                );
+                "#,
+            )?;
+        }
+        if version < 3 {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS agent_sessions (
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    claim      TEXT    NOT NULL,
+                    program_id TEXT    NOT NULL,
+                    session_id TEXT    NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (project_id, claim)
                 );
                 "#,
             )?;

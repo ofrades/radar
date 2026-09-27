@@ -1,38 +1,33 @@
 # Board-first client/server direction
 
+Implementation update: the daemon-owned registry and VTE attachment now keep
+terminal processes alive across client exits; see
+[`session-daemon.md`](session-daemon.md) for its tested protocol and limitations.
+A durable project activity journal, bounded replay/watch protocol,
+revision-checked attention store, stable card IDs, and CLI are also in place.
+Lossless terminal-state import and the live board interaction flow remain follow-up.
+
 The board is the project's full-workspace interaction surface. It presents
 work, agent activity, and requests for human attention together. Opening a
 session is a drill-down; returning to the board must preserve the tool layout
 and leave sessions running. Notifications invite action without stealing focus.
 
-## Review of the current split
+## Current ownership and remaining gaps
 
-The GTK-free PTY owner and parsed terminal state in `src/session/mod.rs` are
-a useful transport foundation. They are not yet an independently running server.
-Before calling phase 2 a detachable client/server implementation, address:
+The original phase-1 concerns about widget-owned process lifetime, blocking
+renderer delivery, view-dependent lifecycle feedback, missing replay cursors,
+and client-owned terminal query replies are addressed by the session daemon and
+VTE attachment described in [`session-daemon.md`](session-daemon.md). Project
+activity now has its own atomic snapshot/replay boundary, durable attention
+records, and separate bounded watcher stream. Process lifecycle, explicit agent
+activity, and each client connection remain distinct state axes.
 
-1. **Lifetime still belongs to a widget.** `Pane::session` owns `Session`, and
-   dropping `Session` stops the child. Move ownership to a server session registry;
-   attach/detach must only change subscriptions. Explicit stop ends a process.
-2. **A renderer can stall the session.** `bridge_loop` writes synchronously to
-   the widget PTY. A client that stops reading can block parsing, input, exit
-   detection, and shutdown. Use bounded independent client delivery, disconnect
-   lagging clients with an explicit resync requirement, and keep server event
-   processing independent of terminal delivery.
-3. **Feedback is view-dependent.** The GUI consumes only `Exit`; title and bell
-   come from VTE. Use server events for feedback even without attached clients.
-   The current GUI now queues only exit events rather than copying unused output
-   into an unbounded GUI queue.
-4. **Process existence is not agent state.** `Pane::is_live` checks whether a
-   session was spawned, not whether it exited or needs input. A terminal title,
-   bell, silence, or nonzero exit cannot reliably describe agent intent.
-5. **There is no reconnect boundary.** Callback events lack session identity,
-   sequence numbers, replay, or acknowledgement. A screen mutex is not an atomic
-   snapshot-and-subscribe protocol. Process exit can also precede final PTY
-   output; distinguish process exit from stream completion.
-6. **Terminal replies still require a client.** DSR/DA/colour queries are ignored
-   by the session parser. Assign one authoritative reply owner before supporting
-   zero or multiple attached clients; never let each viewer reply independently.
+The remaining gaps are exact terminal parser-state import, vendor-specific hooks
+that automatically turn native agent prompts into activity requests,
+project-wide board-file monitoring while the board pane is closed, and desktop
+notifications. Agents can already submit requests and wait for typed responses
+with `radar activity request --wait`. Do not infer agent intent from terminal
+output, process existence, silence, or a bell.
 
 ## Ownership and state
 
@@ -102,19 +97,32 @@ expand into available space, tool selection restores the tool arrangement, and
 board grouping/split drops cannot shrink it into a tile. Board/Alt+K, its close
 button, or Alt+F returns to tools. Existing grouped layouts are normalized when
 rendered. Existing card editing, adding, and dragging remain available.
+Claimed cards link to their agent: a card's `@claim` opens the matching agent
+session — matched exactly by the process's own `RADAR_AGENT`, or by the
+claim's leading program — and an exited agent re-opens resumed. When the
+agent exits, radar captures the conversation its CLI recorded (opencode's
+session list) and binds it to the claim in the database; the next click
+reopens that exact conversation with `--session <id>`.
 
-**Next, before more transport-only work:**
+**Implemented:** server-owned registry and bounded terminal/feedback transport;
+sequenced, persistent project activity; stable session/card identities;
+idempotent commands and revision-checked persistent attention with independent
+seen, acknowledged and resolved state. Tests cover restart, duplicate commands,
+stale revisions, cursor resync, multiple watchers, terminal flooding, and an
+agent CLI reporting with its radar-provided project/session environment.
 
-1. Server registry, typed lifecycle, bounded client transport, query ownership.
-   Verify detach with output flooding, blocked client, stop, exit, and reattach.
-2. Sequenced project journal, atomic snapshot/replay, idempotent commands and
-   persistent attention. Verify duplicates, stale revisions, cursor gaps,
-   restart, two clients, and events produced with no client attached.
-3. Agent adapter reports a real question/approval; board renders the request,
-   opens the linked session, accepts a response, and reflects server resolution.
-   Verify end-to-end latency under terminal load and no focus theft.
-4. Board feed, project attention badges, and optional desktop delivery consume
-   the same records. Verify cross-project attention and reconnect deduplication.
+**Implemented:** the board renders the live project feed and explicit states,
+shows actionable unresolved requests with seen/acknowledge/answer/approve/deny/
+dismiss actions, opens linked stable sessions, reflects authoritative resolution,
+and shows unresolved counts for every sidebar project. GUI watching reconnects,
+replays and deduplicates activity; file changes observed while the board pane is
+open publish card-linked events.
 
-The feed, agent states, and persistent notifications described here are the
-next implementation contracts; they are not implemented by the fullscreen change.
+**Next:** vendor-specific hooks can translate native agent prompts into the
+existing request/wait flow; project-wide board-file monitoring while the pane is
+closed and optional desktop delivery consume the same journal. Verify these with
+real agent CLIs and no focus theft.
+
+The journal, attention storage and live board presentation are implemented
+independently of the fullscreen change; vendor-specific prompt hooks and desktop
+notifications remain follow-up work.

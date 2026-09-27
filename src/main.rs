@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use radar::board;
 use radar::config::Paths;
@@ -39,10 +39,21 @@ struct Cli {
 enum Command {
     /// Run the persistent session daemon (foreground; independent of the GUI)
     Serve,
+    /// Serve Radar's responsive browser client on localhost
+    Web {
+        /// Local HTTP port (Tailscale Serve can expose this to your tailnet)
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+    },
     /// Control daemon-owned sessions without a GUI
     Session {
         #[command(subcommand)]
         action: SessionAction,
+    },
+    /// Publish explicit agent activity or manage human-attention requests
+    Activity {
+        #[command(subcommand)]
+        action: ActivityAction,
     },
     /// List projects with their git status
     List,
@@ -181,6 +192,109 @@ enum SessionAction {
     },
     /// Stop all sessions and shut down the daemon
     Shutdown,
+}
+
+#[derive(Args, Debug, Default)]
+struct ActivityIdentity {
+    /// Radar project ID (defaults to RADAR_PROJECT_ID in a radar-launched pane)
+    #[arg(long)]
+    project_id: Option<i64>,
+    /// Stable daemon session ID (defaults to RADAR_SESSION_ID)
+    #[arg(long)]
+    session_id: Option<String>,
+    /// Stable BOARD.md card ID (defaults to RADAR_CARD_ID)
+    #[arg(long)]
+    card_id: Option<String>,
+    /// Retry token. Reuse it to make a retry idempotent.
+    #[arg(long)]
+    command_id: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum ActivityAction {
+    /// Explicitly report an agent state; state is never inferred from output
+    State {
+        #[command(flatten)]
+        identity: ActivityIdentity,
+        #[arg(long, value_enum)]
+        state: radar::session::activity::AgentState,
+        #[arg(long)]
+        message: Option<String>,
+    },
+    /// Add a human-readable event to the project feed
+    Report {
+        #[command(flatten)]
+        identity: ActivityIdentity,
+        text: String,
+    },
+    /// Create a persistent question, approval, failure, or review request
+    Request {
+        #[command(flatten)]
+        identity: ActivityIdentity,
+        #[arg(long, value_enum)]
+        kind: radar::session::activity::AttentionKind,
+        #[arg(long)]
+        reason: String,
+        /// Allowed action; repeat for multiple choices
+        #[arg(long = "allow", value_enum, required = true)]
+        allowed_actions: Vec<radar::session::activity::AttentionActionKind>,
+        /// Wait until a human responds, then print the authoritative response
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Mark an attention request as seen
+    Seen {
+        #[command(flatten)]
+        identity: ActivityIdentity,
+        request_id: String,
+        #[arg(long)]
+        revision: u64,
+    },
+    /// Acknowledge an outstanding request without resolving it
+    Acknowledge {
+        #[command(flatten)]
+        identity: ActivityIdentity,
+        request_id: String,
+        #[arg(long)]
+        revision: u64,
+    },
+    /// Respond to and resolve an outstanding request
+    Respond {
+        #[command(flatten)]
+        identity: ActivityIdentity,
+        request_id: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long, value_enum)]
+        action: ActivityResponseAction,
+        #[arg(long)]
+        answer: Option<String>,
+    },
+    /// Read a bounded snapshot of the project feed and unresolved requests
+    Snapshot {
+        #[arg(long)]
+        project_id: Option<i64>,
+        #[arg(long)]
+        after: Option<u64>,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
+    /// Replay from a project sequence, then stream sequenced live events
+    Watch {
+        #[arg(long)]
+        project_id: Option<i64>,
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum ActivityResponseAction {
+    Answer,
+    Approve,
+    Deny,
+    Dismiss,
 }
 
 #[derive(Subcommand, Debug)]
@@ -362,6 +476,290 @@ fn session_command(paths: &Paths, action: SessionAction) -> Result<()> {
     Ok(())
 }
 
+fn activity_command(paths: &Paths, action: ActivityAction) -> Result<()> {
+    use radar::session::activity::{
+        ActivityKind, ActivityPayload, AttentionChange, AttentionResponse, ChangeAttention,
+        CreateAttention, PublishActivity,
+    };
+    use radar::session::daemon::{self, Client, Command as Request, Response};
+
+    daemon::ensure_running(&paths.data_dir)?;
+    let project_id = |explicit: Option<i64>| -> Result<i64> {
+        explicit
+            .or_else(|| std::env::var("RADAR_PROJECT_ID").ok()?.parse().ok())
+            .context("project ID is required (use --project-id or launch from a radar project)")
+    };
+    let command_id = |explicit: Option<String>| {
+        explicit.unwrap_or_else(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            format!("cli-{}-{now:x}", std::process::id())
+        })
+    };
+    let session_id =
+        |explicit: Option<String>| explicit.or_else(|| std::env::var("RADAR_SESSION_ID").ok());
+    let card_id =
+        |explicit: Option<String>| explicit.or_else(|| std::env::var("RADAR_CARD_ID").ok());
+
+    let mut wait_for_response = None;
+    let request = match action {
+        ActivityAction::State {
+            identity,
+            state,
+            message,
+        } => Request::PublishActivity(PublishActivity {
+            project_id: project_id(identity.project_id)?,
+            command_id: command_id(identity.command_id),
+            session_id: session_id(identity.session_id),
+            card_id: card_id(identity.card_id),
+            kind: ActivityKind::AgentStateChanged,
+            payload: ActivityPayload::AgentState { state, message },
+        }),
+        ActivityAction::Report { identity, text } => Request::PublishActivity(PublishActivity {
+            project_id: project_id(identity.project_id)?,
+            command_id: command_id(identity.command_id),
+            session_id: session_id(identity.session_id),
+            card_id: card_id(identity.card_id),
+            kind: ActivityKind::Reported,
+            payload: ActivityPayload::Message { text },
+        }),
+        ActivityAction::Request {
+            identity,
+            kind,
+            reason,
+            allowed_actions,
+            wait,
+        } => {
+            let project_id = project_id(identity.project_id)?;
+            if wait {
+                wait_for_response = Some(project_id);
+            }
+            Request::CreateAttention(CreateAttention {
+                project_id,
+                command_id: command_id(identity.command_id),
+                session_id: session_id(identity.session_id),
+                card_id: card_id(identity.card_id),
+                kind,
+                reason,
+                allowed_actions,
+            })
+        }
+        ActivityAction::Seen {
+            identity,
+            request_id,
+            revision,
+        } => Request::ChangeAttention(ChangeAttention {
+            project_id: project_id(identity.project_id)?,
+            request_id,
+            command_id: command_id(identity.command_id),
+            expected_revision: revision,
+            change: AttentionChange::MarkSeen,
+        }),
+        ActivityAction::Acknowledge {
+            identity,
+            request_id,
+            revision,
+        } => Request::ChangeAttention(ChangeAttention {
+            project_id: project_id(identity.project_id)?,
+            request_id,
+            command_id: command_id(identity.command_id),
+            expected_revision: revision,
+            change: AttentionChange::Acknowledge,
+        }),
+        ActivityAction::Respond {
+            identity,
+            request_id,
+            revision,
+            action,
+            answer,
+        } => {
+            let response = match action {
+                ActivityResponseAction::Answer => AttentionResponse::Answer(
+                    answer.context("--answer is required with --action answer")?,
+                ),
+                ActivityResponseAction::Approve if answer.is_none() => AttentionResponse::Approve,
+                ActivityResponseAction::Deny if answer.is_none() => AttentionResponse::Deny,
+                ActivityResponseAction::Dismiss if answer.is_none() => AttentionResponse::Dismiss,
+                _ => anyhow::bail!("--answer is only valid with --action answer"),
+            };
+            Request::ChangeAttention(ChangeAttention {
+                project_id: project_id(identity.project_id)?,
+                request_id,
+                command_id: command_id(identity.command_id),
+                expected_revision: revision,
+                change: AttentionChange::Respond(response),
+            })
+        }
+        ActivityAction::Snapshot {
+            project_id: explicit,
+            after,
+            limit,
+        } => Request::ActivitySnapshot {
+            project_id: project_id(explicit)?,
+            after_sequence: after,
+            limit,
+        },
+        ActivityAction::Watch {
+            project_id: explicit,
+            after,
+        } => {
+            let mut client = Client::connect(
+                &paths.data_dir,
+                Request::WatchActivity {
+                    project_id: project_id(explicit)?,
+                    after_sequence: after,
+                },
+            )?;
+            let initial = client.receive()?;
+            println!("{}", serde_json::to_string(&initial)?);
+            if matches!(initial, Response::ResyncRequired) {
+                anyhow::bail!("activity history is too old; take a fresh snapshot")
+            }
+            client.set_read_timeout(None)?;
+            loop {
+                let response = client.receive()?;
+                let resync = matches!(response, Response::ResyncRequired);
+                println!("{}", serde_json::to_string(&response)?);
+                if resync {
+                    anyhow::bail!("activity stream lagged; resnapshot and reconnect")
+                }
+            }
+        }
+    };
+
+    let response = Client::request(&paths.data_dir, request)?;
+    println!("{}", serde_json::to_string(&response)?);
+    if let (Some(project_id), Response::AttentionCreated(created)) = (wait_for_response, &response)
+    {
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let attention = wait_for_attention(
+            &paths.data_dir,
+            project_id,
+            &created.attention.id,
+            created.event.sequence,
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string(&Response::AttentionStatus(attention))?
+        );
+    }
+    Ok(())
+}
+
+/// Keep an agent-side CLI invocation alive until its request receives a typed
+/// human response. The durable record is checked after resync, while watching
+/// from the snapshot watermark closes the race with a response arriving then.
+fn wait_for_attention(
+    home: &Path,
+    project_id: i64,
+    request_id: &str,
+    mut cursor: u64,
+) -> Result<radar::session::activity::Attention> {
+    use radar::session::activity::{ActivityPayload, Attention};
+    use radar::session::daemon::{Client, Command as Request, Response};
+
+    let resolved = |event: &radar::session::activity::ActivityEvent| {
+        event.project_id == project_id
+            && matches!(
+                &event.payload,
+                ActivityPayload::AttentionResolved { request_id: id, .. } if id == request_id
+            )
+    };
+    let current_attention = || -> Result<Attention> {
+        match Client::request(
+            home,
+            Request::AttentionStatus {
+                project_id,
+                request_id: request_id.to_string(),
+            },
+        )? {
+            Response::AttentionStatus(attention) => Ok(attention),
+            other => anyhow::bail!("unexpected attention status response: {other:?}"),
+        }
+    };
+    let delay = || std::thread::sleep(std::time::Duration::from_millis(100));
+
+    loop {
+        let mut client = match Client::connect(
+            home,
+            Request::WatchActivity {
+                project_id,
+                after_sequence: cursor,
+            },
+        ) {
+            Ok(client) => client,
+            Err(_) => {
+                delay();
+                continue;
+            }
+        };
+        let initial = client.receive();
+        match initial {
+            Ok(Response::ActivityWatching { snapshot, .. }) => {
+                if snapshot.events.iter().any(&resolved) {
+                    if let Ok(attention) = current_attention() {
+                        if attention.resolved_at_millis.is_some() {
+                            return Ok(attention);
+                        }
+                    }
+                }
+                cursor = snapshot.watermark;
+                client.set_read_timeout(None)?;
+                loop {
+                    match client.receive() {
+                        Ok(Response::Activity(event)) => {
+                            cursor = event.sequence;
+                            if resolved(&event) {
+                                match current_attention() {
+                                    Ok(attention) if attention.resolved_at_millis.is_some() => {
+                                        return Ok(attention);
+                                    }
+                                    Err(_) => break,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Ok(Response::ResyncRequired) => break,
+                        Ok(_) | Err(_) => break,
+                    }
+                }
+            }
+            Ok(Response::ResyncRequired) => {}
+            Ok(_) | Err(_) => {
+                delay();
+                continue;
+            }
+        }
+        drop(client);
+
+        let snapshot = match Client::request(
+            home,
+            Request::ActivitySnapshot {
+                project_id,
+                after_sequence: None,
+                limit: 200,
+            },
+        ) {
+            Ok(Response::ActivitySnapshot(snapshot)) => snapshot,
+            _ => {
+                delay();
+                continue;
+            }
+        };
+        cursor = snapshot.watermark;
+        match current_attention() {
+            Ok(attention) if attention.resolved_at_millis.is_some() => return Ok(attention),
+            Ok(_) => {}
+            Err(_) => {
+                delay();
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = match &cli.home {
@@ -373,7 +771,9 @@ fn main() -> Result<()> {
         Some(Command::Serve) => {
             return radar::session::daemon::Server::bind(&paths.data_dir)?.run()
         }
+        Some(Command::Web { port }) => return radar::web::run(&paths.data_dir, port),
         Some(Command::Session { action }) => return session_command(&paths, action),
+        Some(Command::Activity { action }) => return activity_command(&paths, action),
         _ => {}
     }
     let db = Db::open(&paths)?;
@@ -381,7 +781,12 @@ fn main() -> Result<()> {
     match cli.command {
         // No subcommand: this is the app.
         None | Some(Command::Gui) => run_gui(paths, db),
-        Some(Command::Serve | Command::Session { .. }) => {
+        Some(
+            Command::Serve
+            | Command::Web { .. }
+            | Command::Session { .. }
+            | Command::Activity { .. },
+        ) => {
             unreachable!("handled before opening the database")
         }
         Some(Command::List) => list(&db, cli.json),
@@ -927,6 +1332,8 @@ fn launch_options(preferences: &Preferences, safe: bool) -> LaunchOptions {
         safe: safe || !preferences.agent_auto_flags,
         extra_args: Vec::new(),
         prompt: None,
+        resume: false,
+        session: None,
         agent_instance: None,
     }
 }

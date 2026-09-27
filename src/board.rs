@@ -11,7 +11,9 @@
 //! write atomically (temporary file + rename), re-reading when the file moved
 //! under us, so a claim is not lost because another agent wrote first.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
@@ -44,6 +46,9 @@ pub struct Column {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Card {
+    /// Stable identity stored in a hidden HTML comment beside the card. Titles
+    /// and claims can change without breaking activity or attention links.
+    pub id: String,
     pub title: String,
     /// Notes, one line each, the indent stripped.
     pub body: Vec<String>,
@@ -57,6 +62,7 @@ pub struct Card {
 impl Card {
     pub fn new(title: impl Into<String>) -> Card {
         Card {
+            id: new_card_id(),
             title: title.into(),
             body: Vec::new(),
             claimed_by: None,
@@ -96,8 +102,18 @@ impl Board {
         None
     }
 
+    pub fn find_id(&self, id: &str) -> Option<(usize, usize)> {
+        self.columns.iter().enumerate().find_map(|(column, value)| {
+            value
+                .cards
+                .iter()
+                .position(|card| card.id == id)
+                .map(|card| (column, card))
+        })
+    }
+
     /// Render the canonical file: header, then one heading per column with its
-    /// cards. Deterministic, so an unchanged board round-trips byte for byte.
+    /// cards and invisible stable-ID comments.
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str(&self.header);
@@ -116,6 +132,9 @@ impl Board {
                     out.push_str(who);
                 }
                 out.push('\n');
+                out.push_str("      <!-- radar:card-id:");
+                out.push_str(&card.id);
+                out.push_str(" -->\n");
                 for line in &card.body {
                     out.push_str("      ");
                     out.push_str(line);
@@ -166,7 +185,11 @@ pub fn parse(text: &str) -> Board {
         if let Some((c, i)) = last_card {
             let note = line.trim();
             if !note.is_empty() {
-                board.columns[c].cards[i].body.push(note.to_string());
+                if let Some(id) = parse_card_id(note) {
+                    board.columns[c].cards[i].id = id.to_string();
+                } else {
+                    board.columns[c].cards[i].body.push(note.to_string());
+                }
             }
         }
     }
@@ -208,6 +231,35 @@ fn parse_card_line(line: &str) -> Option<Card> {
     Some(card)
 }
 
+fn parse_card_id(line: &str) -> Option<&str> {
+    let id = line
+        .strip_prefix("<!-- radar:card-id:")?
+        .strip_suffix(" -->")?;
+    if id.is_empty()
+        || id.len() > 100
+        || !id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return None;
+    }
+    Some(id)
+}
+
+fn new_card_id() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "card-{:x}-{:x}-{:x}",
+        std::process::id(),
+        timestamp,
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// The claim is a trailing `@name`, so an agent claims by appending text. All
 /// trailing `@name` tokens come out of the title — the last one wins — so
 /// claiming over someone else's claim is just appending your name. An `@`
@@ -244,6 +296,7 @@ pub fn file_path(project: &Path) -> PathBuf {
 pub fn ensure_file(project: &Path) -> Result<PathBuf> {
     let path = file_path(project);
     if path.exists() {
+        ensure_card_ids(project)?;
         return Ok(path);
     }
     let name = project
@@ -253,6 +306,88 @@ pub fn ensure_file(project: &Path) -> Result<PathBuf> {
     std::fs::write(&path, Board::default_for(&name).render())
         .with_context(|| format!("creating {}", path.display()))?;
     Ok(path)
+}
+
+/// Give pre-migration cards a persistent identity without reformatting the
+/// rest of an agent-authored markdown file. The marker is an HTML comment, so
+/// it is invisible in rendered markdown and survives ordinary edits/moves.
+fn ensure_card_ids(project: &Path) -> Result<()> {
+    let path = file_path(project);
+    for _ in 0..ATTEMPTS {
+        let before = mtime(&path);
+        let text = std::fs::read_to_string(&path)?;
+        let lines: Vec<&str> = text.lines().collect();
+        let mut output = String::with_capacity(text.len() + lines.len() * 48);
+        let mut changed = false;
+        let mut in_columns = false;
+        let mut seen = HashSet::new();
+        let mut index = 0;
+        while index < lines.len() {
+            let line = lines[index];
+            output.push_str(line);
+            output.push('\n');
+            if line.starts_with("## ") {
+                in_columns = true;
+            }
+            if !in_columns || parse_card_line(line).is_none() {
+                index += 1;
+                continue;
+            }
+
+            let existing = lines
+                .get(index + 1)
+                .and_then(|next| parse_card_id(next.trim()));
+            if existing.is_some_and(|id| seen.insert(id.to_string())) {
+                // Preserve the original indentation/spacing of existing metadata.
+                output.push_str(lines[index + 1]);
+                output.push('\n');
+                index += 2;
+                continue;
+            }
+            let mut id = parse_card_line(line).expect("checked card line").id;
+            while !seen.insert(id.clone()) {
+                id = new_card_id();
+            }
+            output.push_str("      <!-- radar:card-id:");
+            output.push_str(&id);
+            output.push_str(" -->\n");
+            changed = true;
+            index += if existing.is_some() { 2 } else { 1 };
+        }
+        if !changed {
+            return Ok(());
+        }
+        if before != mtime(&path) {
+            continue;
+        }
+        let temp = project.join(TEMP_NAME);
+        std::fs::write(&temp, output).with_context(|| format!("writing {}", temp.display()))?;
+        if before != mtime(&path) {
+            let _ = std::fs::remove_file(&temp);
+            continue;
+        }
+        std::fs::rename(&temp, &path)
+            .with_context(|| format!("renaming over {}", path.display()))?;
+        return Ok(());
+    }
+    bail!(
+        "{} kept changing while migrating stable card IDs; nothing was written",
+        path.display()
+    )
+}
+
+fn normalize_card_ids(board: &mut Board) {
+    let mut seen = HashSet::new();
+    for card in board
+        .columns
+        .iter_mut()
+        .flat_map(|column| &mut column.cards)
+    {
+        if card.id.is_empty() || !seen.insert(card.id.clone()) {
+            card.id = new_card_id();
+            seen.insert(card.id.clone());
+        }
+    }
 }
 
 /// Read the board. A missing file reads as an empty default board, so
@@ -290,14 +425,12 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 /// Apply `change` to the board and save it, retrying when the file changed
 /// under us. `Ok(None)` means "nothing to do" (no card by that name): no
 /// write, no retry.
-fn edit<T>(
-    project: &Path,
-    change: impl Fn(&mut Board) -> Result<Option<T>>,
-) -> Result<Option<T>> {
+fn edit<T>(project: &Path, change: impl Fn(&mut Board) -> Result<Option<T>>) -> Result<Option<T>> {
     let path = file_path(project);
     for _ in 0..ATTEMPTS {
         let before = mtime(&path);
         let mut board = load(project)?;
+        normalize_card_ids(&mut board);
         let Some(result) = change(&mut board)? else {
             return Ok(None);
         };
@@ -323,6 +456,7 @@ pub fn add_card(
 ) -> Result<String> {
     let column_name = column.unwrap_or(DEFAULT_COLUMNS[0]).to_string();
     let card = Card {
+        id: new_card_id(),
         title: title.trim().to_string(),
         body: body
             .lines()
@@ -343,7 +477,10 @@ pub fn add_card(
         Ok(Some(card.title.clone()))
     })? {
         Some(title) => Ok(title),
-        None => Err(anyhow::anyhow!("no column named “{}”", column.unwrap_or(DEFAULT_COLUMNS[0]))),
+        None => Err(anyhow::anyhow!(
+            "no column named “{}”",
+            column.unwrap_or(DEFAULT_COLUMNS[0])
+        )),
     }
 }
 
@@ -405,13 +542,20 @@ pub fn finish_card(project: &Path, title: &str) -> Result<bool> {
 
 /// Replace a card: the GUI's edit dialog. The card is found by its old title;
 /// the updated card may carry a new title, notes, claim, or column.
-pub fn update_card(project: &Path, title: &str, updated: Card, column: Option<&str>) -> Result<bool> {
+pub fn update_card(
+    project: &Path,
+    title: &str,
+    updated: Card,
+    column: Option<&str>,
+) -> Result<bool> {
     let title = title.to_string();
     let column = column.map(str::to_string);
     edit(project, move |board| {
         let Some((c, i)) = board.find(&title) else {
             return Ok(None);
         };
+        let mut updated = updated.clone();
+        updated.id = board.columns[c].cards[i].id.clone();
         if let Some(target) = &column {
             if let Some(to) = board.column_named(target) {
                 if to != c {
@@ -463,9 +607,11 @@ pub fn next_card(project: &Path, who: &str, column: Option<&str>) -> Result<Opti
             None => &mut board.columns[..],
         };
         for column in columns {
-            if let Some(card) = column.cards.iter_mut().find(|card| {
-                !card.done && card.claimed_by.is_none() && !card.title.is_empty()
-            }) {
+            if let Some(card) = column
+                .cards
+                .iter_mut()
+                .find(|card| !card.done && card.claimed_by.is_none() && !card.title.is_empty())
+            {
                 card.claimed_by = Some(who.clone());
                 return Ok(Some(card.clone()));
             }
@@ -595,6 +741,63 @@ mod tests {
     }
 
     #[test]
+    fn card_identity_is_invisible_persistent_and_survives_edits_and_moves() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(FILE_NAME),
+            "# Board\n\n## Backlog\n- [ ] Original title @agent\n  a note\n## In progress\n",
+        )
+        .unwrap();
+
+        ensure_file(project.path()).unwrap();
+        let original = load(project.path()).unwrap();
+        let id = original.columns[0].cards[0].id.clone();
+        let saved = std::fs::read_to_string(project.path().join(FILE_NAME)).unwrap();
+        assert!(saved.contains(&format!("<!-- radar:card-id:{id} -->")));
+        assert!(saved.contains("- [ ] Original title @agent\n"));
+        assert_eq!(
+            ensure_file(project.path()).unwrap(),
+            project.path().join(FILE_NAME)
+        );
+        assert_eq!(load(project.path()).unwrap().columns[0].cards[0].id, id);
+
+        let mut renamed = original.columns[0].cards[0].clone();
+        renamed.title = "Renamed title".to_string();
+        update_card(
+            project.path(),
+            "Original title",
+            renamed,
+            Some("In progress"),
+        )
+        .unwrap();
+        let moved = load(project.path()).unwrap();
+        assert_eq!(moved.find_id(&id), Some((1, 0)));
+        assert_eq!(moved.columns[1].cards[0].title, "Renamed title");
+    }
+
+    #[test]
+    fn card_id_migration_preserves_header_and_repairs_copied_ids() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(FILE_NAME),
+            "# Board\n- [ ] example in header\n\n## Backlog\n- [ ] First\n      <!-- radar:card-id:copied -->\n- [ ] Second\n      <!-- radar:card-id:copied -->\n",
+        )
+        .unwrap();
+
+        ensure_file(project.path()).unwrap();
+        let saved = std::fs::read_to_string(project.path().join(FILE_NAME)).unwrap();
+        assert!(saved.starts_with("# Board\n- [ ] example in header\n\n"));
+        assert_eq!(saved.matches("<!-- radar:card-id:").count(), 2);
+        let board = load(project.path()).unwrap();
+        let ids: HashSet<_> = board.columns[0]
+            .cards
+            .iter()
+            .map(|card| card.id.as_str())
+            .collect();
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
     fn find_matches_the_first_card_with_that_title() {
         let board = board_with("## A\n- one\n## B\n- one\n- two\n");
         let (c, _) = board.find("one").unwrap();
@@ -617,7 +820,8 @@ mod tests {
     fn render_canonicalises_claims_and_notes() {
         let board = board_with("## A\n- [ ] fix @claude\nnote here\n");
         let text = board.render();
-        assert!(text.contains("- [ ] fix @claude\n      note here\n"));
+        assert!(text.contains("- [ ] fix @claude\n      <!-- radar:card-id:"));
+        assert!(text.contains("      note here\n"));
         assert_eq!(parse(&text), board);
     }
 
@@ -646,14 +850,18 @@ mod tests {
     }
 
     #[test]
-    fn ensure_file_creates_once_and_never_overwrites() {
+    fn ensure_file_creates_once_and_migrates_existing_cards() {
         let (_dir, project) = project();
         let path = ensure_file(&project).unwrap();
         assert!(path.exists());
         std::fs::write(&path, "## Custom\n- [x] kept @me\n").unwrap();
         ensure_file(&project).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text, "## Custom\n- [x] kept @me\n");
+        assert!(text.starts_with("## Custom\n- [x] kept @me\n"));
+        assert_eq!(text.matches("<!-- radar:card-id:").count(), 1);
+        let board = load(&project).unwrap();
+        assert_eq!(board.columns[0].cards[0].title, "kept");
+        assert_eq!(board.columns[0].cards[0].claimed_by.as_deref(), Some("me"));
     }
 
     #[test]
@@ -699,7 +907,10 @@ mod tests {
         add_card(&project, None, "task", "", None).unwrap();
         assert!(claim_card(&project, "task", Some("codex")).unwrap());
         let board = load(&project).unwrap();
-        assert_eq!(board.columns[0].cards[0].claimed_by.as_deref(), Some("codex"));
+        assert_eq!(
+            board.columns[0].cards[0].claimed_by.as_deref(),
+            Some("codex")
+        );
         assert!(claim_card(&project, "task", None).unwrap());
         assert_eq!(load(&project).unwrap().columns[0].cards[0].claimed_by, None);
         assert!(!claim_card(&project, "ghost", Some("x")).unwrap());
@@ -720,8 +931,14 @@ mod tests {
         assert!(next_card(&project, "droid", None).unwrap().is_none());
 
         let board = load(&project).unwrap();
-        assert_eq!(board.columns[0].cards[0].claimed_by.as_deref(), Some("claude"));
-        assert_eq!(board.columns[0].cards[1].claimed_by.as_deref(), Some("codex"));
+        assert_eq!(
+            board.columns[0].cards[0].claimed_by.as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            board.columns[0].cards[1].claimed_by.as_deref(),
+            Some("codex")
+        );
     }
 
     #[test]
@@ -741,14 +958,18 @@ mod tests {
         add_card(&project, Some("Review"), "review work", "", None).unwrap();
 
         // The reviewer is handed the Review card, not the first in the file.
-        let card = next_card(&project, "codex", Some("review")).unwrap().unwrap();
+        let card = next_card(&project, "codex", Some("review"))
+            .unwrap()
+            .unwrap();
         assert_eq!(card.title, "review work");
         // And the backlog card stays unclaimed.
         let board = load(&project).unwrap();
         assert_eq!(board.columns[0].cards[0].claimed_by, None);
 
         // When the column runs dry, that is all it is — no work there.
-        assert!(next_card(&project, "droid", Some("review")).unwrap().is_none());
+        assert!(next_card(&project, "droid", Some("review"))
+            .unwrap()
+            .is_none());
         // A column that does not exist is an error, not "no work".
         let err = next_card(&project, "codex", Some("nope")).unwrap_err();
         assert!(err.to_string().contains("nope"));
@@ -787,7 +1008,10 @@ mod tests {
         assert!(update_card(&project, "old title", card.clone(), None).unwrap());
         let board = load(&project).unwrap();
         assert_eq!(board.columns[0].cards[0].title, "new title");
-        assert_eq!(board.columns[0].cards[0].claimed_by.as_deref(), Some("claude"));
+        assert_eq!(
+            board.columns[0].cards[0].claimed_by.as_deref(),
+            Some("claude")
+        );
 
         // Move by way of an update.
         assert!(update_card(&project, "new title", card, Some("Review")).unwrap());
@@ -817,4 +1041,3 @@ mod tests {
         assert_eq!(load(&project).unwrap().columns[0].cards[0].title, "early");
     }
 }
-

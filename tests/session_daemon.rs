@@ -4,6 +4,7 @@
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -21,15 +22,7 @@ struct Daemon {
 impl Daemon {
     fn start() -> Self {
         let home = tempfile::tempdir().unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_radar"))
-            .arg("--home")
-            .arg(home.path())
-            .arg("serve")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
+        let child = Self::launch(home.path());
         let daemon = Self { home, child };
         until(|| {
             matches!(
@@ -38,6 +31,35 @@ impl Daemon {
             )
         });
         daemon
+    }
+
+    fn launch(home: &Path) -> Child {
+        Command::new(env!("CARGO_BIN_EXE_radar"))
+            .arg("--home")
+            .arg(home)
+            .arg("serve")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap()
+    }
+
+    fn restart(&mut self) {
+        let _ = Client::request(self.home.path(), Request::Shutdown);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.child = Self::launch(self.home.path());
+        until(|| {
+            matches!(
+                Client::request(self.home.path(), Request::Ping),
+                Ok(Response::Hello { version: VERSION })
+            )
+        });
     }
 
     fn request(&self, request: Request) -> Response {
@@ -161,14 +183,20 @@ fn blocked_socket_cannot_delay_feedback_or_control() {
     });
     let start = Instant::now();
     let mut bell = false;
+    let mut exited = false;
+    let mut closed = false;
     loop {
         match watch.receive().unwrap() {
             Response::Feedback(item) => match item.event {
                 Feedback::Bell => bell = true,
-                Feedback::Lifecycle(Lifecycle::Exited(_)) => break,
+                Feedback::Lifecycle(Lifecycle::Exited(_)) => exited = true,
+                Feedback::StreamClosed => closed = true,
                 _ => {}
             },
             other => panic!("unexpected response {other:?}"),
+        }
+        if exited && closed {
+            break;
         }
     }
     assert!(bell);
@@ -204,6 +232,11 @@ fn singleton_lock_private_socket_and_bad_frames_do_not_replace_daemon() {
             .mode()
             & 0o777,
         0o700
+    );
+    let activity_db = path.parent().unwrap().join("activity.sqlite");
+    assert_eq!(
+        std::fs::metadata(activity_db).unwrap().permissions().mode() & 0o777,
+        0o600
     );
     let duplicate = Command::new(env!("CARGO_BIN_EXE_radar"))
         .arg("--home")
@@ -251,4 +284,528 @@ fn stream_and_watch_finish_when_attaching_to_an_ended_session() {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+#[cfg(feature = "vte")]
+#[test]
+fn vte_bridge_restores_snapshot_forwards_input_and_detaches_without_stopping_process() {
+    use radar::session::client::RemoteSession;
+
+    fn wait_output(fd: libc::c_int, output: &mut Vec<u8>, text: &str) {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        while !String::from_utf8_lossy(output).contains(text) {
+            assert!(
+                Instant::now() < deadline,
+                "renderer did not receive {text:?}: {}",
+                String::from_utf8_lossy(output)
+            );
+            unsafe {
+                libc::poll(&mut poll, 1, 100);
+            }
+            let mut buffer = [0_u8; 8192];
+            let n = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if n > 0 {
+                output.extend_from_slice(&buffer[..n as usize]);
+            }
+        }
+    }
+
+    let daemon = Daemon::start();
+    let spawn = Spawn {
+        id: "test".into(),
+        argv: vec!["/bin/sh".into(), "-c".into(), "printf 'daemon-banner'; read first; printf '\\r\\nreceived:%s' \"$first\"; read second; printf '\\r\\nagain:%s' \"$second\"; sleep 1".into()],
+        cwd: daemon.home.path().to_owned(),
+        env: vec![("RADAR_SESSION_TEST".into(), "yes".into())],
+        env_remove: vec!["COLORTERM".into()],
+        dims: Dims { cols: 80, rows: 24 },
+    };
+    let mut output = Vec::new();
+    let first = RemoteSession::attach(
+        daemon.home.path(),
+        "test".into(),
+        spawn.clone(),
+        false,
+        |_| {},
+    )
+    .unwrap();
+    wait_output(first.client_fd(), &mut output, "daemon-banner");
+    let pid = first
+        .process_id()
+        .expect("freshly created daemon session has a PID");
+    assert_eq!(first.process_id(), Some(pid));
+    assert_eq!(
+        unsafe { libc::write(first.client_fd(), b"hello\n".as_ptr().cast(), 6) },
+        6
+    );
+    wait_output(first.client_fd(), &mut output, "received:hello");
+    drop(first);
+
+    let session = daemon.request(Request::List);
+    assert!(
+        matches!(session, Response::Sessions(ref entries) if entries[0].pid == Some(pid) && entries[0].lifecycle == Lifecycle::Running)
+    );
+    let second =
+        RemoteSession::attach(daemon.home.path(), "test".into(), spawn, false, |_| {}).unwrap();
+    let mut restored = Vec::new();
+    wait_output(second.client_fd(), &mut restored, "received:hello");
+    assert_eq!(second.process_id(), Some(pid));
+    assert_eq!(
+        unsafe { libc::write(second.client_fd(), b"world\n".as_ptr().cast(), 6) },
+        6
+    );
+    wait_output(second.client_fd(), &mut restored, "again:world");
+}
+
+#[cfg(feature = "vte")]
+#[test]
+fn vte_attachment_reports_an_ended_session_once() {
+    use radar::session::client::{ClientEvent, RemoteSession};
+
+    let daemon = Daemon::start();
+    daemon.spawn("exit 7");
+    until(|| {
+        matches!(daemon.request(Request::List), Response::Sessions(ref entries)
+            if entries[0].stream_closed && matches!(entries[0].lifecycle, Lifecycle::Exited(_)))
+    });
+    let spawn = Spawn {
+        id: "test".into(),
+        argv: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+        cwd: daemon.home.path().to_owned(),
+        env: Vec::new(),
+        env_remove: Vec::new(),
+        dims: Dims { cols: 80, rows: 24 },
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _session = RemoteSession::attach(
+        daemon.home.path(),
+        "test".into(),
+        spawn,
+        false,
+        move |event| {
+            let _ = tx.send(event);
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ClientEvent::Exit(info) if info.code == 7
+    ));
+    assert!(rx.recv_timeout(Duration::from_millis(250)).is_err());
+}
+
+#[test]
+fn daemon_activity_is_replayable_and_attention_commands_are_idempotent() {
+    use radar::session::activity::{
+        ActivityKind, ActivityPayload, AgentState, AttentionActionKind, AttentionChange,
+        AttentionKind, AttentionResponse, ChangeAttention, CreateAttention, PublishActivity,
+    };
+
+    let mut daemon = Daemon::start();
+    let created = match daemon.request(Request::CreateAttention(CreateAttention {
+        project_id: 42,
+        command_id: "request-question-1".into(),
+        session_id: Some("project-42-agent-0-opencode".into()),
+        card_id: Some("card-stable-7".into()),
+        kind: AttentionKind::Question,
+        reason: "Which deployment target should I use?".into(),
+        allowed_actions: vec![AttentionActionKind::Answer, AttentionActionKind::Dismiss],
+    })) {
+        Response::AttentionCreated(result) => result,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(created.event.sequence, 1);
+
+    let retried = match daemon.request(Request::CreateAttention(CreateAttention {
+        project_id: 42,
+        command_id: "request-question-1".into(),
+        session_id: Some("project-42-agent-0-opencode".into()),
+        card_id: Some("card-stable-7".into()),
+        kind: AttentionKind::Question,
+        reason: "Which deployment target should I use?".into(),
+        allowed_actions: vec![AttentionActionKind::Answer, AttentionActionKind::Dismiss],
+    })) {
+        Response::AttentionCreated(result) => result,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert!(retried.duplicate);
+    assert_eq!(retried.attention.id, created.attention.id);
+
+    let mut watcher = Client::connect(
+        daemon.home.path(),
+        Request::WatchActivity {
+            project_id: 42,
+            after_sequence: 0,
+        },
+    )
+    .unwrap();
+    match watcher.receive().unwrap() {
+        Response::ActivityWatching { snapshot, .. } => {
+            assert_eq!(snapshot.watermark, 1);
+            assert_eq!(snapshot.events, vec![created.event]);
+            assert_eq!(snapshot.attention, vec![created.attention.clone()]);
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    let state_event = match daemon.request(Request::PublishActivity(PublishActivity {
+        project_id: 42,
+        command_id: "state-1".into(),
+        session_id: Some("project-42-agent-0-opencode".into()),
+        card_id: Some("card-stable-7".into()),
+        kind: ActivityKind::AgentStateChanged,
+        payload: ActivityPayload::AgentState {
+            state: AgentState::WaitingForInput,
+            message: Some("Need deployment choice".into()),
+        },
+    })) {
+        Response::ActivityPublished(event) => event,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(state_event.sequence, 2);
+    assert!(
+        matches!(watcher.receive().unwrap(), Response::Activity(event) if event == state_event)
+    );
+
+    let changed = match daemon.request(Request::ChangeAttention(ChangeAttention {
+        project_id: 42,
+        request_id: created.attention.id.clone(),
+        command_id: "answer-1".into(),
+        expected_revision: 1,
+        change: AttentionChange::Respond(AttentionResponse::Answer(
+            "Use the staging target".into(),
+        )),
+    })) {
+        Response::AttentionChanged(result) => result,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert!(!changed.attention.is_unresolved());
+    assert_eq!(changed.attention.revision, 2);
+    assert!(matches!(watcher.receive().unwrap(), Response::Activity(event) if event.sequence == 3));
+
+    let snapshot = match daemon.request(Request::ActivitySnapshot {
+        project_id: 42,
+        after_sequence: None,
+        limit: 20,
+    }) {
+        Response::ActivitySnapshot(snapshot) => snapshot,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(snapshot.watermark, 3);
+    assert!(snapshot.attention.is_empty());
+
+    drop(watcher);
+    let pending = match daemon.request(Request::CreateAttention(CreateAttention {
+        project_id: 42,
+        command_id: "request-question-2".into(),
+        session_id: Some("project-42-agent-0-opencode".into()),
+        card_id: Some("card-stable-7".into()),
+        kind: AttentionKind::Question,
+        reason: "Should I continue with the optional cleanup?".into(),
+        allowed_actions: vec![AttentionActionKind::Answer, AttentionActionKind::Dismiss],
+    })) {
+        Response::AttentionCreated(result) => result,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    let acknowledged = match daemon.request(Request::ChangeAttention(ChangeAttention {
+        project_id: 42,
+        request_id: pending.attention.id.clone(),
+        command_id: "ack-question-2".into(),
+        expected_revision: 1,
+        change: AttentionChange::Acknowledge,
+    })) {
+        Response::AttentionChanged(result) => result,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert!(acknowledged.attention.is_unresolved());
+    assert_eq!(acknowledged.attention.revision, 2);
+
+    daemon.restart();
+    let restored = match daemon.request(Request::ActivitySnapshot {
+        project_id: 42,
+        after_sequence: None,
+        limit: 20,
+    }) {
+        Response::ActivitySnapshot(snapshot) => snapshot,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(restored.watermark, 5);
+    assert_eq!(restored.attention, vec![acknowledged.attention]);
+
+    let resolved = match daemon.request(Request::ChangeAttention(ChangeAttention {
+        project_id: 42,
+        request_id: pending.attention.id,
+        command_id: "answer-question-2".into(),
+        expected_revision: 2,
+        change: AttentionChange::Respond(AttentionResponse::Answer("Continue with cleanup".into())),
+    })) {
+        Response::AttentionChanged(result) => result,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(resolved.event.unwrap().sequence, 6);
+    assert!(resolved.attention.resolved_at_millis.is_some());
+}
+
+#[test]
+fn activity_cli_uses_radar_project_and_session_environment() {
+    let daemon = Daemon::start();
+    let output = Command::new(env!("CARGO_BIN_EXE_radar"))
+        .arg("--home")
+        .arg(daemon.home.path())
+        .args(["activity", "state", "--state", "waiting-for-approval"])
+        .env("RADAR_PROJECT_ID", "73")
+        .env("RADAR_SESSION_ID", "project-73-agent-0-claude")
+        .env("RADAR_CARD_ID", "card-legacy-stable")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["ActivityPublished"]["project_id"], 73);
+    assert_eq!(
+        response["ActivityPublished"]["session_id"],
+        "project-73-agent-0-claude"
+    );
+    assert_eq!(
+        response["ActivityPublished"]["card_id"],
+        "card-legacy-stable"
+    );
+
+    let question = Command::new(env!("CARGO_BIN_EXE_radar"))
+        .arg("--home")
+        .arg(daemon.home.path())
+        .args([
+            "activity",
+            "request",
+            "--kind",
+            "question",
+            "--reason",
+            "Use the staging endpoint?",
+            "--allow",
+            "answer",
+            "--allow",
+            "dismiss",
+            "--command-id",
+            "cli-question-1",
+        ])
+        .env("RADAR_PROJECT_ID", "73")
+        .env("RADAR_SESSION_ID", "project-73-agent-0-claude")
+        .env("RADAR_CARD_ID", "card-legacy-stable")
+        .output()
+        .unwrap();
+    assert!(
+        question.status.success(),
+        "{}",
+        String::from_utf8_lossy(&question.stderr)
+    );
+    let question: serde_json::Value = serde_json::from_slice(&question.stdout).unwrap();
+    let request_id = question["AttentionCreated"]["attention"]["id"]
+        .as_str()
+        .unwrap();
+    let answered = Command::new(env!("CARGO_BIN_EXE_radar"))
+        .arg("--home")
+        .arg(daemon.home.path())
+        .args([
+            "activity",
+            "respond",
+            request_id,
+            "--project-id",
+            "73",
+            "--revision",
+            "1",
+            "--action",
+            "answer",
+            "--answer",
+            "Use staging",
+            "--command-id",
+            "cli-answer-1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        answered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+    let answered: serde_json::Value = serde_json::from_slice(&answered.stdout).unwrap();
+    assert_eq!(
+        answered["AttentionChanged"]["attention"]["resolution"]["action"],
+        "answer"
+    );
+    assert_eq!(
+        answered["AttentionChanged"]["attention"]["resolution"]["value"],
+        "Use staging"
+    );
+    assert!(answered["AttentionChanged"]["attention"]["resolved_at_millis"].is_number());
+}
+
+#[test]
+fn activity_request_wait_returns_human_approval_to_the_agent_process() {
+    use radar::session::activity::{
+        ActivityJournal, ActivityKind, ActivityPayload, AttentionChange, AttentionResponse,
+        ChangeAttention, PublishActivity,
+    };
+
+    let mut daemon = Daemon::start();
+    let agent = Command::new(env!("CARGO_BIN_EXE_radar"))
+        .arg("--home")
+        .arg(daemon.home.path())
+        .args([
+            "activity",
+            "request",
+            "--kind",
+            "approval",
+            "--reason",
+            "Deploy this change?",
+            "--allow",
+            "approve",
+            "--allow",
+            "deny",
+            "--wait",
+        ])
+        .env("RADAR_PROJECT_ID", "81")
+        .env("RADAR_SESSION_ID", "project-81-agent-0-opencode")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let pending = loop {
+        let snapshot = match daemon.request(Request::ActivitySnapshot {
+            project_id: 81,
+            after_sequence: None,
+            limit: 20,
+        }) {
+            Response::ActivitySnapshot(snapshot) => snapshot,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        if let Some(attention) = snapshot.attention.into_iter().next() {
+            break attention;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agent did not publish its request"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    // Stop the daemon while the agent is blocked, then let more than the
+    // bounded replay window and the response land before restarting it. The
+    // waiter must recover the durable resolved record after ResyncRequired.
+    let _ = Client::request(daemon.home.path(), Request::Shutdown);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while matches!(daemon.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        daemon.child.try_wait().unwrap().is_some(),
+        "daemon did not stop"
+    );
+    let _ = daemon.child.wait();
+
+    let journal = ActivityJournal::open(&daemon.home.path().join("run/activity.sqlite")).unwrap();
+    for index in 0..205 {
+        journal
+            .publish(PublishActivity {
+                project_id: 81,
+                command_id: format!("after-restart-{index}"),
+                session_id: None,
+                card_id: None,
+                kind: ActivityKind::Reported,
+                payload: ActivityPayload::Message {
+                    text: format!("event {index}"),
+                },
+            })
+            .unwrap();
+    }
+    let response = journal
+        .change_attention(ChangeAttention {
+            project_id: 81,
+            request_id: pending.id.clone(),
+            command_id: "human-approve-after-outage".into(),
+            expected_revision: pending.revision,
+            change: AttentionChange::Respond(AttentionResponse::Approve),
+        })
+        .unwrap();
+    drop(journal);
+    assert_eq!(
+        response.attention.resolution,
+        Some(AttentionResponse::Approve)
+    );
+
+    daemon.child = Daemon::launch(daemon.home.path());
+    until(|| {
+        matches!(
+            Client::request(daemon.home.path(), Request::Ping),
+            Ok(Response::Hello { version: VERSION })
+        )
+    });
+
+    let response = match daemon.request(Request::AttentionStatus {
+        project_id: 81,
+        request_id: pending.id.clone(),
+    }) {
+        Response::AttentionStatus(response) => response,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(response.resolution, Some(AttentionResponse::Approve));
+
+    let output = agent.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2, "agent output: {lines:?}");
+    assert_eq!(lines[0]["AttentionCreated"]["attention"]["id"], pending.id);
+    assert_eq!(
+        lines[1]["AttentionStatus"]["resolution"]["action"],
+        "approve"
+    );
+    assert!(lines[1]["AttentionStatus"]["resolved_at_millis"].is_number());
+}
+
+#[test]
+fn activity_mutation_stays_responsive_with_a_stalled_terminal_renderer() {
+    use radar::session::activity::{ActivityKind, ActivityPayload, PublishActivity};
+
+    let daemon = Daemon::start();
+    daemon.spawn("yes terminal-flood");
+    let mut stalled_output =
+        Client::connect(daemon.home.path(), Request::Attach { id: "test".into() }).unwrap();
+    assert!(matches!(
+        stalled_output.receive().unwrap(),
+        Response::Snapshot(_)
+    ));
+    std::thread::sleep(Duration::from_millis(150));
+
+    let started = Instant::now();
+    let response = daemon.request(Request::PublishActivity(PublishActivity {
+        project_id: 91,
+        command_id: "under-load".into(),
+        session_id: Some("project-91-agent-0-opencode".into()),
+        card_id: None,
+        kind: ActivityKind::Reported,
+        payload: ActivityPayload::Message {
+            text: "attention path is live".into(),
+        },
+    }));
+    assert!(matches!(response, Response::ActivityPublished(_)));
+    assert!(started.elapsed() < Duration::from_secs(1));
+
+    let _ = daemon.request(Request::Stop { id: "test".into() });
+    drop(stalled_output);
 }

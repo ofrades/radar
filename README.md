@@ -53,9 +53,10 @@ the program. That keeps radar usable on a machine where you cannot install VTE.
 | Action | Shortcut |
 | --- | --- |
 | Keys & primitives overlay (open a primitive, read the keymap) | `Alt+H` |
+| Home panel — programs, layout, new project | `Alt+Home` |
 | Move between the panes on screen | `Alt+Arrows` |
 | Cycle panes — the sidebar included | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
-| The focused pane's menu (change program, close, move, group, split out) | `Menu` / `Shift+F10` |
+| The focused pane's menu (group, move, zoom, close) | `Menu` / `Shift+F10` |
 | Search projects (filter, or find one to add) | `Alt+N` |
 | Show or hide a primitive | `Alt+E` / `A` / `G` / `K` / `T` |
 | Change the focused pane's program | `Alt+P` |
@@ -83,6 +84,13 @@ screen — the settings, and the whole keymap. Type to filter, arrows to move,
 Changing a pane's program from its menu or with `Alt+P` opens program
 choices in this same overlay.
 
+**Home** (`Alt+Home`, the button by the logo, or the first dock toggle) is the
+workspace at rest — and the panel radar opens with when there are no projects
+yet. It holds the program each slot uses, the layout a new project opens with,
+and the two ways forward: **Find projects** (the sidebar's search) and **New
+project…**, which picks or creates a folder, runs `git init` in it, and opens
+it. Going home never stops a program; the panes keep running behind it.
+
 **Adding a project** needs no dialog and no button: the sidebar's search box
 does both jobs. It filters your projects, and below them it lists directories
 under the scan root (usually `~/Work`) that match — repositories marked `git`,
@@ -91,8 +99,19 @@ Adding never leaves the search: the project joins the rows above the moment
 it is added. The small `from ~/Work` label picks another directory to scan,
 and `Esc` empties the search.
 
-The **+** on the tab bar offers your preferred editor, agent, diff and shell plus
-"Choose program…" (every terminal program radar can find, grouped by kind).
+**Every pane header carries its own controls, right on the chip**: the
+program's live info beside its name, a ▾ dropdown to change that program —
+filtered to the chip's own primitive, so an agent chip lists agents and an
+editor chip lists editors — a ＋ that adds **another tab of the same
+primitive** (a second agent tab, grouped under the same header, its own
+process; the list is the same kind-filtered one), and an × to close it — the
+program keeps running in the background either way. Tabs of the same
+primitive number from the second: "Agent 2". The ⋮ menu keeps the
+pane-level actions: group with, split out, move, zoom, close.
+
+**Adding a different primitive to a pane** is a drag of one header onto
+another — or the pane menu's "Group with …". The dock and the chords keep
+aiming at a primitive's first tab.
 
 **Preferences** is where "preferred editor / agent / diff / shell" lives. Leave a
 slot on *Auto* and radar picks the best installed one; the resolved choice is
@@ -137,6 +156,7 @@ radar agents                # agents, omarchy's default, what is installed
 radar programs diff         # the registry, by kind
 radar prefs                 # resolved preference per slot
 radar prefs agent claude    # set one
+radar web [--port 8787]     # responsive browser client on localhost
 radar pin / move / rename / remove / prune
 radar board                 # the project's kanban (BOARD.md)
 radar card add / claim / release / move / done / next
@@ -151,17 +171,82 @@ radar doctor                # environment check
 client API. Daemon sessions survive client exits. Terminal output and lifecycle
 feedback have separate bounded streams with explicit resync on overload.
 
+The daemon also stores a replayable, project-sequenced activity journal and
+revision-checked, persistent attention requests. Radar-launched programs receive
+`RADAR_PROJECT_ID`, `RADAR_SESSION_ID`, and `RADAR_HOME`; agents can report
+explicit state or create a request without mixing it into terminal output:
+
+```sh
+radar activity state --state working
+radar activity request --kind question --reason "Which target?" \
+  --allow answer --allow dismiss --command-id question-1 --wait
+radar activity snapshot --project-id 7
+radar activity watch --project-id 7 --after 12
+radar activity respond attention-7-3 --revision 1 --action answer \
+  --answer staging --command-id answer-1
+```
+
+`radar board --json` includes a stable ID for each card. `RADAR_CARD_ID` or
+`--card-id` associates agent activity and requests with that card. Request
+creation, seen/acknowledged state, and responses are persisted under the private
+daemon run directory; reconnecting clients replay events or receive an explicit
+resync requirement. `activity request --wait` keeps an agent-side command open
+until a human responds, then prints the authoritative typed answer/approval as a
+second JSON result. If the watcher reconnects or falls behind, it checks the
+persistent request record before resuming, so a response is not lost to replay
+limits.
+
 See [the daemon guide](docs/session-daemon.md) for commands and protocol details.
-The v1 snapshot is for display/inspection; complete terminal-state import and
-GUI attachment are the next integration step. The GUI currently uses the local
-VTE bridge.
+The GUI autostarts the daemon; with VTE enabled, its local PTY is only the VTE
+input adapter for daemon-owned sessions. Snapshot replay restores the active
+screen, common modes and recent scrollback, but full parser-state restoration
+remains the next terminal compatibility step.
+
+## Remote browser client
+
+`radar web` serves a responsive browser workspace on `127.0.0.1:8787`: choose a
+project, see its Radar-launched sessions and activity, answer outstanding agent
+requests, attach to a live session, or start a project shell. Detaching the web
+terminal leaves the session running. The browser terminal is rendered with
+xterm.js; it is independent of the native VTE/Ghostty renderer.
+
+To reach it from another device on your tailnet, run `radar web` on the host,
+then in another terminal run:
+
+```sh
+tailscale serve --bg --https=8443 8787
+```
+
+Tailscale prints the private HTTPS URL, such as
+`https://<device>.<tailnet>.ts.net:8443/`. The separate HTTPS port leaves an
+existing default-port Serve route in place. Access follows your tailnet ACLs.
+Radar listens only on loopback; the browser gateway talks to the private
+session-daemon socket locally. Avoid Tailscale Funnel for this service. See
+[the web client guide](docs/web-client.md) for details.
 
 ## The board
+
+The Board (Alt+K) opens as a full-width, full-height workspace panel. Its
+columns expand with the window; it cannot be grouped or split into a tool tile.
+Select a tool from the dock to return to the saved tool arrangement, or close
+the board with Alt+K, its close button, or Alt+F. Sessions keep running while
+the board is open.
+
+The client/server direction is **board-first interaction**: the server owns
+session state, explicit agent activity and durable attention; the board presents
+the live project feed, explicit agent states and actionable human requests.
+Sidebar badges show unresolved requests across projects. The activity panel can
+mark requests seen, acknowledge them, answer questions, approve/deny, dismiss,
+and open the linked session. Agents can block on `radar activity request --wait`
+to receive that typed response. Vendor-specific adapters and exact terminal-state
+import remain follow-up work. See
+[the review and delivery contracts](docs/board-interactivity.md).
 
 Every project has a kanban, and the kanban is a file: `BOARD.md` in the project
 root, created when the project opens. Columns are `## ` headings, cards are
 `- [ ]` lines, a claim is a `@name` on the card's line, indented lines under a
-card are its notes.
+card are its notes. radar adds an invisible HTML comment with a stable card ID;
+ordinary markdown rendering does not show it.
 
 That plainness is the point: an agent already running in the project claims
 work and moves it along by editing the file with the tools it already has — no
@@ -197,6 +282,22 @@ whoever checks, and prefer picking up Review work — a card is done when a
 claim, so the handover is real: the moment a worker's card reaches Review, the
 worker's edit rights are gone until it claims again.
 
+Claimed cards are links, too: clicking a card's `@name` opens that agent's
+session in the agent panel. The match is exact where radar can be: the tab
+whose program carries the claim as its own `RADAR_AGENT` (read from the
+process), so two tabs of one program are told apart by their stamps; the
+claim's leading program picks the tab when the process cannot be asked, and
+any agent tab takes the rest — an agent radar did not launch works in the
+agent panel all the same. The claimed conversation, when it is already the
+one running, is never disturbed; anything else — an exited agent, a tab not
+yet opened, another instance in the way — runs again resumed. And the
+resume is bound to the claim: when an agent exits, radar captures the
+conversation its CLI recorded for that instance and stores it (opencode's
+session list; other agents fall back to the project's last conversation),
+so the next click reopens **that exact conversation** with
+`opencode -s <id>`. A displaced instance's conversation stays in the CLI's
+own session store.
+
 And the requirement has teeth, in the one place every agent already answers
 to: **git**. radar installs a `pre-commit` hook in the repository's own hooks
 directory (never touching a hook it did not write, never writing outside
@@ -226,7 +327,7 @@ hooks, but nothing needs to be configured for the gate to hold.
 ## Development
 
 ```bash
-cargo test                  # 116 tests: store, board, skill, git parsing, registry, discovery
+cargo test                  # 120 tests: store, board, skill, git parsing, registry, discovery
 cargo clippy --all-targets  # clean
 cargo build --features gui  # no VTE needed
 ```
@@ -257,3 +358,5 @@ Two environment variables exist because layout bugs are hard to see otherwise:
 - `RADAR_TRACE=/tmp/radar.log` appends what happens when tabs are opened and
   panes are split, which is far easier to read than a screenshot when a widget
   does not appear.
+- `RADAR_NEW_PROJECT=/some/path` runs the new-project flow on startup — folder,
+  `git init`, add, open — without the file chooser.
