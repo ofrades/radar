@@ -672,7 +672,11 @@ fn start_session(
     // A re-launch detaches the prior view first; Stop/Forget/Create happens
     // through the daemon connection and never depends on widget ownership.
     slot.borrow_mut().take();
-    terminal.set_pty(None::<&vte4::Pty>);
+    // Never hand VTE a NULL pty: libvte 2.91 (0.84.x) segfaults in
+    // vte_terminal_set_pty(NULL) once a pty has carried data. Swapping in a
+    // fresh pty directly is safe, so attachment below always replaces; on a
+    // failed attach the old pty simply stays as a frozen view beside the
+    // error box.
     terminal.reset(true, true);
     let cols = terminal.column_count();
     let rows = terminal.row_count();
