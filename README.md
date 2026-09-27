@@ -210,19 +210,22 @@ requests, attach to a live session, or start a project shell. Detaching the web
 terminal leaves the session running. The browser terminal is rendered with
 xterm.js; it is independent of the native VTE/Ghostty renderer.
 
-To reach it from another device on your tailnet, run `radar web` on the host,
-then in another terminal run:
+To keep the client running with your user session, install and enable the
+packaged systemd user unit; see [the web client guide](docs/web-client.md).
+
+To reach it from another device on your tailnet, make sure `radar web` is
+running (or enable `radar-web.service`), then publish it under `/radar` on the
+main HTTPS port:
 
 ```sh
-tailscale serve --bg --https=8443 8787
+tailscale serve --bg --https=443 --set-path=/radar 8787
 ```
 
-Tailscale prints the private HTTPS URL, such as
-`https://<device>.<tailnet>.ts.net:8443/`. The separate HTTPS port leaves an
-existing default-port Serve route in place. Access follows your tailnet ACLs.
-Radar listens only on loopback; the browser gateway talks to the private
-session-daemon socket locally. Avoid Tailscale Funnel for this service. See
-[the web client guide](docs/web-client.md) for details.
+Open `https://<device>.<tailnet>.ts.net/radar`. This path can coexist with other
+Tailscale Serve routes on port 443. Access follows your tailnet ACLs. Radar
+listens only on loopback; the browser gateway talks to the private session-daemon
+socket locally. Avoid Tailscale Funnel for this service. See [the web client
+guide](docs/web-client.md) for details.
 
 ## The board
 

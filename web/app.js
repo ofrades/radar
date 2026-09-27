@@ -1,10 +1,11 @@
-import { Terminal } from "/assets/xterm.mjs";
-import { FitAddon } from "/assets/fit-addon.mjs";
+import { Terminal } from "./xterm.mjs";
+import { FitAddon } from "./fit-addon.mjs";
 
 const $ = (selector) => document.querySelector(selector);
-const projectSelect = $("#project-select");
+const projectList = $("#project-list");
 const dashboard = $("#dashboard");
 const terminalView = $("#terminal-view");
+const mainContent = $(".main-content");
 const serverState = $("#server-state");
 const pageError = $("#page-error");
 let projects = [];
@@ -19,11 +20,13 @@ let reconnectTimer = null;
 let reconnectAttempts = 0;
 let socketGeneration = 0;
 let sessionEnded = false;
+let applyingRemoteResize = false;
 let latestAttentionSnapshot = null;
 const answerDrafts = new Map();
 
 async function request(path, options = {}) {
-  const response = await fetch(path, {
+  const url = new URL(path.replace(/^\/+/, ""), document.baseURI);
+  const response = await fetch(url, {
     ...options,
     headers: { "content-type": "application/json", ...(options.headers || {}) },
   });
@@ -50,24 +53,64 @@ function showToast(message) {
   showToast.timeout = window.setTimeout(() => toast.classList.add("hidden"), 2600);
 }
 
-function currentProject() {
-  return projects.find((project) => project.id === Number(projectSelect.value)) || null;
+function renderProjects(focusProjectId = null) {
+  projectList.replaceChildren();
+  $("#project-count").textContent = String(projects.length);
+
+  for (const project of projects) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "project-link";
+    button.dataset.projectId = String(project.id);
+    button.title = project.path;
+    button.setAttribute("aria-label", `${project.name}, ${project.path}`);
+    if (project.id === selectedProject?.id) {
+      button.classList.add("active");
+      button.setAttribute("aria-current", "page");
+    }
+
+    const symbol = document.createElement("span");
+    symbol.className = "project-symbol";
+    symbol.setAttribute("aria-hidden", "true");
+    symbol.textContent = "⌂";
+
+    const copy = document.createElement("span");
+    copy.className = "project-link-copy";
+    const name = document.createElement("span");
+    name.className = "project-link-name";
+    name.textContent = project.name;
+    const path = document.createElement("span");
+    path.className = "project-link-path";
+    path.textContent = project.path;
+    copy.append(name, path);
+    button.append(symbol, copy);
+    projectList.append(button);
+  }
+
+  if (!projects.length) {
+    const empty = document.createElement("p");
+    empty.className = "project-empty";
+    empty.textContent = "No projects yet";
+    projectList.append(empty);
+  }
+
+  if (focusProjectId !== null) {
+    projectList.querySelector(`[data-project-id="${focusProjectId}"]`)?.focus({ preventScroll: true });
+  }
 }
 
 async function loadProjects() {
   clearError();
   projects = await request("/api/projects");
-  projectSelect.replaceChildren();
-  for (const project of projects) {
-    const option = document.createElement("option");
-    option.value = String(project.id);
-    option.textContent = project.name;
-    projectSelect.append(option);
-  }
   serverState.classList.add("online");
   serverState.setAttribute("aria-label", "Server connected");
+
+  const preferred = new URLSearchParams(location.search).get("project");
+  selectedProject = projects.find((project) => String(project.id) === preferred) || projects[0] || null;
+  renderProjects();
+
   if (!projects.length) {
-    selectedProject = null;
+    $("#project-title").textContent = "No projects yet";
     $("#project-path").textContent = "Add a project in Radar on your computer first.";
     renderSessions([]);
     renderActivity(null);
@@ -76,26 +119,25 @@ async function loadProjects() {
     return;
   }
   $("#new-shell-button").disabled = false;
-  const preferred = new URLSearchParams(location.search).get("project");
-  if (preferred && projects.some((project) => String(project.id) === preferred)) {
-    projectSelect.value = preferred;
-  }
   await loadProjectData();
 }
 
 async function loadProjectData() {
-  selectedProject = currentProject();
-  if (!selectedProject) return;
-  $("#project-path").textContent = selectedProject.path;
+  const project = selectedProject;
+  if (!project) return;
+  $("#project-title").textContent = project.name;
+  $("#project-path").textContent = project.path;
   try {
     const [sessions, snapshot] = await Promise.all([
-      request(`/api/projects/${selectedProject.id}/sessions`),
-      request(`/api/projects/${selectedProject.id}/activity`),
+      request(`/api/projects/${project.id}/sessions`),
+      request(`/api/projects/${project.id}/activity`),
     ]);
+    if (selectedProject?.id !== project.id) return;
     renderSessions(sessions);
     renderAttention(snapshot);
     renderActivity(snapshot);
   } catch (error) {
+    if (selectedProject?.id !== project.id) return;
     showError(error.message);
   }
 }
@@ -109,7 +151,7 @@ function renderSessions(items) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "session-card";
-    button.disabled = session.state === "failed";
+    button.disabled = session.state !== "running";
     const icon = document.createElement("span");
     icon.className = "session-icon";
     icon.textContent = session.slot === "agent" ? "✳" : session.slot === "editor" ? "▤" : "⌘";
@@ -296,6 +338,7 @@ function attach(session) {
   clearError();
   dashboard.classList.add("hidden");
   terminalView.classList.remove("hidden");
+  mainContent.classList.add("terminal-open");
   $("#terminal-title").textContent = session.title || session.label;
   setTerminalStatus("Connecting…");
 
@@ -345,7 +388,9 @@ function attach(session) {
 
   terminal.onData(sendTerminalInput);
   terminal.onBinary((data) => sendTerminalBytes(Uint8Array.from(data, (char) => char.charCodeAt(0))));
-  terminal.onResize(({ cols, rows }) => sendTerminalResize(cols, rows));
+  terminal.onResize(({ cols, rows }) => {
+    if (!applyingRemoteResize) sendTerminalResize(cols, rows);
+  });
   for (const button of document.querySelectorAll("[data-key]")) {
     button.onclick = () => {
       terminal?.focus();
@@ -373,10 +418,13 @@ function attach(session) {
 function connectTerminal(session, reset) {
   if (reset) terminal?.reset();
   sessionEnded = false;
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const socketUrl = `${protocol}//${location.host}/api/projects/${selectedProject.id}/sessions/${encodeURIComponent(session.id)}/terminal`;
+  const socketUrl = new URL(
+    `api/projects/${selectedProject.id}/sessions/${encodeURIComponent(session.id)}/terminal`,
+    document.baseURI,
+  );
+  socketUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const generation = ++socketGeneration;
-  const socket = new WebSocket(socketUrl);
+  const socket = new WebSocket(socketUrl.toString());
   currentSocket = socket;
   socket.binaryType = "arraybuffer";
   socket.addEventListener("open", () => {
@@ -395,6 +443,7 @@ function connectTerminal(session, reset) {
       const status = JSON.parse(message.data);
       if (status.type === "error") setTerminalStatus(status.message, false, true);
       if (status.type === "resync_required") setTerminalStatus("Refreshing terminal…", false, true);
+      if (status.type === "resize") applyRemoteResize(status.cols, status.rows);
       if (status.type === "closed") {
         sessionEnded = true;
         terminalSession = null;
@@ -411,7 +460,7 @@ function connectTerminal(session, reset) {
       if (sessionEnded) setTerminalStatus("Session ended", false);
       return;
     }
-    scheduleReconnect();
+    void retryOrFinishSession(generation);
   });
   socket.addEventListener("error", () => {
     if (generation === socketGeneration) setTerminalStatus("Connection interrupted…", false, true);
@@ -424,6 +473,16 @@ function sendTerminalResize(cols, rows) {
   }
 }
 
+function applyRemoteResize(cols, rows) {
+  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 2 || rows < 1) return;
+  applyingRemoteResize = true;
+  try {
+    terminal?.resize(cols, rows);
+  } finally {
+    applyingRemoteResize = false;
+  }
+}
+
 function scheduleReconnect() {
   if (reconnectTimer || !terminalSession || sessionEnded) return;
   const delay = Math.min(1000 * 2 ** reconnectAttempts, 8000);
@@ -433,6 +492,24 @@ function scheduleReconnect() {
     reconnectTimer = null;
     if (terminalSession && !sessionEnded) connectTerminal(terminalSession, true);
   }, delay);
+}
+
+async function retryOrFinishSession(generation) {
+  const session = terminalSession;
+  if (!session) return;
+  try {
+    const sessions = await request(`/api/projects/${selectedProject.id}/sessions`);
+    const current = sessions.find((item) => item.id === session.id);
+    if (!current || current.state !== "running") {
+      terminalSession = null;
+      sessionEnded = true;
+      setTerminalStatus(current?.state === "failed" ? "Session unavailable" : "Session ended", false, true);
+      return;
+    }
+  } catch {
+    // A temporary HTTP outage is handled by the regular reconnect backoff.
+  }
+  if (generation === socketGeneration && terminalSession) scheduleReconnect();
 }
 
 function reconnectNow() {
@@ -478,20 +555,22 @@ function detach() {
   terminal = null;
   fitAddon = null;
   terminalView.classList.add("hidden");
+  mainContent.classList.remove("terminal-open");
   dashboard.classList.remove("hidden");
   loadProjectData().catch((error) => showError(error.message));
 }
 
 async function createShell() {
-  if (!selectedProject) return;
+  const project = selectedProject;
+  if (!project) return;
   const button = $("#new-shell-button");
   button.disabled = true;
   try {
-    const session = await request(`/api/projects/${selectedProject.id}/sessions`, {
+    const session = await request(`/api/projects/${project.id}/sessions`, {
       method: "POST",
       body: "{}",
     });
-    attach(session);
+    if (selectedProject?.id === project.id) attach(session);
   } catch (error) {
     showError(error.message);
   } finally {
@@ -499,10 +578,24 @@ async function createShell() {
   }
 }
 
-projectSelect.addEventListener("change", () => {
-  selectedProject = currentProject();
-  if (selectedProject) history.replaceState(null, "", `/?project=${selectedProject.id}`);
-  loadProjectData().catch((error) => showError(error.message));
+projectList.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-project-id]");
+  if (!button) return;
+  const project = projects.find((item) => item.id === Number(button.dataset.projectId));
+  if (!project) return;
+
+  const alreadySelected = selectedProject?.id === project.id;
+  selectedProject = project;
+  renderProjects(project.id);
+  const projectUrl = new URL(document.baseURI);
+  projectUrl.searchParams.set("project", String(project.id));
+  history.replaceState(null, "", projectUrl);
+  if (!terminalView.classList.contains("hidden")) {
+    detach();
+  } else if (!alreadySelected) {
+    clearError();
+    loadProjectData().catch((error) => showError(error.message));
+  }
 });
 $("#attention-list").addEventListener("focusout", () => {
   window.setTimeout(() => {

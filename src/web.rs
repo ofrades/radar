@@ -82,7 +82,7 @@ async fn async_run(home: PathBuf, port: u16) -> Result<()> {
 
     eprintln!("radar web: http://{address}");
     eprintln!(
-        "tailnet: run `tailscale serve --bg --https=8443 {port}` to add a private HTTPS port"
+        "tailnet: run `tailscale serve --bg --https=443 --set-path=/radar {port}` to add a private /radar route"
     );
     axum::serve(listener, app)
         .await
@@ -223,12 +223,13 @@ async fn sessions(
     RoutePath(project_id): RoutePath<i64>,
     State(state): State<WebState>,
 ) -> ApiResult<Json<Vec<SessionView>>> {
-    require_project(&state.home, project_id)?;
+    let project = require_project(&state.home, project_id)?;
+    let root = canonical_project_root(&project);
     let statuses = list_sessions(&state.home)?;
     Ok(Json(
         statuses
             .into_iter()
-            .filter(|status| session_project_id(&status.id) == Some(project_id))
+            .filter(|status| session_belongs_to_project(status, project_id, &root))
             .map(SessionView::new)
             .collect(),
     ))
@@ -377,11 +378,22 @@ async fn attach_terminal(
     ws: WebSocketUpgrade,
 ) -> ApiResult<impl IntoResponse> {
     require_same_origin(&headers)?;
-    require_project(&state.home, project_id)?;
-    if session_project_id(&session_id) != Some(project_id) {
+    let project = require_project(&state.home, project_id)?;
+    let root = canonical_project_root(&project);
+    let session = list_sessions(&state.home)?
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| ApiError::not_found("unknown session"))?;
+    if !session_belongs_to_project(&session, project_id, &root) {
         return Err(ApiError::not_found(
             "session does not belong to this project",
         ));
+    }
+    if !matches!(session.lifecycle, Lifecycle::Running) {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: "session is not running".to_string(),
+        });
     }
     let home = state.home.clone();
     Ok(ws.on_upgrade(move |socket| bridge_terminal(socket, home, session_id)))
@@ -460,7 +472,17 @@ async fn bridge_terminal(socket: WebSocket, home: Arc<PathBuf>, session_id: Stri
                                 break;
                             }
                         }
-                        Output::Resize(_) => {}
+                        Output::Resize(dims) => {
+                            let text = serde_json::json!({
+                                "type": "resize",
+                                "cols": dims.cols,
+                                "rows": dims.rows,
+                            })
+                            .to_string();
+                            if out_tx.blocking_send(Outbound::Text(text)).is_err() {
+                                break;
+                            }
+                        }
                         Output::Closed => {
                             let _ = out_tx.blocking_send(Outbound::Text(
                                 serde_json::json!({"type":"closed"}).to_string(),
@@ -599,6 +621,17 @@ fn require_project(home: &Path, project_id: i64) -> ApiResult<Project> {
         .ok_or_else(|| ApiError::not_found("unknown project"))
 }
 
+fn canonical_project_root(project: &Project) -> PathBuf {
+    project
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| project.path.clone())
+}
+
+fn session_belongs_to_project(status: &Status, project_id: i64, project_root: &Path) -> bool {
+    session_project_id(&status.id) == Some(project_id) || status.cwd.starts_with(project_root)
+}
+
 fn list_sessions(home: &Path) -> ApiResult<Vec<Status>> {
     match Client::request(home, Command::List).map_err(ApiError::internal)? {
         Response::Sessions(sessions) => Ok(sessions),
@@ -680,6 +713,48 @@ mod tests {
         assert_eq!(session_project_id("web-project-17-shell-123"), Some(17));
         assert_eq!(session_project_id("project-nope-agent-0-opencode"), None);
         assert_eq!(session_project_id("unrelated"), None);
+    }
+
+    #[test]
+    fn project_sessions_match_stable_ids_or_working_directory() {
+        let make_status = |id: &str, cwd: &str| Status {
+            id: id.to_string(),
+            cwd: PathBuf::from(cwd),
+            pid: Some(1),
+            lifecycle: Lifecycle::Running,
+            title: None,
+            stream_closed: false,
+        };
+        let root = Path::new("/work/project");
+
+        assert!(session_belongs_to_project(
+            &make_status("project-17-agent-0-claude", "/elsewhere"),
+            17,
+            root,
+        ));
+        assert!(session_belongs_to_project(
+            &make_status("custom-shell", "/work/project/packages/app"),
+            17,
+            root,
+        ));
+        assert!(!session_belongs_to_project(
+            &make_status("custom-shell", "/work/another-project"),
+            17,
+            root,
+        ));
+    }
+
+    #[test]
+    fn status_without_a_working_directory_remains_compatible() {
+        let status: Status = serde_json::from_value(serde_json::json!({
+            "id": "project-17-agent-0-claude",
+            "pid": 1,
+            "lifecycle": "Running",
+            "title": null,
+            "stream_closed": false
+        }))
+        .unwrap();
+        assert!(status.cwd.as_os_str().is_empty());
     }
 
     #[test]

@@ -1,0 +1,11 @@
+[Unit]
+Description=Radar remote web client
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/radar web --port 8787
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=default.target

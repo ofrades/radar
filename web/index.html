@@ -5,14 +5,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#111311" />
     <title>Radar Remote</title>
-    <link rel="stylesheet" href="/assets/xterm.css" />
-    <link rel="stylesheet" href="/assets/app.css" />
-    <script type="module" src="/assets/app.js"></script>
+    <base href="/" />
+    <script>
+      const pagePath = location.pathname;
+      document.querySelector("base").href = pagePath.endsWith("/") ? pagePath : `${pagePath}/`;
+    </script>
+    <link rel="stylesheet" href="assets/xterm.css" />
+    <link rel="stylesheet" href="assets/app.css" />
+    <script type="module" src="assets/app.js"></script>
   </head>
   <body>
     <div class="app-shell">
       <header class="topbar">
-        <a class="brand" href="/" aria-label="Radar home">
+        <a class="brand" href="./" aria-label="Radar home">
           <span class="brand-mark">◉</span>
           <span>radar</span>
           <span class="remote-tag">REMOTE</span>
@@ -23,24 +28,24 @@
         </div>
       </header>
 
-      <main class="main-content">
-        <section id="dashboard" class="dashboard">
-          <div class="page-heading">
-            <div>
-              <p class="eyebrow">YOUR WORKSPACE</p>
-              <h1>Pick up where you left off.</h1>
-              <p class="subheading">Your projects and agents, wherever you are.</p>
-            </div>
+      <div class="workspace-layout">
+        <aside class="project-sidebar" aria-label="Project navigation">
+          <div class="sidebar-heading">
+            <p class="section-label">PROJECTS</p>
+            <span class="project-count" id="project-count">0</span>
           </div>
+          <nav class="project-list" id="project-list" aria-label="Projects"></nav>
+        </aside>
 
-          <section class="project-picker surface" aria-labelledby="project-heading">
-            <label class="section-label" id="project-heading" for="project-select">PROJECT</label>
-            <div class="project-select-wrap">
-              <select id="project-select" aria-label="Choose project"></select>
-              <span class="select-chevron">⌄</span>
+        <main class="main-content">
+          <section id="dashboard" class="dashboard">
+            <div class="page-heading">
+              <div>
+                <p class="eyebrow">YOUR WORKSPACE</p>
+                <h1 id="project-title">Pick up where you left off.</h1>
+                <p class="project-summary" id="project-path">Your projects and agents, wherever you are.</p>
+              </div>
             </div>
-            <p class="project-path" id="project-path"></p>
-          </section>
 
           <section class="attention-section" id="attention-section">
             <div class="section-heading">
@@ -82,33 +87,34 @@
             <div class="empty-card hidden" id="activity-empty">Agent updates will show up here.</div>
           </section>
           <div class="page-error hidden" id="page-error" role="status"></div>
-        </section>
+          </section>
 
-        <section id="terminal-view" class="terminal-view hidden" aria-label="Remote terminal">
-          <div class="terminal-toolbar">
-            <button class="back-button" id="back-button" type="button"><span>‹</span> Workspace</button>
-            <div class="terminal-heading">
-              <strong id="terminal-title">Terminal</strong>
-              <span id="terminal-connection">Connecting…</span>
+          <section id="terminal-view" class="terminal-view hidden" aria-label="Remote terminal">
+            <div class="terminal-toolbar">
+              <button class="back-button" id="back-button" type="button"><span>‹</span> Workspace</button>
+              <div class="terminal-heading">
+                <strong id="terminal-title">Terminal</strong>
+                <span id="terminal-connection">Connecting…</span>
+              </div>
+              <button class="icon-button" id="reconnect-button" type="button" aria-label="Reconnect terminal" title="Reconnect">↻</button>
+              <button class="icon-button" id="detach-button" type="button" aria-label="Detach terminal" title="Detach">⤢</button>
             </div>
-            <button class="icon-button" id="reconnect-button" type="button" aria-label="Reconnect terminal" title="Reconnect">↻</button>
-            <button class="icon-button" id="detach-button" type="button" aria-label="Detach terminal" title="Detach">⤢</button>
-          </div>
-          <div class="terminal-frame">
-            <div id="terminal" class="terminal"></div>
-          </div>
-          <nav class="terminal-keys" aria-label="Terminal keys">
-            <button type="button" data-key="esc">Esc</button>
-            <button type="button" data-key="tab">Tab</button>
-            <button type="button" data-key="ctrl-c">Ctrl+C</button>
-            <button type="button" data-key="ctrl-d">Ctrl+D</button>
-            <button type="button" data-key="up" aria-label="Up">↑</button>
-            <button type="button" data-key="down" aria-label="Down">↓</button>
-            <button type="button" data-key="left" aria-label="Left">←</button>
-            <button type="button" data-key="right" aria-label="Right">→</button>
-          </nav>
-        </section>
-      </main>
+            <div class="terminal-frame">
+              <div id="terminal" class="terminal"></div>
+            </div>
+            <nav class="terminal-keys" aria-label="Terminal keys">
+              <button type="button" data-key="esc">Esc</button>
+              <button type="button" data-key="tab">Tab</button>
+              <button type="button" data-key="ctrl-c">Ctrl+C</button>
+              <button type="button" data-key="ctrl-d">Ctrl+D</button>
+              <button type="button" data-key="up" aria-label="Up">↑</button>
+              <button type="button" data-key="down" aria-label="Down">↓</button>
+              <button type="button" data-key="left" aria-label="Left">←</button>
+              <button type="button" data-key="right" aria-label="Right">→</button>
+            </nav>
+          </section>
+        </main>
+      </div>
 
       <div class="toast hidden" id="toast" role="status"></div>
     </div>
