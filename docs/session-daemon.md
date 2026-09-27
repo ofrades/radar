@@ -68,6 +68,13 @@ not daemon crashes or machine reboots.
   a bell or an exit is not a question, approval, or completed board card.
 - Shutdown rejects further creation and stops all sessions. A daemon holds at
   most 128 retained sessions; `forget` explicitly frees history and the ID.
+- Listing captures retained session membership, then samples each session's
+  status independently so a busy terminal cannot lock other sessions out of
+  control commands. Concurrent forget/recreate operations can make a listed
+  status stale; the list is not an atomic cross-session state snapshot.
+- Fatal PTY I/O errors and expiry of the stop deadline are reported as
+  `Failed`; a worker that could not confirm process exit never leaves its
+  retained lifecycle marked `Running`.
 
 ### Attach and ordering
 

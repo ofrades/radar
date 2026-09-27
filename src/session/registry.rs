@@ -55,6 +55,8 @@ pub enum Lifecycle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
     pub id: String,
+    #[serde(default)]
+    pub cwd: PathBuf,
     pub pid: Option<u32>,
     pub lifecycle: Lifecycle,
     pub title: Option<String>,
@@ -297,6 +299,7 @@ impl ManagedSession {
             dims: spec.dims,
             status: Status {
                 id: spec.id.clone(),
+                cwd: spec.cwd.clone(),
                 pid: child.process_id(),
                 lifecycle: Lifecycle::Running,
                 title: None,
@@ -489,13 +492,10 @@ impl Registry {
     }
 
     pub fn list(&self) -> Vec<Status> {
-        let mut statuses: Vec<_> = self
-            .sessions
-            .lock()
-            .unwrap()
-            .values()
-            .map(|session| session.status())
-            .collect();
+        let sessions: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
+        // A session may be snapshotting its terminal. Never hold the registry
+        // lock while waiting for that session's parser lock.
+        let mut statuses: Vec<_> = sessions.iter().map(|session| session.status()).collect();
         statuses.sort_by(|a, b| a.id.cmp(&b.id));
         statuses
     }
@@ -519,8 +519,9 @@ impl Registry {
     }
 
     pub fn stop_all(&self) {
+        let sessions = self.sessions.lock().unwrap();
         self.stopping.store(true, Ordering::Release);
-        for session in self.sessions.lock().unwrap().values() {
+        for session in sessions.values() {
             session.stop();
         }
     }
@@ -641,7 +642,7 @@ fn replay_term(term: &Term<ParserEvents>, title: Option<&str>) -> Vec<u8> {
 
 fn encode_row(row: &alacritty_terminal::grid::Row<Cell>) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
-    let mut previous: Option<Vec<u16>> = None;
+    let mut previous = None;
     for cell in row[..].iter().take(row.line_length().0) {
         if cell
             .flags
@@ -649,8 +650,11 @@ fn encode_row(row: &alacritty_terminal::grid::Row<Cell>) -> (Vec<u8>, bool) {
         {
             continue;
         }
-        let sgr = cell_sgr(cell);
-        if previous.as_ref() != Some(&sgr) {
+        // Most terminal rows contain long runs of one style. Compare the cheap
+        // cell attributes before allocating/formatting SGR codes, not after.
+        let style = (cell.flags, cell.fg, cell.bg);
+        if previous != Some(style) {
+            let sgr = cell_sgr(cell);
             out.extend_from_slice(b"\x1b[");
             for (index, code) in sgr.iter().enumerate() {
                 if index > 0 {
@@ -659,7 +663,7 @@ fn encode_row(row: &alacritty_terminal::grid::Row<Cell>) -> (Vec<u8>, bool) {
                 out.extend_from_slice(code.to_string().as_bytes());
             }
             out.push(b'm');
-            previous = Some(sgr);
+            previous = Some(style);
         }
         let mut utf8 = [0; 4];
         out.extend_from_slice(cell.c.encode_utf8(&mut utf8).as_bytes());
@@ -759,6 +763,60 @@ fn transition(state: &mut State, lifecycle: Lifecycle) {
     state.feedback.publish(Feedback::Lifecycle(lifecycle));
 }
 
+fn write_pending(fd: i32, pending: &mut VecDeque<u8>) -> io::Result<()> {
+    let bytes = pending.make_contiguous();
+    let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+    if n > 0 {
+        pending.drain(..n as usize);
+        Ok(())
+    } else if n == 0 {
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "PTY write made no progress",
+        ))
+    } else {
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(()),
+            _ => Err(error),
+        }
+    }
+}
+
+fn read_pty(fd: i32, bytes: &mut [u8]) -> io::Result<Option<usize>> {
+    let n = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+    if n >= 0 {
+        return Ok(Some(n as usize));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EIO) {
+        // Linux PTY masters report EIO when the last slave descriptor closes.
+        return Ok(Some(0));
+    }
+    match error.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(None),
+        _ => Err(error),
+    }
+}
+
+fn close_stream(state: &mut State) {
+    if !state.status.stream_closed {
+        state.status.stream_closed = true;
+        state.output.publish(Output::Closed);
+        state.feedback.publish(Feedback::StreamClosed);
+    }
+}
+
+fn stop_deadline_reached(state: &mut State) {
+    if matches!(state.status.lifecycle, Lifecycle::Running) {
+        transition(
+            state,
+            Lifecycle::Failed("process did not exit before the stop deadline".into()),
+        );
+    }
+    close_stream(state);
+}
+
 fn run(
     mut process: Process,
     shared: Arc<Mutex<State>>,
@@ -805,10 +863,11 @@ fn run(
                 let _ = process.child.kill();
             }
         }
-        if pending.len() < INPUT_LIMIT {
+        if pending.len() <= INPUT_LIMIT - CHUNK {
             // Bounded work per tick: input cannot starve output or lifecycle.
+            // Leave room for a whole accepted frame before dequeuing it.
             for _ in 0..8 {
-                if pending.len() >= INPUT_LIMIT {
+                if pending.len() > INPUT_LIMIT - CHUNK {
                     break;
                 }
                 match input.try_recv() {
@@ -845,75 +904,84 @@ fn run(
             stop.store(true, Ordering::Release);
         }
         if pollfd.revents & libc::POLLOUT != 0 && !pending.is_empty() {
-            let bytes = pending.make_contiguous();
-            let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-            if n > 0 {
-                pending.drain(..n as usize);
+            if let Err(error) = write_pending(fd, &mut pending) {
+                transition(
+                    &mut shared.lock().unwrap(),
+                    Lifecycle::Failed(format!("PTY input failed: {error}")),
+                );
+                pending.clear();
+                stop.store(true, Ordering::Release);
             }
         }
-        if pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if n > 0 {
-                let bytes = &buf[..n as usize];
-                let mut state = shared.lock().unwrap();
-                parser.advance(&mut state.term, bytes);
-                // Flush synchronized updates too: the authoritative display must
-                // represent every byte covered by this output watermark.
-                parser.stop_sync(&mut state.term);
-                for event in events.0.lock().unwrap().drain(..) {
-                    let reply = match event {
-                        Event::Title(title) => {
-                            state.status.title = Some(title.clone());
-                            state.feedback.publish(Feedback::Title(Some(title)));
-                            None
-                        }
-                        Event::ResetTitle => {
-                            state.status.title = None;
-                            state.feedback.publish(Feedback::Title(None));
-                            None
-                        }
-                        Event::Bell => {
-                            state.feedback.publish(Feedback::Bell);
-                            None
-                        }
-                        Event::PtyWrite(text) => Some(text),
-                        Event::TextAreaSizeRequest(format) => Some(format(WindowSize {
-                            num_lines: state.dims.rows,
-                            num_cols: state.dims.cols,
-                            cell_width: 0,
-                            cell_height: 0,
-                        })),
-                        // Headless query policy: fixed default palette and empty
-                        // clipboard. Clients never provide automatic PTY replies.
-                        Event::ColorRequest(index, format) => Some(format(default_color(index))),
-                        Event::ClipboardLoad(_, format) => Some(format("")),
-                        _ => None,
-                    };
-                    if let Some(reply) = reply {
-                        if pending.len() + reply.len() <= INPUT_LIMIT {
-                            pending.extend(reply.bytes());
-                        } else {
-                            transition(
-                                &mut state,
-                                Lifecycle::Failed("terminal reply queue overflow".into()),
-                            );
-                            stop.store(true, Ordering::Release);
+        if pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            match read_pty(fd, &mut buf) {
+                Ok(Some(n)) if n > 0 => {
+                    let bytes = &buf[..n];
+                    let mut state = shared.lock().unwrap();
+                    parser.advance(&mut state.term, bytes);
+                    // Flush synchronized updates too: the authoritative display must
+                    // represent every byte covered by this output watermark.
+                    parser.stop_sync(&mut state.term);
+                    for event in events.0.lock().unwrap().drain(..) {
+                        let reply = match event {
+                            Event::Title(title) => {
+                                state.status.title = Some(title.clone());
+                                state.feedback.publish(Feedback::Title(Some(title)));
+                                None
+                            }
+                            Event::ResetTitle => {
+                                state.status.title = None;
+                                state.feedback.publish(Feedback::Title(None));
+                                None
+                            }
+                            Event::Bell => {
+                                state.feedback.publish(Feedback::Bell);
+                                None
+                            }
+                            Event::PtyWrite(text) => Some(text),
+                            Event::TextAreaSizeRequest(format) => Some(format(WindowSize {
+                                num_lines: state.dims.rows,
+                                num_cols: state.dims.cols,
+                                cell_width: 0,
+                                cell_height: 0,
+                            })),
+                            // Headless query policy: fixed default palette and empty
+                            // clipboard. Clients never provide automatic PTY replies.
+                            Event::ColorRequest(index, format) => {
+                                Some(format(default_color(index)))
+                            }
+                            Event::ClipboardLoad(_, format) => Some(format("")),
+                            _ => None,
+                        };
+                        if let Some(reply) = reply {
+                            if pending.len() + reply.len() <= INPUT_LIMIT {
+                                pending.extend(reply.bytes());
+                            } else {
+                                transition(
+                                    &mut state,
+                                    Lifecycle::Failed("terminal reply queue overflow".into()),
+                                );
+                                stop.store(true, Ordering::Release);
+                            }
                         }
                     }
+                    state.output.publish(Output::Bytes(bytes.to_vec()));
                 }
-                state.output.publish(Output::Bytes(bytes.to_vec()));
-            } else if n == 0
-                || (n < 0
-                    && !matches!(
-                        io::Error::last_os_error().kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ))
-            {
-                eof = true;
-                let mut state = shared.lock().unwrap();
-                state.status.stream_closed = true;
-                state.output.publish(Output::Closed);
-                state.feedback.publish(Feedback::StreamClosed);
+                Ok(Some(_)) => {
+                    eof = true;
+                    close_stream(&mut shared.lock().unwrap());
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let mut state = shared.lock().unwrap();
+                    transition(
+                        &mut state,
+                        Lifecycle::Failed(format!("PTY output failed: {error}")),
+                    );
+                    stop.store(true, Ordering::Release);
+                    eof = true;
+                    close_stream(&mut state);
+                }
             }
         }
         if !exited {
@@ -947,12 +1015,7 @@ fn run(
         }
         if stopping.is_some_and(|at| at.elapsed() >= Duration::from_secs(2)) {
             // No descriptor or client write can keep shutdown waiting forever.
-            let mut state = shared.lock().unwrap();
-            if !state.status.stream_closed {
-                state.status.stream_closed = true;
-                state.output.publish(Output::Closed);
-                state.feedback.publish(Feedback::StreamClosed);
-            }
+            stop_deadline_reached(&mut shared.lock().unwrap());
             break;
         }
     }
@@ -1029,6 +1092,141 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn listing_a_busy_session_does_not_block_unrelated_control() {
+        let registry = Arc::new(Registry::default());
+        let busy = registry.create(spec("busy", "read line")).unwrap();
+        let other = registry.create(spec("other", "read line")).unwrap();
+        // Model a snapshot holding the parser lock while a list waits for it.
+        let parser = busy.state.lock().unwrap();
+        let retained = Arc::strong_count(&busy);
+        let listing_registry = registry.clone();
+        let listing = std::thread::spawn(move || listing_registry.list());
+        // Wait until list has retained its handles, rather than guessing when
+        // the listing thread was scheduled. It then blocks on our parser lock.
+        until(|| Arc::strong_count(&busy) > retained);
+        let (done, received) = mpsc::channel();
+        let controlling_registry = registry.clone();
+        let control = std::thread::spawn(move || {
+            controlling_registry.get("other").unwrap().stop();
+            done.send(()).unwrap();
+        });
+        let result = received.recv_timeout(Duration::from_millis(250));
+        // Release before asserting so even a regression cannot hang teardown.
+        drop(parser);
+        control.join().unwrap();
+        listing.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "a busy session blocked another session's stop"
+        );
+        until(|| other.status().stream_closed);
+    }
+
+    #[test]
+    fn stopping_an_unreaped_process_reports_failure_even_after_pty_eof() {
+        for closed in [false, true] {
+            let dims = Dims { cols: 80, rows: 24 };
+            let mut state = State {
+                term: Term::new(
+                    Config::default(),
+                    &dims,
+                    ParserEvents(Arc::new(Mutex::new(Vec::new()))),
+                ),
+                dims,
+                status: Status {
+                    id: "unreaped".into(),
+                    cwd: PathBuf::new(),
+                    pid: None,
+                    lifecycle: Lifecycle::Running,
+                    title: None,
+                    stream_closed: closed,
+                },
+                output: Bus::new(),
+                feedback: Bus::new(),
+            };
+            let feedback = state.feedback.subscribe();
+            stop_deadline_reached(&mut state);
+            assert!(state.status.stream_closed);
+            assert!(matches!(state.status.lifecycle, Lifecycle::Failed(_)));
+            assert!(matches!(
+                feedback.try_recv().unwrap().event,
+                Feedback::Lifecycle(Lifecycle::Failed(_))
+            ));
+            if !closed {
+                assert!(matches!(
+                    feedback.try_recv().unwrap().event,
+                    Feedback::StreamClosed
+                ));
+            }
+            // Cleanup is idempotent and preserves the recorded failure reason.
+            let lifecycle = state.status.lifecycle.clone();
+            stop_deadline_reached(&mut state);
+            assert_eq!(state.status.lifecycle, lifecycle);
+            assert_eq!(feedback.try_recv().unwrap_err(), ReceiveError::Empty);
+            state.status.lifecycle = Lifecycle::Exited(ExitInfo {
+                code: 0,
+                signal: None,
+            });
+            stop_deadline_reached(&mut state);
+            assert!(matches!(state.status.lifecycle, Lifecycle::Exited(_)));
+        }
+    }
+
+    #[test]
+    fn pty_reads_distinguish_retry_eof_and_fatal_errors() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let mut bytes = [0; CHUNK];
+        assert_eq!(read_pty(reader.as_raw_fd(), &mut bytes).unwrap(), None);
+        writer.write_all(b"data").unwrap();
+        assert_eq!(read_pty(reader.as_raw_fd(), &mut bytes).unwrap(), Some(4));
+        assert_eq!(&bytes[..4], b"data");
+        writer.shutdown(std::net::Shutdown::Both).unwrap();
+        assert_eq!(read_pty(reader.as_raw_fd(), &mut bytes).unwrap(), Some(0));
+        assert_eq!(
+            read_pty(-1, &mut bytes).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+
+        let pair = native_pty_system()
+            .openpty(pty_size(Dims { cols: 80, rows: 24 }))
+            .unwrap();
+        drop(pair.slave);
+        assert_eq!(
+            read_pty(pair.master.as_raw_fd().unwrap(), &mut bytes).unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn pending_input_retries_backpressure_but_reports_broken_transport() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        loop {
+            match writer.write(&[0; CHUNK]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("unexpected write failure: {error}"),
+            }
+        }
+        let mut pending = VecDeque::from(b"input".to_vec());
+        write_pending(writer.as_raw_fd(), &mut pending).unwrap();
+        assert_eq!(pending.iter().copied().collect::<Vec<_>>(), b"input");
+        reader.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(reader);
+        assert!(write_pending(writer.as_raw_fd(), &mut pending).is_err());
+        assert_eq!(pending.iter().copied().collect::<Vec<_>>(), b"input");
     }
 
     fn text(snapshot: &Snapshot) -> String {

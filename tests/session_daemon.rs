@@ -167,6 +167,42 @@ fn cli_client_exit_does_not_end_session_and_reconnect_streams_in_order() {
 }
 
 #[test]
+fn maximum_screen_with_full_history_can_attach_within_client_timeout() {
+    let daemon = Daemon::start();
+    assert!(matches!(
+        daemon.request(Request::Create(Spawn {
+            id: "test".into(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "awk 'BEGIN { for (i=0; i<11000; i++) printf \"%0499d\\r\\n\", 0 }'; printf '\\033]0;ready\\007'; read line".into(),
+            ],
+            cwd: daemon.home.path().to_owned(),
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            dims: Dims { cols: 500, rows: 300 },
+        })),
+        Response::Status(_)
+    ));
+    until(|| match daemon.request(Request::List) {
+        Response::Sessions(sessions) => sessions[0].title.as_deref() == Some("ready"),
+        other => panic!("unexpected response {other:?}"),
+    });
+    // Use the real client's normal timeout: a valid display must remain attachable
+    // even when the bounded scrollback is full, without extending timeouts.
+    let (snapshot, _stream) = daemon.attach();
+    assert_eq!(snapshot.history_lines, 10_000);
+    assert_eq!(
+        snapshot.dims,
+        Dims {
+            cols: 500,
+            rows: 300
+        }
+    );
+    assert!(!snapshot.replay.is_empty());
+}
+
+#[test]
 fn blocked_socket_cannot_delay_feedback_or_control() {
     let daemon = Daemon::start();
     daemon.spawn("read line; head -c 8000000 /dev/zero; printf '\\007finished'");
