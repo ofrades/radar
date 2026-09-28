@@ -9,10 +9,6 @@ Edit it directly:
 - Notes for a card: indent lines under it
 
 ## Backlog
-- [ ] Land the reviewed tree: backend fixes, GUI attach fix, web client @opencode-muji4fa4
-      <!-- radar:card-id:card-1b51c6-18d951f7ea23fdfc-14 -->
-      Commit the reviewed working tree in verified slices, each isolated-checked before its commit: (1) session backend review corrections + Status.cwd, (2) GUI set_pty fix + attach probe, (3) web client service/layout/path work, (4) board state. Every slice must pass its own test run on the isolated staged tree; web service reinstalled from the fresh build afterwards.
-      Landed (opencode-muji4fa4, 2026-09-28): the working tree is committed in three verified slices, each isolated-checked against HEAD plus its own files before committing — 11801cd fix(session) backend review corrections (164+9 headless, 211+11 VTE), a5f2832 fix(gui) set_pty swap + attach probe (same counts, probe compiles under the vte gate), 5fee7ce feat(web) service unit + sidebar layout + /radar path (166+9, 213+11, node --check). Remaining: reinstall the web service from a fresh release build and verify loopback + tailnet.
 
 ## In progress
 - [ ] Lossless terminal-state snapshot/import across terminal clients @opencode-muip1eb9
@@ -83,24 +79,25 @@ Edit it directly:
       Handover: `packaging/radar-web.service` runs the installed `~/.local/bin/radar web --port 8787`, restarts on failure, and is enabled under `default.target`. Installed the current VTE-enabled Radar build and unit to the user; documented setup and lifecycle commands in `docs/web-client.md` and linked it from README. Existing Tailscale Serve port 443 remains untouched; :8443 continues to proxy to loopback:8787.
       Verification: `systemctl --user is-enabled/is-active radar-web.service` report `enabled`/`active`; after `systemctl --user restart radar-web.service`, both `http://127.0.0.1:8787/` and the tailnet HTTPS URL return 200.
       Landed (opencode-muji4fa4, 2026-09-28): this card's content is committed as 5fee7ce (with README/docs); service binary reinstall from the fresh release build follows the commit.
-
 - [ ] Web layout: projects in sidebar
       <!-- radar:card-id:card-172a90-18d947d8b188683c-10 -->
       Rework the browser client into the same workspace-style layout as the native app, with projects listed in a persistent sidebar. Selecting a project should drive the main workspace content and keep its sessions/activity accessible, with responsive behavior for narrow screens. Preserve the existing browser terminal, project/session discovery, and attention flows.
       Handover: the browser now uses a persistent project sidebar, project-scoped workspace header, and compact horizontal project rail on phones. Project selection updates the URL and workspace; the project rail remains available in terminal view and switching projects returns to the workspace.
       Verification: `node --check web/app.js`, `cargo test --lib web::tests` (5 passed), and `git diff --check`; browser smoke-tested at 1440×960 and 390×844, including project switching from the terminal view.
       Landed (opencode-muji4fa4, 2026-09-28): this card's content is committed as 5fee7ce (with README/docs); service binary reinstall from the fresh release build follows the commit.
-
 - [ ] Radar at /radar; retire OpenCode Omarchy server
       <!-- radar:card-id:card-175fa0-18d9485f24087403-11 -->
       Expose Radar under https://laptop.tailf9eafe.ts.net/radar while preserving other port-443 handlers, document/test prefix behavior, and stop/remove the user-built OpenCode Omarchy serving integration after identifying its exact unit/plugin/config. Preserve unrelated OpenCode plugins and settings.
       Handover: `tailscale serve` now maps only `/radar` on HTTPS 443 to loopback:8787; the OpenCode Remote Omarchy widget (`io.github.ofrades.opencode-remote`) was unloaded and removed, its `/` publication and Radar's old `:8443` route were cleared. OpenCode's local background service remains on `127.0.0.1:49374`. Radar's browser resources, API, project URL, and terminal WebSocket now honor the current page path. Updated `README.md`, `docs/web-client.md`, and the `radar web` startup hint.
       Verification: release `vte` build and `cargo test --all-targets --features vte` (209 unit + 10 daemon integration); `node --check web/app.js`, Rust formatting and `git diff --check`. Browser passed at local `/` and tailnet `/radar` on 390×844; project switching preserved `/radar`, terminal WebSocket connected and accepted `exit`, and the temporary ended shell was forgotten. Tailnet `/radar`, assets, and API return 200; root returns 404; local OpenCode service remains available.
       Landed (opencode-muji4fa4, 2026-09-28): this card's content is committed as 5fee7ce (with README/docs); service binary reinstall from the fresh release build follows the commit.
-
 - [ ] Review GUI daemon attachment and VTE replay
       <!-- radar:card-id:card-123b0c-18d94f1ea529f864-d17 -->
       Independent standards/spec review of GUI attaches to daemon-owned sessions with VTE replay against baseline 46e5418. Verify stable identity, attach-before-create, snapshot/live ordering, resync, input/resize forwarding, query reply ownership and nonblocking detach; correct confirmed defects and hand fixes to another reviewer. Original implementation card remains claimed by its author. Exact parser-state import is a separate blocked card.
+- [ ] Land the reviewed tree: backend fixes, GUI attach fix, web client
+      <!-- radar:card-id:card-1b51c6-18d951f7ea23fdfc-14 -->
+      Commit the reviewed working tree in verified slices, each isolated-checked before its commit: (1) session backend review corrections + Status.cwd, (2) GUI set_pty fix + attach probe, (3) web client service/layout/path work, (4) board state. Every slice must pass its own test run on the isolated staged tree; web service reinstalled from the fresh build afterwards.
+      Landed (opencode-muji4fa4, 2026-09-28): the working tree is committed in three verified slices, each isolated-checked against HEAD plus its own files before committing — 11801cd fix(session) backend review corrections (164+9 headless, 211+11 VTE), a5f2832 fix(gui) set_pty swap + attach probe (same counts, probe compiles under the vte gate), 5fee7ce feat(web) service unit + sidebar layout + /radar path (166+9, 213+11, node --check). Service reinstalled from the fresh release build and verified: radar-web.service active, loopback :8787 and tailnet /radar both return 200.
 
 ## Done
 - [x] Remote web client for phone @reviewer-standards
