@@ -77,6 +77,28 @@ button { color: inherit; }
 .project-link-name { font-size: 12px; font-weight: 620; }
 .project-link-path { color: var(--muted); font-size: 10px; }
 .project-empty { margin: 0; padding: 5px 9px; color: var(--muted); font-size: 12px; }
+.project-progress { color: var(--muted); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+.project-progress.needs-attention { color: var(--warning); }
+.project-agent-copy { display: grid; gap: 3px; min-width: 0; }
+.project-agent-progress { color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+.board-columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr)); gap: 16px; align-items: start; max-height: 420px; overflow: auto; scrollbar-gutter: stable; }
+.board-column { min-width: 0; border-top: 1px solid var(--line); padding-top: 12px; }
+.board-column h3 { margin: 0 0 12px; color: var(--muted); font-size: 12px; font-weight: 650; }
+.board-card { padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.board-card small { display: block; margin-top: 4px; color: var(--accent); }
+.board-claim { display: block; border: 0; padding: 4px 0; color: var(--accent); background: none; font-size: 11px; cursor: pointer; text-align: left; overflow-wrap: anywhere; max-width: 100%; }
+.board-claim:hover { text-decoration: underline; }
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+button:disabled { cursor: default; opacity: .6; }
+.attention-card[aria-busy="true"] { border-color: var(--accent); }
+#attention-shortcut, #terminal-attention-shortcut { color: var(--warning); }
+@media (pointer: coarse) {
+  .project-agent, .project-toggle, .small-button, .icon-button { min-height: 44px; }
+  .project-toggle { min-width: 44px; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .project-link, .project-agent, .small-button { transition: background-color 160ms ease-out; }
+}
 .main-content { width: auto; flex: 1 1 0; min-width: 0; min-height: 0; margin: 0 auto; padding: 44px clamp(22px, 4vw, 56px) 64px; display: flex; flex-direction: column; overflow: auto; }
 .main-content.terminal-open { width: 100%; max-width: none; min-width: 0; margin: 0; padding: 0; overflow: hidden; }
 .dashboard { width: 100%; max-width: 940px; margin: 0 auto; }

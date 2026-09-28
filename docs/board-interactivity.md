@@ -22,12 +22,10 @@ activity now has its own atomic snapshot/replay boundary, durable attention
 records, and separate bounded watcher stream. Process lifecycle, explicit agent
 activity, and each client connection remain distinct state axes.
 
-The remaining gaps are exact terminal parser-state import, vendor-specific hooks
-that automatically turn native agent prompts into activity requests,
-project-wide board-file monitoring while the board pane is closed, and desktop
-notifications. Agents can already submit requests and wait for typed responses
-with `radar activity request --wait`. Do not infer agent intent from terminal
-output, process existence, silence, or a bell.
+The remaining gaps are exact terminal parser-state import and vendor-specific
+hooks that automatically turn native agent prompts into activity requests.
+Agents can already submit requests and wait for typed responses with
+`radar activity request --wait`.
 
 ## Ownership and state
 
@@ -114,16 +112,19 @@ agent CLI reporting with its radar-provided project/session environment.
 
 **Implemented:** the board renders the live project feed and explicit states,
 shows actionable unresolved requests with seen/acknowledge/answer/approve/deny/
-dismiss actions, opens linked stable sessions, reflects authoritative resolution,
-and shows unresolved counts for every sidebar project. GUI watching reconnects,
-replays and deduplicates activity; file changes observed while the board pane is
-open publish card-linked events.
+dismiss actions, opens linked stable sessions, reflects authoritative
+resolution, and shows unresolved counts for every sidebar project. GUI watching
+reconnects, replays and deduplicates activity. The session daemon independently
+monitors registered boards, persists a silent baseline, and journals stable-card
+transitions even while the Board pane is closed. Native and web project sidebars
+show Done/In progress/Review totals using column names (the Done column, not a
+checkbox or Review, is authoritative), attention counts, and explicit per-agent
+state where available. Notifications are deduplicated by attention ID and
+opening one navigates to the relevant Board without resolving the request.
 
 **Next:** vendor-specific hooks can translate native agent prompts into the
-existing request/wait flow; project-wide board-file monitoring while the pane is
-closed and optional desktop delivery consume the same journal. Verify these with
-real agent CLIs and no focus theft.
+existing request/wait flow. Verify agent questions and notification delivery
+with real agent CLIs on supported desktop environments.
 
-The journal, attention storage and live board presentation are implemented
-independently of the fullscreen change; vendor-specific prompt hooks and desktop
-notifications remain follow-up work.
+The journal, attention storage, board monitor, and native notification path are
+implemented independently of fullscreen board presentation.

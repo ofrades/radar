@@ -28,6 +28,8 @@ pub(super) struct AgentSession {
     pub radar_session_id: Option<String>,
     /// The provider's own conversation id, when known — the precise resume target.
     pub provider_session_id: Option<String>,
+    /// Exact `RADAR_AGENT` claim carried by a live process, when readable.
+    pub claim_id: Option<String>,
     pub last_activity_at: i64,
     pub running: bool,
     pub archived: bool,
@@ -50,6 +52,25 @@ fn fallback_title(program_id: &str) -> String {
     programs::by_id(program_id)
         .map(|program| program.name)
         .unwrap_or_else(|| format!("{program_id} session"))
+}
+
+/// A live agent row's title. The program's own terminal title wins when it
+/// says something real; otherwise the conversation the catalog already
+/// knows for this stable session — the previous run's, or a
+/// provider-imported one — is what the row is about. A session with no
+/// conversation anywhere is honestly new, not "starting": nothing more is
+/// coming until it is used, so the placeholder says that.
+fn live_row_title(
+    status_title: Option<&str>,
+    catalog_title: Option<&str>,
+    program: Option<&Program>,
+) -> String {
+    session_title(status_title, program)
+        .or_else(|| session_title(catalog_title, program))
+        .unwrap_or_else(|| match program {
+            Some(program) => format!("New {} session", program.name),
+            None => "New session".to_string(),
+        })
 }
 
 /// The exact-resume conversation id a sidebar row may honestly offer: one
@@ -158,11 +179,14 @@ pub(super) fn discover(projects: &[Project], session_home: &Path) -> Vec<AgentSe
             managed_pids.insert(pid);
         }
         let program = programs::by_id(&program_id);
-        let title = session_title(status.title.as_deref(), program.as_ref())
-            .unwrap_or_else(|| "Starting session…".to_string());
         // A live session the catalog has no row for (pre-catalog session, or
         // the first scan after an upgrade): backfill once and remember it.
         let entry = live_catalog.remove(&status.id);
+        let title = live_row_title(
+            status.title.as_deref(),
+            entry.as_ref().and_then(|entry| entry.title.as_deref()),
+            program.as_ref(),
+        );
         if entry.is_some() {
             consumed.insert(status.id.clone());
         } else {
@@ -184,6 +208,7 @@ pub(super) fn discover(projects: &[Project], session_home: &Path) -> Vec<AgentSe
             tab_key: Some(key.as_str().to_string()),
             external: None,
             catalog_id: entry.as_ref().map(|entry| entry.id),
+            claim_id: status.pid.and_then(programs::launch::radar_agent_of),
             radar_session_id: Some(status.id.clone()),
             provider_session_id: entry
                 .as_ref()
@@ -220,8 +245,9 @@ pub(super) fn discover(projects: &[Project], session_home: &Path) -> Vec<AgentSe
             tab_key: None,
             external: None,
             catalog_id: Some(entry.id),
-            radar_session_id: None,
+            radar_session_id: entry.radar_session_id.clone(),
             provider_session_id: Some(entry.provider_session_id.clone()),
+            claim_id: None,
             last_activity_at: entry.last_activity_at,
             running: entry.lifecycle == "running",
             archived: entry.archived_at.is_some(),
@@ -399,6 +425,7 @@ fn external_sessions(
             catalog_id: None,
             radar_session_id: None,
             provider_session_id: explicit_session_id(&process.program, &process.argv),
+            claim_id: programs::launch::radar_agent_of(process.pid),
             last_activity_at: now,
             running: true,
             archived: false,
@@ -723,6 +750,7 @@ mod tests {
             catalog_id: None,
             radar_session_id: None,
             provider_session_id: None,
+            claim_id: None,
             last_activity_at,
             running: false,
             archived: false,
@@ -747,6 +775,47 @@ mod tests {
     }
 
     #[test]
+    fn a_live_row_titles_from_the_program_then_the_catalog_then_new() {
+        let opencode = crate::programs::by_id("opencode").unwrap();
+        // The program's own title wins when it says something real.
+        assert_eq!(
+            super::live_row_title(
+                Some("Fix the flaky test"),
+                Some("Old talk"),
+                Some(&opencode)
+            ),
+            "Fix the flaky test"
+        );
+        // A generic terminal title (just the program's name) is not real:
+        // the conversation the catalog already knows titles the row.
+        assert_eq!(
+            super::live_row_title(
+                Some("OpenCode"),
+                Some("Fix the flaky test"),
+                Some(&opencode)
+            ),
+            "Fix the flaky test"
+        );
+        // No live title at all (fresh after a restart): the catalog speaks.
+        assert_eq!(
+            super::live_row_title(None, Some("Planning next steps"), Some(&opencode)),
+            "Planning next steps"
+        );
+        // A generic catalog title is not a conversation either.
+        assert_eq!(
+            super::live_row_title(None, Some("OpenCode"), Some(&opencode)),
+            "New OpenCode session"
+        );
+        // No conversation anywhere: honestly new, named for its program.
+        assert_eq!(
+            super::live_row_title(None, None, Some(&opencode)),
+            "New OpenCode session"
+        );
+        // An unknown program still gets a readable placeholder.
+        assert_eq!(super::live_row_title(None, None, None), "New session");
+    }
+
+    #[test]
     fn active_panel_session_prefers_the_launched_conversation_then_the_tab() {
         let session = |id: &str,
                        tab: Option<&str>,
@@ -766,6 +835,7 @@ mod tests {
             catalog_id: None,
             radar_session_id: radar.map(str::to_string),
             provider_session_id: provider.map(str::to_string),
+            claim_id: None,
             last_activity_at: 0,
             running: !external,
             archived: false,
@@ -831,6 +901,7 @@ mod tests {
             external: None,
             catalog_id: None,
             radar_session_id: radar.map(str::to_string),
+            claim_id: None,
             provider_session_id: provider.map(str::to_string),
             last_activity_at: 0,
             running: false,

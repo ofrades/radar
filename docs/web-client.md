@@ -21,6 +21,25 @@ fail. Reopen such a conversation from the native Radar sidebar, where provider
 resume links are available when the provider exposed a stable session id. Use
 **Workspace** to return to the project and choose another live session.
 
+The workspace refreshes each registered project's board, activity, and session
+summary together. Project rows show completed work (the **Done** column alone
+defines completion), active/review counts, unresolved requests, and explicit
+reported agent state. Board claim links appear only when a claim resolves to one
+exact attachable session; ambiguous or ended claims are not guessed. The
+**Board progress** view shows the project's live card columns, while the
+attention shortcut remains available in the terminal and jumps to the first
+outstanding request without clearing it. Progress polling retains the last
+snapshot and marks it unavailable when a refresh fails.
+
+The session daemon observes registered, board-enabled `BOARD.md` files whether
+or not a board pane is open. It silently establishes an initial baseline, then
+records stable card additions, removals, edits, claims, and column transitions
+in the project activity journal. Board snapshots are served through
+`/api/projects/{id}/board` without creating missing files. The native desktop
+also delivers deduplicated attention notifications; opening one takes you to
+the relevant Board, and the request stays unresolved until you answer or
+explicitly dismiss it.
+
 ## Run locally
 
 ```sh

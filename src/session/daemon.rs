@@ -215,6 +215,17 @@ impl Server {
     }
 
     pub fn run(self) -> Result<()> {
+        let home = self
+            .path
+            .parent()
+            .and_then(|run_dir| run_dir.parent())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let monitor_activity = self.activity.clone();
+        let monitor_stopping = self.stopping.clone();
+        let board_monitor = std::thread::Builder::new()
+            .name("radar-board-monitor".into())
+            .spawn(move || super::board_monitor::run(&home, monitor_activity, monitor_stopping))?;
         let mut workers = Vec::new();
         while !self.stopping.load(Ordering::Acquire) {
             workers.retain(|worker: &std::thread::JoinHandle<()>| !worker.is_finished());
@@ -255,6 +266,7 @@ impl Server {
         for worker in workers {
             let _ = worker.join();
         }
+        let _ = board_monitor.join();
         Ok(())
     }
 }

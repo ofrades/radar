@@ -24,6 +24,7 @@
         </a>
         <div class="top-actions">
           <span class="connection-dot" id="server-state" aria-label="Checking server"></span>
+          <button class="small-button hidden" id="attention-shortcut" type="button">Needs attention</button>
           <button class="icon-button" id="refresh-button" type="button" aria-label="Refresh workspace" title="Refresh">↻</button>
         </div>
       </header>
@@ -47,6 +48,17 @@
               </div>
             </div>
 
+          <section class="board-section" aria-labelledby="board-heading">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">WORK</p>
+                <h2 id="board-heading">Board progress</h2>
+              </div>
+              <span class="project-summary" id="board-summary">Loading…</span>
+            </div>
+            <div id="board-columns" class="board-columns"></div>
+            <div id="board-empty" class="empty-card hidden"></div>
+          </section>
           <section class="attention-section" id="attention-section">
             <div class="section-heading">
               <div>
@@ -92,6 +104,7 @@
           <section id="terminal-view" class="terminal-view hidden" aria-label="Remote terminal">
             <div class="terminal-toolbar">
               <button class="back-button" id="back-button" type="button"><span>‹</span> Workspace</button>
+              <button class="small-button hidden" id="terminal-attention-shortcut" type="button">Needs attention</button>
               <div class="terminal-heading">
                 <strong id="terminal-title">Terminal</strong>
                 <span id="terminal-connection">Connecting…</span>

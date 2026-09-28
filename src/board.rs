@@ -11,13 +11,13 @@
 //! write atomically (temporary file + rename), re-reading when the file moved
 //! under us, so a claim is not lost because another agent wrote first.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The board file, in the project root where agents and `git diff` see it.
 pub const FILE_NAME: &str = "BOARD.md";
@@ -44,7 +44,7 @@ pub const DEFAULT_COLUMNS: [&str; 4] = ["Backlog", "In progress", "Review", "Don
 /// How many times a mutation re-reads the file before giving up.
 const ATTEMPTS: usize = 5;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Board {
     /// Everything before the first column heading, kept verbatim: the title
     /// and the note that tells an agent how to use the file.
@@ -52,13 +52,13 @@ pub struct Board {
     pub columns: Vec<Column>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Column {
     pub name: String,
     pub cards: Vec<Card>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Card {
     /// Stable identity stored in a hidden HTML comment beside the card. Titles
     /// and claims can change without breaking activity or attention links.
@@ -71,6 +71,180 @@ pub struct Card {
     /// Written as `- [x]` and shown struck through; cosmetic — the column is
     /// the real state.
     pub done: bool,
+}
+/// One user-visible board transition, expressed using column names rather
+/// than positions so inserting/reordering columns cannot fabricate moves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoardChange {
+    pub action: String,
+    pub card_id: Option<String>,
+    pub title: Option<String>,
+    pub column: Option<String>,
+    pub from_column: Option<String>,
+}
+
+/// Compare two persisted board states. The caller distinguishes first-seen
+/// state from an absent board; `None` here therefore means a later deletion
+/// or recreation, not a startup baseline.
+pub(crate) fn changes(previous: Option<&Board>, current: Option<&Board>) -> Vec<BoardChange> {
+    let mut result = Vec::new();
+    match (previous, current) {
+        (None, None) => {}
+        (None, Some(board)) => {
+            result.push(board_change("board_created", None, None, None, None));
+            for (column, card) in cards(board) {
+                result.push(board_change(
+                    "added",
+                    Some(card.id.clone()),
+                    Some(card.title.clone()),
+                    Some(column.to_string()),
+                    None,
+                ));
+            }
+        }
+        (Some(board), None) => {
+            for (column, card) in cards(board) {
+                result.push(board_change(
+                    "removed",
+                    Some(card.id.clone()),
+                    Some(card.title.clone()),
+                    None,
+                    Some(column.to_string()),
+                ));
+            }
+            result.push(board_change("board_deleted", None, None, None, None));
+        }
+        (Some(before), Some(after)) => {
+            for column in &before.columns {
+                if !after.columns.iter().any(|value| value.name == column.name) {
+                    result.push(board_change(
+                        "column_removed",
+                        None,
+                        None,
+                        Some(column.name.clone()),
+                        None,
+                    ));
+                }
+            }
+            for column in &after.columns {
+                if !before.columns.iter().any(|value| value.name == column.name) {
+                    result.push(board_change(
+                        "column_added",
+                        None,
+                        None,
+                        Some(column.name.clone()),
+                        None,
+                    ));
+                }
+            }
+
+            let before_cards: HashMap<&str, (&str, &Card)> = cards(before)
+                .map(|(column, card)| (card.id.as_str(), (column, card)))
+                .collect();
+            let after_cards: HashMap<&str, (&str, &Card)> = cards(after)
+                .map(|(column, card)| (card.id.as_str(), (column, card)))
+                .collect();
+
+            for (column, card) in cards(before) {
+                let Some((new_column, new_card)) = after_cards.get(card.id.as_str()).copied()
+                else {
+                    result.push(board_change(
+                        "removed",
+                        Some(card.id.clone()),
+                        Some(card.title.clone()),
+                        None,
+                        Some(column.to_string()),
+                    ));
+                    continue;
+                };
+                if column != new_column {
+                    let was_done = column.eq_ignore_ascii_case("Done");
+                    let is_done = new_column.eq_ignore_ascii_case("Done");
+                    let action = if is_done && !was_done {
+                        "completed"
+                    } else if was_done && !is_done {
+                        "reopened"
+                    } else {
+                        "moved"
+                    };
+                    result.push(board_change(
+                        action,
+                        Some(card.id.clone()),
+                        Some(new_card.title.clone()),
+                        Some(new_column.to_string()),
+                        Some(column.to_string()),
+                    ));
+                } else if card.claimed_by != new_card.claimed_by {
+                    result.push(board_change(
+                        if new_card.claimed_by.is_some() {
+                            "claimed"
+                        } else {
+                            "released"
+                        },
+                        Some(card.id.clone()),
+                        Some(new_card.title.clone()),
+                        Some(new_column.to_string()),
+                        None,
+                    ));
+                } else if card.title != new_card.title {
+                    result.push(board_change(
+                        "renamed",
+                        Some(card.id.clone()),
+                        Some(new_card.title.clone()),
+                        Some(new_column.to_string()),
+                        None,
+                    ));
+                } else if card.body != new_card.body || card.done != new_card.done {
+                    // `done` is a checkbox-only display detail. Completion is
+                    // represented by moving to the named Done column above.
+                    result.push(board_change(
+                        "updated",
+                        Some(card.id.clone()),
+                        Some(new_card.title.clone()),
+                        Some(new_column.to_string()),
+                        None,
+                    ));
+                }
+            }
+            for (column, card) in cards(after) {
+                if !before_cards.contains_key(card.id.as_str()) {
+                    result.push(board_change(
+                        "added",
+                        Some(card.id.clone()),
+                        Some(card.title.clone()),
+                        Some(column.to_string()),
+                        None,
+                    ));
+                }
+            }
+        }
+    }
+    result
+}
+
+fn cards(board: &Board) -> impl Iterator<Item = (&str, &Card)> {
+    board.columns.iter().flat_map(|column| {
+        column
+            .cards
+            .iter()
+            .map(move |card| (column.name.as_str(), card))
+    })
+}
+
+fn board_change(
+    action: &str,
+    card_id: Option<String>,
+    title: Option<String>,
+    column: Option<String>,
+    from_column: Option<String>,
+) -> BoardChange {
+    BoardChange {
+        action: action.to_string(),
+        card_id,
+        title,
+        column,
+        from_column,
+    }
 }
 
 impl Card {
@@ -339,7 +513,7 @@ pub fn ensure_enabled_file(db: &crate::db::Db, project: &Path) -> Result<PathBuf
 /// Give pre-migration cards a persistent identity without reformatting the
 /// rest of an agent-authored markdown file. The marker is an HTML comment, so
 /// it is invisible in rendered markdown and survives ordinary edits/moves.
-fn ensure_card_ids(project: &Path) -> Result<()> {
+pub(crate) fn ensure_card_ids(project: &Path) -> Result<()> {
     let path = file_path(project);
     for _ in 0..ATTEMPTS {
         let before = mtime(&path);
@@ -1093,5 +1267,47 @@ mod tests {
         add_card(&project, None, "early", "", None).unwrap();
         assert!(file_path(&project).exists());
         assert_eq!(load(&project).unwrap().columns[0].cards[0].title, "early");
+    }
+    #[test]
+    fn board_changes_use_column_names_and_named_done_semantics() {
+        let before = board_with(
+            "## Backlog\n\
+             - [ ] Ship fix\n\
+                   <!-- radar:card-id:stable-card -->\n\
+             ## In progress\n\
+             ## Done\n",
+        );
+        let reordered = board_with(
+            "## Done\n\
+             ## Backlog\n\
+             - [ ] Ship fix\n\
+                   <!-- radar:card-id:stable-card -->\n\
+             ## In progress\n",
+        );
+        assert!(changes(Some(&before), Some(&reordered)).is_empty());
+
+        let checked = board_with(
+            "## Backlog\n\
+             - [x] Ship fix\n\
+                   <!-- radar:card-id:stable-card -->\n\
+             ## In progress\n\
+             ## Done\n",
+        );
+        let checkbox_change = changes(Some(&before), Some(&checked));
+        assert_eq!(checkbox_change.len(), 1);
+        assert_eq!(checkbox_change[0].action, "updated");
+
+        let moved_to_done = board_with(
+            "## Backlog\n\
+             ## In progress\n\
+             ## Done\n\
+             - [ ] Ship fix\n\
+                   <!-- radar:card-id:stable-card -->\n",
+        );
+        let completion = changes(Some(&before), Some(&moved_to_done));
+        assert_eq!(completion.len(), 1);
+        assert_eq!(completion[0].action, "completed");
+        assert_eq!(completion[0].column.as_deref(), Some("Done"));
+        assert_eq!(completion[0].from_column.as_deref(), Some("Backlog"));
     }
 }

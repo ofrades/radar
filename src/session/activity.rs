@@ -5,10 +5,11 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -115,6 +116,11 @@ pub enum ActivityPayload {
         action: String,
         card_id: Option<String>,
         title: Option<String>,
+        /// Column names are stable across column insertion/reordering.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        column: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_column: Option<String>,
     },
     SessionLifecycle {
         state: String,
@@ -334,6 +340,10 @@ impl ActivityJournal {
                 command_type TEXT NOT NULL,
                 result TEXT NOT NULL,
                 PRIMARY KEY(project_id, command_id)
+            );
+            CREATE TABLE IF NOT EXISTS board_snapshots (
+                project_id INTEGER PRIMARY KEY,
+                board_json TEXT
             );",
         )?;
         Ok(Self {
@@ -352,7 +362,7 @@ impl ActivityJournal {
         )?;
         validate_card_id(input.card_id.as_deref())?;
         validate_activity(&input.kind, &input.payload)?;
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let tx = inner.connection.transaction()?;
         if let Some(event) =
             cached::<ActivityEvent>(&tx, input.project_id, &input.command_id, "publish")?
@@ -392,7 +402,7 @@ impl ActivityJournal {
             bail!("attention allowed actions must be unique");
         }
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let tx = inner.connection.transaction()?;
         if let Some(mut result) = cached::<CreateAttentionResult>(
             &tx,
@@ -477,7 +487,7 @@ impl ActivityJournal {
             AttentionChange::Acknowledge => "attention_acknowledged",
             AttentionChange::Respond(_) => "attention_responded",
         };
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let tx = inner.connection.transaction()?;
         if let Some(mut result) = cached::<AttentionMutationResult>(
             &tx,
@@ -605,7 +615,7 @@ impl ActivityJournal {
     ) -> Result<ActivitySnapshot> {
         validate_project(project_id)?;
         validate_limit(limit)?;
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         snapshot_locked(&inner.connection, project_id, after_sequence, limit)
     }
 
@@ -617,7 +627,7 @@ impl ActivityJournal {
         if request_id.trim().is_empty() || request_id.len() > MAX_ID {
             bail!("attention ID must contain 1..{MAX_ID} characters");
         }
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         load_attention(&inner.connection, project_id, request_id)
     }
 
@@ -625,7 +635,7 @@ impl ActivityJournal {
     /// missed events asks the client to take a fresh bounded snapshot first.
     pub fn watch(&self, project_id: i64, after_sequence: u64) -> Result<WatchResult> {
         validate_project(project_id)?;
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let snapshot = snapshot_locked(
             &inner.connection,
             project_id,
@@ -655,6 +665,82 @@ impl ActivityJournal {
                 attached,
             },
         ))
+    }
+    /// Persist the last observed board and append its transitions in the same
+    /// transaction. A missing row is a silent startup baseline; a stored NULL
+    /// is a known-absent file, allowing later creation to be reported.
+    pub fn reconcile_board(
+        &self,
+        project_id: i64,
+        current: Option<&crate::board::Board>,
+    ) -> Result<Vec<ActivityEvent>> {
+        validate_project(project_id)?;
+        let next_json = current.map(serde_json::to_string).transpose()?;
+        let mut inner = self.inner.lock();
+        let tx = inner.connection.transaction()?;
+        let stored: Option<Option<String>> = tx
+            .query_row(
+                "SELECT board_json FROM board_snapshots WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(previous_json) = stored else {
+            tx.execute(
+                "INSERT INTO board_snapshots(project_id, board_json) VALUES (?1, ?2)",
+                params![project_id, next_json.as_deref()],
+            )?;
+            tx.commit()?;
+            return Ok(Vec::new());
+        };
+
+        if previous_json == next_json {
+            tx.commit()?;
+            return Ok(Vec::new());
+        }
+        let previous: Option<crate::board::Board> = previous_json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?;
+
+        let changes = crate::board::changes(previous.as_ref(), current);
+        let mut events = Vec::with_capacity(changes.len());
+        for change in changes {
+            let event = append_event(
+                &tx,
+                project_id,
+                None,
+                change.card_id.clone(),
+                ActivityKind::BoardChanged,
+                ActivityPayload::BoardChanged {
+                    action: change.action,
+                    card_id: change.card_id,
+                    title: change.title,
+                    column: change.column,
+                    from_column: change.from_column,
+                },
+            )?;
+            events.push(event);
+        }
+        tx.execute(
+            "UPDATE board_snapshots SET board_json = ?2 WHERE project_id = ?1",
+            params![project_id, next_json],
+        )?;
+        tx.commit()?;
+        for event in &events {
+            notify(&mut inner, event.clone());
+        }
+        Ok(events)
+    }
+    /// Stop tracking a disabled board. Re-enabling starts with a fresh silent
+    /// baseline, rather than replaying edits made while board capture was off.
+    pub fn forget_board(&self, project_id: i64) -> Result<()> {
+        validate_project(project_id)?;
+        self.inner.lock().connection.execute(
+            "DELETE FROM board_snapshots WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        Ok(())
     }
 }
 
@@ -717,12 +803,25 @@ fn validate_activity(kind: &ActivityKind, payload: &ActivityPayload) -> Result<(
                 bail!("activity message must contain 1..{MAX_TEXT} bytes");
             }
         }
-        ActivityPayload::BoardChanged { action, title, .. } => {
+        ActivityPayload::BoardChanged {
+            action,
+            title,
+            column,
+            from_column,
+            ..
+        } => {
             if action.trim().is_empty() || action.len() > 200 {
                 bail!("board activity action must contain 1..200 bytes");
             }
             if title.as_ref().is_some_and(|value| value.len() > MAX_TEXT) {
                 bail!("board activity title exceeds {MAX_TEXT} bytes");
+            }
+            if column.as_ref().is_some_and(|value| value.len() > MAX_TEXT)
+                || from_column
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_TEXT)
+            {
+                bail!("board activity column exceeds {MAX_TEXT} bytes");
             }
         }
         ActivityPayload::SessionLifecycle { state, detail } => {
@@ -1197,5 +1296,79 @@ mod tests {
             journal.watch(9, snapshot.watermark).unwrap(),
             WatchResult::Ready(_, _)
         ));
+    }
+    fn board(project: &str) -> crate::board::Board {
+        crate::board::parse(project)
+    }
+
+    #[test]
+    fn board_capture_is_silent_at_baseline_idempotent_and_persistent() {
+        let (dir, journal) = journal();
+        let initial = board(
+            "## Backlog\n\
+             - [ ] Ship fix\n\
+                   <!-- radar:card-id:stable-card -->\n\
+             ## Review\n",
+        );
+        assert!(journal
+            .reconcile_board(9, Some(&initial))
+            .unwrap()
+            .is_empty());
+        assert!(journal
+            .reconcile_board(9, Some(&initial))
+            .unwrap()
+            .is_empty());
+        drop(journal);
+
+        let journal = ActivityJournal::open(&dir.path().join("activity.db")).unwrap();
+        let reordered = board(
+            "## Review\n\
+             ## Backlog\n\
+             - [ ] Ship fix\n\
+                   <!-- radar:card-id:stable-card -->\n",
+        );
+        assert!(journal
+            .reconcile_board(9, Some(&reordered))
+            .unwrap()
+            .is_empty());
+
+        let moved = board(
+            "## Review\n\
+             - [ ] Ship fix\n\
+                   <!-- radar:card-id:stable-card -->\n\
+             ## Backlog\n",
+        );
+        let events = journal.reconcile_board(9, Some(&moved)).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].card_id.as_deref(), Some("stable-card"));
+        assert!(matches!(
+            &events[0].payload,
+            ActivityPayload::BoardChanged {
+                action,
+                column,
+                from_column,
+                ..
+            } if action == "moved"
+                && column.as_deref() == Some("Review")
+                && from_column.as_deref() == Some("Backlog")
+        ));
+        assert!(journal.reconcile_board(9, Some(&moved)).unwrap().is_empty());
+
+        let removed = journal.reconcile_board(9, None).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(removed.iter().any(|event| matches!(
+            &event.payload,
+            ActivityPayload::BoardChanged { action, .. } if action == "removed"
+        )));
+        let recreated = journal.reconcile_board(9, Some(&moved)).unwrap();
+        assert!(recreated.iter().any(|event| matches!(
+            &event.payload,
+            ActivityPayload::BoardChanged { action, .. } if action == "board_created"
+        )));
+        assert!(recreated.iter().any(|event| matches!(
+            &event.payload,
+            ActivityPayload::BoardChanged { action, card_id: Some(id), .. }
+                if action == "added" && id == "stable-card"
+        )));
     }
 }

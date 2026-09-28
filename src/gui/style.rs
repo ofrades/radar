@@ -140,6 +140,21 @@ paned > separator:hover {
 .projects-sidebar button.agent-child.agent-active .row-icon {
   color: @radar_accent;
 }
+.projects-sidebar button.agent-claim-link {
+  min-height: 24px;
+  padding: 1px 5px;
+  color: @radar_accent;
+}
+.projects-sidebar button.agent-claim-link:hover,
+.projects-sidebar button.board-open-button:hover {
+  color: @radar_fg;
+  background-color: @radar_accent_soft;
+}
+.projects-sidebar button.board-open-button {
+  min-height: 26px;
+  padding: 1px 6px;
+  color: @radar_muted;
+}
 .projects-sidebar button.agent-toggle {
   min-width: 24px;
   min-height: 24px;
@@ -340,6 +355,12 @@ paned > separator:hover {
 .board-card:hover {
   border-color: alpha(@radar_accent, 0.35);
   background-color: alpha(@radar_fg, 0.09);
+}
+.board-card:focus,
+.board-card.board-card-target {
+  border-color: alpha(@radar_accent, 0.7);
+  background-color: @radar_accent_soft;
+  box-shadow: inset 0 0 0 1px alpha(@radar_accent, 0.2);
 }
 .board-card-done {
   text-decoration: line-through;

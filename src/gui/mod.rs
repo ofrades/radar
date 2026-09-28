@@ -282,6 +282,9 @@ struct App {
     activity_tx: std::sync::mpsc::SyncSender<ActivityNotice>,
     activity_rx: RefCell<std::sync::mpsc::Receiver<ActivityNotice>>,
     board_panes: RefCell<HashMap<i64, std::rc::Weak<board::BoardPane>>>,
+    board_summaries: RefCell<HashMap<i64, board::BoardSummary>>,
+    board_monitors: RefCell<HashMap<i64, gio::FileMonitor>>,
+    notified_attention: RefCell<HashSet<(i64, String)>>,
     /// What each pane's program last said about itself — its name and its own
     /// live title, or its exit — keyed by (project, tab).
     header_info: RefCell<HashMap<(i64, TabKey), String>>,
@@ -508,6 +511,7 @@ struct ProjectRow {
     id: i64,
     row: gtk::ListBoxRow,
     summary: gtk::Label,
+    board_summary: gtk::Label,
     badge: gtk::Label,
     attention_badge: gtk::Label,
     agents: gtk::Box,
@@ -856,9 +860,12 @@ fn build_window(
         activity: RefCell::new(HashMap::new()),
         activity_online: RefCell::new(HashMap::new()),
         activity_watchers: RefCell::new(HashMap::new()),
-        activity_tx,
         activity_rx: RefCell::new(activity_rx),
+        activity_tx,
         board_panes: RefCell::new(HashMap::new()),
+        board_summaries: RefCell::new(HashMap::new()),
+        board_monitors: RefCell::new(HashMap::new()),
+        notified_attention: RefCell::new(HashSet::new()),
         header_info: RefCell::new(HashMap::new()),
         current: RefCell::new(None),
         find_root: RefCell::new(
@@ -1535,6 +1542,7 @@ fn start_activity_drainer(app: &SharedApp) {
         }
         for project_id in &changed_projects {
             app.refresh_activity_pane(*project_id);
+            app.refresh_project_agents(*project_id);
         }
         if !changed_projects.is_empty() {
             app.apply_status_labels();
@@ -1567,6 +1575,19 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         action.connect_activate(move |_, _| handler());
         app.window.add_action(&action);
     };
+    {
+        let action = gio::SimpleAction::new(
+            "open-board",
+            Some(glib::VariantTy::new("x").expect("a project ID")),
+        );
+        let app = app.clone();
+        action.connect_activate(move |_, parameter| {
+            if let Some(project_id) = parameter.and_then(|value| value.get::<i64>()) {
+                app.open_project_board(project_id, None);
+            }
+        });
+        gtk_app.add_action(&action);
+    }
 
     // ---- projects ----
     {
@@ -1878,6 +1899,22 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
                 return;
             };
             app_for_action.open_catalog_session(project_id, &identity);
+        });
+        app.window.add_action(&action);
+    }
+    {
+        let action = gio::SimpleAction::new(
+            "project-board-card",
+            Some(glib::VariantTy::new("(xs)").expect("a project and card ID")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((project_id, card_id)) =
+                parameter.and_then(|value| value.get::<(i64, String)>())
+            else {
+                return;
+            };
+            app_for_action.open_project_board(project_id, Some(&card_id));
         });
         app.window.add_action(&action);
     }
@@ -2573,6 +2610,73 @@ impl App {
         }
     }
 
+    fn reconcile_board_monitors(self: &Rc<Self>, projects: &[Project]) {
+        let wanted: HashSet<i64> = projects.iter().map(|project| project.id).collect();
+        let removed: Vec<i64> = self
+            .board_monitors
+            .borrow()
+            .keys()
+            .filter(|project_id| !wanted.contains(project_id))
+            .copied()
+            .collect();
+        for project_id in removed {
+            self.board_monitors.borrow_mut().remove(&project_id);
+            self.board_summaries.borrow_mut().remove(&project_id);
+        }
+
+        for project in projects {
+            self.refresh_board_summary(project.id);
+            if project.is_missing() || self.board_monitors.borrow().contains_key(&project.id) {
+                continue;
+            }
+            let directory = gio::File::for_path(&project.path);
+            let Ok(monitor) =
+                directory.monitor_directory(gio::FileMonitorFlags::NONE, None::<&gio::Cancellable>)
+            else {
+                continue;
+            };
+            let project_id = project.id;
+            let board_path = crate::board::file_path(&project.path);
+            let temporary_path = project.path.join(crate::board::TEMP_NAME);
+            let app = Rc::downgrade(self);
+            monitor.connect_changed(move |_, file, other_file, _| {
+                let relevant = [file.path(), other_file.and_then(|other| other.path())]
+                    .into_iter()
+                    .flatten()
+                    .any(|path| path == board_path || path == temporary_path);
+                if relevant {
+                    if let Some(app) = app.upgrade() {
+                        app.refresh_board_summary(project_id);
+                    }
+                }
+            });
+            self.board_monitors.borrow_mut().insert(project.id, monitor);
+        }
+    }
+
+    fn refresh_board_summary(&self, project_id: i64) {
+        let project = self
+            .projects
+            .borrow()
+            .iter()
+            .find(|project| project.id == project_id)
+            .cloned();
+        let Some(project) = project else {
+            return;
+        };
+        if project.is_missing() {
+            self.board_summaries.borrow_mut().remove(&project_id);
+        } else if let Ok(board) = crate::board::load(&project.path) {
+            self.board_summaries
+                .borrow_mut()
+                .insert(project_id, board::summarize(&board));
+        } else {
+            self.board_summaries.borrow_mut().remove(&project_id);
+        }
+        self.apply_status_labels();
+        self.refresh_project_agents(project_id);
+    }
+
     fn apply_activity_notice(&self, notice: ActivityNotice) -> i64 {
         let project_id = match notice {
             ActivityNotice::Snapshot {
@@ -2580,20 +2684,109 @@ impl App {
                 snapshot,
                 replace_events,
             } => {
+                let outstanding = snapshot.attention.clone();
+                let outstanding_ids: HashSet<String> = outstanding
+                    .iter()
+                    .map(|attention| attention.id.clone())
+                    .collect();
                 self.activity
                     .borrow_mut()
                     .entry(project_id)
                     .or_insert_with(|| ProjectActivity::empty(project_id))
                     .merge_snapshot(snapshot, replace_events);
+                let resolved: Vec<String> = self
+                    .notified_attention
+                    .borrow()
+                    .iter()
+                    .filter(|(id, request_id)| {
+                        *id == project_id && !outstanding_ids.contains(request_id)
+                    })
+                    .map(|(_, request_id)| request_id.clone())
+                    .collect();
+                for request_id in resolved {
+                    self.withdraw_attention_notification(project_id, &request_id);
+                }
+                for attention in outstanding {
+                    if attention.seen_at_millis.is_some()
+                        || attention.acknowledged_at_millis.is_some()
+                        || !attention.is_unresolved()
+                    {
+                        continue;
+                    }
+                    self.notify_attention(
+                        project_id,
+                        attention.id,
+                        attention.kind,
+                        attention.reason,
+                    );
+                }
                 project_id
             }
             ActivityNotice::Event(event) => {
                 let project_id = event.project_id;
+                let request = match &event.payload {
+                    crate::session::activity::ActivityPayload::AttentionRequested {
+                        request_id,
+                        attention_kind,
+                        reason,
+                        ..
+                    } => {
+                        let already_outstanding =
+                            self.activity
+                                .borrow()
+                                .get(&project_id)
+                                .is_some_and(|activity| {
+                                    activity.snapshot.attention.iter().any(|attention| {
+                                        attention.id.as_str() == request_id.as_str()
+                                    })
+                                });
+                        (!already_outstanding
+                            && !self
+                                .notified_attention
+                                .borrow()
+                                .contains(&(project_id, request_id.clone())))
+                        .then(|| (request_id.clone(), *attention_kind, reason.clone()))
+                    }
+                    _ => None,
+                };
+                let resolved_request = match &event.payload {
+                    crate::session::activity::ActivityPayload::AttentionResolved {
+                        request_id,
+                        ..
+                    } => Some(request_id.clone()),
+                    _ => None,
+                };
+                let board_changed = matches!(
+                    &event.payload,
+                    crate::session::activity::ActivityPayload::BoardChanged { .. }
+                );
                 self.activity
                     .borrow_mut()
                     .entry(project_id)
                     .or_insert_with(|| ProjectActivity::empty(project_id))
                     .apply_event(event);
+                if let Some((request_id, kind, reason)) = request {
+                    let outstanding =
+                        self.activity
+                            .borrow()
+                            .get(&project_id)
+                            .is_some_and(|activity| {
+                                activity
+                                    .snapshot
+                                    .attention
+                                    .iter()
+                                    .any(|attention| attention.id.as_str() == request_id.as_str())
+                            });
+                    if outstanding {
+                        self.notify_attention(project_id, request_id, kind, reason);
+                    }
+                }
+                if let Some(request_id) = resolved_request {
+                    self.withdraw_attention_notification(project_id, &request_id);
+                }
+                if board_changed {
+                    self.refresh_board_summary(project_id);
+                }
                 project_id
             }
             ActivityNotice::Connection { project_id, online } => {
@@ -2609,6 +2802,22 @@ impl App {
                     Ok(result) => {
                         let result = *result;
                         let attention = result.attention;
+                        let resolved_request_id = result
+                            .event
+                            .as_ref()
+                            .and_then(|event| match &event.payload {
+                                crate::session::activity::ActivityPayload::AttentionResolved {
+                                    request_id,
+                                    ..
+                                } => Some(request_id.clone()),
+                                _ => None,
+                            })
+                            .or_else(|| {
+                                attention
+                                    .resolved_at_millis
+                                    .is_some()
+                                    .then(|| attention.id.clone())
+                            });
                         let mut activity = self.activity.borrow_mut();
                         let project = activity
                             .entry(project_id)
@@ -2618,6 +2827,9 @@ impl App {
                         }
                         project.upsert_attention(attention.clone());
                         drop(activity);
+                        if let Some(request_id) = resolved_request_id {
+                            self.withdraw_attention_notification(project_id, &request_id);
+                        }
                         if let Some(pane) = self
                             .board_panes
                             .borrow()
@@ -2673,12 +2885,68 @@ impl App {
         }
     }
 
+    fn notify_attention(
+        &self,
+        project_id: i64,
+        request_id: String,
+        kind: crate::session::activity::AttentionKind,
+        reason: String,
+    ) {
+        if !self
+            .notified_attention
+            .borrow_mut()
+            .insert((project_id, request_id.clone()))
+        {
+            return;
+        }
+        let Some(application) = self.window.application() else {
+            return;
+        };
+        let project = self
+            .projects
+            .borrow()
+            .iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.name.clone())
+            .unwrap_or_else(|| "Project".to_string());
+        let kind = match kind {
+            crate::session::activity::AttentionKind::Question => "Question",
+            crate::session::activity::AttentionKind::Approval => "Approval",
+            crate::session::activity::AttentionKind::Failure => "Failure",
+            crate::session::activity::AttentionKind::Review => "Review",
+        };
+        let notification = gio::Notification::new(&format!("{kind} · {project}"));
+        notification.set_body(Some(&reason));
+        notification.set_priority(gio::NotificationPriority::High);
+        let target = project_id.to_variant();
+        notification.set_default_action_and_target_value("app.open-board", Some(&target));
+        notification.add_button_with_target_value("Open Board", "app.open-board", Some(&target));
+        application.send_notification(
+            Some(&format!("attention-{project_id}-{request_id}")),
+            &notification,
+        );
+    }
+
+    fn withdraw_attention_notification(&self, project_id: i64, request_id: &str) {
+        if !self
+            .notified_attention
+            .borrow()
+            .contains(&(project_id, request_id.to_string()))
+        {
+            return;
+        }
+        if let Some(application) = self.window.application() {
+            application.withdraw_notification(&format!("attention-{project_id}-{request_id}"));
+        }
+    }
+
     fn refresh_projects(app: &SharedApp) {
         let projects = app.db.projects().unwrap_or_default();
         let selected = *app.current.borrow();
         *app.projects.borrow_mut() = projects.clone();
         app.request_agent_scan();
         app.reconcile_activity_watchers(&projects);
+        app.reconcile_board_monitors(&projects);
 
         while let Some(child) = app.sidebar_list.first_child() {
             app.sidebar_list.remove(&child);
@@ -2790,7 +3058,22 @@ impl App {
         summary.add_css_class("dim-label");
         summary.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         texts.append(&summary);
+        let board_summary = gtk::Label::new(None);
+        board_summary.set_xalign(0.0);
+        board_summary.add_css_class("caption");
+        board_summary.add_css_class("dim-label");
+        board_summary.set_wrap(true);
+        board_summary.set_lines(2);
+        board_summary.set_max_width_chars(36);
+        texts.append(&board_summary);
         box_.append(&texts);
+        let board_button = gtk::Button::with_label("Board");
+        board_button.add_css_class("flat");
+        board_button.add_css_class("board-open-button");
+        board_button.set_tooltip_text(Some("Open this project's board"));
+        board_button.set_action_name(Some("app.open-board"));
+        board_button.set_action_target_value(Some(&project.id.to_variant()));
+        box_.append(&board_button);
 
         let badge = gtk::Label::new(None);
         badge.add_css_class("badge");
@@ -2958,12 +3241,23 @@ impl App {
             (None, _) => "…".to_string(),
         };
         summary.set_text(&format!("{text}  ·  {parent}"));
+        if let Some(stats) = self.board_summaries.borrow().get(&project.id) {
+            let text = format!(
+                "Board · {}/{} done · {} claimed · {} active · {} review",
+                stats.done, stats.total, stats.claimed, stats.in_progress, stats.review
+            );
+            board_summary.set_text(&text);
+            board_summary.set_tooltip_text(Some(&text));
+        } else {
+            board_summary.set_text("Board activity unavailable");
+        }
         badge.set_tooltip_text(Some("Active embedded tools in this project"));
         attention_badge.set_tooltip_text(Some("Unresolved requests for human attention"));
         ProjectRow {
             id: project.id,
             row,
             summary,
+            board_summary,
             badge,
             attention_badge,
             agents,
@@ -2985,6 +3279,7 @@ impl App {
             }
         }
         self.sync_toggles();
+        self.refresh_board_summary(id);
     }
 
     fn populate_project_agents(
@@ -3044,17 +3339,37 @@ impl App {
                 .as_ref()
                 .map(|program| program.name.clone())
                 .unwrap_or_else(|| session.program_id.clone());
-            let state = if session.external.is_some() {
+            let lifecycle = if session.external.is_some() {
                 "external terminal"
             } else if session.running {
                 "running"
             } else {
                 "ended"
             };
-            let subtitle = format!(
-                "{program_name} · {} · {state}",
-                relative_time(session.last_activity_at)
-            );
+            let (activity_text, activity_message) = if let Some((state, at_millis, message)) =
+                self.latest_agent_activity(project_id, session)
+            {
+                let state = match state {
+                    crate::session::activity::AgentState::Unknown => "Unknown",
+                    crate::session::activity::AgentState::Working => "Working",
+                    crate::session::activity::AgentState::WaitingForInput => "Waiting for input",
+                    crate::session::activity::AgentState::WaitingForApproval => {
+                        "Waiting for approval"
+                    }
+                    crate::session::activity::AgentState::Idle => "Idle",
+                };
+                (format!("{state} · {}", relative_time(at_millis)), message)
+            } else {
+                ("Activity unknown".to_string(), None)
+            };
+            let attention_count = self.session_attention_count(project_id, session);
+            let request_text = match attention_count {
+                0 => String::new(),
+                1 => " · 1 request".to_string(),
+                count => format!(" · {count} requests"),
+            };
+            let subtitle = format!("{program_name} · {lifecycle} · {activity_text}{request_text}");
+            let linked_claims = self.claims_for_session(project_id, session);
 
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
             let button = gtk::Button::new();
@@ -3096,6 +3411,7 @@ impl App {
             detail.add_css_class("dim-label");
             detail.set_single_line_mode(true);
             detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            detail.set_tooltip_text(activity_message.as_deref());
             texts.append(&label);
             texts.append(&detail);
             content.append(&icon);
@@ -3141,6 +3457,21 @@ impl App {
                 row.append(&archive);
             }
             container.append(&row);
+            for claim in linked_claims {
+                let claim_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                claim_row.set_margin_start(24);
+                let open_card = gtk::Button::with_label(&format!("Board · {}", claim.title));
+                open_card.add_css_class("flat");
+                open_card.add_css_class("agent-claim-link");
+                open_card.set_halign(gtk::Align::Fill);
+                open_card.set_hexpand(true);
+                open_card.set_tooltip_text(Some("Open this claimed board card"));
+                open_card.set_action_name(Some("win.project-board-card"));
+                open_card
+                    .set_action_target_value(Some(&(project_id, claim.id.as_str()).to_variant()));
+                claim_row.append(&open_card);
+                container.append(&claim_row);
+            }
         }
 
         if sessions.is_empty() {
@@ -3219,6 +3550,95 @@ impl App {
         }
     }
 
+    fn activity_identity(session: &live_agents::AgentSession) -> Option<&str> {
+        session
+            .radar_session_id
+            .as_deref()
+            .or_else(|| parse_stable_session_id(&session.id).map(|_| session.id.as_str()))
+    }
+
+    fn latest_agent_activity(
+        &self,
+        project_id: i64,
+        session: &live_agents::AgentSession,
+    ) -> Option<(crate::session::activity::AgentState, i64, Option<String>)> {
+        let identity = Self::activity_identity(session)?;
+        self.activity
+            .borrow()
+            .get(&project_id)?
+            .snapshot
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| {
+                if event.session_id.as_deref() != Some(identity) {
+                    return None;
+                }
+                match &event.payload {
+                    crate::session::activity::ActivityPayload::AgentState { state, message } => {
+                        Some((*state, event.at_millis, message.clone()))
+                    }
+                    _ => None,
+                }
+            })
+    }
+
+    fn session_attention_count(
+        &self,
+        project_id: i64,
+        session: &live_agents::AgentSession,
+    ) -> usize {
+        let Some(identity) = Self::activity_identity(session) else {
+            return 0;
+        };
+        self.activity
+            .borrow()
+            .get(&project_id)
+            .map_or(0, |activity| {
+                activity
+                    .snapshot
+                    .attention
+                    .iter()
+                    .filter(|attention| attention.session_id.as_deref() == Some(identity))
+                    .count()
+            })
+    }
+
+    fn claims_for_session(
+        &self,
+        project_id: i64,
+        session: &live_agents::AgentSession,
+    ) -> Vec<board::ClaimedWork> {
+        self.board_summaries
+            .borrow()
+            .get(&project_id)
+            .map(|summary| {
+                summary
+                    .claims
+                    .iter()
+                    .filter(|claim| {
+                        if session.claim_id.as_deref() == Some(claim.claim.as_str()) {
+                            return true;
+                        }
+                        let Some(provider_session_id) = session.provider_session_id.as_deref()
+                        else {
+                            return false;
+                        };
+                        self.db
+                            .bound_session(project_id, &claim.claim)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|(program_id, bound_session_id)| {
+                                session.program_id.as_str() == program_id.as_str()
+                                    && provider_session_id == bound_session_id.as_str()
+                            })
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn set_project_expanded(&self, project_id: i64, expanded: bool) {
         let toggle = self
             .rows
@@ -3241,6 +3661,7 @@ impl App {
         let activity = self.activity.borrow();
         let statuses = self.status.borrow();
         let workspaces = self.workspaces.borrow();
+        let board_summaries = self.board_summaries.borrow();
         for row in rows.iter() {
             let Some(project) = projects.iter().find(|project| project.id == row.id) else {
                 continue;
@@ -3257,6 +3678,9 @@ impl App {
             row.attention_badge.set_visible(attention_count > 0);
             if project.is_missing() {
                 row.summary.set_text(&format!("missing  ·  {parent}"));
+                row.board_summary.set_text("Board activity unavailable");
+                row.board_summary
+                    .set_tooltip_text(Some("Board activity unavailable"));
                 row.badge.set_visible(false);
                 continue;
             }
@@ -3266,6 +3690,18 @@ impl App {
                         .set_text(&format!("{}  ·  {parent}", status.summary()));
                 }
                 None => row.summary.set_text(&format!("…  ·  {parent}")),
+            }
+            if let Some(stats) = board_summaries.get(&row.id) {
+                let text = format!(
+                    "Board · {}/{} done · {} claimed · {} active · {} review",
+                    stats.done, stats.total, stats.claimed, stats.in_progress, stats.review
+                );
+                row.board_summary.set_text(&text);
+                row.board_summary.set_tooltip_text(Some(&text));
+            } else {
+                row.board_summary.set_text("Board activity unavailable");
+                row.board_summary
+                    .set_tooltip_text(Some("Board activity unavailable"));
             }
             let count = workspaces.get(&row.id).map_or(0, |workspace| {
                 workspace
@@ -3471,6 +3907,50 @@ impl App {
         self.refresh_menus();
         self.select_row_for(id);
         self.set_project_expanded(id, true);
+    }
+    fn open_project_board(&self, project_id: i64, card_id: Option<&str>) {
+        if !self
+            .projects
+            .borrow()
+            .iter()
+            .any(|project| project.id == project_id)
+        {
+            self.toast("That project is no longer available");
+            return;
+        }
+        self.select_project(project_id);
+        let project = self
+            .projects
+            .borrow()
+            .iter()
+            .find(|project| project.id == project_id)
+            .cloned();
+        let Some(project) = project else {
+            return;
+        };
+        if !crate::board::enabled(&self.db, &project.path).unwrap_or(true) {
+            self.toast("Board is disabled for this project");
+            self.window.present();
+            return;
+        }
+        let Some(workspace) = self.workspaces.borrow().get(&project_id).cloned() else {
+            return;
+        };
+        let key = TabKey::first(Slot::Board);
+        self.show_primitive(&workspace, key);
+        self.activate_primitive(&workspace, key);
+        self.window.present();
+        if let Some(card_id) = card_id {
+            let focused = self
+                .board_panes
+                .borrow()
+                .get(&project_id)
+                .and_then(std::rc::Weak::upgrade)
+                .is_some_and(|pane| pane.focus_card(card_id));
+            if !focused {
+                self.toast("That card is no longer on the board");
+            }
+        }
     }
 
     fn workspace_for(&self, project: &Project) -> Rc<Workspace> {
@@ -4194,100 +4674,91 @@ impl App {
         self.activate_primitive(workspace, key);
     }
 
-    /// The board's @claim links: the named agent's session, opened in THE
-    /// agent panel. The exact match is the tab whose program carries the
-    /// claim as its own `RADAR_AGENT`, read from /proc — two tabs running
-    /// the same program are told apart by their stamps. When that cannot
-    /// be read, the claim's leading program (`program-stamp`) still picks
-    /// a tab, and any agent tab takes the rest: an agent radar did not
-    /// launch works in the agent panel all the same. A program that has
-    /// exited — or a tab not yet opened — runs again, resuming the
-    /// project's last conversation with the agent's own resume flags.
+    /// Open the session bound to this exact board claim. If neither a live
+    /// process stamp nor a stored provider conversation identifies it, leave
+    /// the current agent untouched rather than guessing from its program.
     fn open_agent_session(&self, workspace: &Rc<Workspace>, claim: &str) {
-        let wanted = claim.rsplit_once('-').map(|(program, _)| program);
-        let mut candidates: Vec<(TabKey, bool, bool)> = workspace
-            .tabs
+        let project_id = workspace.project.id;
+        let exact_tab = workspace.tabs_of_kind(Slot::Agent).into_iter().find(|key| {
+            workspace
+                .tab(*key)
+                .and_then(|primitive| primitive.pane.as_ref().and_then(|pane| pane.session_pid()))
+                .and_then(programs::launch::radar_agent_of)
+                .is_some_and(|agent| agent == claim)
+        });
+        if let Some(key) = exact_tab {
+            self.show_agent_session(workspace, key);
+            return;
+        }
+        let sessions = self
+            .agent_sessions
             .borrow()
-            .keys()
-            .filter(|key| key.slot == Slot::Agent)
-            .map(|key| {
-                let primitive = workspace.tab(*key);
-                let exact = primitive
-                    .as_ref()
-                    .and_then(|p| p.pane.as_ref())
-                    .and_then(|pane| pane.session_pid())
-                    .and_then(programs::launch::radar_agent_of)
-                    .is_some_and(|agent| agent == claim);
-                let program = primitive
-                    .as_ref()
-                    .is_some_and(|p| Some(p.program_id.as_str()) == wanted);
-                (*key, exact, program)
-            })
-            .collect();
-        // Best first: the exact claim, then the claim's program, then the
-        // first agent tab of the kind.
-        candidates.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
-        if let Some((key, true, _)) = candidates.first() {
-            // The claimed conversation is this one, running: never
-            // disturb a live agent that already is what was asked for.
-            self.show_agent_session(workspace, *key);
-            return;
-        }
-        // The stored binding: what the claim's agent ran last, and the
-        // conversation it had — captured when its program exited.
-        if let Ok(Some((program_id, session_id))) =
-            self.db.bound_session(workspace.project.id, claim)
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(session) = sessions
+            .iter()
+            .find(|session| session.claim_id.as_deref() == Some(claim))
         {
-            let bound = workspace
-                .tabs
-                .borrow()
-                .keys()
-                .filter(|key| key.slot == Slot::Agent)
-                .copied()
-                .find(|key| {
-                    workspace
-                        .tab(*key)
-                        .is_some_and(|p| p.program_id == program_id)
-                });
-            let key = bound.unwrap_or_else(|| workspace.resolve_tab(TabKey::first(Slot::Agent)));
-            if bound.is_none() {
-                // No tab of that program: open one on that conversation.
-                if self
-                    .ensure_primitive(
-                        workspace,
-                        key,
-                        Some(&program_id),
-                        Resume::Session(session_id),
-                    )
-                    .is_some()
-                {
-                    self.show_agent_session(workspace, key);
-                } else {
-                    self.toast("No agent installed — set one in Preferences");
-                }
-                return;
-            }
-            self.relaunch_agent(workspace, key, Resume::Session(session_id));
+            self.open_catalog_session(project_id, &session.id);
             return;
         }
-        // No binding: the claim's program, then any agent tab, then a new
-        // one — each reopened on the project's last conversation.
-        let key = candidates
-            .first()
-            .map(|(key, ..)| *key)
-            .unwrap_or_else(|| workspace.resolve_tab(TabKey::first(Slot::Agent)));
-        match workspace.tab(key) {
-            Some(_) => self.relaunch_agent(workspace, key, Resume::Last),
-            None => {
-                if self
-                    .ensure_primitive(workspace, key, None, Resume::Last)
-                    .is_some()
-                {
-                    self.show_agent_session(workspace, key);
-                } else {
-                    self.toast("No agent installed — set one in Preferences");
-                }
+
+        let Ok(Some((program_id, provider_session_id))) = self.db.bound_session(project_id, claim)
+        else {
+            self.toast(&format!("No exact session link for @{claim}"));
+            return;
+        };
+        if let Some(session) = sessions.iter().find(|session| {
+            session.program_id.as_str() == program_id.as_str()
+                && session.provider_session_id.as_deref() == Some(provider_session_id.as_str())
+        }) {
+            self.open_catalog_session(project_id, &session.id);
+            return;
+        }
+        let Some(program) = programs::by_id(&program_id) else {
+            self.toast("The claimed session's agent is not installed");
+            return;
+        };
+        if program.resume_session.is_empty() {
+            self.toast("This agent cannot reopen the exact claimed conversation");
+            return;
+        }
+
+        let key = workspace.tabs_of_kind(Slot::Agent).into_iter().find(|key| {
+            workspace.tab(*key).is_some_and(|primitive| {
+                primitive.program_id.as_str() == program_id.as_str()
+                    && primitive.launched_session.borrow().as_deref()
+                        == Some(provider_session_id.as_str())
+            })
+        });
+        if let Some(key) = key {
+            let on_conversation = workspace.tab(key).is_some_and(|primitive| {
+                primitive.pane.as_ref().is_some_and(|pane| pane.is_live())
+                    && primitive.launched_session.borrow().as_deref()
+                        == Some(provider_session_id.as_str())
+            });
+            if on_conversation {
+                self.show_agent_session(workspace, key);
+            } else {
+                self.relaunch_agent(workspace, key, Resume::Session(provider_session_id));
             }
+            return;
+        }
+
+        let key = workspace.next_key(Slot::Agent);
+        if self
+            .ensure_primitive(
+                workspace,
+                key,
+                Some(&program_id),
+                Resume::Session(provider_session_id),
+            )
+            .is_some()
+        {
+            self.show_agent_session(workspace, key);
+        } else {
+            self.toast("No agent installed — set one in Preferences");
         }
     }
 

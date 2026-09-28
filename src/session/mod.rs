@@ -56,6 +56,7 @@ use anyhow::{anyhow, bail, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 pub mod activity;
+pub(super) mod board_monitor;
 pub mod catalog;
 #[cfg(feature = "vte")]
 pub mod client;

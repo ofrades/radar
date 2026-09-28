@@ -25,6 +25,75 @@ let socketGeneration = 0;
 let applyingRemoteResize = false;
 let latestAttentionSnapshot = null;
 const answerDrafts = new Map();
+const projectProgress = new Map();
+const pendingResponses = new Set();
+let refreshInFlight = null;
+const noticedAttention = new Set();
+const initializedAttention = new Set();
+
+function updateAttentionShortcut() {
+  let count = 0;
+  for (const project of projects) {
+    const snapshot = projectProgress.get(project.id)?.snapshot;
+    if (!snapshot) continue;
+    const unresolved = snapshot.attention.filter((item) => item.resolved_at_millis == null);
+    count += unresolved.length;
+    const fresh = unresolved.filter((item) => !noticedAttention.has(item.id) && item.seen_at_millis == null);
+    if (initializedAttention.has(project.id) && fresh.length) {
+      showToast(`${project.name}: ${fresh.length} new request${fresh.length === 1 ? "" : "s"} need your attention`);
+    }
+    for (const item of unresolved) noticedAttention.add(item.id);
+    initializedAttention.add(project.id);
+  }
+  for (const selector of ["#attention-shortcut", "#terminal-attention-shortcut"]) {
+    const button = $(selector);
+    button.classList.toggle("hidden", count === 0);
+    button.textContent = `${count} need you`;
+    button.setAttribute("aria-label", `${count} unresolved requests. Open project attention.`);
+  }
+}
+
+async function openAttention() {
+  const project = projects.find((item) => projectProgress.get(item.id)?.snapshot?.attention.some((request) => request.resolved_at_millis == null));
+  if (!project) return;
+  selectedProject = project;
+  expandedProjects.add(project.id);
+  const url = new URL(document.baseURI);
+  url.searchParams.set("project", String(project.id));
+  history.replaceState(null, "", url);
+  if (!terminalView.classList.contains("hidden")) detach();
+  await loadProjectData();
+  $("#attention-section").scrollIntoView({ block: "start" });
+  $("#attention-list button, #attention-list textarea")?.focus({ preventScroll: true });
+}
+
+function boardProgress(board) {
+  const columns = board?.columns || [];
+  const total = columns.reduce((sum, column) => sum + column.cards.length, 0);
+  const count = (name) => columns.filter((column) => column.name.trim().toLowerCase() === name)
+    .reduce((sum, column) => sum + column.cards.length, 0);
+  return { total, done: count("done"), active: count("in progress"), review: count("review") };
+}
+
+function agentProgress(projectId, session) {
+  const snapshot = projectProgress.get(projectId)?.snapshot;
+  const waiting = snapshot?.attention?.filter((item) =>
+    item.session_id === session.id && item.resolved_at_millis == null) || [];
+  if (waiting.length) return `${waiting.length} awaiting response`;
+  if (session.state !== "running") return session.state;
+  const event = snapshot?.events?.findLast((item) =>
+    item.session_id === session.id && item.kind === "agent_state_changed");
+  return event ? `${event.payload.data.state.replaceAll("_", " ")} · ${relativeTime(event.at_millis)}` : "Activity unknown";
+}
+
+function agentWork(projectId, session) {
+  if (!session.claim) return "";
+  const columns = projectProgress.get(projectId)?.board?.columns || [];
+  return columns.flatMap((column) => {
+    const count = column.cards.filter((card) => card.claimed_by === session.claim).length;
+    return count ? [`${count} ${column.name.toLowerCase()}`] : [];
+  }).join(" · ");
+}
 
 async function request(path, options = {}) {
   const url = new URL(path.replace(/^\/+/, ""), document.baseURI);
@@ -56,6 +125,7 @@ function showToast(message) {
 }
 
 function renderProjects(focusProjectId = null) {
+  const focused = projectList.contains(document.activeElement) ? { ...document.activeElement.dataset } : null;
   projectList.replaceChildren();
   $("#project-count").textContent = String(projects.length);
 
@@ -95,6 +165,19 @@ function renderProjects(focusProjectId = null) {
     path.textContent = project.path;
     copy.append(name, path);
     button.append(symbol, copy);
+    const progress = projectProgress.get(project.id);
+    const summary = document.createElement("span");
+    summary.className = "project-progress";
+    if (progress?.snapshot) {
+      const { total, done, active, review } = boardProgress(progress.board);
+      const waiting = progress.snapshot.attention.filter((item) => item.resolved_at_millis == null).length;
+      summary.textContent = `${progress.stale ? "Offline · " : ""}${progress.board ? `${done}/${total} done${active ? ` · ${active} in progress` : ""}${review ? ` · ${review} review` : ""}` : "No board"}${waiting ? ` · ${waiting} need you` : ""}`;
+      summary.classList.toggle("needs-attention", waiting > 0);
+      button.title += `\n${summary.textContent}`;
+    } else {
+      summary.textContent = progress?.stale ? "Progress unavailable" : "Loading progress…";
+    }
+    copy.append(summary);
 
     const toggle = document.createElement("button");
     toggle.type = "button";
@@ -117,14 +200,28 @@ function renderProjects(focusProjectId = null) {
           agentButton.className = "project-agent";
           agentButton.dataset.sessionId = agent.id;
           agentButton.dataset.agentProjectId = projectId;
-          agentButton.title = `Open session: ${agent.title || agent.program || agent.label}`;
+          agentButton.disabled = agent.attachable === false;
+          agentButton.title = agentButton.disabled ? "Ended conversation — reopen from Radar desktop" : `Open session: ${agent.title || agent.program || agent.label}`;
           const status = document.createElement("span");
           status.className = `project-agent-status ${agent.state}`;
           status.setAttribute("aria-hidden", "true");
           const label = document.createElement("span");
           label.className = "project-agent-name";
           label.textContent = agent.title || agent.program || agent.label;
-          agentButton.append(status, label);
+          const agentCopy = document.createElement("span");
+          agentCopy.className = "project-agent-copy";
+          const progressLabel = document.createElement("span");
+          progressLabel.className = "project-agent-progress";
+          progressLabel.textContent = agentProgress(project.id, agent);
+          agentCopy.append(label, progressLabel);
+          const work = agentWork(project.id, agent);
+          if (work) {
+            const workLabel = document.createElement("span");
+            workLabel.className = "project-agent-progress";
+            workLabel.textContent = work;
+            agentCopy.append(workLabel);
+          }
+          agentButton.append(status, agentCopy);
           agentList.append(agentButton);
         }
       } else {
@@ -147,6 +244,10 @@ function renderProjects(focusProjectId = null) {
 
   if (focusProjectId !== null) {
     projectList.querySelector(`[data-project-id="${focusProjectId}"]`)?.focus({ preventScroll: true });
+  } else if (focused) {
+    const key = focused.sessionId ? "sessionId" : focused.toggleProjectId ? "toggleProjectId" : "projectId";
+    [...projectList.querySelectorAll("button")].find((button) =>
+      button.dataset[key] === focused[key] && (key !== "sessionId" || button.dataset.agentProjectId === focused.agentProjectId))?.focus({ preventScroll: true });
   }
 }
 
@@ -159,7 +260,6 @@ async function loadProjects() {
   const preferred = new URLSearchParams(location.search).get("project");
   selectedProject = projects.find((project) => String(project.id) === preferred) || projects[0] || null;
   if (selectedProject) expandedProjects.add(selectedProject.id);
-  await refreshProjectSessions();
   renderProjects();
 
   if (!projects.length) {
@@ -168,6 +268,7 @@ async function loadProjects() {
     renderSessions([]);
     renderActivity(null);
     renderAttention(null);
+    renderBoard(null);
     $("#new-shell-button").disabled = true;
     return;
   }
@@ -176,35 +277,88 @@ async function loadProjects() {
 }
 
 async function refreshProjectSessions() {
-  const results = await Promise.all(projects.map(async (project) => [
-    project.id,
-    await request(`/api/projects/${project.id}/sessions`),
-  ]));
-  projectSessions = new Map(results);
-  renderProjects();
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = (async () => {
+    const results = await Promise.all(projects.map(async (project) => {
+      try {
+        const [sessions, snapshot, board] = await Promise.all([
+          request(`/api/projects/${project.id}/sessions`),
+          request(`/api/projects/${project.id}/activity`),
+          request(`/api/projects/${project.id}/board`),
+        ]);
+        projectSessions.set(project.id, sessions);
+        projectProgress.set(project.id, { snapshot, board, stale: false });
+        return true;
+      } catch (error) {
+        const progress = projectProgress.get(project.id);
+        if (progress) progress.stale = true;
+        else projectProgress.set(project.id, { stale: true });
+        if (selectedProject?.id === project.id) showError(`Progress unavailable: ${error.message}`);
+        return false;
+      }
+    }));
+    const online = results.every(Boolean);
+    serverState.classList.toggle("online", online);
+    serverState.setAttribute("aria-label", online ? "Progress up to date" : "Progress unavailable — retrying");
+    if (online) clearError();
+    updateAttentionShortcut();
+    renderProjects();
+  })().finally(() => { refreshInFlight = null; });
+  return refreshInFlight;
 }
-
 
 async function loadProjectData() {
   const project = selectedProject;
   if (!project) return;
   $("#project-title").textContent = project.name;
   $("#project-path").textContent = project.path;
-  try {
-    const [sessions, snapshot] = await Promise.all([
-      request(`/api/projects/${project.id}/sessions`),
-      request(`/api/projects/${project.id}/activity`),
-    ]);
-    if (selectedProject?.id !== project.id) return;
-    projectSessions.set(project.id, sessions);
-    renderProjects();
-    renderSessions(sessions);
-    renderAttention(snapshot);
-    renderActivity(snapshot);
-  } catch (error) {
-    if (selectedProject?.id !== project.id) return;
-    showError(error.message);
+  await refreshProjectSessions();
+  if (selectedProject?.id !== project.id) return;
+  const progress = projectProgress.get(project.id);
+  renderSessions(projectSessions.get(project.id) || []);
+  renderAttention(progress?.snapshot);
+  renderActivity(progress?.snapshot);
+  renderBoard(progress?.board);
+}
+
+function renderBoard(board) {
+  const list = $("#board-columns");
+  const scrollTop = list.scrollTop;
+  list.replaceChildren();
+  const { total, done } = boardProgress(board);
+  $("#board-summary").textContent = board ? `${done} of ${total} done` : "No board";
+  $("#board-empty").classList.toggle("hidden", total > 0);
+  $("#board-empty").textContent = board ? "No cards yet. Add work from Radar desktop or the CLI." : "This project has no enabled board.";
+  for (const column of board?.columns || []) {
+    const section = document.createElement("section");
+    section.className = "board-column";
+    const heading = document.createElement("h3");
+    heading.textContent = `${column.name} · ${column.cards.length}`;
+    section.append(heading);
+    for (const card of column.cards) {
+      const item = document.createElement("div");
+      item.className = "board-card";
+      const title = document.createElement("span");
+      title.textContent = card.title;
+      item.append(title);
+      if (card.claimed_by) {
+        const matches = (projectSessions.get(selectedProject.id) || []).filter((session) =>
+          session.claim === card.claimed_by && session.attachable !== false);
+        const claim = document.createElement(matches.length === 1 ? "button" : "small");
+        claim.textContent = `@${card.claimed_by}`;
+        if (matches.length === 1) {
+          claim.type = "button";
+          claim.className = "board-claim";
+          claim.title = "Open this agent’s session";
+          claim.addEventListener("click", () => attach(matches[0]));
+        }
+        item.append(claim);
+      }
+      section.append(item);
+    }
+    list.append(section);
   }
+  list.scrollTop = scrollTop;
 }
 
 function renderSessions(items) {
@@ -288,6 +442,8 @@ function renderAttention(snapshot) {
     const card = document.createElement("article");
     card.className = "attention-card";
     const title = document.createElement("h3");
+    card.dataset.attentionId = item.id;
+    card.setAttribute("aria-busy", String(pendingResponses.has(item.id)));
     title.textContent = item.reason;
     const meta = document.createElement("div");
     meta.className = "attention-meta";
@@ -327,17 +483,25 @@ function renderAttention(snapshot) {
       actions.append(button);
     }
     card.append(title, meta, actions);
+    if (pendingResponses.has(item.id)) {
+      for (const control of card.querySelectorAll("button, textarea")) control.disabled = true;
+      meta.textContent = "Sending response…";
+    }
     list.append(card);
   }
 }
 
 async function resolveAttention(item, action, answer) {
+  if (pendingResponses.has(item.id)) return;
+  const projectId = item.project_id;
+  pendingResponses.add(item.id);
   const focused = document.activeElement;
   if (focused && $("#attention-list").contains(focused)) focused.blur();
+  renderAttention(latestAttentionSnapshot);
   try {
     const payload = { revision: item.revision, action };
     if (answer !== undefined) payload.answer = answer;
-    await request(`/api/projects/${selectedProject.id}/attention/${encodeURIComponent(item.id)}`, {
+    await request(`/api/projects/${projectId}/attention/${encodeURIComponent(item.id)}`, {
       method: "POST",
       body: JSON.stringify(payload),
     });
@@ -346,6 +510,9 @@ async function resolveAttention(item, action, answer) {
     await loadProjectData();
   } catch (error) {
     showToast(error.message);
+  } finally {
+    pendingResponses.delete(item.id);
+    if (selectedProject?.id === projectId) await loadProjectData();
   }
 }
 
@@ -358,7 +525,13 @@ function eventText(event) {
     case "attention_requested": return `Needs attention · ${payload.reason || "Agent request"}`;
     case "attention_resolved": return `Request resolved · ${payload.request_id || ""}`;
     case "session_lifecycle": return `Session ${payload.state || "updated"}${payload.detail ? ` · ${payload.detail}` : ""}`;
-    case "board_changed": return `Board updated${payload.title ? ` · ${payload.title}` : ""}`;
+    case "board_changed": {
+      const action = (payload.action || "board updated").replaceAll("_", " ");
+      const transition = payload.from_column && payload.column
+        ? ` · ${payload.from_column} → ${payload.column}`
+        : payload.column ? ` · ${payload.column}` : "";
+      return `${action[0].toUpperCase()}${action.slice(1)}${payload.title ? ` · ${payload.title}` : ""}${transition}`;
+    }
     case "command_result": return payload.detail || "Command completed";
     default: return event.kind.replaceAll("_", " ");
   }
@@ -671,9 +844,18 @@ async function createShell() {
 projectList.addEventListener("click", (event) => {
   const agentButton = event.target.closest("[data-session-id]");
   if (agentButton) {
-    const sessions = projectSessions.get(Number(agentButton.dataset.agentProjectId)) || [];
+    const projectId = Number(agentButton.dataset.agentProjectId);
+    const sessions = projectSessions.get(projectId) || [];
     const session = sessions.find((item) => item.id === agentButton.dataset.sessionId);
-    if (session) attach(session);
+    const project = projects.find((item) => item.id === projectId);
+    if (session && session.attachable !== false && project) {
+      selectedProject = project;
+      const url = new URL(document.baseURI);
+      url.searchParams.set("project", String(projectId));
+      history.replaceState(null, "", url);
+      renderProjects();
+      attach(session);
+    }
     return;
   }
 
@@ -712,6 +894,8 @@ $("#attention-list").addEventListener("focusout", () => {
     }
   }, 0);
 });
+$("#attention-shortcut").addEventListener("click", openAttention);
+$("#terminal-attention-shortcut").addEventListener("click", openAttention);
 $("#new-shell-button").addEventListener("click", createShell);
 $("#refresh-button").addEventListener("click", () => loadProjectData().catch((error) => showError(error.message)));
 $("#back-button").addEventListener("click", detach);
@@ -725,8 +909,6 @@ loadProjects().catch((error) => {
   showError(error.message);
 });
 refreshTimer = window.setInterval(() => {
-  if (!dashboard.classList.contains("hidden")) {
-    Promise.all([loadProjectData(), refreshProjectSessions()]).catch((error) => showError(error.message));
-  }
-}, 5000);
+  loadProjectData().catch((error) => showError(error.message));
+}, 3000);
 void refreshTimer;

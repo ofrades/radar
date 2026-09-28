@@ -21,17 +21,60 @@ use gtk::glib;
 
 use crate::board::{self, Board, Card, Column};
 use crate::session::activity::{
-    ActivityEvent, ActivityKind, ActivityPayload, ActivitySnapshot, Attention, AttentionActionKind,
-    AttentionChange, AttentionResponse, ChangeAttention, PublishActivity,
+    ActivityEvent, ActivityPayload, ActivitySnapshot, Attention, AttentionActionKind,
+    AttentionChange, AttentionResponse, ChangeAttention,
 };
 use crate::session::daemon::{Client, Command, Response};
 
 /// How long to wait for the file to stop changing before re-reading it. A
 /// single write can fire several monitor events; one rebuild is enough.
 const RELOAD_DEBOUNCE_MS: u64 = 150;
-
-/// Who the board's live counts talk to: the header routing in mod.rs.
 type BoardObserver = Box<dyn Fn(Option<String>)>;
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct BoardSummary {
+    pub done: usize,
+    pub total: usize,
+    pub claimed: usize,
+    pub in_progress: usize,
+    pub review: usize,
+    pub claims: Vec<ClaimedWork>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ClaimedWork {
+    pub id: String,
+    pub title: String,
+    pub claim: String,
+}
+
+pub(super) fn summarize(board: &Board) -> BoardSummary {
+    let mut summary = BoardSummary::default();
+    for column in &board.columns {
+        let name = column.name.trim();
+        if name.eq_ignore_ascii_case("done") {
+            summary.done += column.cards.len();
+        }
+        if name.eq_ignore_ascii_case("in progress") {
+            summary.in_progress += column.cards.len();
+        }
+        if name.eq_ignore_ascii_case("review") {
+            summary.review += column.cards.len();
+        }
+        for card in &column.cards {
+            summary.total += 1;
+            if let Some(claim) = card.claimed_by.as_deref().filter(|claim| !claim.is_empty()) {
+                summary.claimed += 1;
+                summary.claims.push(ClaimedWork {
+                    id: card.id.clone(),
+                    title: card.title.clone(),
+                    claim: claim.to_string(),
+                });
+            }
+        }
+    }
+    summary
+}
 
 pub struct BoardPane {
     project: PathBuf,
@@ -46,7 +89,8 @@ pub struct BoardPane {
     activity_snapshot: RefCell<ActivitySnapshot>,
     activity_online: Cell<bool>,
     pending_attention: Rc<RefCell<HashSet<String>>>,
-    last_board: RefCell<Option<Board>>,
+    card_widgets: RefCell<HashMap<String, gtk::Widget>>,
+    highlighted_card: RefCell<Option<String>>,
     dialog_parent: gtk::Window,
     /// Guards against scheduling two reloads for one burst of file events.
     pending_reload: Cell<Option<glib::SourceId>>,
@@ -141,14 +185,14 @@ impl BoardPane {
             }),
             activity_online: Cell::new(false),
             pending_attention: Rc::new(RefCell::new(HashSet::new())),
-            last_board: RefCell::new(None),
+            card_widgets: RefCell::new(HashMap::new()),
+            highlighted_card: RefCell::new(None),
             dialog_parent: parent.clone().upcast(),
             pending_reload: Cell::new(None),
             observer: RefCell::new(None),
             last_stats: RefCell::new(None),
         });
         pane.reload();
-        pane.render_activity();
         pane.watch();
         pane
     }
@@ -164,7 +208,7 @@ impl BoardPane {
         self.activity_status.set_text(if online {
             "Live · sequenced project feed"
         } else {
-            "Reconnecting · saved requests remain available"
+            "Offline · open requests stay available; reconnect to respond"
         });
         self.render_activity();
     }
@@ -189,6 +233,21 @@ impl BoardPane {
             }
         }
         self.render_activity();
+    }
+
+    pub fn focus_card(&self, card_id: &str) -> bool {
+        let Some(card) = self.card_widgets.borrow().get(card_id).cloned() else {
+            return false;
+        };
+        if let Some(previous) = self.highlighted_card.borrow().as_ref() {
+            if let Some(widget) = self.card_widgets.borrow().get(previous) {
+                widget.remove_css_class("board-card-target");
+            }
+        }
+        card.add_css_class("board-card-target");
+        card.grab_focus();
+        *self.highlighted_card.borrow_mut() = Some(card_id.to_string());
+        true
     }
 
     fn render_activity(&self) {
@@ -293,6 +352,8 @@ impl BoardPane {
     }
 
     fn render_attention(&self, attention: &Attention, board: Option<&Board>) {
+        let pending = self.pending_attention.borrow().contains(&attention.id);
+        let online = self.activity_online.get();
         let frame = gtk::Frame::new(None);
         frame.add_css_class("attention-card");
         let body = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -300,6 +361,16 @@ impl BoardPane {
         body.set_margin_bottom(8);
         body.set_margin_start(8);
         body.set_margin_end(8);
+        if pending || !online {
+            body.append(&activity_label(
+                if pending {
+                    "Sending response…"
+                } else {
+                    "Offline · this request remains open"
+                },
+                true,
+            ));
+        }
 
         let title = gtk::Label::new(Some(&format!(
             "{} · {}",
@@ -331,10 +402,29 @@ impl BoardPane {
             body.append(&activity_label(&target.join("\n"), true));
         }
 
-        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        buttons.set_homogeneous(false);
+        let buttons = gtk::FlowBox::new();
+        buttons.set_selection_mode(gtk::SelectionMode::None);
+        buttons.set_min_children_per_line(1);
+        buttons.set_max_children_per_line(2);
+        buttons.set_row_spacing(4);
+        buttons.set_column_spacing(4);
         if let Some(session_id) = &attention.session_id {
             buttons.append(&self.session_button(session_id, "Open session"));
+        }
+        if let Some(card_id) = &attention.card_id {
+            let button = gtk::Button::with_label("Open card");
+            button.add_css_class("flat");
+            let parent = self.dialog_parent.clone();
+            let project_id = self.project_id;
+            let card_id = card_id.clone();
+            button.connect_clicked(move |_| {
+                let _ = gtk::prelude::WidgetExt::activate_action(
+                    &parent,
+                    "win.project-board-card",
+                    Some(&(project_id, card_id.as_str()).to_variant()),
+                );
+            });
+            buttons.append(&button);
         }
         if attention.seen_at_millis.is_none() {
             buttons.append(&self.attention_change_button(
@@ -354,6 +444,7 @@ impl BoardPane {
             match action {
                 AttentionActionKind::Answer => {
                     let button = gtk::Button::with_label("Answer");
+                    button.set_sensitive(online && !pending);
                     let parent = self.dialog_parent.clone();
                     let attention = attention.clone();
                     let project_id = self.project_id;
@@ -419,6 +510,9 @@ impl BoardPane {
         let pending = self.pending_attention.clone();
         let feedback = self.activity_feedback.clone();
         let attention = attention.clone();
+        button.set_sensitive(
+            self.activity_online.get() && !self.pending_attention.borrow().contains(&attention.id),
+        );
         button.connect_clicked(move |button| {
             button.set_sensitive(false);
             submit_attention_change(
@@ -447,133 +541,58 @@ impl BoardPane {
         }
     }
 
-    /// Re-read BOARD.md and rebuild the columns. Cheap: a board is a page of
-    /// text, and an agent move is one line.
     fn reload(&self) {
-        if let Err(error) = board::ensure_file(&self.project) {
-            eprintln!("radar: could not ensure stable board IDs: {error}");
-        }
-        let Ok(b) = board::load(&self.project) else {
+        let Ok(board) = board::load(&self.project) else {
+            eprintln!("radar: could not load board {}", self.project.display());
             return;
         };
-        if let Some(previous) = self.last_board.borrow_mut().replace(b.clone()) {
-            self.publish_board_changes(&previous, &b);
-        }
         while let Some(child) = self.columns_box.first_child() {
             self.columns_box.remove(&child);
         }
-        for column in &b.columns {
-            self.columns_box.append(&self.build_column(&b, column));
+        self.card_widgets.borrow_mut().clear();
+        for column in &board.columns {
+            self.columns_box.append(&self.build_column(&board, column));
         }
-        // The header wants the board's shape, live.
-        let cards: usize = b.columns.iter().map(|column| column.cards.len()).sum();
-        let stats = if cards == 0 {
-            "no cards".to_string()
-        } else {
-            format!("{cards} cards · {} columns", b.columns.len())
-        };
+        let summary = summarize(&board);
+        let stats = format!(
+            "{}/{} done · {} claimed · {} in progress · {} review",
+            summary.done, summary.total, summary.claimed, summary.in_progress, summary.review
+        );
         *self.last_stats.borrow_mut() = Some(stats.clone());
         if let Some(emit) = self.observer.borrow().as_ref() {
             emit(Some(stats));
         }
-    }
-
-    fn publish_board_changes(&self, previous: &Board, current: &Board) {
-        let before: HashMap<&str, (usize, &Card)> = previous
-            .columns
-            .iter()
-            .enumerate()
-            .flat_map(|(column, value)| {
-                value
-                    .cards
-                    .iter()
-                    .map(move |card| (card.id.as_str(), (column, card)))
-            })
-            .collect();
-        let after: HashMap<&str, (usize, &Card)> = current
-            .columns
-            .iter()
-            .enumerate()
-            .flat_map(|(column, value)| {
-                value
-                    .cards
-                    .iter()
-                    .map(move |card| (card.id.as_str(), (column, card)))
-            })
-            .collect();
-
-        for (id, (_, card)) in &before {
-            if !after.contains_key(id) {
-                self.publish_board_event("removed", Some((*id).to_string()), &card.title);
+        if let Some(id) = self.highlighted_card.borrow().as_ref() {
+            if let Some(card) = self.card_widgets.borrow().get(id) {
+                card.add_css_class("board-card-target");
             }
         }
-        for (id, (column, card)) in &after {
-            let Some((old_column, old)) = before.get(id).copied() else {
-                self.publish_board_event("added", Some((*id).to_string()), &card.title);
-                continue;
-            };
-            let action = if old_column != *column {
-                Some("moved")
-            } else if old.claimed_by != card.claimed_by {
-                Some(if card.claimed_by.is_some() {
-                    "claimed"
-                } else {
-                    "released"
-                })
-            } else if old.done != card.done {
-                Some(if card.done { "completed" } else { "reopened" })
-            } else if old.title != card.title {
-                Some("renamed")
-            } else if old.body != card.body {
-                Some("updated")
-            } else {
-                None
-            };
-            if let Some(action) = action {
-                self.publish_board_event(action, Some((*id).to_string()), &card.title);
-            }
-        }
-    }
-
-    fn publish_board_event(&self, action: &str, card_id: Option<String>, title: &str) {
-        let project_id = self.project_id;
-        let home = self.session_home.clone();
-        let action = action.to_string();
-        let title = title.to_string();
-        std::thread::spawn(move || {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default();
-            let event_card_id = card_id.clone();
-            let request = Command::PublishActivity(PublishActivity {
-                project_id,
-                command_id: format!("board-{}-{now:x}", std::process::id()),
-                session_id: None,
-                card_id,
-                kind: ActivityKind::BoardChanged,
-                payload: ActivityPayload::BoardChanged {
-                    action,
-                    card_id: event_card_id,
-                    title: Some(title),
-                },
-            });
-            let _ = Client::request(&home, request);
-        });
+        self.render_activity();
     }
 
     /// Follow the file: anything that writes BOARD.md — an agent, the CLI,
     /// `git checkout` — ends up on screen here. radar's own writes go through
     /// the same door, so no gesture needs a manual refresh.
     fn watch(self: &Rc<BoardPane>) {
-        let file = gio::File::for_path(board::file_path(&self.project));
-        let Ok(monitor) = file.monitor_file(gio::FileMonitorFlags::NONE, None::<&gio::Cancellable>)
+        let directory = gio::File::for_path(&self.project);
+        let Ok(monitor) =
+            directory.monitor_directory(gio::FileMonitorFlags::NONE, None::<&gio::Cancellable>)
         else {
             return;
         };
+        let board_path = board::file_path(&self.project);
+        let temporary_path = self.project.join(board::TEMP_NAME);
         let pane = Rc::clone(self);
-        monitor.connect_changed(move |_, _, _, _| {
-            if pane.pending_reload.take().is_some() {
+        monitor.connect_changed(move |_, file, other_file, _| {
+            let relevant = [file.path(), other_file.and_then(|other| other.path())]
+                .into_iter()
+                .flatten()
+                .any(|path| path == board_path || path == temporary_path);
+            if !relevant {
+                return;
+            }
+            if let Some(id) = pane.pending_reload.take() {
+                pane.pending_reload.set(Some(id));
                 return;
             }
             let pane_for_timeout = pane.clone();
@@ -616,13 +635,16 @@ impl BoardPane {
         add.add_css_class("flat");
         add.set_tooltip_text(Some(&format!("Add a card to {}", column.name)));
         header.append(&add);
-        column_box.append(&header);
-
-        // The cards.
         let cards = gtk::Box::new(gtk::Orientation::Vertical, 6);
         cards.set_vexpand(true);
+        column_box.append(&header);
+
         for card in &column.cards {
-            cards.append(&self.build_card(card));
+            let widget = self.build_card(card);
+            self.card_widgets
+                .borrow_mut()
+                .insert(card.id.clone(), widget.clone());
+            cards.append(&widget);
         }
         if column.cards.is_empty() {
             let empty = gtk::Label::new(Some("no cards"));
@@ -689,7 +711,6 @@ impl BoardPane {
     fn build_card(&self, card: &Card) -> gtk::Widget {
         let card_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
         card_box.add_css_class("board-card");
-
         let title = gtk::Label::new(Some(&card.title));
         title.set_xalign(0.0);
         title.set_wrap(true);
@@ -770,9 +791,8 @@ impl BoardPane {
         });
         card_box.add_controller(click);
 
-        // The drag payload is `card:<title>`: the board operations find a card
-        // by title, and the `card:` prefix keeps the pane headers (which drop
-        // strings too, for grouping) from ever mistaking a card for a slot.
+        // Dragging is handled by the board operation, which re-reads the
+        // file before moving the card so concurrent agent edits survive.
         let content = gdk::ContentProvider::for_value(&format!("card:{}", card.title).to_value());
         let source = gtk::DragSource::builder()
             .actions(gdk::DragAction::MOVE)
@@ -780,6 +800,26 @@ impl BoardPane {
             .build();
         card_box.add_controller(source);
 
+        card_box.set_tooltip_text(Some("Open card details · Enter"));
+        let keys = gtk::EventControllerKey::new();
+        let project = self.project.clone();
+        let parent = self.dialog_parent.clone();
+        let title = card.title.clone();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if !matches!(key, gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::space) {
+                return glib::Propagation::Proceed;
+            }
+            let project = project.clone();
+            let parent = parent.clone();
+            let title = title.clone();
+            glib::idle_add_local(move || {
+                edit_dialog(&parent, &project, &title);
+                glib::ControlFlow::Break
+            });
+            glib::Propagation::Stop
+        });
+        card_box.add_controller(keys);
+        card_box.set_focusable(true);
         card_box.upcast()
     }
 }
@@ -1182,4 +1222,65 @@ fn edit_dialog(parent: &gtk::Window, project: &Path, title: &str) {
     let card = b.columns[c].cards[i].clone();
     let columns: Vec<String> = b.columns.iter().map(|col| col.name.clone()).collect();
     card_dialog(parent, project, Some((&column, &card)), &columns, None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize;
+    use crate::board::{Board, Card, Column};
+
+    fn card(id: &str, claimed_by: Option<&str>, done: bool) -> Card {
+        Card {
+            id: id.to_string(),
+            title: id.to_string(),
+            body: Vec::new(),
+            claimed_by: claimed_by.map(str::to_string),
+            done,
+        }
+    }
+
+    #[test]
+    fn progress_counts_done_column_and_keeps_review_separate_from_checkbox() {
+        let board = Board {
+            header: String::new(),
+            columns: vec![
+                Column {
+                    name: "Backlog".to_string(),
+                    cards: vec![card("todo", Some("codex-abc123"), true)],
+                },
+                Column {
+                    name: "In progress".to_string(),
+                    cards: vec![card("active", None, false)],
+                },
+                Column {
+                    name: "review".to_string(),
+                    cards: vec![card("review", Some("claude-def456"), true)],
+                },
+                Column {
+                    name: " Done ".to_string(),
+                    cards: vec![card("done", None, false)],
+                },
+            ],
+        };
+
+        let summary = summarize(&board);
+        assert_eq!(
+            (
+                summary.done,
+                summary.total,
+                summary.claimed,
+                summary.in_progress,
+                summary.review,
+            ),
+            (1, 4, 2, 1, 1)
+        );
+        assert_eq!(
+            summary
+                .claims
+                .iter()
+                .map(|claim| claim.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["todo", "review"]
+        );
+    }
 }

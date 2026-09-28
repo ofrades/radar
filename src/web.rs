@@ -71,6 +71,7 @@ async fn async_run(home: PathBuf, port: u16) -> Result<()> {
             get(sessions).post(create_shell),
         )
         .route("/api/projects/{project_id}/activity", get(activity))
+        .route("/api/projects/{project_id}/board", get(board_snapshot))
         .route(
             "/api/projects/{project_id}/attention/{request_id}",
             post(respond_attention),
@@ -182,6 +183,7 @@ struct SessionView {
     label: String,
     slot: Option<String>,
     program: Option<String>,
+    claim: Option<String>,
     title: Option<String>,
     state: &'static str,
     detail: Option<String>,
@@ -203,11 +205,17 @@ impl SessionView {
             Lifecycle::Exited(info) => ("exited", Some(format!("exit {}", info.code))),
             Lifecycle::Failed(message) => ("failed", Some(message.clone())),
         };
+        let claim = if state == "running" {
+            status.pid.and_then(crate::programs::launch::radar_agent_of)
+        } else {
+            None
+        };
         Self {
             id: status.id,
             label,
             slot,
             program,
+            claim,
             title: status.title,
             state,
             detail,
@@ -243,6 +251,7 @@ impl SessionView {
             catalog_id: Some(entry.id),
             provider_session_id: Some(entry.provider_session_id.clone()),
             last_activity_ms: Some(entry.last_activity_at),
+            claim: None,
             attachable: false,
         }
     }
@@ -406,6 +415,35 @@ async fn activity(
             "daemon returned an unexpected activity response",
         )),
     }
+}
+
+async fn board_snapshot(
+    RoutePath(project_id): RoutePath<i64>,
+    State(state): State<WebState>,
+) -> ApiResult<Json<Option<crate::board::Board>>> {
+    let db = open_db(&state.home)?;
+    let Some(project) = db.project(project_id).map_err(ApiError::internal)? else {
+        return Ok(Json(None));
+    };
+    if !db
+        .project_settings(project.id)
+        .map_err(ApiError::internal)?
+        .board_enabled
+    {
+        return Ok(Json(None));
+    }
+
+    let path = crate::board::file_path(&project.path);
+    if !path.is_file() {
+        return Ok(Json(None));
+    }
+    crate::board::ensure_card_ids(&project.path).map_err(ApiError::internal)?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Json(None)),
+        Err(error) => return Err(ApiError::internal(error)),
+    };
+    Ok(Json(Some(crate::board::parse(&text))))
 }
 
 #[derive(Deserialize)]
