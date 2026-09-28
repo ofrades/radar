@@ -14,10 +14,36 @@ use serde::{Deserialize, Serialize};
 
 /// Directories never worth offering as a project, or descending into.
 pub const SKIP_DIRS: &[&str] = &[
-    ".git", ".hg", ".svn", "node_modules", "target", "dist", "build", "out", "vendor",
-    "__pycache__", ".venv", "venv", ".cache", ".local", ".npm", ".cargo", ".rustup",
-    ".gradle", ".next", ".nuxt", ".turbo", ".parcel-cache", "coverage", ".pytest_cache",
-    ".mypy_cache", "site-packages", ".direnv", "tmp", ".Trash", "Library",
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "vendor",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".cache",
+    ".local",
+    ".npm",
+    ".cargo",
+    ".rustup",
+    ".gradle",
+    ".next",
+    ".nuxt",
+    ".turbo",
+    ".parcel-cache",
+    "coverage",
+    ".pytest_cache",
+    ".mypy_cache",
+    "site-packages",
+    ".direnv",
+    "tmp",
+    ".Trash",
+    "Library",
 ];
 
 /// A directory that could become a project.
@@ -224,10 +250,7 @@ pub fn filter(candidates: &[Candidate], query: &str) -> Vec<Candidate> {
             Some((score, candidate.clone()))
         })
         .collect();
-    scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| a.1.rank().cmp(&b.1.rank()))
-    });
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.rank().cmp(&b.1.rank())));
     scored.into_iter().map(|(_, candidate)| candidate).collect()
 }
 
@@ -343,9 +366,14 @@ mod tests {
         assert_eq!(hits[0].name, "api-server");
         // Subsequence matching: w-a-p exists in "web-app".
         let scattered = filter(&candidates, "wap");
-        assert_eq!(scattered[0].name, "web-app", "subsequence matching should work");
+        assert_eq!(
+            scattered[0].name, "web-app",
+            "subsequence matching should work"
+        );
         assert!(filter(&candidates, "zzzz").is_empty());
-        assert!(filter(&candidates, "app").iter().any(|c| c.name == "web-app"));
+        assert!(filter(&candidates, "app")
+            .iter()
+            .any(|c| c.name == "web-app"));
     }
 
     #[test]

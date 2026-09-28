@@ -116,6 +116,26 @@ paned > separator:hover {
 .projects-sidebar row > box {
   min-height: 36px;
 }
+.projects-sidebar .agent-list {
+  margin-bottom: 3px;
+  padding-left: 4px;
+  border-left: 1px solid @radar_hairline;
+}
+.projects-sidebar button.agent-child {
+  min-height: 28px;
+  padding: 2px 4px;
+  border-radius: {control_radius};
+  color: @radar_muted;
+}
+.projects-sidebar button.agent-child:hover {
+  color: @radar_fg;
+  background-color: @radar_surface_hover;
+}
+.projects-sidebar button.agent-toggle {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+}
 
 /* Icons and metadata stay quiet until they carry useful state. */
 .projects-sidebar row .row-icon {

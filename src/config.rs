@@ -201,7 +201,10 @@ mod tests {
     fn paths_use_radar_home_when_set() {
         std::env::set_var("RADAR_HOME", "/tmp/radar-test-home");
         let paths = Paths::resolve();
-        assert_eq!(paths.database(), PathBuf::from("/tmp/radar-test-home/radar.db"));
+        assert_eq!(
+            paths.database(),
+            PathBuf::from("/tmp/radar-test-home/radar.db")
+        );
         std::env::remove_var("RADAR_HOME");
     }
 

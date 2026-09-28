@@ -42,10 +42,19 @@ fn main() {
                 let terminal = terminal.clone();
                 let cwd = cwd.clone();
                 glib::timeout_add_local_once(Duration::from_millis(50), move || {
-                    let argv: Vec<String> = ["/bin/sh", "-c", r#"cd "$1" || exit 126; shift; exec "$@""#, "radar", &cwd, "bash", "-lc", "echo A-OK: $(pwd); hunk --version | head -1; sleep 20"]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect();
+                    let argv: Vec<String> = [
+                        "/bin/sh",
+                        "-c",
+                        r#"cd "$1" || exit 126; shift; exec "$@""#,
+                        "radar",
+                        &cwd,
+                        "bash",
+                        "-lc",
+                        "echo A-OK: $(pwd); hunk --version | head -1; sleep 20",
+                    ]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
                     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
                     println!("A: wrapper, no working_directory");
                     terminal.spawn_async(

@@ -22,6 +22,7 @@ mod group;
 mod home;
 mod hud;
 mod keynav;
+mod live_agents;
 mod pane;
 mod primitive;
 mod split;
@@ -265,6 +266,13 @@ struct App {
     workspaces: RefCell<HashMap<i64, Rc<Workspace>>>,
     projects: RefCell<Vec<Project>>,
     rows: RefCell<Vec<ProjectRow>>,
+    agent_sessions: RefCell<HashMap<i64, Vec<live_agents::AgentSession>>>,
+    agent_tx: std::sync::mpsc::Sender<Vec<live_agents::AgentSession>>,
+    agent_rx: RefCell<std::sync::mpsc::Receiver<Vec<live_agents::AgentSession>>>,
+    agent_scan_pending: Cell<bool>,
+    expanded_projects: RefCell<HashSet<i64>>,
+    /// Projects whose agent list currently shows archived sessions.
+    archived_views: RefCell<HashSet<i64>>,
     status: RefCell<HashMap<i64, crate::git::Status>>,
     status_tx: std::sync::mpsc::Sender<Vec<(i64, crate::git::Status)>>,
     status_rx: RefCell<std::sync::mpsc::Receiver<Vec<(i64, crate::git::Status)>>>,
@@ -496,7 +504,15 @@ impl Drop for ActivityWatcher {
 }
 
 type SharedApp = Rc<App>;
-type ProjectRow = (i64, gtk::ListBoxRow, gtk::Label, gtk::Label, gtk::Label);
+struct ProjectRow {
+    id: i64,
+    row: gtk::ListBoxRow,
+    summary: gtk::Label,
+    badge: gtk::Label,
+    attention_badge: gtk::Label,
+    agents: gtk::Box,
+    agent_toggle: gtk::ToggleButton,
+}
 
 /// How an agent tab's program starts: fresh, on the project's last
 /// conversation, or on one exact stored conversation (a board claim's
@@ -530,6 +546,21 @@ fn parse_stable_session_id(session_id: &str) -> Option<(i64, TabKey, String)> {
     Some((project_id, TabKey { slot, instance }, program_id))
 }
 
+/// A compact age for sidebar subtitles: coarse, monotonic, no clock-format
+/// churn. Beyond a week the exact day matters less than the order.
+fn relative_time(millis: i64) -> String {
+    let now = crate::session::catalog::now_millis();
+    let seconds = (now.saturating_sub(millis)).max(0) / 1000;
+    match seconds {
+        0..=59 => "now".to_string(),
+        60..=3_599 => format!("{}m", seconds / 60),
+        3_600..=86_399 => format!("{}h", seconds / 3_600),
+        86_400..=604_799 => format!("{}d", seconds / 86_400),
+        604_800..=2_591_999 => format!("{}w", seconds / 604_800),
+        _ => format!("{}mo", seconds / 2_592_000),
+    }
+}
+
 fn add_session_environment(
     spec: &mut CommandSpec,
     project_id: i64,
@@ -549,6 +580,24 @@ fn add_session_environment(
         ),
         ("RADAR_SESSION_ID".to_string(), session_id.to_string()),
     ]);
+}
+
+/// Adopt a provider conversation for a radar-spawned session once the CLI's
+/// own store reveals which session the run had. Fire-and-forget: the catalog
+/// row upgrades in place, and the sidebar gains an exact reopen link.
+fn bind_provider_session(
+    home: &std::path::Path,
+    radar_id: &str,
+    program_id: &str,
+    provider_session_id: &str,
+) {
+    use crate::session::daemon::{Client, Command};
+    let request = Command::CatalogBind {
+        radar_id: radar_id.to_string(),
+        provider: program_id.to_string(),
+        provider_session_id: provider_session_id.to_string(),
+    };
+    let _ = Client::request(home, request);
 }
 
 fn publish_session_lifecycle(
@@ -771,6 +820,7 @@ fn build_window(
     let (status_tx, status_rx) = std::sync::mpsc::channel();
     let (find_tx, find_rx) = std::sync::mpsc::channel();
     let (activity_tx, activity_rx) = std::sync::mpsc::sync_channel(512);
+    let (agent_tx, agent_rx) = std::sync::mpsc::channel();
     let state = Rc::new(App {
         db: db.clone(),
         session_home: paths.data_dir.clone(),
@@ -791,6 +841,12 @@ fn build_window(
         workspaces: RefCell::new(HashMap::new()),
         projects: RefCell::new(Vec::new()),
         rows: RefCell::new(Vec::new()),
+        agent_sessions: RefCell::new(HashMap::new()),
+        agent_tx,
+        agent_rx: RefCell::new(agent_rx),
+        agent_scan_pending: Cell::new(false),
+        expanded_projects: RefCell::new(HashSet::new()),
+        archived_views: RefCell::new(HashSet::new()),
         status: RefCell::new(HashMap::new()),
         status_tx,
         status_rx: RefCell::new(status_rx),
@@ -833,6 +889,7 @@ fn build_window(
     });
     start_status_drainer(&state);
     start_activity_drainer(&state);
+    start_agent_session_drainer(&state);
     start_find_drainer(&state);
     wire_sidebar_drop(&state);
     watch_theme(&state);
@@ -841,6 +898,8 @@ fn build_window(
         crate::db::abbreviate(&state.find_root.borrow())
     ));
     App::refresh_projects(&state);
+    state.request_agent_scan();
+    start_agent_session_polling(&state);
     // Development aid: exercise the new-project flow — folder, git init, add,
     // open — without the file chooser. RADAR_NEW_PROJECT=/some/path.
     if let Ok(path) = std::env::var("RADAR_NEW_PROJECT") {
@@ -1207,6 +1266,52 @@ fn start_status_drainer(app: &SharedApp) {
         if changed {
             app.apply_status_labels();
         }
+        glib::ControlFlow::Continue
+    });
+}
+fn start_agent_session_drainer(app: &SharedApp) {
+    let app = app.clone();
+    glib::timeout_add_local(Duration::from_millis(120), move || {
+        let latest = {
+            let rx = app.agent_rx.borrow();
+            let mut latest = None;
+            while let Ok(batch) = rx.try_recv() {
+                latest = Some(batch);
+            }
+            latest
+        };
+        let Some(sessions) = latest else {
+            return glib::ControlFlow::Continue;
+        };
+        app.agent_scan_pending.set(false);
+
+        let mut grouped: HashMap<i64, Vec<live_agents::AgentSession>> = HashMap::new();
+        for session in sessions {
+            grouped.entry(session.project_id).or_default().push(session);
+        }
+        if *app.agent_sessions.borrow() == grouped {
+            return glib::ControlFlow::Continue;
+        }
+        *app.agent_sessions.borrow_mut() = grouped;
+        let rows: Vec<(i64, gtk::Box)> = app
+            .rows
+            .borrow()
+            .iter()
+            .map(|row| (row.id, row.agents.clone()))
+            .collect();
+        for (project_id, agents) in rows {
+            app.populate_project_agents(project_id, &agents);
+        }
+        let query = app.sidebar_search.text();
+        app.filter_sidebar(&query);
+        glib::ControlFlow::Continue
+    });
+}
+
+fn start_agent_session_polling(app: &SharedApp) {
+    let app = app.clone();
+    glib::timeout_add_local(Duration::from_secs(3), move || {
+        app.request_agent_scan();
         glib::ControlFlow::Continue
     });
 }
@@ -1716,6 +1821,147 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         app.window.add_action(&action);
     }
     {
+        let action = gio::SimpleAction::new(
+            "project-agent-open",
+            Some(glib::VariantTy::new("(xs)").expect("a project/tab tuple")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((project_id, tab)) = parameter.and_then(|value| value.get::<(i64, String)>())
+            else {
+                return;
+            };
+            app_for_action.select_project(project_id);
+            if let Some(workspace) = app_for_action.current_workspace() {
+                app_for_action.activate_primitive(&workspace, TabKey::parse(&tab));
+            }
+        });
+        app.window.add_action(&action);
+    }
+    {
+        let action = gio::SimpleAction::new(
+            "project-agent-open-external",
+            Some(glib::VariantTy::new("(xutu)").expect("a project and process identity")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((project_id, pid, start_ticks, window_pid)) =
+                parameter.and_then(|value| value.get::<(i64, u32, u64, u32)>())
+            else {
+                return;
+            };
+            app_for_action.select_project(project_id);
+            #[cfg(target_os = "linux")]
+            if let Err(error) = live_agents::focus_external(pid, start_ticks, window_pid) {
+                app_for_action.toast(&error);
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = (pid, start_ticks, window_pid);
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // The sidebar's unified session action: every row — live tab, catalog
+        // history, or external terminal — opens through here.
+        let action = gio::SimpleAction::new(
+            "project-session-open",
+            Some(glib::VariantTy::new("(xs)").expect("a project/identity tuple")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((project_id, identity)) =
+                parameter.and_then(|value| value.get::<(i64, String)>())
+            else {
+                return;
+            };
+            app_for_action.open_catalog_session(project_id, &identity);
+        });
+        app.window.add_action(&action);
+    }
+    {
+        let action = gio::SimpleAction::new(
+            "project-session-archive",
+            Some(glib::VariantTy::new("(xb)").expect("a catalog row and archive flag")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((catalog_id, archived)) =
+                parameter.and_then(|value| value.get::<(i64, bool)>())
+            else {
+                return;
+            };
+            use crate::session::daemon::{Client, Command};
+            let request = Command::CatalogArchive {
+                id: catalog_id,
+                archived,
+            };
+            match Client::request(&app_for_action.session_home, request) {
+                Ok(_) => app_for_action.request_agent_scan(),
+                Err(error) => {
+                    app_for_action.toast(&format!("Could not update the session: {error}"))
+                }
+            }
+        });
+        app.window.add_action(&action);
+    }
+    {
+        let action = gio::SimpleAction::new(
+            "project-archived-view",
+            Some(glib::VariantTy::new("(xb)").expect("a project and archived-view flag")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((project_id, show)) = parameter.and_then(|value| value.get::<(i64, bool)>())
+            else {
+                return;
+            };
+            if show {
+                app_for_action
+                    .archived_views
+                    .borrow_mut()
+                    .insert(project_id);
+            } else {
+                app_for_action
+                    .archived_views
+                    .borrow_mut()
+                    .remove(&project_id);
+            }
+            app_for_action.refresh_project_agents(project_id);
+        });
+        app.window.add_action(&action);
+    }
+    {
+        let action = gio::SimpleAction::new(
+            "project-agent-create",
+            Some(glib::VariantTy::new("x").expect("a project ID")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some(project_id) = parameter.and_then(|value| value.get::<i64>()) else {
+                return;
+            };
+            app_for_action.select_project(project_id);
+            let Some(workspace) = app_for_action
+                .current_workspace()
+                .filter(|workspace| workspace.project.id == project_id)
+            else {
+                return;
+            };
+            let global = app_for_action.db.preferences().unwrap_or_default();
+            let preferences = app_for_action
+                .db
+                .project_settings(project_id)
+                .unwrap_or_default()
+                .apply_to(&global);
+            let Some(program) = programs::for_slot(Slot::Agent, &preferences) else {
+                app_for_action.toast("No agent installed — set one in Preferences");
+                return;
+            };
+            app_for_action.add_tab(&workspace, TabKey::first(Slot::Agent), &program);
+        });
+        app.window.add_action(&action);
+    }
+    {
         // Activity and attention records carry stable session IDs, so their
         // navigation does not depend on a mutable board claim name.
         let action = gio::SimpleAction::new(
@@ -2189,8 +2435,8 @@ impl App {
         self.rows
             .borrow()
             .iter()
-            .find(|(_, widget, _, _, _)| widget == row)
-            .map(|(id, _, _, _, _)| *id)
+            .find(|project_row| project_row.row == *row)
+            .map(|project_row| project_row.id)
     }
 
     fn current_project(&self) -> Option<Project> {
@@ -2428,6 +2674,7 @@ impl App {
         let projects = app.db.projects().unwrap_or_default();
         let selected = *app.current.borrow();
         *app.projects.borrow_mut() = projects.clone();
+        app.request_agent_scan();
         app.reconcile_activity_watchers(&projects);
 
         while let Some(child) = app.sidebar_list.first_child() {
@@ -2467,11 +2714,9 @@ impl App {
         }
 
         for project in &projects {
-            let (row, summary, badge, attention_badge) = app.build_project_row(project);
-            app.rows
-                .borrow_mut()
-                .push((project.id, row.clone(), summary, badge, attention_badge));
-            app.sidebar_list.append(&row);
+            let row = app.build_project_row(project);
+            app.sidebar_list.append(&row.row);
+            app.rows.borrow_mut().push(row);
         }
         app.filter_sidebar(&app.sidebar_search.text());
         // Candidate directories for the query go under the project rows.
@@ -2494,17 +2739,12 @@ impl App {
         }
     }
 
-    fn build_project_row(
-        &self,
-        project: &Project,
-    ) -> (gtk::ListBoxRow, gtk::Label, gtk::Label, gtk::Label) {
+    fn build_project_row(self: &Rc<Self>, project: &Project) -> ProjectRow {
         let row = gtk::ListBoxRow::new();
-
-        // Inset and rounded corners come from the stylesheet; the row only lays
-        // out its content: icon, name, summary, badge, trash.
-        let missing = project.is_missing();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
 
+        let missing = project.is_missing();
         let icon = gtk::Image::from_icon_name(if missing {
             "dialog-warning-symbolic"
         } else {
@@ -2516,8 +2756,6 @@ impl App {
         if missing {
             icon.add_css_class("missing");
         }
-        icon.set_pixel_size(16);
-        icon.set_valign(gtk::Align::Center);
         box_.append(&icon);
 
         let texts = gtk::Box::new(gtk::Orientation::Vertical, 1);
@@ -2564,8 +2802,132 @@ impl App {
         attention_badge.set_visible(false);
         box_.append(&attention_badge);
 
-        // Remove, per row: the id travels with the action so no state is
-        // needed. The stylesheet reveals it on hover or keyboard focus.
+        let agents_revealer = gtk::Revealer::new();
+        agents_revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+        agents_revealer.set_transition_duration(120);
+        let agents = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        agents.add_css_class("agent-list");
+        agents.set_margin_start(8);
+        self.populate_project_agents(project.id, &agents);
+        agents_revealer.set_child(Some(&agents));
+
+        let agent_toggle = gtk::ToggleButton::new();
+        agent_toggle.add_css_class("flat");
+        agent_toggle.add_css_class("agent-toggle");
+        agent_toggle.set_tooltip_text(Some("Show agents in this project"));
+        agent_toggle.set_valign(gtk::Align::Center);
+        let toggle_icon = gtk::Image::from_icon_name("pan-end-symbolic");
+        agent_toggle.set_child(Some(&toggle_icon));
+        let expanded = self.expanded_projects.borrow().contains(&project.id);
+        agent_toggle.set_active(expanded);
+        agents_revealer.set_reveal_child(expanded);
+        let expanded_projects = self.expanded_projects.clone();
+        let project_id = project.id;
+        let revealer = agents_revealer.clone();
+        agent_toggle.connect_toggled(move |button| {
+            let expanded = button.is_active();
+            revealer.set_reveal_child(expanded);
+            toggle_icon.set_icon_name(Some(if expanded {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            }));
+            button.set_tooltip_text(Some(if expanded {
+                "Hide agents in this project"
+            } else {
+                "Show agents in this project"
+            }));
+            if expanded {
+                expanded_projects.borrow_mut().insert(project_id);
+            } else {
+                expanded_projects.borrow_mut().remove(&project_id);
+            }
+        });
+        box_.append(&agent_toggle);
+        let board_toggle = gtk::ToggleButton::with_label("Board");
+        board_toggle.add_css_class("flat");
+        board_toggle.add_css_class("row-action");
+        board_toggle.set_valign(gtk::Align::Center);
+        let board_enabled = crate::board::enabled(&self.db, &project.path).unwrap_or(true);
+        board_toggle.set_active(board_enabled);
+        board_toggle.set_sensitive(!missing);
+        board_toggle.set_tooltip_text(Some(if board_enabled {
+            "Disable board for this project"
+        } else {
+            "Enable board for this project"
+        }));
+        let project_path = project.path.clone();
+        let project_id = project.id;
+        let db = self.db.clone();
+        let app = Rc::downgrade(self);
+        let changing = Rc::new(Cell::new(false));
+        let changing_signal = changing.clone();
+        board_toggle.connect_toggled(move |button| {
+            if changing_signal.get() {
+                return;
+            }
+            let enabled = button.is_active();
+            if let Err(error) = crate::board::set_enabled(&db, &project_path, enabled) {
+                changing_signal.set(true);
+                button.set_active(!enabled);
+                changing_signal.set(false);
+                if let Some(app) = app.upgrade() {
+                    app.toast(&format!("Could not update board setting: {error}"));
+                }
+                return;
+            }
+            button.set_tooltip_text(Some(if enabled {
+                "Disable board for this project"
+            } else {
+                "Enable board for this project"
+            }));
+            if let Some(app) = app.upgrade() {
+                app.project_board_setting_changed(project_id, &project_path, enabled);
+            }
+        });
+        box_.append(&board_toggle);
+        let project_defaults = gtk::Button::builder()
+            .icon_name("emblem-system-symbolic")
+            .tooltip_text("Project defaults")
+            .build();
+        project_defaults.add_css_class("flat");
+        project_defaults.add_css_class("row-action");
+        project_defaults.set_valign(gtk::Align::Center);
+        project_defaults.set_sensitive(!missing);
+        let settings_app = Rc::downgrade(self);
+        let settings_id = project.id;
+        let settings_name = project.name.clone();
+        project_defaults.connect_clicked(move |_| {
+            if let Some(app) = settings_app.upgrade() {
+                let changed_app = Rc::downgrade(&app);
+                dialogs::project_preferences(
+                    &app.window,
+                    &app.db,
+                    settings_id,
+                    &settings_name,
+                    move || {
+                        if let Some(app) = changed_app.upgrade() {
+                            app.sync_toggles();
+                            app.refresh_menus();
+                            app.toast("Project defaults saved");
+                        }
+                    },
+                );
+            }
+        });
+        box_.append(&project_defaults);
+        let create_agent = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("Create an agent in this project")
+            .build();
+        create_agent.add_css_class("flat");
+        create_agent.add_css_class("row-action");
+        create_agent.set_valign(gtk::Align::Center);
+        create_agent.set_sensitive(!missing);
+        create_agent.set_action_name(Some("win.project-agent-create"));
+        create_agent.set_action_target_value(Some(&project.id.to_variant()));
+        box_.append(&create_agent);
+
         let remove = gtk::Button::builder()
             .icon_name("user-trash-symbolic")
             .tooltip_text("Remove from sidebar")
@@ -2577,7 +2939,9 @@ impl App {
         remove.set_action_target_value(Some(&(project.id as i32).to_variant()));
         box_.append(&remove);
 
-        row.set_child(Some(&box_));
+        content.append(&box_);
+        content.append(&agents_revealer);
+        row.set_child(Some(&content));
         row.set_tooltip_text(Some(&if missing {
             format!("{} (missing)", project.display_path())
         } else {
@@ -2593,13 +2957,227 @@ impl App {
         summary.set_text(&format!("{text}  ·  {parent}"));
         badge.set_tooltip_text(Some("Active embedded tools in this project"));
         attention_badge.set_tooltip_text(Some("Unresolved requests for human attention"));
-        (row, summary, badge, attention_badge)
+        ProjectRow {
+            id: project.id,
+            row,
+            summary,
+            badge,
+            attention_badge,
+            agents,
+            agent_toggle,
+        }
+    }
+
+    fn project_board_setting_changed(&self, id: i64, path: &std::path::Path, enabled: bool) {
+        if enabled {
+            if let Err(error) = crate::board::ensure_enabled_file(&self.db, path) {
+                self.toast(&format!("Board enabled, but setup failed: {error}"));
+            }
+        } else if let Some(workspace) = self.workspaces.borrow().get(&id).cloned() {
+            self.restore_zoom(&workspace);
+            let key = TabKey::first(Slot::Board);
+            if workspace.is_visible(key) {
+                self.toggle_primitive(&workspace, key);
+            }
+        }
+        self.sync_toggles();
+    }
+
+    fn populate_project_agents(&self, project_id: i64, container: &gtk::Box) {
+        while let Some(child) = container.first_child() {
+            container.remove(&child);
+        }
+
+        let archived_view = self.archived_views.borrow().contains(&project_id);
+        let mut sessions: Vec<_> = self
+            .agent_sessions
+            .borrow()
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|session| session.archived == archived_view)
+            .map(|session| {
+                let title = session.title.clone();
+                (session, title)
+            })
+            .collect();
+        live_agents::sort_sidebar_sessions(&mut sessions);
+
+        let has_archived = self
+            .agent_sessions
+            .borrow()
+            .get(&project_id)
+            .is_some_and(|rows| rows.iter().any(|session| session.archived));
+        if has_archived {
+            let filter = gtk::ToggleButton::with_label(if archived_view {
+                "Showing archived"
+            } else {
+                "Archived"
+            });
+            filter.add_css_class("flat");
+            filter.add_css_class("caption");
+            filter.add_css_class("agent-archived-toggle");
+            filter.set_halign(gtk::Align::Start);
+            filter.set_margin_start(12);
+            filter.set_active(archived_view);
+            filter.set_action_name(Some("win.project-archived-view"));
+            filter.set_action_target_value(Some(&(project_id, !archived_view).to_variant()));
+            container.append(&filter);
+        }
+
+        for (session, title) in &sessions {
+            let program = programs::by_id(&session.program_id);
+            let program_name = program
+                .as_ref()
+                .map(|program| program.name.clone())
+                .unwrap_or_else(|| session.program_id.clone());
+            let state = if session.external.is_some() {
+                "external terminal"
+            } else if session.running {
+                "running"
+            } else {
+                "ended"
+            };
+            let subtitle = format!(
+                "{program_name} · {} · {state}",
+                relative_time(session.last_activity_at)
+            );
+
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+            let button = gtk::Button::new();
+            button.add_css_class("flat");
+            button.add_css_class("agent-child");
+            button.set_halign(gtk::Align::Fill);
+            button.set_hexpand(true);
+            let action = if session.external.is_some() {
+                "Focus terminal for"
+            } else {
+                "Open session:"
+            };
+            button.set_tooltip_text(Some(&format!(
+                "{action} {title}{}",
+                if archived_view { " (archived)" } else { "" }
+            )));
+
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let icon = gtk::Image::from_icon_name("application-x-executable-symbolic");
+            icon.add_css_class("row-icon");
+            if session.running {
+                icon.add_css_class("agent-running");
+            }
+            icon.set_pixel_size(12);
+            icon.set_valign(gtk::Align::Center);
+            let texts = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let label = gtk::Label::new(Some(title));
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            label.set_single_line_mode(true);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            let detail = gtk::Label::new(Some(&subtitle));
+            detail.set_xalign(0.0);
+            detail.add_css_class("caption");
+            detail.add_css_class("dim-label");
+            detail.set_single_line_mode(true);
+            detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            texts.append(&label);
+            texts.append(&detail);
+            content.append(&icon);
+            content.append(&texts);
+            button.set_child(Some(&content));
+            if let Some(target) = &session.external {
+                button.set_action_name(Some("win.project-agent-open-external"));
+                button.set_action_target_value(Some(
+                    &(
+                        project_id,
+                        target.pid,
+                        target.start_ticks,
+                        target.window_pid,
+                    )
+                        .to_variant(),
+                ));
+            } else {
+                button.set_action_name(Some("win.project-session-open"));
+                button
+                    .set_action_target_value(Some(&(project_id, session.id.as_str()).to_variant()));
+            }
+            row.append(&button);
+
+            if let Some(catalog_id) = session.catalog_id {
+                let archive = gtk::Button::builder()
+                    .icon_name(if session.archived {
+                        "view-restore-symbolic"
+                    } else {
+                        "mail-archive-symbolic"
+                    })
+                    .tooltip_text(if session.archived {
+                        "Unarchive this session"
+                    } else {
+                        "Archive this session"
+                    })
+                    .build();
+                archive.add_css_class("flat");
+                archive.add_css_class("row-action");
+                archive.set_valign(gtk::Align::Center);
+                archive.set_action_name(Some("win.project-session-archive"));
+                archive
+                    .set_action_target_value(Some(&(catalog_id, !session.archived).to_variant()));
+                row.append(&archive);
+            }
+            container.append(&row);
+        }
+
+        if sessions.is_empty() {
+            let empty = gtk::Label::new(Some(if archived_view {
+                "No archived sessions"
+            } else {
+                "No agent sessions yet"
+            }));
+            empty.add_css_class("caption");
+            empty.add_css_class("dim-label");
+            empty.set_xalign(0.0);
+            empty.set_margin_start(12);
+            empty.set_margin_top(3);
+            empty.set_margin_bottom(3);
+            container.append(&empty);
+        }
+    }
+    fn refresh_project_agents(&self, project_id: i64) {
+        let container = self
+            .rows
+            .borrow()
+            .iter()
+            .find(|row| row.id == project_id)
+            .map(|row| row.agents.clone());
+        if let Some(container) = container {
+            self.populate_project_agents(project_id, &container);
+        }
+    }
+
+    fn set_project_expanded(&self, project_id: i64, expanded: bool) {
+        let toggle = self
+            .rows
+            .borrow()
+            .iter()
+            .find(|row| row.id == project_id)
+            .map(|row| row.agent_toggle.clone());
+        if let Some(toggle) = toggle {
+            toggle.set_active(expanded);
+        } else if expanded {
+            self.expanded_projects.borrow_mut().insert(project_id);
+        } else {
+            self.expanded_projects.borrow_mut().remove(&project_id);
+        }
     }
 
     fn apply_status_labels(&self) {
         let projects = self.projects.borrow();
-        for (id, _row, summary, badge, attention_badge) in self.rows.borrow().iter() {
-            let Some(project) = projects.iter().find(|p| p.id == *id) else {
+        let rows = self.rows.borrow();
+        let activity = self.activity.borrow();
+        let statuses = self.status.borrow();
+        let workspaces = self.workspaces.borrow();
+        for row in rows.iter() {
+            let Some(project) = projects.iter().find(|project| project.id == row.id) else {
                 continue;
             };
             let parent = project
@@ -2607,25 +3185,24 @@ impl App {
                 .parent()
                 .map(crate::db::abbreviate)
                 .unwrap_or_else(|| project.display_path());
-            let attention_count = self
-                .activity
-                .borrow()
-                .get(id)
+            let attention_count = activity
+                .get(&row.id)
                 .map_or(0, |activity| activity.snapshot.attention.len());
-            attention_badge.set_text(&attention_count.to_string());
-            attention_badge.set_visible(attention_count > 0);
+            row.attention_badge.set_text(&attention_count.to_string());
+            row.attention_badge.set_visible(attention_count > 0);
             if project.is_missing() {
-                summary.set_text(&format!("missing  ·  {parent}"));
-                badge.set_visible(false);
+                row.summary.set_text(&format!("missing  ·  {parent}"));
+                row.badge.set_visible(false);
                 continue;
             }
-            match self.status.borrow().get(id) {
+            match statuses.get(&row.id) {
                 Some(status) => {
-                    summary.set_text(&format!("{}  ·  {parent}", status.summary()));
+                    row.summary
+                        .set_text(&format!("{}  ·  {parent}", status.summary()));
                 }
-                None => summary.set_text(&format!("…  ·  {parent}")),
+                None => row.summary.set_text(&format!("…  ·  {parent}")),
             }
-            let count = self.workspaces.borrow().get(id).map_or(0, |workspace| {
+            let count = workspaces.get(&row.id).map_or(0, |workspace| {
                 workspace
                     .tabs
                     .borrow()
@@ -2633,8 +3210,8 @@ impl App {
                     .filter(|primitive| primitive.pane.as_ref().is_some_and(|pane| pane.is_live()))
                     .count()
             });
-            badge.set_text(&count.to_string());
-            badge.set_visible(count > 0);
+            row.badge.set_text(&count.to_string());
+            row.badge.set_visible(count > 0);
         }
     }
 
@@ -2658,13 +3235,26 @@ impl App {
         });
     }
 
+    fn request_agent_scan(&self) {
+        if self.agent_scan_pending.replace(true) {
+            return;
+        }
+        let projects = self.projects.borrow().clone();
+        let session_home = self.session_home.clone();
+        let tx = self.agent_tx.clone();
+        std::thread::spawn(move || {
+            let sessions = live_agents::discover(&projects, &session_home);
+            let _ = tx.send(sessions);
+        });
+    }
+
     fn select_row_for(&self, id: i64) {
         let target = self
             .rows
             .borrow()
             .iter()
-            .find(|(row_id, _, _, _, _)| *row_id == id)
-            .map(|(_, row, _, _, _)| row.clone());
+            .find(|row| row.id == id)
+            .map(|row| row.row.clone());
         if let Some(row) = target {
             self.sidebar_list.select_row(Some(&row));
         }
@@ -2673,17 +3263,25 @@ impl App {
     fn filter_sidebar(&self, query: &str) {
         let matcher = fuzzy_matcher::skim::SkimMatcherV2::default().ignore_case();
         use fuzzy_matcher::FuzzyMatcher;
+        let query = query.trim();
         let projects = self.projects.borrow();
-        for (id, row, _, _, _) in self.rows.borrow().iter() {
-            let Some(project) = projects.iter().find(|p| p.id == *id) else {
+        let agent_sessions = self.agent_sessions.borrow();
+        for row in self.rows.borrow().iter() {
+            let Some(project) = projects.iter().find(|p| p.id == row.id) else {
                 continue;
             };
-            let visible = query.trim().is_empty()
-                || matcher.fuzzy_match(&project.name, query).is_some()
+            let project_matches = matcher.fuzzy_match(&project.name, query).is_some()
                 || matcher
                     .fuzzy_match(&project.display_path(), query)
                     .is_some();
-            row.set_visible(visible);
+            let agent_matches = agent_sessions.get(&row.id).is_some_and(|sessions| {
+                sessions.iter().any(|session| {
+                    matcher.fuzzy_match(&session.title, query).is_some()
+                        || matcher.fuzzy_match(&session.program_id, query).is_some()
+                })
+            });
+            row.row
+                .set_visible(query.is_empty() || project_matches || agent_matches);
         }
     }
 
@@ -2794,12 +3392,20 @@ impl App {
         self.stack.set_visible_child_name(&format!("project-{id}"));
         let _ = self.db.touch_project(id);
         let _ = self.db.remember_last_project(Some(id));
-        // Starting a project starts its board: BOARD.md is there before any
-        // agent looks for it.
-        let _ = crate::board::ensure_file(&project.path);
+        // Initialize the board only when enabled in global project settings.
+        match crate::board::enabled(&self.db, &project.path) {
+            Ok(true) => {
+                if let Err(error) = crate::board::ensure_file(&project.path) {
+                    eprintln!("radar: setting up the board: {error}");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!("radar: reading board policy: {error}"),
+        }
         self.sync_toggles();
         self.refresh_menus();
         self.select_row_for(id);
+        self.set_project_expanded(id, true);
     }
 
     fn workspace_for(&self, project: &Project) -> Rc<Workspace> {
@@ -2845,6 +3451,7 @@ impl App {
         }
 
         // Which primitives were on screen last time, and which program each ran.
+        let board_enabled = crate::board::enabled(&self.db, &project.path).unwrap_or(true);
         let ui_prefs = self.db.ui_prefs().ok();
         let restore = ui_prefs
             .as_ref()
@@ -2860,13 +3467,19 @@ impl App {
         } else {
             None
         };
+        let board_open = board_enabled && saved_state.as_ref().is_some_and(saved_board_open);
         if let Some(state) = &saved_state {
             workspace
                 .programs
                 .borrow_mut()
                 .extend(state.programs.clone());
         }
-        let preferences = self.db.preferences().unwrap_or_default();
+        let global_preferences = self.db.preferences().unwrap_or_default();
+        let preferences = self
+            .db
+            .project_settings(project.id)
+            .unwrap_or_default()
+            .apply_to(&global_preferences);
         // Tabs to open, and the program each was running. Stored rows map to
         // tab keys in order — the second `agent` row becomes the second agent
         // tab — so a saved workspace with same-primitive tabs comes back with
@@ -2884,6 +3497,9 @@ impl App {
                     .and_then(|prefs| prefs.layout)
                     .unwrap_or(NewWorkspaceLayout::Agent);
                 for slot in layout.slots() {
+                    if *slot == Slot::Board && !board_enabled {
+                        continue;
+                    }
                     let key = workspace.next_key(*slot);
                     wanted.push(key);
                     if let Some(program) = programs::for_slot(*slot, &preferences) {
@@ -2896,6 +3512,9 @@ impl App {
             }
         } else {
             for tab in &stored {
+                if tab.slot == Slot::Board && !board_enabled {
+                    continue;
+                }
                 let key = workspace.next_key(tab.slot);
                 wanted.push(key);
                 key_programs.insert(key, tab.program_id.clone());
@@ -2904,6 +3523,10 @@ impl App {
                     .borrow_mut()
                     .insert(tab.slot, tab.program_id.clone());
             }
+        }
+        let board_key = TabKey::first(Slot::Board);
+        if board_open && !wanted.contains(&board_key) {
+            wanted.push(board_key);
         }
         wanted.sort_by_key(|key| {
             (
@@ -2930,70 +3553,64 @@ impl App {
             );
         }
 
-        let mut groups = Vec::new();
-        let mut assigned = HashSet::new();
-        if let Some(state) = &saved_state {
-            for saved_group in &state.groups {
-                let keys: Vec<TabKey> = saved_group
-                    .slots
-                    .iter()
-                    .copied()
-                    .filter(|key| {
-                        wanted.contains(key)
-                            && workspace.tab(*key).is_some()
-                            && assigned.insert(*key)
-                    })
-                    .collect();
-                if keys.is_empty() {
-                    continue;
-                }
-                let group = Group::new();
-                for key in &keys {
-                    if let Some(primitive) = workspace.tab(*key) {
-                        group.insert(*key, &primitive.widget, false);
-                    }
-                }
-                if keys.contains(&saved_group.active) {
-                    group.activate(saved_group.active);
-                }
-                group.rebuild_header();
-                self.refresh_group_menu(&group);
-                groups.push(group);
+        let restore_plan = workspace_restore_plan(saved_state.as_ref(), &wanted);
+        let mut groups = Vec::with_capacity(restore_plan.groups.len());
+        for saved_group in &restore_plan.groups {
+            let keys: Vec<TabKey> = saved_group
+                .slots
+                .iter()
+                .copied()
+                .filter(|key| workspace.tab(*key).is_some())
+                .collect();
+            if keys.is_empty() {
+                continue;
             }
-        }
-        for key in wanted {
-            if assigned.insert(key) {
-                let Some(primitive) = workspace.tab(key) else {
-                    continue;
-                };
-                let group = Group::new();
-                group.insert(key, &primitive.widget, true);
-                group.rebuild_header();
-                self.refresh_group_menu(&group);
-                groups.push(group);
+            let group = Group::new();
+            for key in &keys {
+                if let Some(primitive) = workspace.tab(*key) {
+                    group.insert(*key, &primitive.widget, false);
+                }
             }
+            if keys.contains(&saved_group.active) {
+                group.activate(saved_group.active);
+            }
+            group.rebuild_header();
+            self.refresh_group_menu(&group);
+            groups.push(group);
         }
         *workspace.groups.borrow_mut() = groups.clone();
 
-        if let Some(state) = &saved_state {
-            if let Some(layout) = state.layout.as_ref() {
-                let restored = restore_layout(layout, &groups);
-                if restored
-                    .as_ref()
-                    .is_some_and(|tree| layout_covers(tree, &groups))
-                {
-                    *workspace.tree.borrow_mut() = restored;
-                }
+        if let Some(layout) = restore_plan.layout.as_ref() {
+            let layout_groups: Vec<Rc<Group>> = groups
+                .iter()
+                .filter(|group| {
+                    group_id(group)
+                        .is_some_and(|id| restore_plan.layout_group_anchors.contains(&id))
+                })
+                .cloned()
+                .collect();
+            let restored = restore_layout(layout, &layout_groups);
+            if restored
+                .as_ref()
+                .is_some_and(|tree| layout_covers(tree, &layout_groups))
+            {
+                *workspace.tree.borrow_mut() = restored;
             }
-            if let Some(zoomed) = state.zoomed {
-                if groups.len() > 1 {
-                    if let Some(group) = groups.iter().find(|group| group_id(group) == Some(zoomed))
-                    {
-                        let tree = workspace.tree.borrow_mut().take();
-                        *workspace.zoom.borrow_mut() = Some((groups.clone(), tree));
-                        *workspace.groups.borrow_mut() = vec![group.clone()];
-                    }
-                }
+        }
+        if let Some(zoomed) = restore_plan.zoomed {
+            if let Some(group) = groups.iter().find(|group| group_id(group) == Some(zoomed)) {
+                let tree = workspace.tree.borrow_mut().take();
+                *workspace.zoom.borrow_mut() = Some((groups.clone(), tree));
+                *workspace.groups.borrow_mut() = vec![group.clone()];
+            }
+        }
+        if restore_plan.board_open {
+            if let Some(group) = groups.iter().find(|group| group.contains(board_key)) {
+                let current_zoom = workspace.zoom.borrow_mut().take();
+                let snapshot = current_zoom
+                    .unwrap_or_else(|| (groups.clone(), workspace.tree.borrow_mut().take()));
+                *workspace.zoom.borrow_mut() = Some(snapshot);
+                *workspace.groups.borrow_mut() = vec![group.clone()];
             }
         }
 
@@ -3015,6 +3632,11 @@ impl App {
         program: Option<&str>,
         resume: Resume,
     ) -> Option<Rc<Primitive>> {
+        if key.slot == Slot::Board
+            && !crate::board::enabled(&self.db, &workspace.project.path).unwrap_or(true)
+        {
+            return None;
+        }
         if let Some(existing) = workspace.tab(key) {
             return Some(existing);
         }
@@ -3074,7 +3696,12 @@ impl App {
             workspace.tabs.borrow_mut().insert(key, primitive.clone());
             return Some(primitive);
         }
-        let preferences = self.db.preferences().unwrap_or_default();
+        let global_preferences = self.db.preferences().unwrap_or_default();
+        let preferences = self
+            .db
+            .project_settings(workspace.project.id)
+            .unwrap_or_default()
+            .apply_to(&global_preferences);
         let wanted = program
             .map(|id| id.to_string())
             .or_else(|| workspace.programs.borrow().get(&key.slot).cloned());
@@ -3100,10 +3727,17 @@ impl App {
         // each other's cards.
         let mut launch_record: Option<(String, u128)> = None;
         if program.kind == Kind::Agent {
-            if let Err(error) = crate::board::ensure_file(&workspace.project.path)
-                .and_then(|_| crate::skill::install(&workspace.project.path))
-            {
-                eprintln!("radar: setting up the board: {error}");
+            match crate::board::enabled(&self.db, &workspace.project.path) {
+                Ok(true) => {
+                    if let Err(error) =
+                        crate::board::ensure_enabled_file(&self.db, &workspace.project.path)
+                            .and_then(|_| crate::skill::install(&self.db, &workspace.project.path))
+                    {
+                        eprintln!("radar: setting up the board: {error}");
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => eprintln!("radar: reading board policy: {error}"),
             }
             let stamp = crate::programs::launch::now_stamp();
             options.agent_instance = Some(stamp.clone());
@@ -3172,11 +3806,20 @@ impl App {
                 let program_id = program_id.clone();
                 let cwd = cwd.clone();
                 let claim = claim.clone();
+                let exit_home = lifecycle_home.clone();
+                let exit_radar_session = lifecycle_session.clone();
                 std::thread::spawn(move || {
                     if let Some(session) =
                         crate::programs::sessions::newest_since(&program_id, &cwd, launched_ms)
                     {
-                        let _ = tx.try_send((project_id, claim, program_id, session));
+                        let _ =
+                            tx.try_send((project_id, claim, program_id.clone(), session.clone()));
+                        bind_provider_session(
+                            &exit_home,
+                            &exit_radar_session,
+                            &program_id,
+                            &session,
+                        );
                     }
                 });
             });
@@ -3184,6 +3827,17 @@ impl App {
             let lifecycle_home = self.session_home.clone();
             let lifecycle_session = session_id.clone();
             let project_id = workspace.project.id;
+            // Without a claim there is no launch record, but an agent run
+            // still earns its exact reopen link: capture the conversation it
+            // had the same way, keyed by this session's stable id.
+            let capture = program.kind == crate::programs::Kind::Agent;
+            let capture_home = lifecycle_home.clone();
+            let capture_radar = lifecycle_session.clone();
+            let capture_program = program.id.clone();
+            let capture_cwd = workspace.project.path.clone();
+            // No launch record means no recorded stamp; the pane spawns now,
+            // so "created after this instant" is the right capture window.
+            let capture_launch = crate::session::catalog::now_millis();
             pane.set_exit_handler(move || {
                 publish_session_lifecycle(
                     &lifecycle_home,
@@ -3191,6 +3845,22 @@ impl App {
                     &lifecycle_session,
                     "exited",
                 );
+                if capture {
+                    let bind_home = capture_home.clone();
+                    let bind_radar = capture_radar.clone();
+                    let bind_program = capture_program.clone();
+                    let bind_cwd = capture_cwd.clone();
+                    std::thread::spawn(move || {
+                        let cutoff = u128::try_from(capture_launch.max(0)).unwrap_or(0);
+                        if let Some(session) = crate::programs::sessions::newest_since(
+                            &bind_program,
+                            &bind_cwd,
+                            cutoff,
+                        ) {
+                            bind_provider_session(&bind_home, &bind_radar, &bind_program, &session);
+                        }
+                    });
+                }
             });
         }
         // The pane's header wants the program's live self-description: its
@@ -3218,6 +3888,9 @@ impl App {
             );
         });
         let primitive = Primitive::new(&program, pane);
+        if let Resume::Session(id) = resume {
+            *primitive.launched_session.borrow_mut() = Some(id.clone());
+        }
         workspace.tabs.borrow_mut().insert(key, primitive.clone());
         Some(primitive)
     }
@@ -3389,15 +4062,80 @@ impl App {
         }
     }
 
-    /// The board's @claim links: the named agent's session, opened. The
-    /// exact match is the tab whose program carries the claim as its own
-    /// `RADAR_AGENT`, read from /proc — two tabs running the same program
-    /// are told apart by their stamps. When that cannot be read, the
-    /// claim's leading program (`program-stamp`) still picks a tab, and
-    /// any agent tab takes the rest: an agent radar did not launch works
-    /// in the agent panel all the same. A program that has exited — or a
-    /// tab not yet opened — runs again, resuming the project's last
-    /// conversation with the agent's own resume flags.
+    /// The workspace's one agent panel: the first pane on screen that holds
+    /// an Agent tab. Sidebar navigation lands every session here, so a
+    /// project shows one agent at a time no matter how many run.
+    fn agent_panel(workspace: &Rc<Workspace>) -> Option<Rc<Group>> {
+        workspace
+            .groups
+            .borrow()
+            .iter()
+            .find(|group| group.tabs().iter().any(|key| key.slot == Slot::Agent))
+            .cloned()
+    }
+
+    /// Show an open Agent tab the sidebar way: in THE agent panel, alone in
+    /// its stack, with the keys in it. A tab living in another pane — dragged
+    /// out for a side-by-side, or left there by an older layout — moves back
+    /// into the panel; the pane it left keeps its other tabs or goes away.
+    /// Hiding the agent that was on screen never stops it: the process and
+    /// its pty belong to the session, not the pane.
+    fn show_agent_session(&self, workspace: &Rc<Workspace>, key: TabKey) {
+        let Some(primitive) = workspace.tab(key) else {
+            return;
+        };
+        self.restore_zoom(workspace);
+        let mut moved = false;
+        match (Self::agent_panel(workspace), workspace.group_of(key)) {
+            // Already home: the stack switch is all that is left to do.
+            (Some(panel), Some(home)) if Rc::ptr_eq(&panel, &home) => {}
+            (Some(panel), home) => {
+                if let Some(home) = home {
+                    home.remove(key);
+                    if home.is_empty() {
+                        workspace.forget_group(&home);
+                    }
+                    home.rebuild_header();
+                    self.refresh_group_menu(&home);
+                }
+                panel.insert(key, &primitive.widget, true);
+                panel.rebuild_header();
+                self.refresh_group_menu(&panel);
+                moved = true;
+            }
+            // No agent tab is on screen: the panel comes into being here.
+            (None, _) => {
+                let group = Group::new();
+                group.insert(key, &primitive.widget, true);
+                group.rebuild_header();
+                self.refresh_group_menu(&group);
+                workspace.push_group(group.clone());
+                if let Some(node) = workspace.tree.borrow_mut().as_mut() {
+                    node.append(&group);
+                }
+                moved = true;
+            }
+        }
+        if moved {
+            *workspace.zoom.borrow_mut() = None;
+            self.layout(workspace);
+            self.sync_toggles();
+            self.refresh_workspace_menus(workspace);
+            self.persist_primitives(workspace);
+            self.apply_status_labels();
+        }
+        self.activate_primitive(workspace, key);
+    }
+
+    /// The board's @claim links: the named agent's session, opened in THE
+    /// agent panel. The exact match is the tab whose program carries the
+    /// claim as its own `RADAR_AGENT`, read from /proc — two tabs running
+    /// the same program are told apart by their stamps. When that cannot
+    /// be read, the claim's leading program (`program-stamp`) still picks
+    /// a tab, and any agent tab takes the rest: an agent radar did not
+    /// launch works in the agent panel all the same. A program that has
+    /// exited — or a tab not yet opened — runs again, resuming the
+    /// project's last conversation with the agent's own resume flags.
     fn open_agent_session(&self, workspace: &Rc<Workspace>, claim: &str) {
         let wanted = claim.rsplit_once('-').map(|(program, _)| program);
         let mut candidates: Vec<(TabKey, bool, bool)> = workspace
@@ -3425,7 +4163,7 @@ impl App {
         if let Some((key, true, _)) = candidates.first() {
             // The claimed conversation is this one, running: never
             // disturb a live agent that already is what was asked for.
-            self.activate_primitive(workspace, *key);
+            self.show_agent_session(workspace, *key);
             return;
         }
         // The stored binding: what the claim's agent ran last, and the
@@ -3456,7 +4194,7 @@ impl App {
                     )
                     .is_some()
                 {
-                    self.activate_primitive(workspace, key);
+                    self.show_agent_session(workspace, key);
                 } else {
                     self.toast("No agent installed — set one in Preferences");
                 }
@@ -3478,9 +4216,116 @@ impl App {
                     .ensure_primitive(workspace, key, None, Resume::Last)
                     .is_some()
                 {
-                    self.activate_primitive(workspace, key);
+                    self.show_agent_session(workspace, key);
                 } else {
                     self.toast("No agent installed — set one in Preferences");
+                }
+            }
+        }
+    }
+
+    /// Open one sidebar session row, whatever kind it is: a live Radar pane,
+    /// an external terminal, or a catalog conversation to resume.
+    fn open_catalog_session(&self, project_id: i64, identity: &str) {
+        let session = self
+            .agent_sessions
+            .borrow()
+            .get(&project_id)
+            .and_then(|rows| rows.iter().find(|session| session.id == identity))
+            .cloned();
+        let Some(session) = session else {
+            self.toast("This session is no longer listed");
+            return;
+        };
+        if self.current.borrow().as_ref() != Some(&project_id) {
+            self.select_project(project_id);
+        }
+        let Some(workspace) = self.current_workspace() else {
+            return;
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(target) = &session.external {
+            if let Err(error) =
+                live_agents::focus_external(target.pid, target.start_ticks, target.window_pid)
+            {
+                self.toast(&error);
+            }
+            return;
+        }
+        if session.running {
+            if let Some(radar_id) = &session.radar_session_id {
+                self.open_linked_session(project_id, radar_id);
+                return;
+            }
+        }
+        // History: resume the exact recorded conversation. Without the
+        // provider's own session id there is no honest reopen — "last" could
+        // be a different conversation than the row the user clicked.
+        let Some(program) = programs::by_id(&session.program_id) else {
+            self.toast("The session's agent is not installed");
+            return;
+        };
+        let resume = match &session.provider_session_id {
+            Some(id) if !program.resume_session.is_empty() => Resume::Session(id.clone()),
+            _ => {
+                self.toast(
+                    "This conversation has no exact reopen link — its agent did not report a session id",
+                );
+                return;
+            }
+        };
+        // Which tab shows this conversation: one already on it, the
+        // session's own stable place, a quiet agent tab — or a new one.
+        // Whatever the answer, it is shown the sidebar way: in THE agent
+        // panel. Repeated clicks on a row land on the same tab instead of
+        // stacking processes on one conversation.
+        let keys = workspace.tabs_of_kind(Slot::Agent);
+        let key = agent_tab_for_session(
+            &keys,
+            session
+                .radar_session_id
+                .as_ref()
+                .and_then(|id| parse_stable_session_id(id))
+                .filter(|(parsed, _, _)| *parsed == project_id)
+                .map(|(_, key, _)| key),
+            session.provider_session_id.as_deref(),
+            |key| {
+                workspace
+                    .tab(key)
+                    .and_then(|primitive| primitive.launched_session.borrow().clone())
+            },
+            |key| {
+                workspace
+                    .tab(key)
+                    .and_then(|primitive| primitive.pane.clone())
+                    .is_some_and(|pane| pane.is_live())
+            },
+            workspace.next_key(Slot::Agent),
+        );
+        match workspace.tab(key) {
+            Some(primitive) => {
+                let on_conversation = primitive.launched_session.borrow().as_deref()
+                    == session.provider_session_id.as_deref();
+                if primitive.pane.as_ref().is_some_and(|pane| pane.is_live()) && on_conversation {
+                    // The conversation asked for is this live tab: showing
+                    // it is all the row can do.
+                    self.show_agent_session(&workspace, key);
+                } else {
+                    // Dead, or running some other conversation in the
+                    // conversation's own place: run it again on the row's
+                    // talk. The displaced conversation stays in the CLI's
+                    // own session store.
+                    self.relaunch_agent(&workspace, key, resume);
+                }
+            }
+            None => {
+                if self
+                    .ensure_primitive(&workspace, key, Some(&program.id), resume)
+                    .is_some()
+                {
+                    self.show_agent_session(&workspace, key);
+                } else {
+                    self.toast("The linked program is not installed");
                 }
             }
         }
@@ -3510,12 +4355,13 @@ impl App {
             self.toast("The linked tab is open with a different program");
             return;
         }
-        self.activate_primitive(&workspace, key);
+        self.show_agent_session(&workspace, key);
     }
 
     /// Run a tab's agent again on `resume`'s conversation, in its own
-    /// pane — same widget, same scrollback, fresh claim stamp. A live
-    /// instance of a different claim is displaced: the click named the
+    /// pane — same widget, same scrollback, fresh claim stamp — and show
+    /// it the sidebar way: in THE agent panel. A live instance of a
+    /// different conversation is displaced: the click named the
     /// conversation to see, and the displaced one stays in the CLI's own
     /// session store.
     fn relaunch_agent(&self, workspace: &Rc<Workspace>, key: TabKey, resume: Resume) {
@@ -3546,7 +4392,11 @@ impl App {
         if let Some(pane) = primitive.pane.as_ref() {
             pane.respawn(&spec);
         }
-        self.activate_primitive(workspace, key);
+        *primitive.launched_session.borrow_mut() = match &resume {
+            Resume::Session(id) => Some(id.clone()),
+            Resume::Last | Resume::No => None,
+        };
+        self.show_agent_session(workspace, key);
     }
 
     /// Hovering a member selects its content and moves keyboard focus into that
@@ -4134,6 +4984,7 @@ impl App {
     /// tree so the project comes back in the same arrangement.
     fn persist_primitives(&self, workspace: &Rc<Workspace>) {
         persist_workspace(&self.db, workspace);
+        self.refresh_project_agents(workspace.project.id);
     }
 
     /// Save every project before the window is closed. Most changes are saved
@@ -4154,13 +5005,28 @@ impl App {
             .current_workspace()
             .map(|workspace| workspace.visible_kinds())
             .unwrap_or_default();
-        let preferences = self.db.preferences().unwrap_or_default();
+        let board_available = self.current_workspace().is_some_and(|workspace| {
+            crate::board::enabled(&self.db, &workspace.project.path).unwrap_or(true)
+        });
+        let global_preferences = self.db.preferences().unwrap_or_default();
+        let preferences = self.current_workspace().map_or_else(
+            || global_preferences.clone(),
+            |workspace| {
+                self.db
+                    .project_settings(workspace.project.id)
+                    .unwrap_or_default()
+                    .apply_to(&global_preferences)
+            },
+        );
         self.projects_toggle.set_active(self.sidebar_shown.get());
         self.home_toggle.set_active(self.home_shown.get());
         for (slot, button) in self.toggles.borrow().iter() {
             button.set_active(visible.contains(slot));
+            if *slot == Slot::Board {
+                button.set_visible(board_available);
+            }
             let available = *slot == Slot::Shell
-                || *slot == Slot::Board
+                || (*slot == Slot::Board && board_available)
                 || programs::for_slot(*slot, &preferences).is_some();
             button.set_sensitive(available);
         }
@@ -4243,13 +5109,29 @@ impl App {
 /// Save one project's tabs and presentation state to SQLite.
 fn persist_workspace(db: &Db, workspace: &Workspace) {
     let zoom = workspace.zoom.borrow();
-    let (groups, tree) = match zoom.as_ref() {
+    let board_key = TabKey::first(Slot::Board);
+    let board_open = workspace.group_of(board_key).is_some();
+    let (all_groups, tree) = match zoom.as_ref() {
         Some((groups, tree)) => (groups.clone(), tree.clone()),
         None => (workspace.groups(), workspace.tree.borrow().clone()),
     };
-    let zoomed = zoom
-        .as_ref()
-        .and_then(|_| workspace.groups().first().and_then(group_id));
+    let groups: Vec<Rc<Group>> = all_groups
+        .into_iter()
+        .filter(|group| !board_open || !group.contains(board_key))
+        .collect();
+    let tree = tree.and_then(|tree| {
+        if board_open {
+            tree.prune(&groups)
+        } else {
+            Some(tree)
+        }
+    });
+    let zoomed = if board_open {
+        None
+    } else {
+        zoom.as_ref()
+            .and_then(|_| workspace.groups().first().and_then(group_id))
+    };
 
     // One row per tab, same-primitive tabs included: the second agent tab is
     // a second `agent` row, and its key comes back the same way on restore.
@@ -4293,6 +5175,7 @@ fn persist_workspace(db: &Db, workspace: &Workspace) {
         layout: tree.as_ref().and_then(save_layout),
         programs: workspace.programs.borrow().clone(),
         positions: workspace.positions.borrow().clone(),
+        board_open,
         zoomed,
     };
 
@@ -4351,6 +5234,15 @@ fn save_layout(node: &split::Node<Group>) -> Option<WorkspaceLayout> {
 }
 
 fn restore_layout(node: &WorkspaceLayout, groups: &[Rc<Group>]) -> Option<split::Node<Group>> {
+    let anchors: Vec<TabKey> = groups.iter().filter_map(group_id).collect();
+    restore_layout_keys(node, &anchors)?;
+    restore_layout_nodes(node, groups)
+}
+
+fn restore_layout_nodes(
+    node: &WorkspaceLayout,
+    groups: &[Rc<Group>],
+) -> Option<split::Node<Group>> {
     match node {
         WorkspaceLayout::Pane { group } => groups
             .iter()
@@ -4362,21 +5254,160 @@ fn restore_layout(node: &WorkspaceLayout, groups: &[Rc<Group>]) -> Option<split:
             key,
             first,
             second,
-        } => {
-            if !ratio.is_finite() || !(0.05..=0.95).contains(ratio) {
-                return None;
+        } => Some(split::Node::split(
+            match axis {
+                WorkspaceAxis::Horizontal => split::Axis::Horizontal,
+                WorkspaceAxis::Vertical => split::Axis::Vertical,
+            },
+            *ratio,
+            key.clone(),
+            restore_layout_nodes(first, groups)?,
+            restore_layout_nodes(second, groups)?,
+        )),
+    }
+}
+
+fn restore_layout_keys(node: &WorkspaceLayout, groups: &[TabKey]) -> Option<Vec<TabKey>> {
+    fn collect(node: &WorkspaceLayout, groups: &[TabKey], leaves: &mut Vec<TabKey>) -> Option<()> {
+        match node {
+            WorkspaceLayout::Pane { group } if groups.contains(group) => {
+                leaves.push(*group);
+                Some(())
             }
-            Some(split::Node::split(
-                match axis {
-                    WorkspaceAxis::Horizontal => split::Axis::Horizontal,
-                    WorkspaceAxis::Vertical => split::Axis::Vertical,
-                },
-                *ratio,
-                key.clone(),
-                restore_layout(first, groups)?,
-                restore_layout(second, groups)?,
-            ))
+            WorkspaceLayout::Pane { .. } => None,
+            WorkspaceLayout::Split {
+                ratio,
+                first,
+                second,
+                ..
+            } => {
+                if !ratio.is_finite() || !(0.05..=0.95).contains(ratio) {
+                    return None;
+                }
+                collect(first, groups, leaves)?;
+                collect(second, groups, leaves)
+            }
         }
+    }
+
+    let mut leaves = Vec::new();
+    collect(node, groups, &mut leaves)?;
+    if leaves.len() != groups.len()
+        || groups
+            .iter()
+            .any(|group| leaves.iter().filter(|leaf| **leaf == *group).count() != 1)
+    {
+        return None;
+    }
+    Some(leaves)
+}
+
+struct WorkspaceRestorePlan {
+    groups: Vec<WorkspaceGroup>,
+    layout: Option<WorkspaceLayout>,
+    layout_group_anchors: Vec<TabKey>,
+    zoomed: Option<TabKey>,
+    board_open: bool,
+}
+
+fn saved_board_open(state: &WorkspaceState) -> bool {
+    let board = TabKey::first(Slot::Board);
+    state.board_open
+        || state.zoomed == Some(board)
+        || state
+            .groups
+            .iter()
+            .any(|group| group.slots.contains(&board))
+}
+
+fn strip_board_layout(node: &WorkspaceLayout, board: TabKey) -> Option<WorkspaceLayout> {
+    match node {
+        WorkspaceLayout::Pane { group } if *group != board => Some(node.clone()),
+        WorkspaceLayout::Pane { .. } => None,
+        WorkspaceLayout::Split {
+            axis,
+            ratio,
+            key,
+            first,
+            second,
+        } => match (
+            strip_board_layout(first, board),
+            strip_board_layout(second, board),
+        ) {
+            (Some(first), Some(second)) => Some(WorkspaceLayout::Split {
+                axis: *axis,
+                ratio: *ratio,
+                key: key.clone(),
+                first: Box::new(first),
+                second: Box::new(second),
+            }),
+            (Some(remaining), None) | (None, Some(remaining)) => Some(remaining),
+            (None, None) => None,
+        },
+    }
+}
+
+fn workspace_restore_plan(
+    state: Option<&WorkspaceState>,
+    wanted: &[TabKey],
+) -> WorkspaceRestorePlan {
+    let mut groups = Vec::new();
+    let mut assigned = HashSet::new();
+    if let Some(state) = state {
+        for saved_group in &state.groups {
+            let slots: Vec<TabKey> = saved_group
+                .slots
+                .iter()
+                .copied()
+                .filter(|key| wanted.contains(key) && assigned.insert(*key))
+                .collect();
+            if slots.is_empty() {
+                continue;
+            }
+            let active = if slots.contains(&saved_group.active) {
+                saved_group.active
+            } else {
+                slots[0]
+            };
+            groups.push(WorkspaceGroup { slots, active });
+        }
+    }
+    for key in wanted {
+        if assigned.insert(*key) {
+            groups.push(WorkspaceGroup {
+                slots: vec![*key],
+                active: *key,
+            });
+        }
+    }
+
+    let board = TabKey::first(Slot::Board);
+    let board_open = state.is_some_and(saved_board_open);
+    let zoomed = state
+        .and_then(|state| state.zoomed)
+        .filter(|key| *key != board)
+        .filter(|key| groups.len() > 1 && groups.iter().any(|group| group.slots.contains(key)));
+    let layout_group_anchors = groups
+        .iter()
+        .filter(|group| !board_open || !group.slots.contains(&board))
+        .filter_map(|group| group.slots.first().copied())
+        .collect();
+    let layout = state
+        .and_then(|state| state.layout.as_ref())
+        .and_then(|layout| {
+            if board_open {
+                strip_board_layout(layout, board)
+            } else {
+                Some(layout.clone())
+            }
+        });
+
+    WorkspaceRestorePlan {
+        groups,
+        layout,
+        layout_group_anchors,
+        zoomed,
+        board_open,
     }
 }
 
@@ -4386,6 +5417,41 @@ fn layout_covers(node: &split::Node<Group>, groups: &[Rc<Group>]) -> bool {
         && groups
             .iter()
             .all(|group| leaves.iter().any(|leaf| Rc::ptr_eq(group, leaf)))
+}
+
+/// Which agent tab a sidebar row is about. The precedence keeps repeated
+/// clicks from stacking tabs — and processes — on one conversation:
+///
+/// 1. a tab already launched on the row's conversation, wherever it sits;
+/// 2. the row's own stable place — a radar-run session reopens the key it
+///    ran at, so its identity survives GUI restarts;
+/// 3. an imported conversation has no radar identity: the first quiet tab
+///    of the kind, rather than displacing a live one;
+/// 4. the next free key — the caller creates the tab and the panel homes it.
+fn agent_tab_for_session(
+    keys: &[TabKey],
+    stable_key: Option<TabKey>,
+    wanted: Option<&str>,
+    conversation_of: impl Fn(TabKey) -> Option<String>,
+    is_live: impl Fn(TabKey) -> bool,
+    next_key: TabKey,
+) -> TabKey {
+    if let Some(wanted) = wanted {
+        if let Some(key) = keys
+            .iter()
+            .copied()
+            .find(|key| conversation_of(*key).as_deref() == Some(wanted))
+        {
+            return key;
+        }
+    }
+    if let Some(key) = stable_key {
+        return key;
+    }
+    keys.iter()
+        .copied()
+        .find(|key| !is_live(*key))
+        .unwrap_or(next_key)
 }
 
 /// The classic arrangement as a tree: agent-anchored main pane on the left,
@@ -4627,6 +5693,114 @@ mod activity_ui_tests {
     }
 
     #[test]
+    fn board_open_restore_preserves_tool_tree_for_dismissal() {
+        let agent = TabKey::first(Slot::Agent);
+        let diff = TabKey::first(Slot::Diff);
+        let board = TabKey::first(Slot::Board);
+        let state = WorkspaceState {
+            groups: vec![
+                WorkspaceGroup {
+                    slots: vec![agent],
+                    active: agent,
+                },
+                WorkspaceGroup {
+                    slots: vec![diff],
+                    active: diff,
+                },
+            ],
+            layout: Some(WorkspaceLayout::Split {
+                axis: WorkspaceAxis::Horizontal,
+                ratio: 0.5,
+                key: "manual".into(),
+                first: Box::new(WorkspaceLayout::Pane { group: agent }),
+                second: Box::new(WorkspaceLayout::Pane { group: diff }),
+            }),
+            board_open: true,
+            ..WorkspaceState::default()
+        };
+
+        let plan = workspace_restore_plan(Some(&state), &[agent, diff, board]);
+        assert!(plan.board_open);
+        assert_eq!(plan.zoomed, None);
+        assert_eq!(plan.layout_group_anchors, vec![agent, diff]);
+        assert_eq!(
+            plan.groups
+                .iter()
+                .map(|group| group.slots[0])
+                .collect::<Vec<_>>(),
+            vec![agent, diff, board]
+        );
+
+        let layout = plan.layout.as_ref().unwrap();
+        let restored_tree = restore_layout_keys(layout, &plan.layout_group_anchors).unwrap();
+        assert_eq!(restored_tree, vec![agent, diff]);
+
+        let tools_after_dismissal: Vec<TabKey> = plan
+            .groups
+            .iter()
+            .filter(|group| !group.slots.contains(&board))
+            .filter_map(|group| group.slots.first().copied())
+            .collect();
+        assert_eq!(tools_after_dismissal, restored_tree);
+
+        let tree_with_board = WorkspaceLayout::Split {
+            axis: WorkspaceAxis::Horizontal,
+            ratio: 0.5,
+            key: "invalid".into(),
+            first: Box::new(WorkspaceLayout::Pane { group: agent }),
+            second: Box::new(WorkspaceLayout::Pane { group: board }),
+        };
+        assert!(restore_layout_keys(&tree_with_board, &plan.layout_group_anchors).is_none());
+    }
+
+    #[test]
+    fn legacy_board_zoom_state_migrates_to_explicit_board_open() {
+        let agent = TabKey::first(Slot::Agent);
+        let diff = TabKey::first(Slot::Diff);
+        let board = TabKey::first(Slot::Board);
+        let state = WorkspaceState {
+            groups: vec![
+                WorkspaceGroup {
+                    slots: vec![agent],
+                    active: agent,
+                },
+                WorkspaceGroup {
+                    slots: vec![diff],
+                    active: diff,
+                },
+                WorkspaceGroup {
+                    slots: vec![board],
+                    active: board,
+                },
+            ],
+            layout: Some(WorkspaceLayout::Split {
+                axis: WorkspaceAxis::Horizontal,
+                ratio: 0.5,
+                key: "outer".into(),
+                first: Box::new(WorkspaceLayout::Pane { group: agent }),
+                second: Box::new(WorkspaceLayout::Split {
+                    axis: WorkspaceAxis::Vertical,
+                    ratio: 0.5,
+                    key: "inner".into(),
+                    first: Box::new(WorkspaceLayout::Pane { group: diff }),
+                    second: Box::new(WorkspaceLayout::Pane { group: board }),
+                }),
+            }),
+            zoomed: Some(board),
+            ..WorkspaceState::default()
+        };
+
+        let plan = workspace_restore_plan(Some(&state), &[agent, diff, board]);
+        assert!(plan.board_open);
+        assert_eq!(plan.zoomed, None);
+        assert_eq!(plan.layout_group_anchors, vec![agent, diff]);
+        assert_eq!(
+            restore_layout_keys(plan.layout.as_ref().unwrap(), &plan.layout_group_anchors),
+            Some(vec![agent, diff])
+        );
+    }
+
+    #[test]
     fn stable_session_links_keep_project_tab_instance_and_hyphenated_program() {
         let (project_id, key, program_id) =
             parse_stable_session_id("project-73-agent-2-claude-code").unwrap();
@@ -4640,5 +5814,97 @@ mod activity_ui_tests {
         );
         assert_eq!(program_id, "claude-code");
         assert!(parse_stable_session_id("random-session-id").is_none());
+    }
+}
+
+#[cfg(test)]
+mod agent_panel_tests {
+    use super::*;
+
+    fn k(instance: u32) -> TabKey {
+        TabKey {
+            slot: Slot::Agent,
+            instance,
+        }
+    }
+
+    fn chooser<'a>(
+        keys: &'a [TabKey],
+        conversations: impl Fn(TabKey) -> Option<String> + 'a,
+        live: impl Fn(TabKey) -> bool + 'a,
+    ) -> impl Fn(Option<TabKey>, Option<&str>, TabKey) -> TabKey + 'a {
+        move |stable_key, wanted, next_key| {
+            agent_tab_for_session(keys, stable_key, wanted, &conversations, &live, next_key)
+        }
+    }
+
+    #[test]
+    fn a_row_lands_on_the_tab_already_running_its_conversation() {
+        // A radar-run row's own stable place holds a different conversation
+        // now; the row's talk went to another tab. The exact match wins —
+        // and the stable place's live agent is not disturbed by a relaunch.
+        let keys = [k(0), k(3)];
+        let choose = chooser(
+            &keys,
+            |key| {
+                if key == k(0) {
+                    Some("ses-other".to_string())
+                } else {
+                    Some("ses-wanted".to_string())
+                }
+            },
+            |key| key == k(0),
+        );
+        assert_eq!(
+            choose(Some(k(0)), Some("ses-wanted"), k(4)),
+            k(3),
+            "the conversation's own tab beats the row's stable key"
+        );
+    }
+
+    #[test]
+    fn a_radar_run_row_reopens_at_its_own_stable_key() {
+        // No tab carries the conversation: the session returns to the key
+        // it ran at, even while quiet tabs of the kind sit around.
+        let keys = [k(0), k(1)];
+        let choose = chooser(&keys, |_| None, |_| false);
+        assert_eq!(choose(Some(k(1)), Some("ses-a"), k(2)), k(1));
+    }
+
+    #[test]
+    fn an_imported_row_reuses_a_quiet_tab_and_never_a_live_one() {
+        let keys = [k(0), k(1), k(2)];
+        let choose = chooser(&keys, |_| None, |key| key == k(0) || key == k(2));
+        assert_eq!(
+            choose(None, Some("ses-a"), k(3)),
+            k(1),
+            "the one quiet tab of the kind takes the conversation"
+        );
+        assert_eq!(
+            choose(None, Some("ses-a"), k(3)),
+            k(1),
+            "every tab live means a new key, not a displaced agent"
+        );
+    }
+
+    #[test]
+    fn every_tab_live_gives_an_imported_row_a_fresh_key() {
+        let keys = [k(0)];
+        let choose = chooser(&keys, |_| None, |_| true);
+        assert_eq!(choose(None, Some("ses-a"), k(1)), k(1));
+    }
+
+    #[test]
+    fn a_row_without_a_conversation_id_skips_the_exact_match() {
+        // No provider id to match: the stable key and the quiet tab still
+        // answer, in that order.
+        let keys = [k(0), k(1)];
+        let choose = chooser(
+            &keys,
+            |key| (key == k(0)).then(|| "ses-a".to_string()),
+            |key| key == k(0),
+        );
+        assert_eq!(choose(Some(k(1)), None, k(2)), k(1));
+        assert_eq!(choose(None, None, k(2)), k(1), "k(0) is live");
     }
 }

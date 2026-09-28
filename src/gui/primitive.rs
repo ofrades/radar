@@ -7,6 +7,7 @@
 //! the widget is detached, the process and its pty keep going, so an agent
 //! never dies because you looked away.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -19,6 +20,11 @@ pub struct Primitive {
     pub program_id: String,
     pub widget: gtk::Widget,
     pub pane: Option<Rc<Pane>>,
+    /// The provider conversation this pane was launched on, when the launch
+    /// named one exactly (`--session <id>`). How a sidebar row recognizes
+    /// its own conversation in a tab: showing a running tab is only honest
+    /// when it really is the conversation the row points at.
+    pub launched_session: RefCell<Option<String>>,
 }
 
 impl Primitive {
@@ -32,6 +38,7 @@ impl Primitive {
             program_id: program.id.clone(),
             widget,
             pane: Some(pane),
+            launched_session: RefCell::new(None),
         })
     }
 
@@ -43,6 +50,7 @@ impl Primitive {
             program_id: program_id.to_string(),
             widget,
             pane: None,
+            launched_session: RefCell::new(None),
         })
     }
 

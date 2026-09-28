@@ -111,6 +111,10 @@ pub fn install(app: &SharedApp) {
         let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
         let hud_open = app.hud.is_visible();
+        if hud_open && key == gtk::gdk::Key::Escape {
+            app.hud.handle_escape(app);
+            return glib::Propagation::Stop;
+        }
 
         if let Some(direction) = match key {
             gtk::gdk::Key::Left => Some(Direction::Left),

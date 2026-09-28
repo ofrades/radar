@@ -3,8 +3,23 @@
 `radar web` starts a local HTTP/WebSocket client for the existing session daemon.
 It binds to `127.0.0.1` by default (port `8787`) and does not expose the daemon's
 private Unix socket. The web page uses xterm.js to render terminal bytes and
-provides a responsive project view with sessions, activity, and outstanding
-attention requests.
+provides a responsive project view with sessions, activity, outstanding
+attention requests, and expandable project-sidebar agent lists. Live and
+registry-retained rows are “Open session” actions: running sessions open as
+interactive terminals; ended daemon sessions open their retained terminal
+screen read-only.
+
+Opening a session switches to an immersive terminal view that hides project
+navigation so the terminal uses the available viewport; **Workspace** returns
+to the project view.
+
+The session endpoint also includes durable catalog history. Catalog-only rows
+are sorted by their provider activity time and marked **ended**; they are
+deliberately inert because the daemon no longer has a terminal to attach to.
+The browser identifies that state instead of sending a request that can only
+fail. Reopen such a conversation from the native Radar sidebar, where provider
+resume links are available when the provider exposed a stable session id. Use
+**Workspace** to return to the project and choose another live session.
 
 ## Run locally
 

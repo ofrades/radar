@@ -177,6 +177,19 @@ impl Hud {
         }
     }
 
+    /// Clear the filter first, then close the panel, no matter which of its
+    /// widgets currently has keyboard focus.
+    pub fn handle_escape(&self, app: &SharedApp) {
+        if !self.root.is_visible() {
+            return;
+        }
+        if self.search.text().is_empty() {
+            self.close(app);
+        } else {
+            self.search.set_text("");
+        }
+    }
+
     /// Connect the panel to the app: row activation, and the keys while the
     /// filter box has them. Split from `new` so the panel holds no
     /// reference back to the app (it is dropped, its widgets live on).
@@ -199,15 +212,6 @@ impl Hud {
                     gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter => {
                         if let Some(row) = hud.list.selected_row() {
                             hud.activate(&app, &row);
-                        }
-                    }
-                    // Esc empties the filter first, the way the sidebar's
-                    // search does, then closes.
-                    gtk::gdk::Key::Escape => {
-                        if hud.search.text().is_empty() {
-                            hud.close(&app);
-                        } else {
-                            hud.search.set_text("");
                         }
                     }
                     _ => return glib::Propagation::Proceed,

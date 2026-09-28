@@ -34,11 +34,7 @@ impl Db {
     }
 
     /// The conversation a claim's agent last had: `(program_id, session_id)`.
-    pub fn bound_session(
-        &self,
-        project_id: i64,
-        claim: &str,
-    ) -> Result<Option<(String, String)>> {
+    pub fn bound_session(&self, project_id: i64, claim: &str) -> Result<Option<(String, String)>> {
         Ok(self
             .conn
             .query_row(
@@ -61,14 +57,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("one")).unwrap();
         let project = db.add_project(dir.path().join("one")).unwrap().id;
-        assert!(db.bound_session(project, "opencode-mui9zs8a").unwrap().is_none());
+        assert!(db
+            .bound_session(project, "opencode-mui9zs8a")
+            .unwrap()
+            .is_none());
 
-        db.bind_session(project, "opencode-mui9zs8a", "opencode", "ses_abc").unwrap();
+        db.bind_session(project, "opencode-mui9zs8a", "opencode", "ses_abc")
+            .unwrap();
         let bound = db.bound_session(project, "opencode-mui9zs8a").unwrap();
         assert_eq!(bound, Some(("opencode".into(), "ses_abc".into())));
 
         // Rebinding the same claim replaces the conversation.
-        db.bind_session(project, "opencode-mui9zs8a", "opencode", "ses_def").unwrap();
+        db.bind_session(project, "opencode-mui9zs8a", "opencode", "ses_def")
+            .unwrap();
         assert_eq!(
             db.bound_session(project, "opencode-mui9zs8a").unwrap(),
             Some(("opencode".into(), "ses_def".into()))
@@ -76,6 +77,9 @@ mod tests {
         // Another project's claim with the same name is its own.
         std::fs::create_dir_all(dir.path().join("two")).unwrap();
         let other = db.add_project(dir.path().join("two")).unwrap().id;
-        assert!(db.bound_session(other, "opencode-mui9zs8a").unwrap().is_none());
+        assert!(db
+            .bound_session(other, "opencode-mui9zs8a")
+            .unwrap()
+            .is_none());
     }
 }

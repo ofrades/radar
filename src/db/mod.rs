@@ -3,9 +3,9 @@
 //! One database, owned by this binary. Every front-end (GUI, CLI, a future
 //! shell widget) goes through the same `Db` type, so nothing can disagree
 //! about what a project is.
-
 mod agent_sessions;
 mod events;
+mod project_settings;
 mod projects;
 mod settings;
 mod tabs;
@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 pub use events::Event;
+pub use project_settings::ProjectSettings;
 pub use projects::Project;
 pub use settings::{NewWorkspaceLayout, Preferences, UiPrefs};
 pub use tabs::{Slot, Tab, TabKey};
@@ -25,7 +26,7 @@ pub use workspace::{WorkspaceAxis, WorkspaceGroup, WorkspaceLayout, WorkspaceSta
 use crate::config::Paths;
 
 /// Current schema version; bump with a migration below when changing tables.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 pub struct Db {
     conn: Connection,
@@ -128,6 +129,20 @@ impl Db {
                     session_id TEXT    NOT NULL,
                     updated_at INTEGER NOT NULL,
                     PRIMARY KEY (project_id, claim)
+                );
+                "#,
+            )?;
+        }
+        if version < 4 {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS project_settings (
+                    project_id   INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                    board_enabled INTEGER NOT NULL DEFAULT 1,
+                    editor       TEXT,
+                    agent        TEXT,
+                    diff         TEXT,
+                    shell        TEXT
                 );
                 "#,
             )?;

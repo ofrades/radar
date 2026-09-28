@@ -60,10 +60,7 @@ fn main() {
                     &argv,
                     &[],
                     std::env::current_dir().unwrap().as_path(),
-                    radar::session::Dims {
-                        cols: 80,
-                        rows: 24,
-                    },
+                    radar::session::Dims { cols: 80, rows: 24 },
                     move |event| {
                         let _ = sender.try_send(event);
                     },
@@ -73,8 +70,9 @@ fn main() {
                         println!("tty of the program: {:?}", session.tty_name());
                         // A separate descriptor for the widget, the way
                         // the pane does it.
-                        let fd =
-                            unsafe { std::os::fd::OwnedFd::from_raw_fd(libc::dup(session.client_fd())) };
+                        let fd = unsafe {
+                            std::os::fd::OwnedFd::from_raw_fd(libc::dup(session.client_fd()))
+                        };
                         match vte4::Pty::foreign_sync(fd, None::<&gtk::gio::Cancellable>) {
                             Ok(pty) => {
                                 terminal.set_pty(Some(&pty));

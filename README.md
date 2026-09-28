@@ -2,13 +2,24 @@
 
 <img src="packaging/radar.svg" alt="radar logo" width="96">
 
-A native workspace manager: **projects in a sidebar, one tab per tool**.
+A native workspace manager: **projects in a sidebar, tabs for every tool**.
 
 Open radar and you get a real window. The sidebar lists your projects with their
-git state; picking one shows that project's tabs. Each tab runs one program —
-your editor, your agent, your diff — with the project as its working directory.
-Switching projects switches everything, and the tabs of projects you leave stay
-alive, so a running agent is never interrupted.
+git state; picking one shows that project's tabs. Expand a project to see its
+agent sessions, including ended conversations from the durable session catalog,
+sorted by recent activity. Radar keeps **one agent panel**: selecting a session
+shows it there — its tab joins the panel's header as a chip, and the agent
+that was on screen is hidden but never stopped, its process and pty safe in
+the session layer. A tab dragged out for a side-by-side goes home on the next
+sidebar selection. External
+CLI sessions under terminal windows are discovered by working directory and show
+the CLI or terminal-window title. Selecting an external session focuses its
+terminal window. Catalog rows with a provider resume id reopen that exact
+conversation; rows without one are kept as honest history instead of guessing.
+Ended or failed history older than seven days moves to the archived view
+automatically. The project's **+** starts another agent. Live sessions are
+rediscovered after a Radar restart, and tabs of projects you leave stay alive,
+so a running agent is never interrupted.
 
 ```
 ┌────────────────┬──────────────────────────────────────────────┐
@@ -155,7 +166,7 @@ radar open api-server       # what its tabs resolve to, command per tab
 radar agents                # agents, omarchy's default, what is installed
 radar programs diff         # the registry, by kind
 radar prefs                 # resolved preference per slot
-radar prefs agent claude    # set one
+radar prefs agent omp        # set one of OpenCode, OMP, or Cursor
 radar web [--port 8787]     # responsive browser client on localhost
 radar pin / move / rename / remove / prune
 radar board                 # the project's kanban (BOARD.md)
@@ -163,6 +174,10 @@ radar card add / claim / release / move / done / next
 radar hook guard            # the board's pre-edit check, for harness hooks
 radar doctor                # environment check
 ```
+
+New agent selections are limited to OpenCode, OMP (Oh My Pi), and Cursor. Other
+registered agents remain available to restore existing tabs, but do not appear
+in agent selectors or resolve as new/default agent choices.
 
 ## Persistent session daemon (client/server groundwork)
 
@@ -202,13 +217,23 @@ input adapter for daemon-owned sessions. Snapshot replay restores the active
 screen, common modes and recent scrollback, but full parser-state restoration
 remains the next terminal compatibility step.
 
+Agent conversation history is provider-specific. Radar imports and reopens exact
+OpenCode conversations from OpenCode's JSON session list. OpenCode, OMP, and
+Cursor can resume the last conversation; exact resume flags are configured when
+a provider session ID is available. OMP and Cursor sessions started in another
+terminal appear as external-terminal rows that focus the original terminal;
+Radar does not claim those separate processes are attached to its PTY. Their
+history is not imported unless the CLI provides a supported machine-readable
+session list.
+
 ## Remote browser client
 
 `radar web` serves a responsive browser workspace on `127.0.0.1:8787`: choose a
 project, see its Radar-launched sessions and activity, answer outstanding agent
-requests, attach to a live session, or start a project shell. Detaching the web
-terminal leaves the session running. The browser terminal is rendered with
-xterm.js; it is independent of the native VTE/Ghostty renderer.
+requests, open running sessions interactively or ended sessions read-only, and
+start a project shell. Detaching the web terminal leaves a running session alive.
+The browser terminal is rendered with xterm.js; it is independent of the native
+VTE/Ghostty renderer.
 
 To keep the client running with your user session, install and enable the
 packaged systemd user unit; see [the web client guide](docs/web-client.md).
@@ -232,8 +257,9 @@ guide](docs/web-client.md) for details.
 The Board (Alt+K) opens as a full-width, full-height workspace panel. Its
 columns expand with the window; it cannot be grouped or split into a tool tile.
 Select a tool from the dock to return to the saved tool arrangement, or close
-the board with Alt+K, its close button, or Alt+F. Sessions keep running while
-the board is open.
+the board with Alt+K, its close button, or Alt+F. That arrangement is restored
+when you reopen the project, even if you left Board open. Sessions keep running
+while the board is open.
 
 The client/server direction is **board-first interaction**: the server owns
 session state, explicit agent activity and durable attention; the board presents
@@ -245,11 +271,24 @@ to receive that typed response. Vendor-specific adapters and exact terminal-stat
 import remain follow-up work. See
 [the review and delivery contracts](docs/board-interactivity.md).
 
-Every project has a kanban, and the kanban is a file: `BOARD.md` in the project
-root, created when the project opens. Columns are `## ` headings, cards are
-`- [ ]` lines, a claim is a `@name` on the card's line, indented lines under a
-card are its notes. radar adds an invisible HTML comment with a stable card ID;
-ordinary markdown rendering does not show it.
+Projects use an optional kanban stored as `BOARD.md` in the project root.
+Boards are enabled by default. Toggle **Board** on a project's sidebar row to
+opt that project out; the setting is stored in Radar's global database, not
+the project tree.
+
+Open **Project defaults** from a project's sidebar row to set its default
+Editor, Agent, Diff, and Shell programs. Each pane inherits the corresponding
+global **Preferences** choice until a project override is selected. Board and
+pane defaults are per-project Radar settings and are never written to files
+that need to be committed with the project.
+
+When disabled, Radar does not initialize or open the board and its claim
+guards allow edits and commits. Existing `BOARD.md` and skill files are left
+untouched. When enabled, the board file is initialized as the project opens.
+Columns are `## ` headings, cards are `- [ ]` lines, a claim
+is an `@name` on the card's line, and indented lines under a card are its
+notes. radar adds an invisible HTML comment with a stable card ID; ordinary
+markdown rendering does not show it.
 
 That plainness is the point: an agent already running in the project claims
 work and moves it along by editing the file with the tools it already has — no
@@ -268,15 +307,12 @@ radar card move "Fix login" --to Review  # hands the card over: the claim drops
 
 ### The convention
 
-A board nobody is made to use is a wall decoration, so radar puts the board in
-the agents' way at both ends — without touching a single agent's
-configuration. When an **agent pane opens**, radar writes the convention into
-the project: the board file, a skill describing the loop
-(`.opencode/skills/board/SKILL.md` for opencode, `.claude/skills/board/SKILL.md`
-for Claude Code, a pointer in `AGENTS.md` for the harnesses that only read
-that), and a `RADAR_AGENT` environment variable — `claude-mx7k2b1f`, unique
-per launch — so two instances of the same agent never hold each other's cards,
-and a claim on the board says which one.
+When an agent pane opens in a board-enabled project, radar writes harness skill
+files for opencode and Claude Code (`.opencode/skills/board/SKILL.md` and
+`.claude/skills/board/SKILL.md`) and installs a pre-commit claim gate when the
+repository has no conflicting hook. The setup never changes `AGENTS.md`.
+A unique `RADAR_AGENT` environment variable — `claude-mx7k2b1f`, for example —
+distinguishes concurrent instances so each board claim identifies its owner.
 
 The loop the skill teaches: claim with `radar card next --by "$RADAR_AGENT"`,
 work one card at a time, hand over by moving to **Review** with a note for

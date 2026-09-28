@@ -96,7 +96,11 @@ pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
         };
     }
     if agents::use_omarchy_launcher(program, options) {
-        let mut argv = vec!["omarchy".to_string(), "agent".to_string(), "--inline".to_string()];
+        let mut argv = vec![
+            "omarchy".to_string(),
+            "agent".to_string(),
+            "--inline".to_string(),
+        ];
         if let Some(prompt) = options.prompt.as_deref() {
             if !prompt.is_empty() {
                 argv.push("--prompt".to_string());
@@ -219,7 +223,9 @@ mod tests {
 
     #[test]
     fn always_on_args_come_before_auto_flags() {
-        let hunk = program("hunk", "hunk").with_args(&["diff", "--watch"]).with_auto_args(&["--x"]);
+        let hunk = program("hunk", "hunk")
+            .with_args(&["diff", "--watch"])
+            .with_auto_args(&["--x"]);
         let spec = command_spec(&hunk, &LaunchOptions::default());
         assert_eq!(spec.argv, vec!["hunk", "diff", "--watch", "--x"]);
     }
@@ -284,7 +290,9 @@ mod tests {
         let mut editor = program("nvim", "nvim");
         editor.kind = Kind::Editor;
         assert!(command_spec(&editor, &options).env_set.is_empty());
-        assert!(command_spec(&agent, &LaunchOptions::default()).env_set.is_empty());
+        assert!(command_spec(&agent, &LaunchOptions::default())
+            .env_set
+            .is_empty());
     }
 
     #[test]
@@ -363,5 +371,42 @@ mod tests {
         let mut crush = program("crush", "crush");
         crush.resume_session = String::new();
         assert_eq!(command_spec(&crush, &options).argv, vec!["crush"]);
+    }
+
+    #[test]
+    fn supported_agents_resume_last_or_exact_provider_session() {
+        let by_id = |id: &str| crate::programs::by_id(id).unwrap();
+        for id in ["opencode", "omp", "cursor-agent"] {
+            let program = by_id(id);
+            let resumed = command_spec(
+                &program,
+                &LaunchOptions {
+                    resume: true,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                resumed.argv,
+                vec![program.command.clone(), "--continue".to_string()],
+                "{id}"
+            );
+        }
+
+        let exact = LaunchOptions {
+            session: Some("session-42".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            command_spec(&by_id("opencode"), &exact).argv,
+            vec!["opencode", "--session", "session-42"]
+        );
+        assert_eq!(
+            command_spec(&by_id("omp"), &exact).argv,
+            vec!["omp", "--resume=session-42"]
+        );
+        assert_eq!(
+            command_spec(&by_id("cursor-agent"), &exact).argv,
+            vec!["cursor-agent", "--resume", "session-42"]
+        );
     }
 }

@@ -29,7 +29,13 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 5] = [Kind::Editor, Kind::Agent, Kind::Diff, Kind::Shell, Kind::Tool];
+    pub const ALL: [Kind; 5] = [
+        Kind::Editor,
+        Kind::Agent,
+        Kind::Diff,
+        Kind::Shell,
+        Kind::Tool,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
@@ -96,7 +102,14 @@ pub struct Program {
 }
 
 impl Program {
-    fn new(id: &str, name: &str, command: &str, kind: Kind, description: &str, priority: i32) -> Program {
+    fn new(
+        id: &str,
+        name: &str,
+        command: &str,
+        kind: Kind,
+        description: &str,
+        priority: i32,
+    ) -> Program {
         Program {
             id: id.to_string(),
             name: name.to_string(),
@@ -168,20 +181,48 @@ pub fn registry() -> Vec<Program> {
     // ---- Editors (terminal only: a GUI editor cannot live in a tab) ----
     let editor_priority = 0;
     programs.push(
-        Program::new("nvim", "Neovim", "nvim", Kind::Editor, "the editor", editor_priority)
-            .with_args(&["."]),
+        Program::new(
+            "nvim",
+            "Neovim",
+            "nvim",
+            Kind::Editor,
+            "the editor",
+            editor_priority,
+        )
+        .with_args(&["."]),
     );
     programs.push(
-        Program::new("vim", "Vim", "vim", Kind::Editor, "classic vim", editor_priority + 1)
-            .with_args(&["."]),
+        Program::new(
+            "vim",
+            "Vim",
+            "vim",
+            Kind::Editor,
+            "classic vim",
+            editor_priority + 1,
+        )
+        .with_args(&["."]),
     );
     programs.push(
-        Program::new("hx", "Helix", "hx", Kind::Editor, "modal editor in Rust", editor_priority + 2)
-            .with_args(&["."]),
+        Program::new(
+            "hx",
+            "Helix",
+            "hx",
+            Kind::Editor,
+            "modal editor in Rust",
+            editor_priority + 2,
+        )
+        .with_args(&["."]),
     );
     programs.push(
-        Program::new("micro", "Micro", "micro", Kind::Editor, "friendly editor", editor_priority + 3)
-            .with_args(&["."]),
+        Program::new(
+            "micro",
+            "Micro",
+            "micro",
+            Kind::Editor,
+            "friendly editor",
+            editor_priority + 3,
+        )
+        .with_args(&["."]),
     );
     // Honour $EDITOR when it is something the list does not already cover, so a
     // kakoune or emacs user gets their editor without a second nvim entry.
@@ -203,43 +244,96 @@ pub fn registry() -> Vec<Program> {
 
     // GUI editors: offered as "open externally", never as a tab.
     programs.push(
-        Program::new("zed", "Zed", "zed", Kind::Editor, "open the project in Zed", 50)
-            .with_args(&["."])
-            .external(),
+        Program::new(
+            "zed",
+            "Zed",
+            "zed",
+            Kind::Editor,
+            "open the project in Zed",
+            50,
+        )
+        .with_args(&["."])
+        .external(),
     );
     programs.push(
-        Program::new("code", "VS Code", "code", Kind::Editor, "open the project in VS Code", 51)
-            .with_args(&["."])
-            .external(),
+        Program::new(
+            "code",
+            "VS Code",
+            "code",
+            Kind::Editor,
+            "open the project in VS Code",
+            51,
+        )
+        .with_args(&["."])
+        .external(),
     );
     programs.push(
-        Program::new("cursor", "Cursor", "cursor", Kind::Editor, "open the project in Cursor", 52)
-            .with_args(&["."])
-            .external(),
+        Program::new(
+            "cursor",
+            "Cursor",
+            "cursor",
+            Kind::Editor,
+            "open the project in Cursor",
+            52,
+        )
+        .with_args(&["."])
+        .external(),
     );
 
     // ---- Agents: omarchy's list, plus a few the registry knows directly ----
     programs.extend(agents::programs());
 
-
     // ---- Diffs ----
     // lazygit leads: it is the general git TUI, so it is what the Changes
     // primitive opens when nothing else is preferred. Hunk stays second as the
     // focused reviewer for a single changeset.
-    programs.push(Program::new("lazygit", "Lazygit", "lazygit", Kind::Diff, "git TUI", 0));
+    programs.push(Program::new(
+        "lazygit",
+        "Lazygit",
+        "lazygit",
+        Kind::Diff,
+        "git TUI",
+        0,
+    ));
     programs.push(
-        Program::new("hunk", "Hunk", "hunk", Kind::Diff, "live review of agent changes", 1)
-            .with_args(&["diff", "--watch"]),
+        Program::new(
+            "hunk",
+            "Hunk",
+            "hunk",
+            Kind::Diff,
+            "live review of agent changes",
+            1,
+        )
+        .with_args(&["diff", "--watch"]),
     );
-    programs.push(Program::new("gitui", "GitUI", "gitui", Kind::Diff, "git TUI", 2));
-    programs.push(Program::new("tig", "Tig", "tig", Kind::Diff, "git browser", 3));
+    programs.push(Program::new(
+        "gitui",
+        "GitUI",
+        "gitui",
+        Kind::Diff,
+        "git TUI",
+        2,
+    ));
+    programs.push(Program::new(
+        "tig",
+        "Tig",
+        "tig",
+        Kind::Diff,
+        "git browser",
+        3,
+    ));
 
     // ---- Shells ----
     let shell = crate::config::login_shell();
     let shell_name = shell.rsplit('/').next().unwrap_or("shell").to_string();
-    programs.push(
-        Program::new("shell", &format!("Shell ({shell_name})"), &shell, Kind::Shell, "your login shell", 0),
-    );
+    programs.push(Program::new(
+        "shell",
+        &format!("Shell ({shell_name})"),
+        &shell,
+        Kind::Shell,
+        "your login shell",
+        0,
+    ));
     for (index, candidate) in ["bash", "zsh", "fish"].iter().enumerate() {
         if crate::config::have(candidate) {
             programs.push(Program::new(
@@ -323,9 +417,11 @@ pub fn external_programs() -> Vec<Program> {
 pub fn for_slot(slot: Slot, preferences: &Preferences) -> Option<Program> {
     let kind = Kind::from_slot(slot)?;
     if let Some(id) = preferences.get(slot) {
-        if let Some(program) = by_id(id) {
-            if program.installed() && !program.external {
-                return Some(program);
+        if slot != Slot::Agent || agents::is_supported(id) {
+            if let Some(program) = by_id(id) {
+                if program.installed() && !program.external {
+                    return Some(program);
+                }
             }
         }
     }
@@ -342,8 +438,7 @@ pub fn candidates_for_slot(slot: Slot, preferences: &Preferences) -> Vec<Program
     };
     let mut candidates = installed_of(kind);
     if slot == Slot::Agent {
-        // Agents the registry knows but omarchy does not, plus a blank slate.
-        candidates = agents::installable_agents();
+        candidates = agents::selectable_agents();
     }
     let preferred = preferences.get(slot);
     candidates.sort_by_key(|p| (p.id != preferred.unwrap_or_default(), p.priority));
@@ -398,6 +493,30 @@ mod tests {
         assert!(agents.iter().any(|a| a.id == "claude"));
         assert!(agents.iter().all(|a| a.kind == Kind::Agent));
         assert!(agents.iter().any(|a| a.omarchy));
+    }
+
+    #[test]
+    fn agent_choice_lists_only_supported_providers() {
+        let prefs = Preferences {
+            agent: Some("claude".into()),
+            ..Default::default()
+        };
+        let candidates = candidates_for_slot(Slot::Agent, &prefs);
+        assert!(candidates
+            .iter()
+            .all(|program| agents::is_supported(&program.id)));
+        assert!(!candidates.iter().any(|program| program.id == "claude"));
+    }
+
+    #[test]
+    fn old_unsupported_agent_preference_resolves_to_a_supported_fallback() {
+        let prefs = Preferences {
+            agent: Some("claude".into()),
+            ..Default::default()
+        };
+        assert!(
+            for_slot(Slot::Agent, &prefs).is_none_or(|program| agents::is_supported(&program.id))
+        );
     }
 
     #[test]

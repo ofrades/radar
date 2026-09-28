@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 
-use super::daemon::{Client, Command, Response};
+use super::daemon::{ensure_running, Client, Command, Response};
 use super::registry::{Feedback, Lifecycle, Output, Sequenced, Spawn};
 use super::{Dims, ExitInfo};
 
@@ -265,6 +265,33 @@ fn open_bridge(dims: Dims) -> Result<(Fd, Fd)> {
     Ok((Fd(master), Fd(slave)))
 }
 
+fn connect_attach(home: &Path, id: &str) -> Result<Client> {
+    connect_attach_with(home, id, ensure_running)
+}
+
+fn connect_attach_with(
+    home: &Path,
+    id: &str,
+    ensure: impl FnOnce(&Path) -> Result<()>,
+) -> Result<Client> {
+    let command = || Command::Attach { id: id.into() };
+    match Client::connect(home, command()) {
+        Ok(client) => Ok(client),
+        Err(error)
+            if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                )
+            }) =>
+        {
+            ensure(home)?;
+            Client::connect(home, command())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn output_loop(
     home: &Path,
@@ -319,7 +346,7 @@ fn output_loop(
         if stop.load(Ordering::Acquire) {
             return;
         }
-        let mut client = match Client::connect(home, Command::Attach { id: id.into() }) {
+        let mut client = match connect_attach(home, id) {
             Ok(client) => client,
             Err(error) => {
                 emit(ClientEvent::Failed(format!(
@@ -340,7 +367,7 @@ fn output_loop(
                         process_id.store(pid, Ordering::Release);
                     }
                     create_needed = false;
-                    client = match Client::connect(home, Command::Attach { id: id.into() }) {
+                    client = match connect_attach(home, id) {
                         Ok(client) => client,
                         Err(error) => {
                             emit(ClientEvent::Failed(format!(
@@ -365,7 +392,7 @@ fn output_loop(
                     // Another client may have created the stable tab ID after
                     // our first attach probe. Retry attachment before surfacing
                     // an ID conflict (launch stamps can differ across clients).
-                    if let Ok(attached) = Client::connect(home, Command::Attach { id: id.into() }) {
+                    if let Ok(attached) = connect_attach(home, id) {
                         if let Ok(interrupt) = attached.interrupt_handle() {
                             Interrupts::set(&interrupts.output, &interrupt);
                             client = attached;
@@ -737,5 +764,73 @@ mod tests {
         );
         assert_eq!(filter.filter(b"\x1b"), b"");
         assert_eq!(filter.filter(b"x"), b"\x1bx");
+    }
+
+    #[test]
+    fn refused_attach_restarts_daemon_and_retries_protocol_attach() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!(
+            "radar-attach-recovery-{}-{nonce}",
+            std::process::id()
+        ));
+        let socket = super::super::daemon::socket_path(&home);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let stale = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        drop(stale);
+
+        let initial_error = Client::connect(
+            &home,
+            Command::Attach {
+                id: "stable".into(),
+            },
+        )
+        .err()
+        .and_then(|error| error.downcast_ref::<io::Error>().map(io::Error::kind));
+
+        let mut server_thread = None;
+        let result = (|| -> Result<()> {
+            let mut client = connect_attach_with(&home, "stable", |home| {
+                let server = super::super::daemon::Server::bind(home)?;
+                server_thread = Some(std::thread::spawn(move || server.run()));
+                match Client::request(
+                    home,
+                    Command::Create(Spawn {
+                        id: "stable".into(),
+                        cwd: std::env::current_dir()?,
+                        argv: vec!["/bin/true".into()],
+                        dims: Dims { cols: 80, rows: 24 },
+                        env: Vec::new(),
+                        env_remove: Vec::new(),
+                    }),
+                )? {
+                    Response::Status(_) => Ok(()),
+                    other => bail!("unexpected session create response: {other:?}"),
+                }
+            })?;
+            match client.receive()? {
+                Response::Snapshot(snapshot) => assert_eq!(snapshot.status.id, "stable"),
+                other => bail!("expected attach snapshot, got {other:?}"),
+            }
+            drop(client);
+            Ok(())
+        })();
+
+        let shutdown = server_thread.map(|server| {
+            let response = Client::request(&home, Command::Shutdown);
+            let result = server.join();
+            (response, result)
+        });
+        std::fs::remove_dir_all(&home).unwrap();
+
+        assert_eq!(initial_error, Some(io::ErrorKind::ConnectionRefused));
+        result.unwrap();
+        let (response, server) = shutdown.expect("recovery must start the daemon");
+        assert!(matches!(response.unwrap(), Response::Ok));
+        server.unwrap().unwrap();
     }
 }

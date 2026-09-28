@@ -24,6 +24,20 @@ pub const FILE_NAME: &str = "BOARD.md";
 /// Scratch file for atomic writes; renamed over [`FILE_NAME`] when complete.
 pub const TEMP_NAME: &str = ".BOARD.md.tmp";
 
+/// Whether Radar's kanban is enabled for this project. Unregistered paths
+/// have no override and retain the default-enabled behavior.
+pub fn enabled(db: &crate::db::Db, project: &Path) -> Result<bool> {
+    Ok(db.project_settings_for_path(project)?.board_enabled)
+}
+
+/// Persist a project's board preference in Radar's global database.
+pub fn set_enabled(db: &crate::db::Db, project: &Path, enabled: bool) -> Result<()> {
+    let project = db
+        .project_by_path(project)?
+        .context("project is not registered in Radar")?;
+    db.set_project_board_enabled(project.id, enabled)
+}
+
 /// Columns a fresh board starts with.
 pub const DEFAULT_COLUMNS: [&str; 4] = ["Backlog", "In progress", "Review", "Done"];
 
@@ -291,6 +305,14 @@ pub fn file_path(project: &Path) -> PathBuf {
     project.join(FILE_NAME)
 }
 
+/// Fail when this project's board is disabled in Radar's global settings.
+pub fn require_enabled(db: &crate::db::Db, project: &Path) -> Result<()> {
+    if !enabled(db, project)? {
+        bail!("the board is disabled for {}", project.display());
+    }
+    Ok(())
+}
+
 /// Create the board file if the project has none. Never overwrites: the file
 /// belongs to the project once it exists.
 pub fn ensure_file(project: &Path) -> Result<PathBuf> {
@@ -306,6 +328,12 @@ pub fn ensure_file(project: &Path) -> Result<PathBuf> {
     std::fs::write(&path, Board::default_for(&name).render())
         .with_context(|| format!("creating {}", path.display()))?;
     Ok(path)
+}
+
+/// Check the global preference, then create the project's board if needed.
+pub fn ensure_enabled_file(db: &crate::db::Db, project: &Path) -> Result<PathBuf> {
+    require_enabled(db, project)?;
+    ensure_file(project)
 }
 
 /// Give pre-migration cards a persistent identity without reformatting the
@@ -847,6 +875,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         (dir, path)
+    }
+
+    #[test]
+    fn board_policy_defaults_enabled_and_is_stored_only_in_global_database() {
+        let (_dir, project) = project();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let stored = db.add_project(&project).unwrap();
+
+        assert!(enabled(&db, &project).unwrap());
+        set_enabled(&db, &project, false).unwrap();
+        assert!(!enabled(&db, &project).unwrap());
+        assert!(ensure_enabled_file(&db, &project).is_err());
+        assert!(!file_path(&project).exists());
+        assert!(!project.join(".radar.toml").exists());
+        assert!(!db.project_settings(stored.id).unwrap().board_enabled);
+    }
+
+    #[test]
+    fn project_file_config_does_not_override_global_board_policy() {
+        let (_dir, project) = project();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.add_project(&project).unwrap();
+        std::fs::write(project.join(".radar.toml"), "[board]\nenabled = false\n").unwrap();
+
+        assert!(enabled(&db, &project).unwrap());
+        assert!(ensure_enabled_file(&db, &project).unwrap().exists());
     }
 
     #[test]

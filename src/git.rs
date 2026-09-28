@@ -61,7 +61,10 @@ pub fn status(dir: impl AsRef<Path>) -> Status {
     if !dir.is_dir() {
         return Status::not_a_repo();
     }
-    let output = git(dir, &["status", "--porcelain=v1", "-b", "--untracked-files=normal"]);
+    let output = git(
+        dir,
+        &["status", "--porcelain=v1", "-b", "--untracked-files=normal"],
+    );
     let Some(output) = output else {
         return Status::not_a_repo();
     };
@@ -186,7 +189,10 @@ mod tests {
         assert_eq!(status.branch.as_deref(), Some("main"));
         assert_eq!(status.changed, 0);
         assert!(!status.dirty);
-        assert_eq!(status.root.as_deref(), std::fs::canonicalize(dir.path()).ok().as_deref());
+        assert_eq!(
+            status.root.as_deref(),
+            std::fs::canonicalize(dir.path()).ok().as_deref()
+        );
     }
 
     #[test]

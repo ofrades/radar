@@ -2,6 +2,7 @@
 //! per connection; Attach and Watch turn that connection into a bounded stream.
 //! Control and feedback use separate connections from terminal output.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -10,9 +11,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use parking_lot::Mutex;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use super::activity::{
@@ -20,6 +22,7 @@ use super::activity::{
     Attention, AttentionMutationResult, ChangeAttention, CreateAttention, CreateAttentionResult,
     PublishActivity, WatchResult,
 };
+use super::catalog::{self, CatalogFilter, SessionCatalog};
 use super::registry::{
     Feedback, History, Lifecycle, Output, ReceiveError, Registry, Sequenced, Snapshot, Spawn,
     Status, Subscription,
@@ -30,6 +33,8 @@ pub const VERSION: u32 = 1;
 const MAX_REQUEST: usize = 128 * 1024;
 const MAX_RESPONSE: usize = 128 * 1024 * 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often the daemon re-reads a provider's own session store per project.
+const PROVIDER_IMPORT_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -85,6 +90,40 @@ pub enum Command {
         project_id: i64,
         after_sequence: u64,
     },
+    /// One project of a catalog query: its stable id and root directory.
+    CatalogList {
+        projects: Vec<CatalogProject>,
+        filter: CatalogFilter,
+        query: Option<String>,
+        limit: u32,
+    },
+    CatalogArchive {
+        id: i64,
+        archived: bool,
+    },
+    /// Backfill a live session the daemon has no Create record for (a session
+    /// that predates the catalog or a daemon the GUI re-adopted).
+    CatalogSeen {
+        project_id: i64,
+        radar_id: String,
+        program: String,
+        cwd: PathBuf,
+    },
+    /// Adopt a provider conversation for a radar-spawned row once the CLI's
+    /// own store reveals which session the run had (exit capture).
+    CatalogBind {
+        radar_id: String,
+        provider: String,
+        provider_session_id: String,
+    },
+}
+
+/// A project as the catalog knows it: the client supplies the roster, since
+/// projects live in radar's own database, not the daemon's.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogProject {
+    pub id: i64,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -115,6 +154,7 @@ pub enum Response {
     AttentionCreated(CreateAttentionResult),
     AttentionChanged(AttentionMutationResult),
     AttentionStatus(Attention),
+    Catalog(Vec<super::catalog::Entry>),
 }
 
 /// Socket directory is private even when the surrounding RADAR_HOME is shared.
@@ -128,6 +168,9 @@ pub struct Server {
     _lock: File,
     registry: Arc<Registry>,
     activity: Arc<ActivityJournal>,
+    catalog: Arc<SessionCatalog>,
+    /// Last provider-history refresh per project root.
+    imports: Arc<Mutex<HashMap<PathBuf, Instant>>>,
     stopping: Arc<AtomicBool>,
 }
 
@@ -150,6 +193,7 @@ impl Server {
             bail!("session daemon is already running");
         }
         let activity = Arc::new(ActivityJournal::open(&directory.join("activity.sqlite"))?);
+        let catalog = Arc::new(SessionCatalog::open(&directory.join("catalog.sqlite"))?);
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -164,6 +208,8 @@ impl Server {
             _lock: lock,
             registry: Arc::new(Registry::default()),
             activity,
+            catalog,
+            imports: Arc::new(Mutex::new(HashMap::new())),
             stopping: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -183,10 +229,14 @@ impl Server {
                     stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
                     let registry = self.registry.clone();
                     let activity = self.activity.clone();
+                    let catalog = self.catalog.clone();
+                    let imports = self.imports.clone();
                     let stopping = self.stopping.clone();
                     workers.push(std::thread::spawn(move || {
                         let mut stream = stream;
-                        if let Err(error) = serve(&mut stream, registry, activity, stopping) {
+                        if let Err(error) =
+                            serve(&mut stream, registry, activity, catalog, imports, stopping)
+                        {
                             let _ = write_frame(
                                 &mut stream,
                                 &Response::Error(error.to_string()),
@@ -221,6 +271,8 @@ fn serve(
     stream: &mut UnixStream,
     registry: Arc<Registry>,
     activity: Arc<ActivityJournal>,
+    catalog: Arc<SessionCatalog>,
+    imports: Arc<Mutex<HashMap<PathBuf, Instant>>>,
     stopping: Arc<AtomicBool>,
 ) -> Result<()> {
     let request: Request = read_frame(stream, MAX_REQUEST)?;
@@ -235,7 +287,23 @@ fn serve(
     }
     let response = match request.command {
         Command::Ping => Response::Hello { version: VERSION },
-        Command::Create(spec) => Response::Status(registry.create(spec)?.status()),
+        Command::Create(spec) => {
+            let status = registry.create(spec.clone())?.status();
+            if let Some(project_id) = catalog::project_of_session_id(&status.id) {
+                let provider = catalog::provider_of_session_id(&status.id)
+                    .unwrap_or_else(|| "shell".to_string());
+                if let Err(error) = catalog.record_radar(
+                    project_id,
+                    &status.id,
+                    &provider,
+                    &spec.cwd,
+                    catalog::now_millis(),
+                ) {
+                    eprintln!("radar session catalog: {error:#}");
+                }
+            }
+            Response::Status(status)
+        }
         Command::List => Response::Sessions(registry.list()),
         Command::History {
             id,
@@ -262,6 +330,78 @@ fn serve(
         Command::Shutdown => {
             registry.stop_all();
             stopping.store(true, Ordering::Release);
+            Response::Ok
+        }
+        Command::CatalogList {
+            projects,
+            filter,
+            query,
+            limit,
+        } => {
+            let now = catalog::now_millis();
+            catalog.reconcile(&registry.list(), now)?;
+            catalog.archive_stale(now)?;
+            for project in &projects {
+                let due = {
+                    let mut pending = imports.lock();
+                    match pending.get(&project.path) {
+                        Some(seen) if seen.elapsed() < PROVIDER_IMPORT_INTERVAL => false,
+                        _ => {
+                            pending.insert(project.path.clone(), Instant::now());
+                            true
+                        }
+                    }
+                };
+                if due {
+                    if let Some(found) =
+                        crate::programs::sessions::list_provider_sessions("opencode", &project.path)
+                    {
+                        let imported = found
+                            .into_iter()
+                            .map(|session| catalog::Imported {
+                                id: session.id,
+                                title: session.title,
+                                created_ms: session.created,
+                                last_activity_ms: session.updated.unwrap_or(session.created),
+                            })
+                            .collect::<Vec<_>>();
+                        catalog.import_provider(
+                            project.id,
+                            "opencode",
+                            &project.path,
+                            &imported,
+                            now,
+                        )?;
+                    }
+                }
+            }
+            let ids: Vec<i64> = projects.iter().map(|project| project.id).collect();
+            Response::Catalog(catalog.list(&ids, filter, query.as_deref(), i64::from(limit))?)
+        }
+        Command::CatalogArchive { id, archived } => {
+            catalog.archive(id, archived, catalog::now_millis())?;
+            Response::Ok
+        }
+        Command::CatalogSeen {
+            project_id,
+            radar_id,
+            program,
+            cwd,
+        } => {
+            catalog.record_radar(project_id, &radar_id, &program, &cwd, catalog::now_millis())?;
+            Response::Ok
+        }
+        Command::CatalogBind {
+            radar_id,
+            provider,
+            provider_session_id,
+        } => {
+            catalog.bind_provider(
+                &radar_id,
+                &provider,
+                &provider_session_id,
+                catalog::now_millis(),
+            )?;
             Response::Ok
         }
         Command::PublishActivity(input) => Response::ActivityPublished(activity.publish(input)?),
@@ -675,6 +815,8 @@ mod tests {
             &mut server,
             Arc::new(Registry::default()),
             Arc::new(ActivityJournal::open_in_memory().unwrap()),
+            Arc::new(SessionCatalog::open_in_memory().unwrap()),
+            Arc::new(Mutex::new(HashMap::new())),
             stopping.clone(),
         )
         .unwrap_err();
@@ -699,6 +841,8 @@ mod tests {
             &mut server,
             registry.clone(),
             Arc::new(ActivityJournal::open_in_memory().unwrap()),
+            Arc::new(SessionCatalog::open_in_memory().unwrap()),
+            Arc::new(Mutex::new(HashMap::new())),
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap();

@@ -21,6 +21,7 @@ use crate::db::{Db, Project};
 use crate::session::activity::{
     ActivitySnapshot, AttentionChange, AttentionResponse, ChangeAttention,
 };
+use crate::session::catalog::CatalogFilter;
 use crate::session::daemon::{self, Client, Command, Response};
 use crate::session::registry::{Lifecycle, Output, Spawn, Status};
 use crate::session::Dims;
@@ -185,6 +186,13 @@ struct SessionView {
     state: &'static str,
     detail: Option<String>,
     pid: Option<u32>,
+    /// The durable catalog row backing this view, when one exists.
+    catalog_id: Option<i64>,
+    provider_session_id: Option<String>,
+    last_activity_ms: Option<i64>,
+    /// False for catalog-only history: no live PTY exists, so the terminal
+    /// route must never be called for these rows.
+    attachable: bool,
 }
 
 impl SessionView {
@@ -204,8 +212,86 @@ impl SessionView {
             state,
             detail,
             pid: status.pid,
+            catalog_id: None,
+            provider_session_id: None,
+            last_activity_ms: None,
+            // Every daemon-status row has (or had) a live PTY: running rows
+            // attach interactively, retained ended rows attach read-only.
+            attachable: true,
         }
     }
+
+    /// A catalog-only history row: the conversation survives, the process
+    /// does not. Never attachable.
+    fn history(entry: &crate::session::catalog::Entry) -> Self {
+        let (state, detail) = match entry.lifecycle.as_str() {
+            "failed" => ("failed", Some("the run failed".to_string())),
+            _ => ("ended", None),
+        };
+        Self {
+            id: format!("catalog-{}", entry.id),
+            label: entry
+                .title
+                .clone()
+                .unwrap_or_else(|| format!("{} session", entry.provider)),
+            slot: None,
+            program: Some(entry.provider.clone()),
+            title: entry.title.clone(),
+            state,
+            detail,
+            pid: None,
+            catalog_id: Some(entry.id),
+            provider_session_id: Some(entry.provider_session_id.clone()),
+            last_activity_ms: Some(entry.last_activity_at),
+            attachable: false,
+        }
+    }
+}
+
+/// Live daemon statuses enriched with their catalog rows, plus catalog-only
+/// history — one list, newest activity first. This is the shared shape both
+/// the native sidebar and the browser render from.
+fn merge_catalog_sessions(
+    statuses: Vec<Status>,
+    entries: Vec<crate::session::catalog::Entry>,
+) -> Vec<SessionView> {
+    let live_ids: std::collections::HashSet<String> =
+        statuses.iter().map(|status| status.id.clone()).collect();
+    let mut rows: Vec<SessionView> = statuses
+        .into_iter()
+        .map(|status| {
+            let mut view = SessionView::new(status);
+            if let Some(entry) = entries
+                .iter()
+                .find(|entry| entry.radar_session_id.as_deref() == Some(view.id.as_str()))
+            {
+                view.catalog_id = Some(entry.id);
+                view.provider_session_id = Some(entry.provider_session_id.clone());
+                view.last_activity_ms = Some(entry.last_activity_at);
+            }
+            view
+        })
+        .collect();
+    for entry in &entries {
+        if entry
+            .radar_session_id
+            .as_ref()
+            .is_some_and(|radar_id| live_ids.contains(radar_id))
+        {
+            continue;
+        }
+        if entry.radar_session_id.is_some() && entry.lifecycle == "running" {
+            // Reconcile has not caught up with this id yet; skip until then.
+            continue;
+        }
+        rows.push(SessionView::history(entry));
+    }
+    rows.sort_by(|a, b| {
+        b.last_activity_ms
+            .unwrap_or(0)
+            .cmp(&a.last_activity_ms.unwrap_or(0))
+    });
+    rows
 }
 
 async fn projects(State(state): State<WebState>) -> ApiResult<Json<Vec<ProjectView>>> {
@@ -225,14 +311,30 @@ async fn sessions(
 ) -> ApiResult<Json<Vec<SessionView>>> {
     let project = require_project(&state.home, project_id)?;
     let root = canonical_project_root(&project);
-    let statuses = list_sessions(&state.home)?;
-    Ok(Json(
-        statuses
-            .into_iter()
-            .filter(|status| session_belongs_to_project(status, project_id, &root))
-            .map(SessionView::new)
-            .collect(),
-    ))
+    let statuses: Vec<Status> = list_sessions(&state.home)?
+        .into_iter()
+        .filter(|status| session_belongs_to_project(status, project_id, &root))
+        .collect();
+    // One catalog query also reconciles lifecycle and refreshes provider
+    // history (throttled server-side), so the browser list stays truthful.
+    let entries = match Client::request(
+        &state.home,
+        Command::CatalogList {
+            projects: vec![daemon::CatalogProject {
+                id: project.id,
+                path: project.path.clone(),
+            }],
+            filter: CatalogFilter::All,
+            query: None,
+            limit: 200,
+        },
+    )
+    .map_err(ApiError::internal)?
+    {
+        Response::Catalog(entries) => entries,
+        _ => Vec::new(),
+    };
+    Ok(Json(merge_catalog_sessions(statuses, entries)))
 }
 
 async fn create_shell(
@@ -378,6 +480,11 @@ async fn attach_terminal(
     ws: WebSocketUpgrade,
 ) -> ApiResult<impl IntoResponse> {
     require_same_origin(&headers)?;
+    if session_id.starts_with("catalog-") {
+        return Err(ApiError::bad_request(
+            "catalog history has no live terminal to attach to",
+        ));
+    }
     let project = require_project(&state.home, project_id)?;
     let root = canonical_project_root(&project);
     let session = list_sessions(&state.home)?
@@ -389,14 +496,9 @@ async fn attach_terminal(
             "session does not belong to this project",
         ));
     }
-    if !matches!(session.lifecycle, Lifecycle::Running) {
-        return Err(ApiError {
-            status: StatusCode::CONFLICT,
-            message: "session is not running".to_string(),
-        });
-    }
+    let read_only = !matches!(&session.lifecycle, Lifecycle::Running);
     let home = state.home.clone();
-    Ok(ws.on_upgrade(move |socket| bridge_terminal(socket, home, session_id)))
+    Ok(ws.on_upgrade(move |socket| bridge_terminal(socket, home, session_id, read_only)))
 }
 
 enum Outbound {
@@ -411,7 +513,12 @@ enum TerminalCommand {
     Resize { cols: u16, rows: u16 },
 }
 
-async fn bridge_terminal(socket: WebSocket, home: Arc<PathBuf>, session_id: String) {
+async fn bridge_terminal(
+    socket: WebSocket,
+    home: Arc<PathBuf>,
+    session_id: String,
+    read_only: bool,
+) {
     let (mut sender, mut receiver) = socket.split();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Outbound>(32);
     let interrupt = Arc::new(Mutex::new(None));
@@ -540,7 +647,7 @@ async fn bridge_terminal(socket: WebSocket, home: Arc<PathBuf>, session_id: Stri
             }
             incoming = receiver.next() => {
                 match incoming {
-                    Some(Ok(Message::Binary(bytes))) => {
+                    Some(Ok(Message::Binary(bytes))) if !read_only => {
                         let home = home.clone();
                         let id = session_id.clone();
                         let bytes = bytes.to_vec();
@@ -549,9 +656,10 @@ async fn bridge_terminal(socket: WebSocket, home: Arc<PathBuf>, session_id: Stri
                             if sender.send(Message::Text(text.into())).await.is_err() { break; }
                         }
                     }
+                    Some(Ok(Message::Binary(_))) => {}
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<TerminalCommand>(text.as_str()) {
-                            Ok(TerminalCommand::Resize { cols, rows }) => {
+                            Ok(TerminalCommand::Resize { cols, rows }) if !read_only => {
                                 let home = home.clone();
                                 let id = session_id.clone();
                                 if let Err(error) = tokio::task::spawn_blocking(move || resize_session(&home, &id, cols, rows)).await.unwrap_or_else(|e| Err(anyhow::anyhow!(e.to_string()))) {
@@ -559,7 +667,7 @@ async fn bridge_terminal(socket: WebSocket, home: Arc<PathBuf>, session_id: Stri
                                     if sender.send(Message::Text(text.into())).await.is_err() { break; }
                                 }
                             }
-                            Err(_) => {}
+                            Ok(TerminalCommand::Resize { .. }) | Err(_) => {}
                         }
                     }
                     Some(Ok(Message::Ping(bytes))) => {
@@ -702,7 +810,121 @@ fn require_same_origin(headers: &HeaderMap) -> ApiResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::catalog::Entry;
     use axum::http::HeaderValue;
+
+    fn entry(
+        id: i64,
+        provider: &str,
+        radar_id: Option<&str>,
+        lifecycle: &str,
+        activity: i64,
+    ) -> Entry {
+        Entry {
+            id,
+            project_id: 17,
+            provider: provider.to_string(),
+            provider_session_id: format!("ses_{id}"),
+            radar_session_id: radar_id.map(str::to_string),
+            source: "provider".to_string(),
+            title: Some(format!("Conversation {id}")),
+            cwd: PathBuf::from("/work/project"),
+            created_at: activity,
+            last_activity_at: activity,
+            ended_at: None,
+            lifecycle: lifecycle.to_string(),
+            archived_at: None,
+        }
+    }
+
+    fn status(id: &str, lifecycle: Lifecycle) -> Status {
+        Status {
+            id: id.to_string(),
+            cwd: PathBuf::from("/work/project"),
+            pid: Some(9),
+            lifecycle,
+            title: Some("Live title".to_string()),
+            stream_closed: false,
+        }
+    }
+
+    fn exited() -> Lifecycle {
+        Lifecycle::Exited(crate::session::ExitInfo {
+            code: 0,
+            signal: None,
+        })
+    }
+
+    #[test]
+    fn merged_sessions_order_by_activity_and_flag_attachability() {
+        let statuses = vec![
+            status("project-17-agent-0-opencode", Lifecycle::Running),
+            status("project-17-agent-1-opencode", exited()),
+        ];
+        let entries = vec![
+            entry(
+                1,
+                "opencode",
+                Some("project-17-agent-0-opencode"),
+                "running",
+                5_000,
+            ),
+            entry(2, "opencode", None, "ended", 9_000),
+        ];
+
+        let merged = merge_catalog_sessions(statuses, entries);
+
+        assert_eq!(
+            merged
+                .iter()
+                .map(|view| view.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "catalog-2",
+                "project-17-agent-0-opencode",
+                "project-17-agent-1-opencode"
+            ],
+            "newest catalog activity first, then live rows"
+        );
+        let live = &merged[1];
+        assert!(live.attachable, "a running daemon row is attachable");
+        assert_eq!(
+            live.catalog_id,
+            Some(1),
+            "live rows carry their catalog link"
+        );
+        let retained = &merged[2];
+        assert!(
+            retained.attachable,
+            "a retained ended daemon row stays attachable read-only"
+        );
+        let history = &merged[0];
+        assert!(
+            !history.attachable,
+            "catalog-only history is never attachable"
+        );
+        assert_eq!(history.state, "ended");
+    }
+
+    #[test]
+    fn a_running_catalog_row_without_a_live_session_is_hidden_until_reconciled() {
+        let statuses = Vec::new();
+        let entries = vec![
+            entry(
+                3,
+                "opencode",
+                Some("project-17-agent-9-opencode"),
+                "running",
+                1_000,
+            ),
+            entry(4, "claude", None, "ended", 500),
+        ];
+
+        let merged = merge_catalog_sessions(statuses, entries);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "catalog-4");
+    }
 
     #[test]
     fn maps_gui_and_web_session_ids_to_projects() {

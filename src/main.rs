@@ -912,9 +912,9 @@ fn log_board(db: &Db, dir: &PathBuf, kind: &str, data: serde_json::Value) {
     }
 }
 
-fn show_board(_db: &Db, path: Option<PathBuf>, json: bool) -> Result<()> {
+fn show_board(db: &Db, path: Option<PathBuf>, json: bool) -> Result<()> {
     let dir = board_dir(path)?;
-    let _ = board::ensure_file(&dir);
+    board::ensure_enabled_file(db, &dir)?;
     let b = board::load(&dir)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&b)?);
@@ -944,7 +944,7 @@ fn card_add(
     by: Option<&str>,
 ) -> Result<()> {
     let dir = board_dir(path)?;
-    let _ = board::ensure_file(&dir);
+    board::ensure_enabled_file(db, &dir)?;
     board::add_card(&dir, column, title, body.unwrap_or(""), by)?;
     log_board(
         db,
@@ -964,6 +964,7 @@ fn card_claim(
     json: bool,
 ) -> Result<()> {
     let dir = board_dir(path)?;
+    board::require_enabled(db, &dir)?;
     let found = board::claim_card(&dir, title, by)?;
     if !found {
         anyhow::bail!("no card titled \"{}\"", title);
@@ -991,6 +992,7 @@ fn card_claim(
 
 fn card_move(db: &Db, path: Option<PathBuf>, title: &str, to: &str, json: bool) -> Result<()> {
     let dir = board_dir(path)?;
+    board::require_enabled(db, &dir)?;
     let found = board::move_card(&dir, title, to)?;
     if !found {
         anyhow::bail!("no card titled \"{}\"", title);
@@ -1011,6 +1013,7 @@ fn card_move(db: &Db, path: Option<PathBuf>, title: &str, to: &str, json: bool) 
 
 fn card_done(db: &Db, path: Option<PathBuf>, title: &str, json: bool) -> Result<()> {
     let dir = board_dir(path)?;
+    board::require_enabled(db, &dir)?;
     let found = board::finish_card(&dir, title)?;
     if !found {
         anyhow::bail!("no card titled \"{}\"", title);
@@ -1042,8 +1045,8 @@ fn card_next(
     json: bool,
 ) -> Result<()> {
     let dir = board_dir(path)?;
-    let _ = board::ensure_file(&dir);
-    if let Err(error) = radar::skill::install(&dir) {
+    board::ensure_enabled_file(db, &dir)?;
+    if let Err(error) = radar::skill::install(db, &dir) {
         eprintln!("radar: could not install the board skill: {error}");
     }
     let Some(card) = board::next_card(&dir, by, in_column)? else {
@@ -1075,7 +1078,7 @@ fn card_next(
 /// JSON and reads the exit code (2 denies, stderr goes to the model). The
 /// opencode plugin calls the same check in-process. `--file` covers both and
 /// the human running it by hand.
-fn hook_guard(_db: &Db, file: Option<PathBuf>, path: Option<PathBuf>) -> Result<()> {
+fn hook_guard(db: &Db, file: Option<PathBuf>, path: Option<PathBuf>) -> Result<()> {
     use std::io::IsTerminal;
 
     let mut input = String::new();
@@ -1087,6 +1090,7 @@ fn hook_guard(_db: &Db, file: Option<PathBuf>, path: Option<PathBuf>) -> Result<
     let dir = board_dir(path)?;
     let who = std::env::var("RADAR_AGENT").ok().filter(|s| !s.is_empty());
     guard_exit(radar::skill::guard_decision(
+        db,
         &dir,
         who.as_deref(),
         file.as_deref(),
@@ -1096,10 +1100,10 @@ fn hook_guard(_db: &Db, file: Option<PathBuf>, path: Option<PathBuf>) -> Result<
 /// The commit gate: the git pre-commit hook's half of the convention. No file
 /// is weighed — the claim is the whole question, since whatever an agent
 /// edited with, the work enters the repository here.
-fn hook_commit_guard(_db: &Db, path: Option<PathBuf>) -> Result<()> {
+fn hook_commit_guard(db: &Db, path: Option<PathBuf>) -> Result<()> {
     let dir = board_dir(path)?;
     let who = std::env::var("RADAR_AGENT").ok().filter(|s| !s.is_empty());
-    guard_exit(radar::skill::commit_decision(&dir, who.as_deref()))
+    guard_exit(radar::skill::commit_decision(db, &dir, who.as_deref()))
 }
 
 fn guard_exit(decision: radar::skill::GuardDecision) -> Result<()> {
@@ -1250,11 +1254,16 @@ fn open(db: &Db, path: &PathBuf, json: bool) -> Result<()> {
     db.touch_project(project.id)?;
     db.remember_last_project(Some(project.id))?;
     db.log_event("project_opened", Some(project.id), &serde_json::Value::Null)?;
-    // Starting a project starts its board: the file is there before any agent
-    // looks for it. A project that cannot carry a file still opens.
-    let _ = board::ensure_file(&project.path);
+    // Make the board available before agents start when enabled in Radar's
+    // global per-project settings.
+    if board::enabled(db, &project.path)? {
+        board::ensure_file(&project.path)?;
+    }
 
-    let preferences = db.preferences()?;
+    let preferences = db
+        .project_settings(project.id)?
+        .apply_to(&db.preferences()?);
+
     let stored = db.tabs(project.id)?;
     let tabs = if stored.is_empty() {
         default_tabs(&preferences)
@@ -1358,6 +1367,12 @@ fn prefs(db: &Db, slot: Option<String>, program: Option<String>, json: bool) -> 
                     programs::by_id(id).is_some(),
                     "{id} is not a program radar knows about (see `radar programs`)"
                 );
+                if slot == Slot::Agent {
+                    anyhow::ensure!(
+                        agents::is_supported(id),
+                        "selectable agents are opencode, omp, and cursor-agent"
+                    );
+                }
             }
             db.set_preference(slot, program.as_deref())?;
             db.log_event(
@@ -1431,7 +1446,7 @@ fn prefs(db: &Db, slot: Option<String>, program: Option<String>, json: bool) -> 
 fn show_agents(db: &Db, json: bool) -> Result<()> {
     let preferences = db.preferences()?;
     let default = agents::omarchy_default();
-    let rows: Vec<serde_json::Value> = agents::programs()
+    let rows: Vec<serde_json::Value> = agents::supported_programs()
         .iter()
         .map(|agent| {
             serde_json::json!({
@@ -1449,14 +1464,22 @@ fn show_agents(db: &Db, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
-    println!(
-        "omarchy default agent: {}",
-        default.unwrap_or_else(|| "(none set — `omarchy default agent <name>`)".into())
-    );
-    println!(
-        "preferred in radar: {}",
-        preferences.agent.as_deref().unwrap_or("(follow omarchy)")
-    );
+    let default_label = match default.as_deref() {
+        Some(id) if !agents::is_supported(id) => {
+            format!("{id} (not selectable in Radar)")
+        }
+        Some(id) => id.to_string(),
+        None => "(none set — `omarchy default agent <name>`)".into(),
+    };
+    println!("omarchy default agent: {default_label}");
+    let preferred_label = match preferences.agent.as_deref() {
+        Some(id) if !agents::is_supported(id) => {
+            format!("{id} (not selectable; ignored)")
+        }
+        Some(id) => id.to_string(),
+        None => "(follow omarchy)".into(),
+    };
+    println!("preferred in radar: {preferred_label}");
     println!();
     for row in rows {
         let mark = if row["default"] == true {

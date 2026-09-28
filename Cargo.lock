@@ -1367,6 +1367,7 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "libc",
+ "parking_lot",
  "portable-pty",
  "rusqlite",
  "serde",

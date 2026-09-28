@@ -47,6 +47,8 @@ pub enum WorkspaceLayout {
 pub struct WorkspaceState {
     pub groups: Vec<WorkspaceGroup>,
     pub layout: Option<WorkspaceLayout>,
+    /// Whether the Board should reopen as the full-workspace surface.
+    pub board_open: bool,
     /// Last chosen program for each primitive, including primitives currently
     /// hidden from the workspace.
     pub programs: HashMap<Slot, String>,
@@ -107,8 +109,12 @@ mod tests {
                 axis: WorkspaceAxis::Horizontal,
                 ratio: 0.42,
                 key: "main".to_string(),
-                first: Box::new(WorkspaceLayout::Pane { group: TabKey::first(Slot::Agent) }),
-                second: Box::new(WorkspaceLayout::Pane { group: TabKey::first(Slot::Shell) }),
+                first: Box::new(WorkspaceLayout::Pane {
+                    group: TabKey::first(Slot::Agent),
+                }),
+                second: Box::new(WorkspaceLayout::Pane {
+                    group: TabKey::first(Slot::Shell),
+                }),
             }),
             programs: HashMap::from([
                 (Slot::Agent, "claude".to_string()),
@@ -116,11 +122,14 @@ mod tests {
             ]),
             positions: HashMap::from([("main".to_string(), 640)]),
             zoomed: Some(TabKey::first(Slot::Agent)),
+            board_open: true,
         };
 
         db.set_workspace_state(first.id, &state).unwrap();
 
         assert_eq!(db.workspace_state(first.id).unwrap(), Some(state));
+        let legacy: WorkspaceState = serde_json::from_str(r#"{"groups":[]}"#).unwrap();
+        assert!(!legacy.board_open);
         assert_eq!(db.workspace_state(second.id).unwrap(), None);
     }
 

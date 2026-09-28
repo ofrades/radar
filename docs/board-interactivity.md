@@ -5,7 +5,7 @@ terminal processes alive across client exits; see
 [`session-daemon.md`](session-daemon.md) for its tested protocol and limitations.
 A durable project activity journal, bounded replay/watch protocol,
 revision-checked attention store, stable card IDs, and CLI are also in place.
-Lossless terminal-state import and the live board interaction flow remain follow-up.
+Lossless terminal-state import and native verification of the Board walkthrough remain follow-up.
 
 The board is the project's full-workspace interaction surface. It presents
 work, agent activity, and requests for human attention together. Opening a
@@ -95,8 +95,9 @@ Desktop notifications link back to that same request and are a secondary channel
 **Implemented now:** board opens full workspace width and height, its columns
 expand into available space, tool selection restores the tool arrangement, and
 board grouping/split drops cannot shrink it into a tile. Board/Alt+K, its close
-button, or Alt+F returns to tools. Existing grouped layouts are normalized when
-rendered. Existing card editing, adding, and dragging remain available.
+button, or Alt+F returns to tools; the saved tool split tree survives restarting
+with Board open. Existing grouped layouts are normalized when rendered. Existing
+card editing, adding, and dragging remain available.
 Claimed cards link to their agent: a card's `@claim` opens the matching agent
 session — matched exactly by the process's own `RADAR_AGENT`, or by the
 claim's leading program — and an exited agent re-opens resumed. When the

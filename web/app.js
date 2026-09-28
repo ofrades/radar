@@ -6,9 +6,12 @@ const projectList = $("#project-list");
 const dashboard = $("#dashboard");
 const terminalView = $("#terminal-view");
 const mainContent = $(".main-content");
+const appShell = $(".app-shell");
 const serverState = $("#server-state");
 const pageError = $("#page-error");
 let projects = [];
+let projectSessions = new Map();
+let expandedProjects = new Set();
 let selectedProject = null;
 let currentSocket = null;
 let terminal = null;
@@ -19,7 +22,6 @@ let refreshTimer = null;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
 let socketGeneration = 0;
-let sessionEnded = false;
 let applyingRemoteResize = false;
 let latestAttentionSnapshot = null;
 const answerDrafts = new Map();
@@ -58,10 +60,19 @@ function renderProjects(focusProjectId = null) {
   $("#project-count").textContent = String(projects.length);
 
   for (const project of projects) {
+    const entry = document.createElement("div");
+    entry.className = "project-entry";
+    const projectId = String(project.id);
+    const sessions = projectSessions.get(project.id) || [];
+    const agents = sessions.filter((session) => session.slot === "agent");
+    const expanded = expandedProjects.has(project.id);
+
+    const row = document.createElement("div");
+    row.className = "project-row";
     const button = document.createElement("button");
     button.type = "button";
     button.className = "project-link";
-    button.dataset.projectId = String(project.id);
+    button.dataset.projectId = projectId;
     button.title = project.path;
     button.setAttribute("aria-label", `${project.name}, ${project.path}`);
     if (project.id === selectedProject?.id) {
@@ -84,7 +95,47 @@ function renderProjects(focusProjectId = null) {
     path.textContent = project.path;
     copy.append(name, path);
     button.append(symbol, copy);
-    projectList.append(button);
+
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "project-toggle";
+    toggle.dataset.toggleProjectId = projectId;
+    toggle.setAttribute("aria-expanded", String(expanded));
+    toggle.setAttribute("aria-label", `${expanded ? "Collapse" : "Expand"} agents for ${project.name}`);
+    toggle.textContent = expanded ? "⌄" : "›";
+    row.append(button, toggle);
+    entry.append(row);
+
+    if (expanded) {
+      const agentList = document.createElement("div");
+      agentList.className = "project-agents";
+      agentList.setAttribute("aria-label", `Agents in ${project.name}`);
+      if (agents.length) {
+        for (const agent of agents) {
+          const agentButton = document.createElement("button");
+          agentButton.type = "button";
+          agentButton.className = "project-agent";
+          agentButton.dataset.sessionId = agent.id;
+          agentButton.dataset.agentProjectId = projectId;
+          agentButton.title = `Open session: ${agent.title || agent.program || agent.label}`;
+          const status = document.createElement("span");
+          status.className = `project-agent-status ${agent.state}`;
+          status.setAttribute("aria-hidden", "true");
+          const label = document.createElement("span");
+          label.className = "project-agent-name";
+          label.textContent = agent.title || agent.program || agent.label;
+          agentButton.append(status, label);
+          agentList.append(agentButton);
+        }
+      } else {
+        const empty = document.createElement("span");
+        empty.className = "project-agent-empty";
+        empty.textContent = "No agents";
+        agentList.append(empty);
+      }
+      entry.append(agentList);
+    }
+    projectList.append(entry);
   }
 
   if (!projects.length) {
@@ -107,6 +158,8 @@ async function loadProjects() {
 
   const preferred = new URLSearchParams(location.search).get("project");
   selectedProject = projects.find((project) => String(project.id) === preferred) || projects[0] || null;
+  if (selectedProject) expandedProjects.add(selectedProject.id);
+  await refreshProjectSessions();
   renderProjects();
 
   if (!projects.length) {
@@ -122,6 +175,16 @@ async function loadProjects() {
   await loadProjectData();
 }
 
+async function refreshProjectSessions() {
+  const results = await Promise.all(projects.map(async (project) => [
+    project.id,
+    await request(`/api/projects/${project.id}/sessions`),
+  ]));
+  projectSessions = new Map(results);
+  renderProjects();
+}
+
+
 async function loadProjectData() {
   const project = selectedProject;
   if (!project) return;
@@ -133,6 +196,8 @@ async function loadProjectData() {
       request(`/api/projects/${project.id}/activity`),
     ]);
     if (selectedProject?.id !== project.id) return;
+    projectSessions.set(project.id, sessions);
+    renderProjects();
     renderSessions(sessions);
     renderAttention(snapshot);
     renderActivity(snapshot);
@@ -146,12 +211,27 @@ function renderSessions(items) {
   const list = $("#session-list");
   const empty = $("#sessions-empty");
   list.replaceChildren();
-  empty.classList.toggle("hidden", items.length > 0);
-  for (const session of items) {
+  // Server order is authoritative (newest activity first); the client-side
+  // sort keeps old cached payloads from jumping around before refresh.
+  const ordered = [...items].sort(
+    (a, b) => (b.last_activity_ms || 0) - (a.last_activity_ms || 0),
+  );
+  empty.classList.toggle("hidden", ordered.length > 0);
+  for (const session of ordered) {
+    // Catalog-only history has no live PTY: the terminal route must never
+    // see its id. Render it as an inert record, not an attach button.
+    const attachable = session.attachable !== false;
     const button = document.createElement("button");
     button.type = "button";
     button.className = "session-card";
-    button.disabled = session.state !== "running";
+    button.disabled = !attachable;
+    button.title = attachable
+      ? "Open session"
+      : "Ended conversation — reopen it from the Radar desktop app";
+    button.setAttribute(
+      "aria-label",
+      `${attachable ? "Open session" : "Ended conversation"}: ${session.title || session.label}`,
+    );
     const icon = document.createElement("span");
     icon.className = "session-icon";
     icon.textContent = session.slot === "agent" ? "✳" : session.slot === "editor" ? "▤" : "⌘";
@@ -162,16 +242,17 @@ function renderSessions(items) {
     title.textContent = session.title || session.label;
     const subtitle = document.createElement("span");
     subtitle.className = "session-subtitle";
-    subtitle.textContent = `${session.label} · ${session.detail || (session.pid ? `PID ${session.pid}` : "Radar session")}`;
+    const age = session.last_activity_ms ? ` · ${relativeTime(session.last_activity_ms)}` : "";
+    subtitle.textContent = `${session.label}${age} · ${session.detail || (session.pid ? `PID ${session.pid}` : session.program || "Radar session")}`;
     copy.append(title, subtitle);
     const state = document.createElement("span");
     state.className = `session-state ${session.state}`;
     state.textContent = session.state;
     const arrow = document.createElement("span");
     arrow.className = "session-arrow";
-    arrow.textContent = "›";
+    arrow.textContent = attachable ? "›" : "";
     button.append(icon, copy, state, arrow);
-    button.addEventListener("click", () => attach(session));
+    if (attachable) button.addEventListener("click", () => attach(session));
     list.append(button);
   }
 }
@@ -324,35 +405,39 @@ function terminalInputFilter(data) {
 }
 
 function sendTerminalInput(data) {
-  if (!currentSocket || currentSocket.readyState !== WebSocket.OPEN) return;
+  if (terminalSession?.state !== "running" || !currentSocket || currentSocket.readyState !== WebSocket.OPEN) return;
   const filtered = terminalInputFilter(data);
   if (filtered) currentSocket.send(new TextEncoder().encode(filtered));
 }
 
 function sendTerminalBytes(bytes) {
-  if (currentSocket?.readyState === WebSocket.OPEN && bytes.length) currentSocket.send(bytes);
+  if (terminalSession?.state === "running" && currentSocket?.readyState === WebSocket.OPEN && bytes.length) currentSocket.send(bytes);
 }
 
 function attach(session) {
   if (!selectedProject) return;
   clearError();
+  appShell.classList.add("session-open");
   dashboard.classList.add("hidden");
   terminalView.classList.remove("hidden");
   mainContent.classList.add("terminal-open");
   $("#terminal-title").textContent = session.title || session.label;
-  setTerminalStatus("Connecting…");
+  const readOnly = session.state !== "running";
+  $("#reconnect-button").disabled = readOnly;
+  document.querySelectorAll("[data-key]").forEach((button) => { button.disabled = readOnly; });
+  setTerminalStatus(readOnly ? "Read-only · use Workspace to choose another session" : "Connecting…", false, readOnly);
 
   socketGeneration += 1;
   currentSocket?.close();
   currentSocket = null;
   if (terminal) terminal.dispose();
   terminalSession = session;
-  sessionEnded = false;
   reconnectAttempts = 0;
   window.clearTimeout(reconnectTimer);
   reconnectTimer = null;
   terminal = new Terminal({
     cursorBlink: true,
+    disableStdin: readOnly,
     convertEol: false,
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
     fontSize: 14,
@@ -389,9 +474,10 @@ function attach(session) {
   terminal.onData(sendTerminalInput);
   terminal.onBinary((data) => sendTerminalBytes(Uint8Array.from(data, (char) => char.charCodeAt(0))));
   terminal.onResize(({ cols, rows }) => {
-    if (!applyingRemoteResize) sendTerminalResize(cols, rows);
+    if (!applyingRemoteResize && !readOnly) sendTerminalResize(cols, rows);
   });
   for (const button of document.querySelectorAll("[data-key]")) {
+    button.disabled = readOnly;
     button.onclick = () => {
       terminal?.focus();
       const key = {
@@ -417,7 +503,6 @@ function attach(session) {
 
 function connectTerminal(session, reset) {
   if (reset) terminal?.reset();
-  sessionEnded = false;
   const socketUrl = new URL(
     `api/projects/${selectedProject.id}/sessions/${encodeURIComponent(session.id)}/terminal`,
     document.baseURI,
@@ -429,9 +514,14 @@ function connectTerminal(session, reset) {
   socket.binaryType = "arraybuffer";
   socket.addEventListener("open", () => {
     if (generation !== socketGeneration) return;
-    setTerminalStatus("Connected", true);
+    setTerminalStatus(
+      session.state === "running"
+        ? "Connected"
+        : "Read-only · use Workspace to choose another session",
+      session.state === "running",
+    );
     fitAddon?.fit();
-    sendTerminalResize(terminal?.cols, terminal?.rows);
+    if (session.state === "running") sendTerminalResize(terminal?.cols, terminal?.rows);
   });
   socket.addEventListener("message", (message) => {
     if (generation !== socketGeneration) return;
@@ -444,11 +534,7 @@ function connectTerminal(session, reset) {
       if (status.type === "error") setTerminalStatus(status.message, false, true);
       if (status.type === "resync_required") setTerminalStatus("Refreshing terminal…", false, true);
       if (status.type === "resize") applyRemoteResize(status.cols, status.rows);
-      if (status.type === "closed") {
-        sessionEnded = true;
-        terminalSession = null;
-        setTerminalStatus("Session ended", false);
-      }
+      if (status.type === "closed") setTerminalReadOnly("exited");
     } catch {
       setTerminalStatus(String(message.data), false, true);
     }
@@ -456,10 +542,7 @@ function connectTerminal(session, reset) {
   socket.addEventListener("close", () => {
     if (generation !== socketGeneration) return;
     currentSocket = null;
-    if (sessionEnded || !terminalSession) {
-      if (sessionEnded) setTerminalStatus("Session ended", false);
-      return;
-    }
+    if (!terminalSession) return;
     void retryOrFinishSession(generation);
   });
   socket.addEventListener("error", () => {
@@ -468,9 +551,9 @@ function connectTerminal(session, reset) {
 }
 
 function sendTerminalResize(cols, rows) {
-  if (currentSocket?.readyState === WebSocket.OPEN && cols && rows) {
+  if (terminalSession?.state === "running" && currentSocket?.readyState === WebSocket.OPEN && cols && rows) {
     currentSocket.send(JSON.stringify({ type: "resize", cols, rows }));
-  }
+}
 }
 
 function applyRemoteResize(cols, rows) {
@@ -484,36 +567,38 @@ function applyRemoteResize(cols, rows) {
 }
 
 function scheduleReconnect() {
-  if (reconnectTimer || !terminalSession || sessionEnded) return;
+  if (reconnectTimer || terminalSession?.state !== "running") return;
   const delay = Math.min(1000 * 2 ** reconnectAttempts, 8000);
   reconnectAttempts += 1;
   setTerminalStatus(`Reconnecting in ${Math.ceil(delay / 1000)}s…`, false, true);
   reconnectTimer = window.setTimeout(() => {
     reconnectTimer = null;
-    if (terminalSession && !sessionEnded) connectTerminal(terminalSession, true);
+    if (terminalSession?.state === "running") connectTerminal(terminalSession, true);
   }, delay);
 }
 
 async function retryOrFinishSession(generation) {
   const session = terminalSession;
-  if (!session) return;
+  if (!session || session.state !== "running") return;
   try {
     const sessions = await request(`/api/projects/${selectedProject.id}/sessions`);
     const current = sessions.find((item) => item.id === session.id);
-    if (!current || current.state !== "running") {
-      terminalSession = null;
-      sessionEnded = true;
-      setTerminalStatus(current?.state === "failed" ? "Session unavailable" : "Session ended", false, true);
+    if (!current) {
+      detach();
+      return;
+    }
+    if (current.state !== "running") {
+      setTerminalReadOnly(current.state);
       return;
     }
   } catch {
     // A temporary HTTP outage is handled by the regular reconnect backoff.
   }
-  if (generation === socketGeneration && terminalSession) scheduleReconnect();
+  if (generation === socketGeneration && terminalSession?.state === "running") scheduleReconnect();
 }
 
 function reconnectNow() {
-  if (!terminalSession) return;
+  if (terminalSession?.state !== "running") return;
   window.clearTimeout(reconnectTimer);
   reconnectTimer = null;
   reconnectAttempts = 0;
@@ -527,7 +612,12 @@ function setTerminalStatus(message, connected = false, error = false) {
   const status = $("#terminal-connection");
   status.textContent = message;
   status.classList.toggle("connected", connected);
-  status.classList.toggle("terminal-error", error);
+}
+function setTerminalReadOnly(state) {
+  if (terminalSession) terminalSession = { ...terminalSession, state };
+  $("#reconnect-button").disabled = true;
+  document.querySelectorAll("[data-key]").forEach((button) => { button.disabled = true; });
+  setTerminalStatus("Read-only · use Workspace to choose another session");
 }
 
 function fitTerminal() {
@@ -539,7 +629,6 @@ function fitTerminal() {
 
 function detach() {
   terminalSession = null;
-  sessionEnded = false;
   socketGeneration += 1;
   window.clearTimeout(reconnectTimer);
   reconnectTimer = null;
@@ -555,6 +644,7 @@ function detach() {
   terminal = null;
   fitAddon = null;
   terminalView.classList.add("hidden");
+  appShell.classList.remove("session-open");
   mainContent.classList.remove("terminal-open");
   dashboard.classList.remove("hidden");
   loadProjectData().catch((error) => showError(error.message));
@@ -579,6 +669,23 @@ async function createShell() {
 }
 
 projectList.addEventListener("click", (event) => {
+  const agentButton = event.target.closest("[data-session-id]");
+  if (agentButton) {
+    const sessions = projectSessions.get(Number(agentButton.dataset.agentProjectId)) || [];
+    const session = sessions.find((item) => item.id === agentButton.dataset.sessionId);
+    if (session) attach(session);
+    return;
+  }
+
+  const toggle = event.target.closest("[data-toggle-project-id]");
+  if (toggle) {
+    const projectId = Number(toggle.dataset.toggleProjectId);
+    if (expandedProjects.has(projectId)) expandedProjects.delete(projectId);
+    else expandedProjects.add(projectId);
+    renderProjects();
+    return;
+  }
+
   const button = event.target.closest("[data-project-id]");
   if (!button) return;
   const project = projects.find((item) => item.id === Number(button.dataset.projectId));
@@ -586,6 +693,7 @@ projectList.addEventListener("click", (event) => {
 
   const alreadySelected = selectedProject?.id === project.id;
   selectedProject = project;
+  expandedProjects.add(project.id);
   renderProjects(project.id);
   const projectUrl = new URL(document.baseURI);
   projectUrl.searchParams.set("project", String(project.id));
@@ -618,7 +726,7 @@ loadProjects().catch((error) => {
 });
 refreshTimer = window.setInterval(() => {
   if (!dashboard.classList.contains("hidden")) {
-    loadProjectData().catch((error) => showError(error.message));
+    Promise.all([loadProjectData(), refreshProjectSessions()]).catch((error) => showError(error.message));
   }
 }, 5000);
 void refreshTimer;

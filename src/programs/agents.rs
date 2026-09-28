@@ -25,6 +25,13 @@ struct AgentDef {
     omarchy: bool,
 }
 
+/// Agent providers Radar currently offers for new selections.
+const SUPPORTED_AGENT_IDS: &[&str] = &["opencode", "omp", "cursor-agent"];
+
+pub fn is_supported(id: &str) -> bool {
+    SUPPORTED_AGENT_IDS.contains(&id)
+}
+
 /// omarchy's agent list, then a few the registry knows directly.
 const AGENTS: &[AgentDef] = &[
     AgentDef {
@@ -221,7 +228,7 @@ impl AgentDef {
         // A resumed launch reopens the project's last conversation, which
         // is the session a claimed card's agent was working in.
         let resume: &[&str] = match self.id {
-            "opencode" | "claude" => &["--continue"],
+            "opencode" | "claude" | "omp" | "cursor-agent" => &["--continue"],
             "codex" => &["resume", "--last"],
             _ => &[],
         };
@@ -230,8 +237,9 @@ impl AgentDef {
         // session id a claim's agent had (db::agent_sessions).
         program.resume_session = match self.id {
             "opencode" => "--session {id}".to_string(),
-            "claude" => "--resume {id}".to_string(),
+            "claude" | "cursor-agent" => "--resume {id}".to_string(),
             "codex" => "resume {id}".to_string(),
+            "omp" => "--resume={id}".to_string(),
             _ => String::new(),
         };
         // omarchy's default agent is the one users expect first everywhere.
@@ -256,7 +264,23 @@ pub fn programs() -> Vec<Program> {
     agents
 }
 
-/// Agents that are installed right now.
+/// Providers Radar offers as agent choices, including those not installed.
+pub fn supported_programs() -> Vec<Program> {
+    programs()
+        .into_iter()
+        .filter(|program| is_supported(&program.id))
+        .collect()
+}
+
+/// Providers that can currently be selected to launch a new agent.
+pub fn selectable_agents() -> Vec<Program> {
+    supported_programs()
+        .into_iter()
+        .filter(Program::installed)
+        .collect()
+}
+
+/// All known agents that are installed; retained for legacy program handling.
 pub fn installable_agents() -> Vec<Program> {
     programs().into_iter().filter(|p| p.installed()).collect()
 }
@@ -284,21 +308,21 @@ pub fn have_omarchy() -> bool {
 /// Agents are terminal programs. radar gives them a terminal and stays out of
 /// the way — no API adapters, no reimplemented session browsers.
 pub fn preferred_agent(preferences: &Preferences) -> Option<Program> {
-    if let Some(id) = preferences.agent.as_deref() {
+    if let Some(id) = preferences.agent.as_deref().filter(|id| is_supported(id)) {
         if let Some(program) = super::by_id(id) {
             if program.installed() {
                 return Some(program);
             }
         }
     }
-    if let Some(default_id) = omarchy_default() {
+    if let Some(default_id) = omarchy_default().filter(|id| is_supported(id)) {
         if let Some(program) = super::by_id(&default_id) {
             if program.installed() {
                 return Some(program);
             }
         }
     }
-    installable_agents().into_iter().next()
+    selectable_agents().into_iter().next()
 }
 
 /// Run `omarchy agent --inline` instead of building the command line ourselves?
@@ -331,11 +355,50 @@ mod tests {
     }
 
     #[test]
+    fn supported_agents_declare_documented_resume_forms() {
+        let by_id = |id: &str| programs().into_iter().find(|p| p.id == id).unwrap();
+        for id in ["opencode", "omp", "cursor-agent"] {
+            assert_eq!(by_id(id).resume_args, vec!["--continue"], "{id}");
+            assert!(!by_id(id).resume_session.is_empty(), "{id}");
+        }
+        assert_eq!(by_id("omp").resume_session, "--resume={id}");
+        assert_eq!(by_id("cursor-agent").resume_session, "--resume {id}");
+        assert_eq!(by_id("opencode").resume_session, "--session {id}");
+    }
+
+    #[test]
+    fn supported_agent_choices_are_exactly_the_three_providers() {
+        let mut ids: Vec<_> = supported_programs()
+            .into_iter()
+            .map(|program| program.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["cursor-agent", "omp", "opencode"]);
+        assert!(selectable_agents()
+            .iter()
+            .all(|program| is_supported(&program.id)));
+        assert!(!is_supported("claude"));
+        assert!(!is_supported("cursor"));
+    }
+
+    #[test]
+    fn unsupported_saved_preferences_never_resolve_to_another_agent() {
+        let prefs = Preferences {
+            agent: Some("claude".into()),
+            ..Default::default()
+        };
+        assert!(preferred_agent(&prefs).is_none_or(|program| is_supported(&program.id)));
+    }
+
+    #[test]
     fn omarchy_default_is_read_from_the_omarchy_config() {
         // The test environment's answer is whatever the machine says; the
         // contract is just that a set default is a known agent id.
         if let Some(id) = omarchy_default() {
-            assert!(AGENTS.iter().any(|a| a.id == id), "unknown default agent {id}");
+            assert!(
+                AGENTS.iter().any(|a| a.id == id),
+                "unknown default agent {id}"
+            );
         }
     }
 
@@ -356,7 +419,10 @@ mod tests {
         let agents = installable_agents();
         if let Some(first) = agents.first() {
             if agents.iter().any(|a| a.id == default_id) {
-                assert_eq!(first.id, default_id, "the default agent should lead the list");
+                assert_eq!(
+                    first.id, default_id,
+                    "the default agent should lead the list"
+                );
             }
         }
     }
@@ -364,8 +430,8 @@ mod tests {
     #[test]
     fn preferred_agent_prefers_the_preference() {
         let mut prefs = Preferences::default();
-        let installed = installable_agents();
-        let Some(some_agent) = installed.first() else {
+        let selectable = selectable_agents();
+        let Some(some_agent) = selectable.first() else {
             return;
         };
         prefs.agent = Some(some_agent.id.clone());

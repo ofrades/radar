@@ -14,6 +14,21 @@ attaches each project/tab/program to the same persistent server session. Closing
 the pane or GUI detaches; the process remains in the daemon. The daemon and CLI
 API can also be used independently.
 
+## Agent conversations versus terminal sessions
+
+The daemon shares a terminal process and its PTY stream. It does not make two
+independently launched agent CLIs share a conversation. OpenCode has a
+machine-readable session list, so Radar imports its project history and reopens
+the exact provider session when selected. OMP and Cursor support continuing or
+resuming through their own CLI flags, but their history is not imported without a
+supported machine-readable listing interface. A live external agent is shown as
+an external-terminal row; selecting it focuses the terminal that owns it rather
+than implying Radar has attached to its conversation or PTY.
+
+If a later GUI attach finds the daemon socket missing or refused, the GUI starts
+the daemon and retries that attach once. A daemon crash still loses its
+in-memory sessions; restarting the daemon cannot restore processes it owned.
+
 ### Try it
 
 Build with `cargo build` (no GUI feature required). In one terminal:
@@ -141,6 +156,45 @@ returns the replay page and registers the live tail. A cursor more than 200
 events behind receives `ResyncRequired`; clients take a recent bounded snapshot
 and resume from its watermark. Watch queues hold 64 events; a slow watcher is
 marked for resync without blocking journal writes or terminal transport.
+
+### Session catalog
+
+Beside the activity journal, the daemon keeps a durable session catalog at
+`<RADAR_HOME>/run/catalog.sqlite`: one row per `(project, provider, provider
+session id)` with `created_at`, `last_activity_at`, `ended_at`, lifecycle
+(`running`/`ended`/`failed`), title, working directory, and an archive stamp.
+It is the history the registry does not keep — sessions survive `forget` and
+daemon restarts as catalog rows, without implying their processes survived.
+
+- `Create` records a row for the session's stable id. Title changes seen by
+  the parser bump the row's `last_activity_at`; when a session ends — or is
+  missing from the registry at reconciliation time, e.g. after a daemon
+  restart — the row ends. A running row is never a claim that the process is
+  alive; it is corrected on the next list.
+- `CatalogSeen` backfills a live session the daemon has no record for, and
+  `CatalogBind` adopts the provider's own conversation id for a radar-spawned
+  row (exit capture). Provider histories import as throttled upserts (60 s per
+  project, currently OpenCode): the importer requests up to 10,000 rows,
+  preserves the provider's `updated` timestamp as activity, and binds a
+  conversation that matches a young running Radar row instead of duplicating
+  it.
+- Every catalog refresh archives ended or failed rows whose last activity is
+  more than seven days old. Running rows are never auto-archived merely
+  because their last title/activity update is old. `CatalogArchive(id,
+  archived)` remains available for explicit presentation changes.
+- Cursor Agent exposes `cursor-agent ls` as an interactive workspace chat
+  picker, but the command has no documented machine-readable output or stable
+  history-record schema (non-interactive use enters the TUI and cannot be
+  imported safely). Radar therefore discovers Cursor while its process is
+  running, but does not scrape private stores or parse the picker UI; durable
+  old Cursor capture needs a provider-supported export/list contract.
+- `CatalogList(projects, filter, query, limit)` returns rows newest-activity
+  first; the client supplies the project roster. `CatalogArchive(id, archived)`
+  is presentation state only — it hides a row from the active list and never
+  deletes the conversation or another program's data.
+- Catalog rows without a live radar session are history. The native sidebar
+  reopens them exactly when the provider exposed a session id (resume
+  template); otherwise the row says so instead of guessing "last".
 
 Attention creation and its source event share one transaction. Requests survive
 daemon restarts with stable request/source-event IDs, revision, reason, target,

@@ -845,3 +845,137 @@ fn activity_mutation_stays_responsive_with_a_stalled_terminal_renderer() {
     let _ = daemon.request(Request::Stop { id: "test".into() });
     drop(stalled_output);
 }
+
+fn catalog_entries(daemon: &Daemon, filter: Request) -> Vec<radar::session::catalog::Entry> {
+    match daemon.request(filter) {
+        Response::Catalog(entries) => entries,
+        other => panic!("unexpected catalog response {other:?}"),
+    }
+}
+
+fn catalog_list(daemon: &Daemon, filter: radar::session::catalog::CatalogFilter) -> Request {
+    Request::CatalogList {
+        projects: vec![radar::session::daemon::CatalogProject {
+            id: 99,
+            path: daemon.home.path().join("project-99"),
+        }],
+        filter,
+        query: None,
+        limit: 100,
+    }
+}
+
+/// A created session lands in the catalog immediately, inherits its
+/// terminal's title, and ends when its process does.
+#[test]
+fn created_sessions_are_cataloged_and_end_with_their_process() {
+    use radar::session::catalog::CatalogFilter;
+
+    let daemon = Daemon::start();
+    let id = "project-99-agent-0-opencode";
+    std::fs::create_dir_all(daemon.home.path().join("project-99")).unwrap();
+    match daemon.request(Request::Create(Spawn {
+        id: id.into(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf ready; sleep 60".into(),
+        ],
+        cwd: daemon.home.path().join("project-99"),
+        env: Vec::new(),
+        env_remove: Vec::new(),
+        dims: Dims { cols: 80, rows: 24 },
+    })) {
+        Response::Status(_) => {}
+        other => panic!("unexpected create response {other:?}"),
+    }
+
+    let entries = catalog_entries(&daemon, catalog_list(&daemon, CatalogFilter::Active));
+    assert_eq!(entries.len(), 1, "the spawned session is cataloged");
+    assert_eq!(entries[0].radar_session_id.as_deref(), Some(id));
+    assert_eq!(entries[0].provider, "opencode");
+    assert_eq!(entries[0].lifecycle, "running");
+    let catalog_id = entries[0].id;
+
+    daemon.request(Request::Stop { id: id.into() });
+    until(|| {
+        catalog_entries(&daemon, catalog_list(&daemon, CatalogFilter::Active))
+            .first()
+            .is_some_and(|entry| entry.lifecycle == "ended")
+    });
+
+    // Archiving hides it from the active list without deleting it.
+    daemon.request(Request::CatalogArchive {
+        id: catalog_id,
+        archived: true,
+    });
+    assert!(catalog_entries(&daemon, catalog_list(&daemon, CatalogFilter::Active)).is_empty());
+    let archived = catalog_entries(&daemon, catalog_list(&daemon, CatalogFilter::Archived));
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].id, catalog_id);
+}
+
+/// Sessions that predate the catalog are backfilled by CatalogSeen; the
+/// catalog — unlike the registry — survives a daemon restart, and a row
+/// whose session is not live never lingers as running.
+#[test]
+fn catalog_backfill_survives_a_daemon_restart() {
+    use radar::session::catalog::CatalogFilter;
+
+    let mut daemon = Daemon::start();
+    daemon.request(Request::CatalogSeen {
+        project_id: 99,
+        radar_id: "project-99-agent-1-opencode".into(),
+        program: "opencode".into(),
+        cwd: daemon.home.path().join("project-99"),
+    });
+    let entries = catalog_entries(&daemon, catalog_list(&daemon, CatalogFilter::All));
+    assert_eq!(entries.len(), 1, "the backfilled session is cataloged");
+    assert_eq!(
+        entries[0].lifecycle, "ended",
+        "a backfill for a session the registry has never seen ends immediately"
+    );
+
+    daemon.restart();
+
+    let entries = catalog_entries(&daemon, catalog_list(&daemon, CatalogFilter::All));
+    assert_eq!(
+        entries.len(),
+        1,
+        "the catalog outlives the daemon that wrote it"
+    );
+    assert_eq!(
+        entries[0].lifecycle, "ended",
+        "the row stays ended across the restart"
+    );
+}
+
+/// When the CLI's own store reveals which conversation a run had, the
+/// catalog row adopts it — the sidebar then resumes that exact conversation.
+#[test]
+fn provider_binding_upgrades_a_session_row() {
+    use radar::session::catalog::CatalogFilter;
+
+    let daemon = Daemon::start();
+    let id = "project-99-agent-2-opencode";
+    std::fs::create_dir_all(daemon.home.path().join("project-99")).unwrap();
+    daemon.request(Request::Create(Spawn {
+        id: id.into(),
+        argv: vec!["/bin/sh".into(), "-c".into(), "sleep 60".into()],
+        cwd: daemon.home.path().join("project-99"),
+        env: Vec::new(),
+        env_remove: Vec::new(),
+        dims: Dims { cols: 80, rows: 24 },
+    }));
+    daemon.request(Request::CatalogBind {
+        radar_id: id.into(),
+        provider: "opencode".into(),
+        provider_session_id: "ses_manual".into(),
+    });
+
+    let entries = catalog_entries(&daemon, catalog_list(&daemon, CatalogFilter::Active));
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].provider_session_id, "ses_manual");
+    assert_eq!(entries[0].radar_session_id.as_deref(), Some(id));
+    let _ = daemon.request(Request::Stop { id: id.into() });
+}

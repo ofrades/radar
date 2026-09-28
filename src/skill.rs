@@ -4,10 +4,9 @@
 //! Two halves, one idea — an agent should meet the board at the moment it
 //! starts working, and stumble the moment it tries to skip it:
 //!
-//! - [`install`] writes the convention where each agent harness looks for
-//!   instructions: an agent skill for opencode and Claude Code, a pointer in
-//!   `AGENTS.md` for the harnesses that only read that. radar runs it when an
-//!   agent pane opens, so the files are always there before the agent is.
+//! - [`install`] writes the convention for board-enabled projects: harness
+//!   skills for opencode and Claude Code, and a pre-commit hook. It never edits
+//!   `AGENTS.md`.
 //! - [`guard_decision`] answers the harness hooks' one question — may this
 //!   edit land? A tool call editing a project file without a live board claim
 //!   is denied, with a reason that tells the agent exactly how to comply. The
@@ -76,16 +75,6 @@ If `$RADAR_AGENT` is unset you were not launched by radar: pick a short unique
 name for `--by` (your model name plus a suffix) and follow the same loop.
 "#;
 
-/// The one line added to a project's `AGENTS.md`, for harnesses that only read
-/// that. The marker makes the append idempotent.
-const AGENTS_POINTER: &str = "## The board (required)\n\n\
-    Claim work before editing files, and hand finished work back through the\n\
-    board: read `BOARD.md`, or run `radar card next --by \"$RADAR_AGENT\"`.\n\
-    The skill `.opencode/skills/board/SKILL.md` has the full loop. A claim is\n\
-    also required to commit — the git pre-commit hook enforces it.\n";
-
-const AGENTS_MARKER: &str = "## The board (required)";
-
 /// The git pre-commit hook radar installs: the one gate that holds whatever
 /// tool the agent edited with. Fails open when radar is not on PATH — the
 /// requirement belongs to radar-managed sessions, not to the machine.
@@ -108,35 +97,19 @@ fn skill_files(project: &Path) -> Vec<PathBuf> {
     ]
 }
 
-/// Write the skill into the project, idempotently: files whose content already
-/// matches are left alone (so an agent's editor does not see them change), an
-/// `AGENTS.md` gains the pointer once, and a repository gains the pre-commit
-/// gate when git's own hooks directory has no hook in the way. Returns the
-/// paths written.
-pub fn install(project: &Path) -> Result<Vec<PathBuf>> {
+/// Write the skills for an enabled project without modifying AGENTS.md.
+/// Returns the paths written.
+pub fn install(db: &crate::db::Db, project: &Path) -> Result<Vec<PathBuf>> {
+    if !crate::board::enabled(db, project)? {
+        return Ok(Vec::new());
+    }
     let mut written = Vec::new();
     for path in skill_files(project) {
         write_if_changed(&path, SKILL_MD)?;
         written.push(path);
     }
-    let agents = project.join("AGENTS.md");
-    let existing = std::fs::read_to_string(&agents).unwrap_or_default();
-    if !existing.contains(AGENTS_MARKER) {
-        let mut text = existing;
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(AGENTS_POINTER);
-        std::fs::write(&agents, text)
-            .with_context(|| format!("updating {}", agents.display()))?;
-    }
-    written.push(agents);
-    // The gate: enforcement without a single line of agent configuration.
     // Best effort — a board works in a non-repo directory too.
-    if let Ok(Some(hook)) = install_git_hook(project) {
+    if let Ok(Some(hook)) = install_git_hook(db, project) {
         written.push(hook);
     }
     Ok(written)
@@ -186,26 +159,46 @@ fn claimable_path(project: &Path, file: &Path) -> bool {
 /// launched by radar and is allowed through with a reminder), and `file` the
 /// path the tool call wants to edit. Reading is never blocked — only a file
 /// edit can be.
-pub fn guard_decision(project: &Path, who: Option<&str>, file: Option<&Path>) -> GuardDecision {
+pub fn guard_decision(
+    db: &crate::db::Db,
+    project: &Path,
+    who: Option<&str>,
+    file: Option<&Path>,
+) -> GuardDecision {
+    if let Some(decision) = board_policy_decision(db, project) {
+        return decision;
+    }
     let Some(who) = who else {
-        return GuardDecision::Allow; // not launched by radar: the skill is the convention
+        return GuardDecision::Allow;
     };
     let Some(file) = file else {
-        return GuardDecision::Allow; // nothing we can judge (a bash call, say)
+        return GuardDecision::Allow;
     };
     if claimable_path(project, file) {
-        return GuardDecision::Allow; // the board itself, harness files, git internals
+        return GuardDecision::Allow;
     }
     claim_guard(project, who)
 }
 
-/// The commit gate's judgement: same question, no file to weigh — whatever an
-/// agent used to edit, the work enters the repository through a commit, and
-/// the commit needs a claim.
-pub fn commit_decision(project: &Path, who: Option<&str>) -> GuardDecision {
+/// The commit gate's judgement: when boards are disabled, commits are not
+/// subject to a board claim.
+pub fn commit_decision(db: &crate::db::Db, project: &Path, who: Option<&str>) -> GuardDecision {
+    if let Some(decision) = board_policy_decision(db, project) {
+        return decision;
+    }
     match who {
-        None => GuardDecision::Allow, // a human, or an agent launched elsewhere
+        None => GuardDecision::Allow,
         Some(who) => claim_guard(project, who),
+    }
+}
+
+fn board_policy_decision(db: &crate::db::Db, project: &Path) -> Option<GuardDecision> {
+    match crate::board::enabled(db, project) {
+        Ok(true) => None,
+        Ok(false) => Some(GuardDecision::Allow),
+        Err(error) => Some(GuardDecision::Deny(format!(
+            "cannot read board policy: {error}"
+        ))),
     }
 }
 
@@ -228,7 +221,10 @@ fn claim_guard(project: &Path, who: &str) -> GuardDecision {
 /// everyone else through. Never touches a hook radar did not write, and only
 /// ever writes under a `.git` directory, so hook managers like husky are
 /// left exactly as they are.
-pub fn install_git_hook(project: &Path) -> Result<Option<PathBuf>> {
+pub fn install_git_hook(db: &crate::db::Db, project: &Path) -> Result<Option<PathBuf>> {
+    if !crate::board::enabled(db, project)? {
+        return Ok(None);
+    }
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(project)
@@ -287,29 +283,36 @@ mod tests {
         (dir, path)
     }
 
-    #[test]
-    fn install_writes_every_flavour_and_is_idempotent() {
-        let (_dir, project) = project();
-        let files = install(&project).unwrap();
-        assert_eq!(files.len(), 3);
-        for path in &files {
-            assert!(path.exists(), "{} was not written", path.display());
-        }
-        let skill = std::fs::read_to_string(project.join(".opencode/skills/board/SKILL.md")).unwrap();
-        assert_eq!(skill, SKILL_MD);
-        let claude = std::fs::read_to_string(project.join(".claude/skills/board/SKILL.md")).unwrap();
-        assert_eq!(claude, SKILL_MD);
-        let agents = std::fs::read_to_string(project.join("AGENTS.md")).unwrap();
-        assert!(agents.contains(AGENTS_MARKER));
+    fn database(project: &Path) -> crate::db::Db {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.add_project(project).unwrap();
+        db
+    }
 
-        // A second install changes nothing — same content, one pointer.
-        let before = std::fs::read_to_string(project.join("AGENTS.md")).unwrap();
+    #[test]
+    fn install_writes_harness_skills_and_preserves_agents_md() {
+        let (_dir, project) = project();
+        let db = database(&project);
+        let agents = project.join("AGENTS.md");
+        let original = b"# House rules\n\nBe brief.\n";
+        std::fs::write(&agents, original).unwrap();
+
+        let files = install(&db, &project).unwrap();
+        assert_eq!(files.len(), 2);
+        let skill =
+            std::fs::read_to_string(project.join(".opencode/skills/board/SKILL.md")).unwrap();
+        assert_eq!(skill, SKILL_MD);
+        let claude =
+            std::fs::read_to_string(project.join(".claude/skills/board/SKILL.md")).unwrap();
+        assert_eq!(claude, SKILL_MD);
+        assert_eq!(std::fs::read(&agents).unwrap(), original);
+
         let mtime = std::fs::metadata(project.join(".claude/skills/board/SKILL.md"))
             .unwrap()
             .modified()
             .unwrap();
-        install(&project).unwrap();
-        assert_eq!(std::fs::read_to_string(project.join("AGENTS.md")).unwrap(), before);
+        install(&db, &project).unwrap();
+        assert_eq!(std::fs::read(&agents).unwrap(), original);
         assert_eq!(
             std::fs::metadata(project.join(".claude/skills/board/SKILL.md"))
                 .unwrap()
@@ -321,19 +324,60 @@ mod tests {
     }
 
     #[test]
-    fn install_appends_to_an_existing_agents_md_without_touching_it_elsewhere() {
+    fn disabled_project_does_not_install_skills_or_modify_agents_md() {
         let (_dir, project) = project();
-        std::fs::write(project.join("AGENTS.md"), "# House rules\n\nBe brief.\n").unwrap();
-        install(&project).unwrap();
-        let text = std::fs::read_to_string(project.join("AGENTS.md")).unwrap();
-        assert!(text.starts_with("# House rules\n\nBe brief.\n"));
-        assert!(text.contains(AGENTS_MARKER));
+        let db = database(&project);
+        let project_id = db.project_by_path(&project).unwrap().unwrap().id;
+        db.set_project_board_enabled(project_id, false).unwrap();
+        let agents = project.join("AGENTS.md");
+        let original = b"team-owned instructions\r\n";
+        std::fs::write(&agents, original).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&project)
+            .output()
+            .unwrap();
+
+        assert!(install(&db, &project).unwrap().is_empty());
+        assert!(board::ensure_enabled_file(&db, &project).is_err());
+        assert!(!board::file_path(&project).exists());
+        assert_eq!(std::fs::read(&agents).unwrap(), original);
+        assert!(!project.join(".opencode/skills/board/SKILL.md").exists());
+        assert!(!project.join(".claude/skills/board/SKILL.md").exists());
+        assert!(install_git_hook(&db, &project).unwrap().is_none());
+        assert!(!project.join(".git/hooks/pre-commit").exists());
+        assert!(!project.join(".radar.toml").exists());
+    }
+
+    #[test]
+    fn disabled_project_allows_edits_and_commits_without_a_board_claim() {
+        let (_dir, project) = project();
+        let db = database(&project);
+        let project_id = db.project_by_path(&project).unwrap().unwrap().id;
+        db.set_project_board_enabled(project_id, false).unwrap();
+        assert_eq!(
+            guard_decision(
+                &db,
+                &project,
+                Some("claude-1"),
+                Some(Path::new("src/main.rs"))
+            ),
+            GuardDecision::Allow
+        );
+        assert_eq!(
+            commit_decision(&db, &project, Some("claude-1")),
+            GuardDecision::Allow
+        );
     }
 
     #[test]
     fn the_guard_allows_the_board_itself_and_harness_files() {
         let (_dir, project) = project();
-        for file in ["BOARD.md", ".opencode/skills/board/SKILL.md", ".git/COMMIT_EDITMSG"] {
+        for file in [
+            "BOARD.md",
+            ".opencode/skills/board/SKILL.md",
+            ".git/COMMIT_EDITMSG",
+        ] {
             assert!(
                 claimable_path(&project, Path::new(file)),
                 "{file} should be claimable"
@@ -349,24 +393,24 @@ mod tests {
     #[test]
     fn the_guard_denies_until_a_claim_exists_then_allows() {
         let (_dir, project) = project();
+        let db = database(&project);
         board::ensure_file(&project).unwrap();
         board::add_card(&project, None, "task", "", None).unwrap();
 
         let src = Path::new("src/main.rs");
         assert!(matches!(
-            guard_decision(&project, Some("claude-1"), Some(src)),
+            guard_decision(&db, &project, Some("claude-1"), Some(src)),
             GuardDecision::Deny(_)
         ));
 
         board::next_card(&project, "claude-1", None).unwrap();
         assert_eq!(
-            guard_decision(&project, Some("claude-1"), Some(src)),
+            guard_decision(&db, &project, Some("claude-1"), Some(src)),
             GuardDecision::Allow
         );
-        // A done card no longer holds the guard open.
         board::finish_card(&project, "task").unwrap();
         assert!(matches!(
-            guard_decision(&project, Some("claude-1"), Some(src)),
+            guard_decision(&db, &project, Some("claude-1"), Some(src)),
             GuardDecision::Deny(_)
         ));
     }
@@ -374,15 +418,14 @@ mod tests {
     #[test]
     fn the_guard_never_blocks_what_it_cannot_judge() {
         let (_dir, project) = project();
+        let db = database(&project);
         board::ensure_file(&project).unwrap();
-        // No RADAR_AGENT: not launched by radar, the skill is the convention.
         assert_eq!(
-            guard_decision(&project, None, Some(Path::new("src/main.rs"))),
+            guard_decision(&db, &project, None, Some(Path::new("src/main.rs"))),
             GuardDecision::Allow
         );
-        // No file (a shell call): nothing to judge.
         assert_eq!(
-            guard_decision(&project, Some("claude-1"), None),
+            guard_decision(&db, &project, Some("claude-1"), None),
             GuardDecision::Allow
         );
     }
@@ -390,25 +433,24 @@ mod tests {
     #[test]
     fn the_commit_gate_asks_only_for_a_claim() {
         let (_dir, project) = project();
+        let db = database(&project);
         board::ensure_file(&project).unwrap();
         board::add_card(&project, None, "task", "", None).unwrap();
 
-        // A human, or an agent launched elsewhere: git stays out of the way.
-        assert_eq!(commit_decision(&project, None), GuardDecision::Allow);
+        assert_eq!(commit_decision(&db, &project, None), GuardDecision::Allow);
         assert!(matches!(
-            commit_decision(&project, Some("claude-1")),
+            commit_decision(&db, &project, Some("claude-1")),
             GuardDecision::Deny(_)
         ));
 
         board::next_card(&project, "claude-1", None).unwrap();
         assert_eq!(
-            commit_decision(&project, Some("claude-1")),
+            commit_decision(&db, &project, Some("claude-1")),
             GuardDecision::Allow
         );
-        // Handing the card over ends the right to commit, too.
         board::move_card(&project, "task", "Review").unwrap();
         assert!(matches!(
-            commit_decision(&project, Some("claude-1")),
+            commit_decision(&db, &project, Some("claude-1")),
             GuardDecision::Deny(_)
         ));
     }
@@ -416,6 +458,7 @@ mod tests {
     #[test]
     fn the_git_hook_is_installed_once_and_never_clobbers() {
         let (_dir, project) = project();
+        let db = database(&project);
         std::process::Command::new("git")
             .args(["init", "-q"])
             .current_dir(&project)
@@ -423,7 +466,7 @@ mod tests {
             .unwrap();
 
         // A repository gets the gate; a plain directory gets nothing.
-        let hook = install_git_hook(&project).unwrap().unwrap();
+        let hook = install_git_hook(&db, &project).unwrap().unwrap();
         assert_eq!(hook, project.join(".git/hooks/pre-commit"));
         let text = std::fs::read_to_string(&hook).unwrap();
         assert!(text.contains(GIT_HOOK_MARKER));
@@ -436,7 +479,7 @@ mod tests {
         // A hook radar did not write is never touched.
         let foreign = project.join(".git/hooks/pre-commit");
         std::fs::write(&foreign, "#!/bin/sh\n# mine\necho linting\n").unwrap();
-        assert!(install_git_hook(&project).unwrap().is_none());
+        assert!(install_git_hook(&db, &project).unwrap().is_none());
         assert_eq!(
             std::fs::read_to_string(&foreign).unwrap(),
             "#!/bin/sh\n# mine\necho linting\n"
@@ -444,13 +487,14 @@ mod tests {
 
         // ...but radar's own hook is refreshed in place.
         std::fs::write(&foreign, format!("{GIT_HOOK_MARKER}\nold body\n")).unwrap();
-        assert_eq!(install_git_hook(&project).unwrap().unwrap(), hook);
+        assert_eq!(install_git_hook(&db, &project).unwrap().unwrap(), hook);
         assert!(std::fs::read_to_string(&hook).unwrap().contains(GIT_HOOK));
     }
 
     #[test]
     fn a_non_repository_has_nothing_to_gate() {
         let (_dir, plain) = project();
-        assert!(install_git_hook(&plain).unwrap().is_none());
+        let db = database(&plain);
+        assert!(install_git_hook(&db, &plain).unwrap().is_none());
     }
 }

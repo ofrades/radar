@@ -130,3 +130,99 @@ pub fn preferences<F: Fn() + 'static>(
     dialog.set_child(Some(&scroll));
     dialog.present();
 }
+
+/// Per-project preferred programs, inheriting each global preference until
+/// the user chooses an override.
+pub fn project_preferences<F: Fn() + 'static>(
+    parent: &impl IsA<gtk::Window>,
+    db: &SharedDb,
+    project_id: i64,
+    project_name: &str,
+    on_changed: F,
+) {
+    let dialog = gtk::Window::builder()
+        .title(format!("{project_name} Defaults"))
+        .default_width(560)
+        .modal(true)
+        .transient_for(parent)
+        .build();
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    page.set_margin_top(18);
+    page.set_margin_bottom(18);
+    page.set_margin_start(18);
+    page.set_margin_end(18);
+    let global = db.preferences().unwrap_or_default();
+    let settings = db.project_settings(project_id).unwrap_or_default();
+    let on_changed = Rc::new(on_changed);
+    let slots = gtk::ListBox::new();
+    slots.set_selection_mode(gtk::SelectionMode::None);
+    slots.add_css_class("boxed-list");
+
+    for slot in [Slot::Editor, Slot::Agent, Slot::Diff, Slot::Shell] {
+        let candidates = programs::candidates_for_slot(slot, &global);
+        let global_name = global
+            .get(slot)
+            .and_then(programs::by_id)
+            .map(|program| program.name)
+            .unwrap_or_else(|| "Auto".to_string());
+        let mut labels = vec![format!("Use global ({global_name})")];
+        labels.extend(
+            candidates
+                .iter()
+                .map(|program| format!("{} — {}", program.name, program.id)),
+        );
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let dropdown = gtk::DropDown::from_strings(&label_refs);
+        let selected = settings
+            .get(slot)
+            .and_then(|id| candidates.iter().position(|program| program.id == id))
+            .map(|index| index as u32 + 1)
+            .unwrap_or(0);
+        dropdown.set_selected(selected);
+        dropdown.set_valign(gtk::Align::Center);
+
+        let item = gtk::ListBoxRow::new();
+        item.set_activatable(false);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        row.set_margin_top(10);
+        row.set_margin_bottom(10);
+        row.set_margin_start(12);
+        row.set_margin_end(12);
+        let label = gtk::Label::new(Some(slot.as_str()));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        row.append(&label);
+        row.append(&dropdown);
+        item.set_child(Some(&row));
+        slots.append(&item);
+
+        let db = db.clone();
+        let on_changed = on_changed.clone();
+        dropdown.connect_selected_notify(move |dropdown| {
+            let index = dropdown.selected();
+            let program = if index == 0 {
+                None
+            } else {
+                candidates
+                    .get(index as usize - 1)
+                    .map(|program| program.id.as_str())
+            };
+            if let Err(error) = db.set_project_preference(project_id, slot, program) {
+                eprintln!("radar: {error}");
+            }
+            on_changed();
+        });
+    }
+
+    page.append(&slots);
+    let note = gtk::Label::new(Some(
+        "New panes use these defaults. Use global keeps the matching Preferences setting.",
+    ));
+    note.add_css_class("dim-label");
+    note.add_css_class("caption");
+    note.set_wrap(true);
+    note.set_xalign(0.0);
+    page.append(&note);
+    dialog.set_child(Some(&page));
+    dialog.present();
+}

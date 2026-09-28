@@ -263,7 +263,8 @@ mod tests {
     }
 
     #[test]
-    fn remember_last_project_updates_only_that_field() {        let db = Db::open_in_memory().unwrap();
+    fn remember_last_project_updates_only_that_field() {
+        let db = Db::open_in_memory().unwrap();
         let prefs = crate::db::UiPrefs {
             sidebar_width: 360,
             ..Default::default()

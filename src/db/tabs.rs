@@ -49,7 +49,10 @@ impl TabKey {
 
     /// The tab after this one, when a ＋ adds another of the same primitive.
     pub const fn next_instance(self) -> Self {
-        TabKey { slot: self.slot, instance: self.instance + 1 }
+        TabKey {
+            slot: self.slot,
+            instance: self.instance + 1,
+        }
     }
 
     pub fn as_str(self) -> String {
@@ -66,9 +69,16 @@ impl TabKey {
         match text.split_once('·') {
             Some((slot, tail)) => TabKey {
                 slot: Slot::parse(slot),
-                instance: tail.trim().parse::<u32>().map(|n| n.saturating_sub(1)).unwrap_or(0),
+                instance: tail
+                    .trim()
+                    .parse::<u32>()
+                    .map(|n| n.saturating_sub(1))
+                    .unwrap_or(0),
             },
-            None => TabKey { slot: Slot::parse(text), instance: 0 },
+            None => TabKey {
+                slot: Slot::parse(text),
+                instance: 0,
+            },
         }
     }
 
