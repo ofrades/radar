@@ -512,6 +512,9 @@ struct ProjectRow {
     attention_badge: gtk::Label,
     agents: gtk::Box,
     agent_toggle: gtk::ToggleButton,
+    /// The agent-session buttons this row shows, by session id — how the
+    /// active-panel highlight finds its row without rebuilding it.
+    agent_buttons: RefCell<Vec<(String, gtk::Button)>>,
 }
 
 /// How an agent tab's program starts: fresh, on the project's last
@@ -2808,7 +2811,7 @@ impl App {
         let agents = gtk::Box::new(gtk::Orientation::Vertical, 2);
         agents.add_css_class("agent-list");
         agents.set_margin_start(8);
-        self.populate_project_agents(project.id, &agents);
+        let agent_buttons = self.populate_project_agents(project.id, &agents);
         agents_revealer.set_child(Some(&agents));
 
         let agent_toggle = gtk::ToggleButton::new();
@@ -2965,6 +2968,7 @@ impl App {
             attention_badge,
             agents,
             agent_toggle,
+            agent_buttons: RefCell::new(agent_buttons),
         }
     }
 
@@ -2983,11 +2987,19 @@ impl App {
         self.sync_toggles();
     }
 
-    fn populate_project_agents(&self, project_id: i64, container: &gtk::Box) {
+    fn populate_project_agents(
+        &self,
+        project_id: i64,
+        container: &gtk::Box,
+    ) -> Vec<(String, gtk::Button)> {
         while let Some(child) = container.first_child() {
             container.remove(&child);
         }
 
+        // The session this project's agent panel is showing, if any: its
+        // row wears the active mark.
+        let active = self.active_panel_session_id(project_id);
+        let mut buttons = Vec::new();
         let archived_view = self.archived_views.borrow().contains(&project_id);
         let mut sessions: Vec<_> = self
             .agent_sessions
@@ -3048,6 +3060,10 @@ impl App {
             let button = gtk::Button::new();
             button.add_css_class("flat");
             button.add_css_class("agent-child");
+            if active.as_deref() == Some(session.id.as_str()) {
+                button.add_css_class("agent-active");
+            }
+            buttons.push((session.id.clone(), button.clone()));
             button.set_halign(gtk::Align::Fill);
             button.set_hexpand(true);
             let action = if session.external.is_some() {
@@ -3140,6 +3156,55 @@ impl App {
             empty.set_margin_top(3);
             empty.set_margin_bottom(3);
             container.append(&empty);
+        }
+        // Keep the row's button index current — the active-panel highlight
+        // re-marks these buttons without rebuilding them. A row being built
+        // is not registered yet, so its builder takes the list instead.
+        if let Some(row) = self.rows.borrow().iter().find(|row| row.id == project_id) {
+            *row.agent_buttons.borrow_mut() = buttons.clone();
+        }
+        buttons
+    }
+
+    /// Which sidebar session (by id) the project's agent panel is showing:
+    /// the panel's visible tab, when that tab is an agent tab — named by
+    /// the exact conversation it was launched on, else by the live
+    /// session whose stable place that tab is.
+    fn active_panel_session_id(&self, project_id: i64) -> Option<String> {
+        let workspace = self.workspaces.borrow().get(&project_id).cloned()?;
+        let panel = Self::agent_panel(&workspace)?;
+        let key = panel.active_key()?;
+        if key.slot != Slot::Agent {
+            // The panel's stack is showing another kind — no agent session.
+            return None;
+        }
+        let primitive = workspace.tab(key)?;
+        let launched = primitive.launched_session.borrow().clone();
+        let tab = key.as_str();
+        let sessions = self
+            .agent_sessions
+            .borrow()
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default();
+        live_agents::active_panel_session(&sessions, &tab, launched.as_deref())
+            .map(|session| session.id.clone())
+    }
+
+    /// Re-mark the sidebar row each project's agent panel is showing.
+    /// Chips, board claims, hovers and program swaps move the panel
+    /// without any session data changing; this toggles the marks on the
+    /// buttons a populate built instead of rebuilding them.
+    fn refresh_active_agent_highlights(&self) {
+        for row in self.rows.borrow().iter() {
+            let active = self.active_panel_session_id(row.id);
+            for (session_id, button) in row.agent_buttons.borrow().iter() {
+                if active.as_deref() == Some(session_id.as_str()) {
+                    button.add_css_class("agent-active");
+                } else {
+                    button.remove_css_class("agent-active");
+                }
+            }
         }
     }
     fn refresh_project_agents(&self, project_id: i64) {
@@ -4049,6 +4114,7 @@ impl App {
                 primitive.focus();
             }
             self.persist_primitives(workspace);
+            self.refresh_active_agent_highlights();
             return;
         }
         self.show_primitive(workspace, key);
@@ -4059,6 +4125,7 @@ impl App {
                 primitive.focus();
             }
             self.persist_primitives(workspace);
+            self.refresh_active_agent_highlights();
         }
     }
 
@@ -4258,15 +4325,18 @@ impl App {
                 return;
             }
         }
-        // History: resume the exact recorded conversation. Without the
-        // provider's own session id there is no honest reopen — "last" could
-        // be a different conversation than the row the user clicked.
+        // History: resume the exact recorded conversation. The row counts
+        // as exact only when the provider itself reported the id — radar's
+        // own backfilled identity is not a conversation (see
+        // live_agents::exact_provider_session_id). Without one there is no
+        // honest reopen — "last" could be a different conversation than
+        // the row the user clicked.
         let Some(program) = programs::by_id(&session.program_id) else {
             self.toast("The session's agent is not installed");
             return;
         };
-        let resume = match &session.provider_session_id {
-            Some(id) if !program.resume_session.is_empty() => Resume::Session(id.clone()),
+        let resume = match live_agents::exact_provider_session_id(&session) {
+            Some(id) if !program.resume_session.is_empty() => Resume::Session(id.to_string()),
             _ => {
                 self.toast(
                     "This conversation has no exact reopen link — its agent did not report a session id",
@@ -4419,6 +4489,7 @@ impl App {
             group.activate(key);
             self.refresh_group_menu(&group);
             self.persist_primitives(workspace);
+            self.refresh_active_agent_highlights();
         }
         if let Some(primitive) = workspace.tab(key) {
             let focused_here = self.window.focus_widget().is_some_and(|focus| {
@@ -5030,6 +5101,9 @@ impl App {
                 || programs::for_slot(*slot, &preferences).is_some();
             button.set_sensitive(available);
         }
+        // The sidebar's active-agent marks are arrangement-derived state,
+        // like the dock: every path that relayouts panes lands here.
+        self.refresh_active_agent_highlights();
     }
 
     /// The pane menu belongs to whichever tab its header is showing — and so

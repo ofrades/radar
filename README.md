@@ -11,7 +11,8 @@ sorted by recent activity. Radar keeps **one agent panel**: selecting a session
 shows it there — its tab joins the panel's header as a chip, and the agent
 that was on screen is hidden but never stopped, its process and pty safe in
 the session layer. A tab dragged out for a side-by-side goes home on the next
-sidebar selection. External
+sidebar selection. Whichever session the agent panel is showing is marked in
+the list, so the sidebar always says which agent is on screen. External
 CLI sessions under terminal windows are discovered by working directory and show
 the CLI or terminal-window title. Selecting an external session focuses its
 terminal window. Catalog rows with a provider resume id reopen that exact

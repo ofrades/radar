@@ -52,6 +52,42 @@ fn fallback_title(program_id: &str) -> String {
         .unwrap_or_else(|| format!("{program_id} session"))
 }
 
+/// The exact-resume conversation id a sidebar row may honestly offer: one
+/// the provider itself reported. Radar-created catalog rows backfill
+/// radar's own stable session id (e.g. `project-3-agent-2-omp`) until a
+/// provider reports a conversation id — that value names radar's tab, not
+/// a provider conversation, and resuming it asks the CLI for a session it
+/// has never heard of (omp: `Session "project-…-omp" not found`).
+pub(super) fn exact_provider_session_id(session: &AgentSession) -> Option<&str> {
+    match &session.provider_session_id {
+        Some(id) if Some(id.as_str()) != session.radar_session_id.as_deref() => Some(id),
+        _ => None,
+    }
+}
+
+/// The sidebar row the agent panel's visible tab shows, if any. A tab
+/// launched on an exact conversation (`--session <id>`) shows that
+/// conversation's row — the history row reopened, not whatever else runs
+/// at the tab. Without one, the live radar session whose stable place is
+/// that tab is what the panel shows. External rows live in other
+/// terminals; a radar panel never shows one.
+pub(super) fn active_panel_session<'a>(
+    sessions: &'a [AgentSession],
+    active_tab: &str,
+    launched: Option<&str>,
+) -> Option<&'a AgentSession> {
+    if let Some(conversation) = launched {
+        if let Some(session) = sessions.iter().find(|session| {
+            session.external.is_none() && exact_provider_session_id(session) == Some(conversation)
+        }) {
+            return Some(session);
+        }
+    }
+    sessions.iter().find(|session| {
+        session.external.is_none() && session.tab_key.as_deref() == Some(active_tab)
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ExternalTarget {
     pub pid: u32,
@@ -707,6 +743,128 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["new", "tie-a", "tie-b", "old"],
             "newest activity first; title breaks timestamp ties case-insensitively"
+        );
+    }
+
+    #[test]
+    fn active_panel_session_prefers_the_launched_conversation_then_the_tab() {
+        let session = |id: &str,
+                       tab: Option<&str>,
+                       radar: Option<&str>,
+                       provider: Option<&str>,
+                       external: bool| super::AgentSession {
+            project_id: 1,
+            id: id.to_string(),
+            title: String::new(),
+            program_id: "omp".to_string(),
+            tab_key: tab.map(str::to_string),
+            external: external.then_some(super::ExternalTarget {
+                pid: 42,
+                start_ticks: 1,
+                window_pid: 42,
+            }),
+            catalog_id: None,
+            radar_session_id: radar.map(str::to_string),
+            provider_session_id: provider.map(str::to_string),
+            last_activity_at: 0,
+            running: !external,
+            archived: false,
+        };
+        let live = session("project-1-agent-0-omp", Some("agent-0"), None, None, false);
+        let history = session("catalog-7", None, None, Some("ses_42"), false);
+        let backfilled = session(
+            "catalog-8",
+            None,
+            Some("project-1-agent-1-omp"),
+            Some("project-1-agent-1-omp"),
+            false,
+        );
+        let sessions = [live, history, backfilled];
+
+        // No exact conversation on the tab: the live session running there.
+        assert_eq!(
+            super::active_panel_session(&sessions, "agent-0", None)
+                .map(|session| session.id.as_str()),
+            Some("project-1-agent-0-omp")
+        );
+        // Relaunched on the history row's conversation: that row, not the
+        // session that happens to hold the tab.
+        assert_eq!(
+            super::active_panel_session(&sessions, "agent-0", Some("ses_42"))
+                .map(|session| session.id.as_str()),
+            Some("catalog-7")
+        );
+        // A conversation no row reports — and a radar-backfilled id, which
+        // is not a conversation the provider ever reported — both fall back
+        // to the tab's own session.
+        for conversation in ["ses_missing", "project-1-agent-1-omp"] {
+            assert_eq!(
+                super::active_panel_session(&sessions, "agent-0", Some(conversation))
+                    .map(|session| session.id.as_str()),
+                Some("project-1-agent-0-omp"),
+                "{conversation} is not an honest resume target"
+            );
+        }
+        // Nothing live at the tab and no conversation match: nothing to mark.
+        assert_eq!(
+            super::active_panel_session(&sessions, "agent-9", None).map(|s| s.id.as_str()),
+            None
+        );
+        // An external row is never what a radar panel shows, not even by
+        // its own provider-reported conversation.
+        let external = session("external-42-1", None, None, Some("ses_42"), true);
+        assert_eq!(
+            super::active_panel_session(&[external], "agent-0", Some("ses_42"))
+                .map(|session| session.id.as_str()),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_resume_needs_a_provider_reported_conversation_id() {
+        let session = |radar: Option<&str>, provider: Option<&str>| super::AgentSession {
+            project_id: 3,
+            id: "catalog-1".to_string(),
+            title: String::new(),
+            program_id: "omp".to_string(),
+            tab_key: None,
+            external: None,
+            catalog_id: None,
+            radar_session_id: radar.map(str::to_string),
+            provider_session_id: provider.map(str::to_string),
+            last_activity_at: 0,
+            running: false,
+            archived: false,
+        };
+
+        // Radar-created rows backfill radar's own stable id: not a
+        // conversation the provider ever reported, so no exact reopen.
+        assert_eq!(
+            super::exact_provider_session_id(&session(
+                Some("project-3-agent-2-omp"),
+                Some("project-3-agent-2-omp")
+            )),
+            None,
+            "the backfilled radar id must not reach the provider's resume flag"
+        );
+        // No radar session and no provider id (external/import edges): none.
+        assert_eq!(super::exact_provider_session_id(&session(None, None)), None);
+        assert_eq!(
+            super::exact_provider_session_id(&session(Some("project-3-agent-0-opencode"), None)),
+            None
+        );
+        // A conversation id the provider itself reported (provider-history
+        // import, or a radar row the provider later filled): exact.
+        assert_eq!(
+            super::exact_provider_session_id(&session(None, Some("ses_f22a1495d"))),
+            Some("ses_f22a1495d")
+        );
+        assert_eq!(
+            super::exact_provider_session_id(&session(
+                Some("project-3-agent-0-opencode"),
+                Some("ses_f22a1495d")
+            )),
+            Some("ses_f22a1495d")
         );
     }
 }

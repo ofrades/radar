@@ -131,6 +131,15 @@ paned > separator:hover {
   color: @radar_fg;
   background-color: @radar_surface_hover;
 }
+/* The session the project's agent panel is showing: the quiet accent a
+   chip wears while it is the tab on screen. */
+.projects-sidebar button.agent-child.agent-active {
+  color: @radar_fg;
+  background-color: @radar_accent_soft;
+}
+.projects-sidebar button.agent-child.agent-active .row-icon {
+  color: @radar_accent;
+}
 .projects-sidebar button.agent-toggle {
   min-width: 24px;
   min-height: 24px;
@@ -646,6 +655,19 @@ mod tests {
         let css = stylesheet(&square);
         assert!(css.contains("border-radius: 0px;"));
         assert!(!css.contains("border-radius: -"));
+    }
+
+    #[test]
+    fn the_active_panel_session_row_wears_the_accent() {
+        let css = stylesheet(&Theme::load());
+        // The sidebar marks the session the agent panel is showing with
+        // the same soft accent a chip wears, and accents its icon.
+        assert!(css.contains(
+            ".projects-sidebar button.agent-child.agent-active {\n  color: @radar_fg;\n  background-color: @radar_accent_soft;\n"
+        ));
+        assert!(css.contains(
+            ".projects-sidebar button.agent-child.agent-active .row-icon {\n  color: @radar_accent;\n"
+        ));
     }
 
     #[test]
