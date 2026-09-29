@@ -339,8 +339,9 @@ function renderBoard(board) {
   list.replaceChildren();
   const { total, done } = boardProgress(board);
   $("#board-summary").textContent = board ? `${done} of ${total} done` : "No board";
+  $("#todo-add-form").classList.toggle("hidden", !board);
   $("#board-empty").classList.toggle("hidden", total > 0);
-  $("#board-empty").textContent = board ? "No cards yet. Add work from Radar desktop or the CLI." : "This project has no enabled board.";
+  $("#board-empty").textContent = board ? "No to-dos yet. Type one above." : "This project has no enabled board.";
   for (const column of board?.columns || []) {
     const section = document.createElement("section");
     section.className = "board-column";
@@ -835,6 +836,27 @@ function detach() {
   loadProjectData().catch((error) => showError(error.message));
 }
 
+async function addTodo(title) {
+  const project = selectedProject;
+  const trimmed = title.trim();
+  if (!project || !trimmed) return;
+  try {
+    const board = await request(`/api/projects/${project.id}/board`, {
+      method: "POST",
+      body: JSON.stringify({ title: trimmed }),
+    });
+    const progress = projectProgress.get(project.id);
+    if (progress) progress.board = board;
+    if (selectedProject?.id === project.id) {
+      renderBoard(board);
+      renderProjects();
+    }
+    $("#todo-add-input")?.focus({ preventScroll: true });
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
 async function createShell() {
   const project = selectedProject;
   if (!project) return;
@@ -909,6 +931,13 @@ $("#attention-list").addEventListener("focusout", () => {
 $("#attention-shortcut").addEventListener("click", openAttention);
 $("#terminal-attention-shortcut").addEventListener("click", openAttention);
 $("#new-shell-button").addEventListener("click", createShell);
+$("#todo-add-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const input = $("#todo-add-input");
+  const title = input.value;
+  input.value = "";
+  addTodo(title);
+});
 $("#refresh-button").addEventListener("click", () => loadProjectData().catch((error) => showError(error.message)));
 $("#back-button").addEventListener("click", detach);
 $("#detach-button").addEventListener("click", detach);

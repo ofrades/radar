@@ -92,6 +92,10 @@ button { color: inherit; }
 .board-column { min-width: 0; border-top: 1px solid var(--line); padding-top: 12px; }
 .board-column h3 { margin: 0 0 12px; color: var(--muted); font-size: 12px; font-weight: 650; }
 .board-card { padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.todo-add { margin: 0 0 18px; }
+.todo-add-input { width: 100%; padding: 9px 2px; color: var(--text); background: transparent; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; outline: none; font-size: 13px; }
+.todo-add-input::placeholder { color: var(--muted); }
+.todo-add-input:focus { border-bottom-color: var(--accent); }
 .board-card small { display: block; margin-top: 4px; color: var(--accent); }
 .board-claim { display: block; border: 0; padding: 4px 0; color: var(--accent); background: none; font-size: 11px; cursor: pointer; text-align: left; overflow-wrap: anywhere; max-width: 100%; }
 .board-claim:hover { text-decoration: underline; }

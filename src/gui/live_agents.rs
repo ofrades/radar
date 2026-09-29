@@ -63,19 +63,6 @@ pub(super) fn sort_sidebar_sessions(sessions: &mut [(AgentSession, String)]) {
     });
 }
 
-/// Match an agent's conversation title or provider name using the sidebar's
-/// fuzzy, case-insensitive search semantics.
-pub(super) fn matches_sidebar_query(session: &AgentSession, query: &str) -> bool {
-    let query = query.trim();
-    if query.is_empty() {
-        return true;
-    }
-    use fuzzy_matcher::FuzzyMatcher;
-    let matcher = fuzzy_matcher::skim::SkimMatcherV2::default().ignore_case();
-    matcher.fuzzy_match(&session.title, query).is_some()
-        || matcher.fuzzy_match(&session.program_id, query).is_some()
-}
-
 /// History can only reopen when the provider supplied an exact conversation
 /// id and the selected program has a resume command.
 pub(super) fn can_open_sidebar_session(session: &AgentSession, program_can_resume: bool) -> bool {
@@ -1024,30 +1011,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["running", "recent", "archived"]
         );
-    }
-
-    #[test]
-    fn sidebar_search_matches_session_titles_and_program_names() {
-        let session = super::AgentSession {
-            project_id: 1,
-            id: "catalog-1".to_string(),
-            title: "Repair fuzzy search".to_string(),
-            program_id: "opencode".to_string(),
-            tab_key: None,
-            external: None,
-            catalog_id: Some(1),
-            radar_session_id: None,
-            provider_session_id: Some("ses-1".to_string()),
-            claim_id: None,
-            last_activity_at: 0,
-            running: false,
-            archived: false,
-        };
-
-        assert!(super::matches_sidebar_query(&session, "fuzzy"));
-        assert!(super::matches_sidebar_query(&session, "openc"));
-        assert!(!super::matches_sidebar_query(&session, "codex"));
-        assert!(super::matches_sidebar_query(&session, "   "));
     }
 
     #[test]

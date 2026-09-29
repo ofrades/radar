@@ -1324,7 +1324,7 @@ mod tests {
         };
         assert_eq!(change.action, "added");
         assert_eq!(change.card.title, "Fix login");
-        assert_eq!(change.card.lane, "Backlog");
+        assert_eq!(change.card.lane, "Todo");
 
         // The mutation is visible in the store and published to the journal,
         // which is how every watcher hears about it.
@@ -1334,7 +1334,7 @@ mod tests {
         assert!(snapshot.events.iter().any(|event| matches!(
             &event.payload,
             ActivityPayload::BoardChanged { action, column, .. }
-                if action == "added" && column.as_deref() == Some("Backlog")
+                if action == "added" && column.as_deref() == Some("Todo")
         )));
     }
 }

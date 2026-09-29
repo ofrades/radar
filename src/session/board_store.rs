@@ -1,7 +1,7 @@
 //! The board store: a project's lanes and cards, owned by the daemon.
 //!
 //! Cards are records, not markdown lines. A lane carries a name and a kind
-//! (`backlog`, `in_progress`, `review`, `done`, or `custom`); a card carries a
+//! (`todo`, `in_progress`, `review`, `done`, or `custom`); a card carries a
 //! stable id, its lane and position, a title, a markdown body, a claim, a done
 //! flag, timestamps and a revision. A card is done exactly while it sits in a
 //! done-kind lane — one definition, with no column-heading-versus-checkbox
@@ -26,15 +26,16 @@ const MAX_CLAIM: usize = 200;
 
 /// The four lanes a project starts with: (name, kind).
 const DEFAULT_LANES: [(&str, &str); 4] = [
-    ("Backlog", "backlog"),
+    ("Todo", "todo"),
     ("In progress", "in_progress"),
     ("Review", "review"),
     ("Done", "done"),
 ];
 
 /// Bump when the tables below change; add the next step to `SCHEMA_STEPS`.
-const SCHEMA_VERSION: i64 = 1;
-const SCHEMA_STEPS: [&str; 1] = [r#"
+const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_STEPS: [&str; 2] = [
+    r#"
     CREATE TABLE IF NOT EXISTS board_projects (
         project_id INTEGER PRIMARY KEY
     );
@@ -62,13 +63,21 @@ const SCHEMA_STEPS: [&str; 1] = [r#"
     );
     CREATE INDEX IF NOT EXISTS board_cards_project
         ON board_cards(project_id, lane_id, position);
-"#];
+"#,
+    r#"
+    -- Rename the first lane from Backlog to Todo. The kind moves too, so the
+    -- lane reads as `todo` everywhere; only the label of a lane still called
+    -- "Backlog" is rewritten, so a deliberately renamed lane keeps its name.
+    UPDATE board_lanes SET kind = 'todo' WHERE kind = 'backlog';
+    UPDATE board_lanes SET name = 'Todo' WHERE kind = 'todo' AND name = 'Backlog';
+"#,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lane {
     pub id: i64,
     pub name: String,
-    /// `backlog` | `in_progress` | `review` | `done` | `custom`.
+    /// `todo` | `in_progress` | `review` | `done` | `custom`.
     pub kind: String,
     pub position: i64,
 }
@@ -539,7 +548,7 @@ fn has_cards(connection: &Connection, project_id: i64) -> Result<bool> {
 
 fn lane_kind(name: &str) -> &'static str {
     match name.trim().to_ascii_lowercase().as_str() {
-        "backlog" => "backlog",
+        "todo" | "backlog" => "todo",
         "in progress" => "in_progress",
         "review" => "review",
         "done" => "done",
@@ -811,7 +820,7 @@ mod tests {
         let store = store();
         let state = store.state(7).unwrap();
         let names: Vec<&str> = state.lanes.iter().map(|lane| lane.name.as_str()).collect();
-        assert_eq!(names, vec!["Backlog", "In progress", "Review", "Done"]);
+        assert_eq!(names, vec!["Todo", "In progress", "Review", "Done"]);
         assert!(state.cards.is_empty());
         assert!(!store.is_initialized(7).unwrap());
     }
@@ -823,14 +832,14 @@ mod tests {
             .add_card(1, None, "Fix login", "the 302 loop", None)
             .unwrap();
         assert_eq!(added.action, "added");
-        assert_eq!(added.card.lane, "Backlog");
+        assert_eq!(added.card.lane, "Todo");
         assert!(!added.card.done);
 
         let moved = store
             .move_card(1, &added.card.id, "In progress", None)
             .unwrap();
         assert_eq!(moved.action, "moved");
-        assert_eq!(moved.from_lane.as_deref(), Some("Backlog"));
+        assert_eq!(moved.from_lane.as_deref(), Some("Todo"));
         assert_eq!(moved.card.lane, "In progress");
         assert!(!moved.card.done);
 
@@ -841,7 +850,7 @@ mod tests {
 
         let reopened = store.reopen_card(1, &added.card.id, None).unwrap();
         assert_eq!(reopened.action, "reopened");
-        assert_eq!(reopened.card.lane, "Backlog");
+        assert_eq!(reopened.card.lane, "Todo");
         assert!(!reopened.card.done);
     }
 
@@ -860,9 +869,7 @@ mod tests {
     #[test]
     fn next_claims_the_first_open_card_and_respects_a_lane_filter() {
         let store = store();
-        store
-            .add_card(1, Some("Backlog"), "first", "", None)
-            .unwrap();
+        store.add_card(1, Some("Todo"), "first", "", None).unwrap();
         store
             .add_card(1, Some("In progress"), "second", "", None)
             .unwrap();
@@ -877,9 +884,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(in_progress.card.title, "second");
-        // Both are claimed now: nothing left in Backlog.
+        // Both are claimed now: nothing left in Todo.
         assert!(store
-            .next_card(1, "codex-2", Some("Backlog"))
+            .next_card(1, "codex-2", Some("Todo"))
             .unwrap()
             .is_none());
     }
@@ -904,13 +911,11 @@ mod tests {
     #[test]
     fn cards_keep_their_order_within_a_lane() {
         let store = store();
-        store.add_card(1, Some("Backlog"), "one", "", None).unwrap();
-        store.add_card(1, Some("Backlog"), "two", "", None).unwrap();
-        store
-            .add_card(1, Some("Backlog"), "three", "", None)
-            .unwrap();
+        store.add_card(1, Some("Todo"), "one", "", None).unwrap();
+        store.add_card(1, Some("Todo"), "two", "", None).unwrap();
+        store.add_card(1, Some("Todo"), "three", "", None).unwrap();
         let state = store.state(1).unwrap();
-        assert_eq!(lane_cards(&state, "Backlog"), vec!["one", "two", "three"]);
+        assert_eq!(lane_cards(&state, "Todo"), vec!["one", "two", "three"]);
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub fn set_enabled(db: &crate::db::Db, project: &Path, enabled: bool) -> Result<
 }
 
 /// Columns a fresh board starts with.
-pub const DEFAULT_COLUMNS: [&str; 4] = ["Backlog", "In progress", "Review", "Done"];
+pub const DEFAULT_COLUMNS: [&str; 4] = ["Todo", "In progress", "Review", "Done"];
 
 /// How many times a mutation re-reads the file before giving up.
 const ATTEMPTS: usize = 5;

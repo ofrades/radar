@@ -90,19 +90,6 @@ reviewer's word, never the worker's.
   commit after — the hook's refusal text says how.
 "#;
 
-/// The git pre-commit hook radar installs: the one gate that holds whatever
-/// tool the agent edited with. Fails open when radar is not on PATH — the
-/// requirement belongs to radar-managed sessions, not to the machine.
-const GIT_HOOK_MARKER: &str = "# radar: board claim required to commit";
-
-const GIT_HOOK: &str = "# radar: board claim required to commit —\
- see the board skill\n\
- # Agents launched by radar must claim work before committing; humans in\n\
- # their own terminals are not affected (no RADAR_AGENT is set).\n\
- command -v radar >/dev/null 2>&1 || exit 0\n\
- [ -n \"$RADAR_AGENT\" ] || exit 0\n\
- exec radar hook guard --commit\n";
-
 /// The user-level skills home every harness here discovers: `~/.agents/skills`.
 /// `RADAR_SKILLS_HOME` overrides it (tests, non-standard layouts).
 fn skills_home() -> Option<PathBuf> {
@@ -280,63 +267,6 @@ fn board_policy_decision(db: &crate::db::Db, project: &Path) -> Option<GuardDeci
     }
 }
 
-/// The one hook every harness respects: git. Installed into the repository's
-/// own hooks directory, it refuses a commit from a radar-launched agent that
-/// holds no board claim — whatever tool the agent edited with — and lets
-/// everyone else through. Never touches a hook radar did not write, and only
-/// ever writes under a `.git` directory, so hook managers like husky are
-/// left exactly as they are.
-pub fn install_git_hook(db: &crate::db::Db, project: &Path) -> Result<Option<PathBuf>> {
-    if !crate::board::enabled(db, project)? {
-        return Ok(None);
-    }
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(project)
-        .args(["rev-parse", "--git-path", "hooks"])
-        .output();
-    let Ok(output) = output else {
-        return Ok(None); // no git in PATH: no gate, the skill carries it
-    };
-    if !output.status.success() {
-        return Ok(None); // not a repository: nothing to gate
-    }
-    let hooks = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    let hooks = if hooks.is_absolute() {
-        hooks
-    } else {
-        project.join(hooks)
-    };
-    // Hook managers own their directory; radar only moves into git's own.
-    if !hooks
-        .components()
-        .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
-    {
-        return Ok(None);
-    }
-    let hook = hooks.join("pre-commit");
-    match std::fs::read_to_string(&hook) {
-        // Ours: keep it current.
-        Ok(text) if text.contains(GIT_HOOK_MARKER) => {}
-        // Someone else's hook: it wins, unseen and unedited.
-        Ok(_) => return Ok(None),
-        // No hook yet: ours goes in.
-        Err(_) => {}
-    }
-    if let Some(parent) = hook.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(&hook, GIT_HOOK).with_context(|| format!("writing {}", hook.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("making {} executable", hook.display()))?;
-    }
-    Ok(Some(hook))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,8 +327,6 @@ mod tests {
         assert_eq!(std::fs::read(&agents).unwrap(), original);
         assert!(!project.join(".opencode/skills/board/SKILL.md").exists());
         assert!(!project.join(".claude/skills/board/SKILL.md").exists());
-        assert!(install_git_hook(&db, &project).unwrap().is_none());
-        assert!(!project.join(".git/hooks/pre-commit").exists());
         assert!(!project.join(".radar.toml").exists());
     }
 
@@ -506,48 +434,5 @@ mod tests {
             commit_decision(&db, &project, Some("claude-1")),
             GuardDecision::Deny(_)
         ));
-    }
-
-    #[test]
-    fn the_git_hook_is_installed_once_and_never_clobbers() {
-        let (_dir, project) = project();
-        let db = database(&project);
-        std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&project)
-            .output()
-            .unwrap();
-
-        // A repository gets the gate; a plain directory gets nothing.
-        let hook = install_git_hook(&db, &project).unwrap().unwrap();
-        assert_eq!(hook, project.join(".git/hooks/pre-commit"));
-        let text = std::fs::read_to_string(&hook).unwrap();
-        assert!(text.contains(GIT_HOOK_MARKER));
-        assert!(text.contains("radar hook guard --commit"));
-        assert!(text.contains("exit 0"), "a missing radar must fail open");
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&hook).unwrap().permissions().mode();
-        assert_eq!(mode & 0o111, 0o111, "the hook must be executable");
-
-        // A hook radar did not write is never touched.
-        let foreign = project.join(".git/hooks/pre-commit");
-        std::fs::write(&foreign, "#!/bin/sh\n# mine\necho linting\n").unwrap();
-        assert!(install_git_hook(&db, &project).unwrap().is_none());
-        assert_eq!(
-            std::fs::read_to_string(&foreign).unwrap(),
-            "#!/bin/sh\n# mine\necho linting\n"
-        );
-
-        // ...but radar's own hook is refreshed in place.
-        std::fs::write(&foreign, format!("{GIT_HOOK_MARKER}\nold body\n")).unwrap();
-        assert_eq!(install_git_hook(&db, &project).unwrap().unwrap(), hook);
-        assert!(std::fs::read_to_string(&hook).unwrap().contains(GIT_HOOK));
-    }
-
-    #[test]
-    fn a_non_repository_has_nothing_to_gate() {
-        let (_dir, plain) = project();
-        let db = database(&plain);
-        assert!(install_git_hook(&db, &plain).unwrap().is_none());
     }
 }

@@ -55,15 +55,6 @@ pub fn drop_intent(
     DropIntent::SplitOut
 }
 
-/// Whose widgets a pane's body shows. Radar draws only the Board's body —
-/// the sidebar, settings and onboarding are not panes at all. Every other
-/// slot's body is a terminal running a program radar does not own, so the
-/// right click there is the program's: radar's pane menu keeps to the
-/// three-dot button and the Menu key.
-fn radar_draws(slot: Slot) -> bool {
-    slot == Slot::Board
-}
-
 /// Which part of a pane's body a drop landed on: the half the drop implies.
 fn drop_zone(width: i32, height: i32, x: f64, y: f64) -> &'static str {
     let (fw, fh) = (width as f64, height as f64);
@@ -206,62 +197,7 @@ impl Group {
             attention: RefCell::new(HashSet::new()),
         });
         Group::accept_drags(&group);
-        Group::wire_context_menu(&group);
         group
-    }
-
-    /// A secondary click opens the same menu as the three-dot button and the
-    /// Menu key — but at the pointer, like any context menu, not anchored up
-    /// at the button. Radar's surfaces only: where radar draws what you are
-    /// clicking on (the Board pane; the sidebar, settings and onboarding are
-    /// no panes and carry no interception at all) the menu is radar's to
-    /// open. Every other pane body is a terminal running somebody else's
-    /// program, and the right click there belongs to that program — VTE hands
-    /// button 3 to whatever asked for mouse events. The gesture steps aside
-    /// so the press reaches the terminal untouched.
-    fn wire_context_menu(group: &Rc<Group>) {
-        let context_menu = group.menu_button.clone();
-        let menu_origin = group.widget.clone();
-        let group_for_menu = group.clone();
-        let pointing_wired = std::cell::Cell::new(false);
-        let context_click = gtk::GestureClick::new();
-        context_click.set_button(3);
-        context_click.set_propagation_phase(gtk::PropagationPhase::Capture);
-        context_click.connect_pressed(move |gesture, _, x, y| {
-            // The visible tab decides whose click this is. A terminal tab —
-            // any slot but the Board — lets the press through unclaimed.
-            let Some(key) = group_for_menu.active_key() else {
-                return;
-            };
-            if !radar_draws(key.slot) {
-                return;
-            }
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-            context_menu.grab_focus();
-            // Point the popover at the pointer. The rect is in the menu
-            // button's coordinate space, because the button parents the
-            // popover — and the popover only exists once a menu model has
-            // been set. If either widget is not on screen yet, fall through
-            // and the menu opens at the button as before.
-            if let Some(popover) = context_menu.popover() {
-                if let Some((x, y)) = menu_origin.translate_coordinates(&context_menu, x, y) {
-                    popover.set_pointing_to(Some(&gdk::Rectangle::new(
-                        x.round() as i32,
-                        y.round() as i32,
-                        1,
-                        1,
-                    )));
-                    if !pointing_wired.get() {
-                        pointing_wired.set(true);
-                        // Hand the anchor back once the menu closes, so the
-                        // button itself and the Menu key open at the button.
-                        popover.connect_closed(|popover| popover.set_pointing_to(None));
-                    }
-                }
-            }
-            context_menu.popup();
-        });
-        group.widget.add_controller(context_click);
     }
 
     /// The header drags; the whole pane accepts drops.
@@ -794,26 +730,5 @@ mod tests {
             edge_margins("right", 400, 300, 6),
             "centre splits like right, so it lights like right"
         );
-    }
-
-    #[test]
-    fn the_right_click_belongs_to_radar_only_on_radar_drawn_panes() {
-        // The board is radar's own widgets: the pane menu keeps the click.
-        assert!(radar_draws(Slot::Board));
-        // Every other slot's body is a terminal running a program radar does
-        // not own — its right click goes to that program.
-        for slot in [
-            Slot::Editor,
-            Slot::Agent,
-            Slot::Diff,
-            Slot::Shell,
-            Slot::Custom,
-        ] {
-            assert!(
-                !radar_draws(slot),
-                "{} panes run a program, not radar's widgets",
-                slot.as_str()
-            );
-        }
     }
 }

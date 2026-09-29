@@ -1,7 +1,7 @@
 //! The app window.
 //!
 //! A project workspace is a handful of primitives — editor, agent, diff,
-//! terminal, the board — and nothing else. No tabs: the sidebar's icons decide
+//! terminal, the board — and nothing else. Home leads; workspace tools decide
 //! which primitives are on
 //! screen, and the layout arranges them the same way every time:
 //!
@@ -18,6 +18,7 @@
 
 mod board;
 mod card;
+mod confetti;
 mod dialogs;
 mod group;
 mod home;
@@ -35,7 +36,7 @@ mod theme;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -51,7 +52,6 @@ use crate::db::{
     Db, NewWorkspaceLayout, Project, Slot, TabKey, WorkspaceAxis, WorkspaceGroup, WorkspaceLayout,
     WorkspaceState,
 };
-use crate::discover::{self, Candidate};
 use crate::programs::{self, CommandSpec, Kind, LaunchOptions, Program};
 
 use group::Group;
@@ -63,13 +63,7 @@ type SharedDb = Rc<Db>;
 
 /// The four content primitives, in layout order: the agent leads, because that
 /// is what the workspace is for.
-const PRIMITIVES: [Slot; 5] = [
-    Slot::Agent,
-    Slot::Diff,
-    Slot::Board,
-    Slot::Shell,
-    Slot::Editor,
-];
+const PRIMITIVES: [Slot; 4] = [Slot::Agent, Slot::Diff, Slot::Shell, Slot::Editor];
 
 type ZoomState = (Vec<Rc<Group>>, Option<split::Node<Group>>);
 
@@ -93,8 +87,6 @@ pub fn run(paths: Paths, db: Db) -> Result<()> {
         let window = build_window(app, &paths, &db);
         *window_for_activate.borrow_mut() = Some(window.clone());
         window.present();
-        #[cfg(feature = "vte")]
-        debug_sidebar_sweep(&window); // [DEBUG-sb] temporary
     });
     // Closing the window hides the UI but leaves terminal children and their
     // PTYs running. Launching Radar again activates this same application.
@@ -251,15 +243,10 @@ struct App {
     session_home: PathBuf,
     theme: RefCell<Theme>,
     window: adw::ApplicationWindow,
-    sidebar: gtk::Widget,
-    splitter: gtk::Paned,
-    sidebar_shown: Cell<bool>,
-    sidebar_list: gtk::ListBox,
-    sidebar_search: gtk::SearchEntry,
+    workspace_bar: gtk::Box,
+    workspace_title: gtk::Button,
     toggles: RefCell<HashMap<Slot, gtk::ToggleButton>>,
-    projects_toggle: gtk::ToggleButton,
     /// Home leads the dock; it is checked while the home panel shows.
-    home_toggle: gtk::ToggleButton,
     /// True while the home panel is on screen instead of a project's
     /// workspace — the empty state, or the user's explicit "go home".
     home_shown: Cell<bool>,
@@ -270,7 +257,6 @@ struct App {
     hud: Rc<hud::Hud>,
     workspaces: RefCell<HashMap<i64, Rc<Workspace>>>,
     projects: RefCell<Vec<Project>>,
-    rows: RefCell<Vec<ProjectRow>>,
     agent_sessions: RefCell<live_agents::SessionIndex>,
     agent_tx: std::sync::mpsc::Sender<Result<live_agents::DiscoverySnapshot, String>>,
     agent_rx: RefCell<std::sync::mpsc::Receiver<Result<live_agents::DiscoverySnapshot, String>>>,
@@ -283,8 +269,7 @@ struct App {
     activity_watchers: RefCell<HashMap<i64, ActivityWatcher>>,
     activity_tx: std::sync::mpsc::SyncSender<ActivityNotice>,
     activity_rx: RefCell<std::sync::mpsc::Receiver<ActivityNotice>>,
-    board_panes: RefCell<HashMap<i64, std::rc::Weak<board::BoardPane>>>,
-    /// The last board store state per project, so Home and the board pane
+    /// The last board store state per project, so Home and card conversations
     /// render without re-fetching on every rebuild.
     board_states: RefCell<HashMap<i64, crate::session::board_store::BoardState>>,
     /// Where Home is drilled in: empty means the cockpit, otherwise a stack of
@@ -296,18 +281,17 @@ struct App {
     /// Attention responses the Home cockpit has sent but not yet heard back
     /// about. Home is rebuilt often, so the pending set outlives its widgets.
     home_pending_attention: Rc<RefCell<HashSet<String>>>,
+    /// After a to-do is added from Home the cockpit is rebuilt, destroying the
+    /// input that was focused. This remembers which project's input should get
+    /// the keys back, so a human can add several to-dos in a row.
+    home_focus_todo: Cell<Option<i64>>,
+    home_todo_drafts: Rc<RefCell<HashMap<i64, String>>>,
+    /// The confetti layer thrown when a to-do is completed.
+    confetti: confetti::Confetti,
     /// What each pane's program last said about itself — its name and its own
     /// live title, or its exit — keyed by (project, tab).
     header_info: RefCell<HashMap<(i64, TabKey), String>>,
     current: RefCell<Option<i64>>,
-    // The search box doubles as the add flow: candidates for the query show
-    // under the projects, each with its own add button.
-    find_root: RefCell<PathBuf>,
-    find_candidates: RefCell<Vec<Candidate>>,
-    find_rows: RefCell<Vec<gtk::ListBoxRow>>,
-    find_tx: std::sync::mpsc::Sender<(PathBuf, Vec<Candidate>)>,
-    find_rx: RefCell<std::sync::mpsc::Receiver<(PathBuf, Vec<Candidate>)>>,
-    find_root_button: gtk::Button,
     /// Last real pointer movement over the window, in milliseconds of the
     /// glib monotonic clock. Enter events a mapped widget synthesizes under a
     /// parked pointer must not read as mouse intent.
@@ -316,8 +300,10 @@ struct App {
 
 #[derive(Clone)]
 enum HomeView {
-    Board(i64),
+    Project(i64),
     Card(i64, String),
+    /// Home's New-project drill-down: no dialog window.
+    NewProject,
 }
 
 #[derive(Debug)]
@@ -529,34 +515,14 @@ impl Drop for ActivityWatcher {
 }
 
 type SharedApp = Rc<App>;
-struct ProjectRow {
-    id: i64,
-    row: gtk::ListBoxRow,
-    summary: gtk::Label,
-    badge: gtk::Label,
-    attention_badge: gtk::Label,
-    agent_badge: gtk::Label,
-}
 
-fn set_row_action_target(row: &gtk::ListBoxRow, target: bool) {
-    fn update(widget: &gtk::Widget, target: bool) {
-        if widget.has_css_class("row-action") {
-            widget.set_can_target(target);
-            widget.set_focusable(target);
-        }
-        // The meta line's quiet controls take no space on quiet rows, so the
-        // board summary breathes; the line itself never changes height.
-        if widget.has_css_class("row-actions") {
-            widget.set_visible(target);
-        }
-        let mut child = widget.first_child();
-        while let Some(current) = child {
-            child = current.next_sibling();
-            update(&current, target);
-        }
-    }
-
-    update(row.upcast_ref(), target);
+/// Optional launch context a card message adds to an agent launch: the human's
+/// message as the initial prompt, and the card it belongs to (`RADAR_CARD_ID`).
+#[derive(Default, Clone)]
+struct Extras {
+    prompt: Option<String>,
+    card: Option<String>,
+    instance: Option<String>,
 }
 
 /// How an agent tab's program starts: fresh, on the project's last
@@ -682,144 +648,45 @@ fn build_window(
         .default_height(950)
         .build();
 
-    // ---- sidebar ----
-    let sidebar_list = gtk::ListBox::new();
-    sidebar_list.set_selection_mode(gtk::SelectionMode::Single);
-    // No `navigation-sidebar`: its own row padding and radii would fight the
-    // stylesheet. This sidebar styles its rows itself.
-    sidebar_list.set_show_separators(false);
-
-    let sidebar_scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&sidebar_list)
-        .build();
-
-    // The dock: one toggle per primitive, along the bottom of the sidebar.
-    // It spans the sidebar's full inset width like the search above, so all
-    // three floating surfaces read as one family.
+    // Workspace tools stay local to the workspace. Home needs no tool rail.
+    let workspace_bar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    workspace_bar.add_css_class("workspace-bar");
+    let home_button = gtk::Button::with_label("Home");
+    home_button.add_css_class("flat");
+    home_button.set_action_name(Some("win.show-home"));
+    home_button.set_tooltip_text(Some("All projects · Alt+Home / Alt+B"));
+    workspace_bar.append(&home_button);
+    let workspace_title = gtk::Button::new();
+    workspace_title.add_css_class("flat");
+    workspace_title.add_css_class("heading");
+    workspace_title.set_hexpand(true);
+    workspace_title.set_halign(gtk::Align::Start);
+    workspace_title.set_action_name(Some("win.workspace-project"));
+    workspace_title.set_tooltip_text(Some("Back to this project's tasks and conversations"));
+    workspace_bar.append(&workspace_title);
     let toggles = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     toggles.add_css_class("dock");
-    toggles.set_halign(gtk::Align::Fill);
-    toggles.set_margin_top(6);
-    toggles.set_margin_bottom(8);
-
-    // Home leads the dock: the panel the dock returns to when nothing is
-    // open, and the empty state itself when there are no projects yet.
-    let home_toggle = gtk::ToggleButton::builder()
-        .icon_name("go-home-symbolic")
-        .tooltip_text("Home\tAlt+Home")
-        .build();
-    home_toggle.add_css_class("flat");
-    home_toggle.set_hexpand(true);
-    home_toggle.set_action_name(Some("win.show-home"));
-    if let Some(image) = home_toggle.child().and_downcast::<gtk::Image>() {
-        image.set_pixel_size(14);
-    }
-    toggles.append(&home_toggle);
-
-    // One toggle per primitive, in the order they are named: agent, changes,
-    // project, editor, commands. The project toggle is the sidebar.
     let mut toggle_buttons = HashMap::new();
-    let mut add_toggle = |slot: Slot, project: bool, row: &gtk::Box| {
+    for slot in PRIMITIVES {
         let button = gtk::ToggleButton::builder()
-            .icon_name(if project {
-                primitive::PROJECTS_ICON
-            } else {
-                icon_name(slot)
-            })
-            .tooltip_text(if project {
-                format!("{}\tAlt+B", primitive::PROJECTS_LABEL)
-            } else {
-                format!("{}\t{}", label_for(slot), accel_hint(slot))
-            })
+            .icon_name(icon_name(slot))
+            .tooltip_text(format!("{}\t{}", label_for(slot), accel_hint(slot)))
             .build();
         button.add_css_class("flat");
-        button.set_hexpand(true);
-        // Smaller icon than the default: the dock is a compact control strip.
         if let Some(image) = button.child().and_downcast::<gtk::Image>() {
             image.set_pixel_size(14);
         }
-        if project {
-            button.set_action_name(Some("win.toggle-sidebar"));
-        } else {
-            button.set_action_name(Some("win.primitive-toggle"));
-            button.set_action_target_value(Some(&slot.as_str().to_variant()));
-            toggle_buttons.insert(slot, button.clone());
-        }
-        row.append(&button);
-        button
-    };
-    let mut projects_toggle: Option<gtk::ToggleButton> = None;
-    for (slot, is_project) in [
-        (Slot::Agent, false),
-        (Slot::Diff, false),
-        (Slot::Board, false),
-        (Slot::Custom, true),
-        (Slot::Editor, false),
-        (Slot::Shell, false),
-    ] {
-        let button = add_toggle(slot, is_project, &toggles);
-        if is_project {
-            projects_toggle = Some(button);
-        }
+        button.set_action_name(Some("win.primitive-toggle"));
+        button.set_action_target_value(Some(&slot.as_str().to_variant()));
+        toggles.append(&button);
+        toggle_buttons.insert(slot, button);
     }
-    let projects_toggle = projects_toggle.expect("the project toggle is in the row");
-
-    let search = gtk::SearchEntry::new();
-    search.set_placeholder_text(Some("Search projects and sessions…"));
-    search.set_tooltip_text(Some(
-        "Filter projects or agent sessions, or type to find a directory to add",
-    ));
-    search.set_hexpand(true);
-
-    // Brand header: the app logo, not a pane header. No menu button.
-    let sidebar_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    sidebar_header.add_css_class("group-header");
-    let header_icon = gtk::Image::from_icon_name("radar");
-    header_icon.set_pixel_size(16);
-    header_icon.set_tooltip_text(Some("Radar"));
-    sidebar_header.append(&header_icon);
-    let sidebar_title = gtk::Label::new(Some("Radar"));
-    sidebar_title.add_css_class("caption-heading");
-    sidebar_title.set_xalign(0.0);
-    sidebar_title.set_hexpand(true);
-    sidebar_header.append(&sidebar_title);
-    // Home, by the logo: back to the panel that is there when nothing is.
-    let home_button = gtk::Button::builder()
-        .icon_name("go-home-symbolic")
-        .tooltip_text("Home\tAlt+Home")
-        .build();
-    home_button.add_css_class("flat");
-    home_button.set_action_name(Some("win.show-home"));
-    if let Some(image) = home_button.child().and_downcast::<gtk::Image>() {
-        image.set_pixel_size(14);
-    }
-    sidebar_header.append(&home_button);
-
-    // The search goes straight into the sidebar box; its margins come from the
-    // stylesheet, aligned with the row inset.
-
-    // Shown only while a search is up: where the directory results come from.
-    let find_root_button = gtk::Button::new();
-    find_root_button.add_css_class("flat");
-    find_root_button.add_css_class("caption");
-    find_root_button.set_halign(gtk::Align::Start);
-    find_root_button.set_margin_start(8);
-    find_root_button.set_margin_bottom(2);
-    find_root_button.set_tooltip_text(Some("Choose another directory to scan"));
-
-    find_root_button.set_visible(false);
-
-    let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    sidebar_box.add_css_class("projects-sidebar");
-    sidebar_box.append(&sidebar_header);
-    sidebar_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    sidebar_box.append(&search);
-    sidebar_box.append(&find_root_button);
-    sidebar_box.append(&sidebar_scroll);
-    sidebar_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    sidebar_box.append(&toggles);
+    workspace_bar.append(&toggles);
+    let tools = gtk::Button::with_label("Tools & shortcuts");
+    tools.add_css_class("flat");
+    tools.set_action_name(Some("win.hud"));
+    workspace_bar.append(&tools);
+    workspace_bar.set_visible(false);
 
     // ---- main area ----
     let stack = gtk::Stack::builder()
@@ -831,28 +698,12 @@ fn build_window(
     // preferences and its new-project flow selects — so it joins the stack
     // once the state exists, just before it can first be shown.
 
-    let splitter = gtk::Paned::new(gtk::Orientation::Horizontal);
-    splitter.set_start_child(Some(&sidebar_box));
-    splitter.set_end_child(Some(&stack));
-    splitter.set_resize_start_child(false);
-    // Both children keep their minimum width: the handle stops at the
-    // sidebar's dock floor on the left and at the content's minimum on the
-    // right. With either shrink flag GTK drags the handle past the pane's
-    // minimum and paints the overflow off the window's edge. Rows still
-    // ellipsize smoothly down to the floor; the floor itself is the dock of
-    // icons, which cannot shrink without being clipped anyway.
-    splitter.set_shrink_start_child(false);
-    splitter.set_shrink_end_child(false);
-    splitter.set_wide_handle(true);
-    splitter.set_vexpand(true);
-    splitter.set_position(
-        db.ui_prefs()
-            .map(|prefs| prefs.sidebar_width)
-            .unwrap_or(260),
-    );
+    let main = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    main.append(&workspace_bar);
+    main.append(&stack);
 
     let toasts = adw::ToastOverlay::new();
-    toasts.set_child(Some(&splitter));
+    toasts.set_child(Some(&main));
     // The overlay panel floats above everything else: keys and primitives,
     // one keystroke away (Alt+H).
     let hud = hud::Hud::new();
@@ -864,11 +715,13 @@ fn build_window(
     root.add_css_class("app-frame");
     root.set_child(Some(&toasts));
     root.add_overlay(hud.widget());
+    // The confetti sits above everything and never takes input.
+    let confetti = confetti::Confetti::new();
+    root.add_overlay(confetti.widget());
     window.set_content(Some(&root));
     window.set_tooltip_text(Some(&format!("state: {}", paths.database().display())));
 
     let (status_tx, status_rx) = std::sync::mpsc::channel();
-    let (find_tx, find_rx) = std::sync::mpsc::channel();
     let (activity_tx, activity_rx) = std::sync::mpsc::sync_channel(512);
     let (agent_tx, agent_rx) = std::sync::mpsc::channel();
     let state = Rc::new(App {
@@ -876,21 +729,15 @@ fn build_window(
         session_home: paths.data_dir.clone(),
         theme: RefCell::new(Theme::load()),
         window: window.clone(),
-        sidebar: sidebar_box.upcast(),
-        splitter,
-        sidebar_shown: Cell::new(true),
-        sidebar_list,
-        sidebar_search: search.clone(),
+        workspace_bar,
+        workspace_title,
         toggles: RefCell::new(toggle_buttons),
-        projects_toggle: projects_toggle.clone(),
-        home_toggle: home_toggle.clone(),
-        home_shown: Cell::new(false),
+        home_shown: Cell::new(true),
         stack,
         toasts,
         hud: hud.clone(),
         workspaces: RefCell::new(HashMap::new()),
         projects: RefCell::new(Vec::new()),
-        rows: RefCell::new(Vec::new()),
         agent_sessions: RefCell::new(live_agents::SessionIndex::default()),
         agent_tx,
         agent_rx: RefCell::new(agent_rx),
@@ -903,25 +750,17 @@ fn build_window(
         activity_watchers: RefCell::new(HashMap::new()),
         activity_rx: RefCell::new(activity_rx),
         activity_tx,
-        board_panes: RefCell::new(HashMap::new()),
         board_states: RefCell::new(HashMap::new()),
         home_nav: RefCell::new(Vec::new()),
         board_summaries: RefCell::new(HashMap::new()),
         board_monitors: RefCell::new(HashMap::new()),
         notified_attention: RefCell::new(HashSet::new()),
         home_pending_attention: Rc::new(RefCell::new(HashSet::new())),
+        home_focus_todo: Cell::new(None),
+        home_todo_drafts: Rc::new(RefCell::new(HashMap::new())),
+        confetti,
         header_info: RefCell::new(HashMap::new()),
         current: RefCell::new(None),
-        find_root: RefCell::new(
-            db.ui_prefs()
-                .map(|prefs| prefs.resolved_add_root())
-                .unwrap_or_else(|_| crate::config::default_project_root()),
-        ),
-        find_candidates: RefCell::new(Vec::new()),
-        find_rows: RefCell::new(Vec::new()),
-        find_tx,
-        find_rx: RefCell::new(find_rx),
-        find_root_button: find_root_button.clone(),
         pointer_motion_ms: Cell::new(0),
     });
 
@@ -944,13 +783,8 @@ fn build_window(
     start_status_drainer(&state);
     start_activity_drainer(&state);
     start_agent_session_drainer(&state);
-    start_find_drainer(&state);
-    wire_sidebar_drop(&state);
+    wire_workspace_drop(&state);
     watch_theme(&state);
-    state.find_root_button.set_label(&format!(
-        "from {}",
-        crate::db::abbreviate(&state.find_root.borrow())
-    ));
     App::refresh_projects(&state);
     state.request_agent_scan();
     start_agent_session_polling(&state);
@@ -959,12 +793,9 @@ fn build_window(
     if let Ok(path) = std::env::var("RADAR_NEW_PROJECT") {
         home::create_project(&state, PathBuf::from(path));
     }
-    // Seed the candidate cache, so the first search is instant.
-    state.rescan_find();
-    if let Ok(prefs) = state.db.ui_prefs() {
-        if let Some(id) = prefs.last_project {
-            state.select_project(id);
-        }
+    // Start on the human overview. Persisted workspaces are restored on demand.
+    if std::env::var("RADAR_NEW_PROJECT").is_err() {
+        state.show_home();
     }
     state.reload_theme();
     // Keys belong to the program you are looking at, not to the filter box.
@@ -1016,15 +847,31 @@ fn build_window(
             }
         }
     }
-    // Development aid: open a project's board inside Home.
-    // RADAR_OPEN_BOARD=<project_id>.
-    if let Ok(value) = std::env::var("RADAR_OPEN_BOARD") {
+    // Development aid: open a project's own view inside Home.
+    // RADAR_OPEN_PROJECT=<project_id>.
+    if let Ok(value) = std::env::var("RADAR_OPEN_PROJECT") {
         if let Ok(project_id) = value.parse::<i64>() {
-            let state_for_board = state.clone();
+            let state_for_project = state.clone();
             glib::timeout_add_local_once(Duration::from_millis(1700), move || {
-                state_for_board.open_home_board(project_id);
+                state_for_project.open_home_project(project_id);
             });
         }
+    }
+    // Development aid: open Home's New-project view on startup.
+    // RADAR_OPEN_NEW_PROJECT=1.
+    if std::env::var("RADAR_OPEN_NEW_PROJECT").is_ok() {
+        let state_for_new = state.clone();
+        glib::timeout_add_local_once(Duration::from_millis(1700), move || {
+            state_for_new.open_home_new_project();
+        });
+    }
+    // Development aid: throw the completion confetti on startup, so the burst
+    // can be checked without completing a card. RADAR_CONFETTI=1.
+    if std::env::var("RADAR_CONFETTI").is_ok() {
+        let state_for_confetti = state.clone();
+        glib::timeout_add_local_once(Duration::from_millis(2000), move || {
+            state_for_confetti.confetti.celebrate();
+        });
     }
     window
 }
@@ -1045,7 +892,7 @@ fn accel_hint(slot: Slot) -> &'static str {
         Slot::Editor => "Alt+E",
         Slot::Agent => "Alt+A",
         Slot::Diff => "Alt+G",
-        Slot::Board => "Alt+K",
+        Slot::Board => "",
         Slot::Shell => "Alt+T",
         Slot::Custom => "",
     }
@@ -1073,110 +920,7 @@ fn status_page(
     page.upcast()
 }
 
-/// A candidate row in the sidebar: icon, name, path, a git pill for
-/// repositories, and its own add button. The row itself is inert — adding is
-/// the button's job, so several projects can be added in one search.
-fn candidate_row(title: &str, subtitle: &str, is_repo: bool) -> (gtk::ListBoxRow, gtk::Button) {
-    let row = gtk::ListBoxRow::new();
-    row.set_activatable(false);
-    let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-
-    let icon = gtk::Image::from_icon_name("folder-symbolic");
-    icon.add_css_class("row-icon");
-    icon.set_pixel_size(14);
-    icon.set_valign(gtk::Align::Center);
-    box_.append(&icon);
-
-    let texts = gtk::Box::new(gtk::Orientation::Vertical, 1);
-    texts.set_valign(gtk::Align::Center);
-    texts.set_hexpand(true);
-    let name = gtk::Label::new(Some(title));
-    name.set_xalign(0.0);
-    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    texts.append(&name);
-    let sub = gtk::Label::new(Some(subtitle));
-    sub.set_xalign(0.0);
-    sub.add_css_class("caption");
-    sub.add_css_class("dim-label");
-    sub.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    texts.append(&sub);
-    box_.append(&texts);
-
-    if is_repo {
-        let badge = gtk::Label::new(Some("git"));
-        badge.add_css_class("badge");
-        badge.set_valign(gtk::Align::Center);
-        box_.append(&badge);
-    }
-
-    let add = gtk::Button::builder()
-        .icon_name("list-add-symbolic")
-        .tooltip_text("Add project")
-        .build();
-    if let Some(image) = add.child().and_downcast::<gtk::Image>() {
-        image.set_pixel_size(14);
-    }
-    add.add_css_class("flat");
-    add.set_valign(gtk::Align::Center);
-    box_.append(&add);
-
-    row.set_child(Some(&box_));
-    (row, add)
-}
-
 fn connect_widgets(app: &SharedApp) {
-    {
-        let list = app.sidebar_list.clone();
-        let app = app.clone();
-        list.connect_row_selected(move |_, row| {
-            let selected_id = row.and_then(|row| app.id_for_row(row));
-            for project_row in app.rows.borrow().iter() {
-                set_row_action_target(&project_row.row, Some(project_row.id) == selected_id);
-            }
-            let Some(row) = row else { return };
-            let Some(id) = selected_id else {
-                return;
-            };
-            // Switching projects must not take the keys out of the sidebar:
-            // keyboard selection keeps them on the row, and a mouse click
-            // brings them here. The switch itself can pull them away — the
-            // pane holding the window's focus is hidden, and the stack hands
-            // focus to the pane it just showed — so land them back on the row
-            // afterwards. Rows not yet mapped (startup) have nothing to grab.
-            app.select_project(id);
-            let on_row = app
-                .window
-                .focus_widget()
-                .is_some_and(|focus| focus == row.clone().upcast::<gtk::Widget>());
-            if !on_row && row.is_mapped() {
-                row.grab_focus();
-            }
-        });
-    }
-    {
-        // One box, two jobs: filter the projects, and below them find
-        // directories to add. A fresh scan follows a moment after typing
-        // stops, so what shows is what is on disk right now.
-        let entry = app.sidebar_search.clone();
-        let app = app.clone();
-        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-        entry.connect_search_changed(move |entry| {
-            app.filter_sidebar(&entry.text());
-            App::show_candidates(&app, &entry.text());
-            if let Some(id) = pending.borrow_mut().take() {
-                id.remove();
-            }
-            if !entry.text().trim().is_empty() {
-                let app = app.clone();
-                let pending_for_cb = pending.clone();
-                let id = glib::timeout_add_local_once(Duration::from_millis(250), move || {
-                    app.rescan_find();
-                    *pending_for_cb.borrow_mut() = None;
-                });
-                *pending.borrow_mut() = Some(id);
-            }
-        });
-    }
     {
         // Real pointer motion, anywhere over the window: the clock hover-focus
         // checks. Capture phase, so primitives that consume motion (the
@@ -1193,101 +937,6 @@ fn connect_widgets(app: &SharedApp) {
         });
         app.window.add_controller(controller);
     }
-    {
-        // Esc empties the search, the way a browser's address bar does.
-        let entry = app.sidebar_search.clone();
-        let entry_for_clear = entry.clone();
-        let controller = gtk::EventControllerKey::new();
-        controller.connect_key_pressed(move |_, key, _, _| {
-            if key == gtk::gdk::Key::Escape && !entry_for_clear.text().is_empty() {
-                entry_for_clear.set_text("");
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
-            }
-        });
-        entry.add_controller(controller);
-    }
-    {
-        // Pick another directory for the find search to scan.
-        let app = app.clone();
-        let root_button = app.find_root_button.clone();
-        root_button.connect_clicked(move |_| {
-            #[allow(deprecated)]
-            let dialog = gtk::FileChooserDialog::new(
-                Some("Choose a directory to scan"),
-                Some(&app.window),
-                gtk::FileChooserAction::SelectFolder,
-                &[
-                    ("Cancel", gtk::ResponseType::Cancel),
-                    ("Scan", gtk::ResponseType::Accept),
-                ],
-            );
-            let app = app.clone();
-            #[allow(deprecated)]
-            dialog.connect_response(move |dialog, response| {
-                if response == gtk::ResponseType::Accept {
-                    if let Some(path) = dialog.file().and_then(|file| file.path()) {
-                        // Remember it, so the next find starts here.
-                        let mut prefs = app.db.ui_prefs().unwrap_or_default();
-                        prefs.add_root = Some(path.clone());
-                        if let Err(error) = app.db.set_ui_prefs(&prefs) {
-                            eprintln!("radar: could not store the scan root: {error}");
-                        }
-                        *app.find_root.borrow_mut() = path.clone();
-                        app.find_root_button
-                            .set_label(&format!("from {}", crate::db::abbreviate(&path)));
-                        app.rescan_find();
-                    }
-                }
-                dialog.close();
-            });
-            dialog.present();
-        });
-    }
-    {
-        // Remember the sidebar width when it is dragged.
-        let splitter = app.splitter.clone();
-        let app = app.clone();
-        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-        splitter.connect_position_notify(move |splitter| {
-            if let Some(id) = pending.borrow_mut().take() {
-                id.remove();
-            }
-            let app = app.clone();
-            let pending_for_cb = pending.clone();
-            let position = splitter.position();
-            let id = glib::timeout_add_local_once(Duration::from_millis(400), move || {
-                let mut prefs = app.db.ui_prefs().unwrap_or_default();
-                prefs.sidebar_width = position;
-                if let Err(error) = app.db.set_ui_prefs(&prefs) {
-                    eprintln!("radar: could not store the sidebar width: {error}");
-                }
-                *pending_for_cb.borrow_mut() = None;
-            });
-            *pending.borrow_mut() = Some(id);
-        });
-    }
-}
-
-/// Apply directory scans that arrived from the worker thread.
-fn start_find_drainer(app: &SharedApp) {
-    let app = app.clone();
-    glib::timeout_add_local(Duration::from_millis(120), move || {
-        let batch = {
-            let rx = app.find_rx.borrow();
-            rx.try_recv().ok()
-        };
-        if let Some((_root, found)) = batch {
-            *app.find_candidates.borrow_mut() = found;
-            // Results only matter while a search is up.
-            let query = app.sidebar_search.text();
-            if !query.trim().is_empty() {
-                App::show_candidates(&app, &query);
-            }
-        }
-        glib::ControlFlow::Continue
-    });
 }
 
 /// Apply git statuses that arrived from the worker thread.
@@ -1318,7 +967,6 @@ fn start_status_drainer(app: &SharedApp) {
             }
         }
         if changed {
-            app.apply_status_labels();
             app.refresh_home();
         }
         glib::ControlFlow::Continue
@@ -1341,9 +989,6 @@ fn start_agent_session_drainer(app: &SharedApp) {
         app.agent_scan_pending.set(false);
         let sessions_changed = app.agent_sessions.borrow_mut().apply(result);
         if sessions_changed {
-            let query = app.sidebar_search.text();
-            app.filter_sidebar(&query);
-            app.apply_status_labels();
             app.refresh_home();
         }
         glib::ControlFlow::Continue
@@ -1572,11 +1217,7 @@ fn start_activity_drainer(app: &SharedApp) {
         for notice in notices {
             changed_projects.insert(app.apply_activity_notice(notice));
         }
-        for project_id in &changed_projects {
-            app.refresh_activity_pane(*project_id);
-        }
         if !changed_projects.is_empty() {
-            app.apply_status_labels();
             app.refresh_home();
         }
         glib::ControlFlow::Continue
@@ -1609,13 +1250,13 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
     };
     {
         let action = gio::SimpleAction::new(
-            "open-board",
+            "open-project",
             Some(glib::VariantTy::new("x").expect("a project ID")),
         );
         let app = app.clone();
         action.connect_activate(move |_, parameter| {
             if let Some(project_id) = parameter.and_then(|value| value.get::<i64>()) {
-                app.open_project_board(project_id, None);
+                app.open_project_home(project_id);
             }
         });
         gtk_app.add_action(&action);
@@ -1623,12 +1264,84 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
 
     // ---- projects ----
     {
-        // The search is the add flow; this action just puts the keys there.
         let app = app.clone();
         add(
-            "find-projects",
-            Box::new(move || app.focus_projects_search()),
+            "home-new-project",
+            Box::new(move || app.open_home_new_project()),
         );
+    }
+    {
+        // Home's New-project form: (name, parent) → create, validate, toast.
+        let action = gio::SimpleAction::new(
+            "home-project-create",
+            Some(glib::VariantTy::new("(ss)").expect("a (name, parent) tuple")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((name, parent)) = parameter.and_then(|value| value.get::<(String, String)>())
+            else {
+                return;
+            };
+            home::create_project_from_fields(&app_for_action, &name, &parent);
+        });
+        app.window.add_action(&action);
+    }
+    {
+        let app = app.clone();
+        add(
+            "home-add-project",
+            Box::new(move || home::add_project_dialog(&app)),
+        );
+    }
+    {
+        let action = gio::SimpleAction::new("home-project-import", Some(glib::VariantTy::STRING));
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            if let Some(path) = parameter.and_then(|value| value.get::<String>()) {
+                app_for_action.add_home_project(Path::new(&path));
+            }
+        });
+        app.window.add_action(&action);
+    }
+    for name in [
+        "home-project-edit",
+        "home-project-archive",
+        "home-project-defaults",
+        "home-project-pin",
+        "home-project-up",
+        "home-project-down",
+    ] {
+        let action = gio::SimpleAction::new(name, Some(glib::VariantTy::INT64));
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some(id) = parameter.and_then(|value| value.get::<i64>()) else {
+                return;
+            };
+            match name {
+                "home-project-archive" => app_for_action.confirm_remove(id),
+                "home-project-edit" => app_for_action.edit_project_name(id),
+                "home-project-defaults" => app_for_action.project_defaults(id),
+                _ => {
+                    let result = if name == "home-project-pin" {
+                        app_for_action.db.project(id).and_then(|project| {
+                            let project = project
+                                .ok_or_else(|| anyhow::anyhow!("Project no longer exists"))?;
+                            app_for_action.db.set_pinned(id, !project.pinned)
+                        })
+                    } else {
+                        app_for_action
+                            .db
+                            .move_project(id, if name == "home-project-up" { -1 } else { 1 })
+                    };
+                    if let Err(error) = result {
+                        app_for_action.toast(&format!("Could not update project: {error}"));
+                    } else {
+                        App::refresh_projects(&app_for_action);
+                    }
+                }
+            }
+        });
+        app.window.add_action(&action);
     }
     {
         // Takes a project id, so a row's own button can call it.
@@ -1719,41 +1432,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
                 let Some(project) = app.current_project() else {
                     return;
                 };
-                let entry = gtk::Entry::new();
-                entry.set_text(&project.name);
-                let dialog = gtk::Window::builder()
-                    .title("Rename project")
-                    .modal(true)
-                    .default_width(420)
-                    .transient_for(&app.window)
-                    .build();
-                let box_ = gtk::Box::new(gtk::Orientation::Vertical, 12);
-                box_.set_margin_top(18);
-                box_.set_margin_bottom(18);
-                box_.set_margin_start(18);
-                box_.set_margin_end(18);
-                box_.append(&entry);
-                let save = gtk::Button::with_label("Rename");
-                save.add_css_class("suggested-action");
-                box_.append(&save);
-                dialog.set_child(Some(&box_));
-                let app_for_save = app.clone();
-                let dialog_for_save = dialog.clone();
-                let entry_for_save = entry.clone();
-                save.connect_clicked(move |_| {
-                    let name = entry_for_save.text().to_string();
-                    if let Err(error) = app_for_save.db.rename_project(project.id, &name) {
-                        eprintln!("radar: {error}");
-                    }
-                    App::refresh_projects(&app_for_save);
-                    dialog_for_save.close();
-                });
-                entry.connect_activate({
-                    let save = save.clone();
-                    move |_| save.emit_clicked()
-                });
-                dialog.present();
-                entry.grab_focus();
+                app.edit_project_name(project.id);
             }),
         );
     }
@@ -1936,22 +1615,6 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
     }
     {
         let action = gio::SimpleAction::new(
-            "project-board-card",
-            Some(glib::VariantTy::new("(xs)").expect("a project and card ID")),
-        );
-        let app_for_action = app.clone();
-        action.connect_activate(move |_, parameter| {
-            let Some((project_id, card_id)) =
-                parameter.and_then(|value| value.get::<(i64, String)>())
-            else {
-                return;
-            };
-            app_for_action.open_project_board(project_id, Some(&card_id));
-        });
-        app.window.add_action(&action);
-    }
-    {
-        let action = gio::SimpleAction::new(
             "project-agent-create",
             Some(glib::VariantTy::new("x").expect("a project ID")),
         );
@@ -2052,6 +1715,23 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         app.window.add_action(&action);
     }
     {
+        // Home's add-to-do input: the title typed under a project's To-dos.
+        let action = gio::SimpleAction::new(
+            "home-add-todo",
+            Some(glib::VariantTy::new("(xs)").expect("a project ID and title")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((project_id, title)) =
+                parameter.and_then(|value| value.get::<(i64, String)>())
+            else {
+                return;
+            };
+            app_for_action.add_home_todo(project_id, &title);
+        });
+        app.window.add_action(&action);
+    }
+    {
         // Home's Back: leave a board/card drill-down for the cockpit.
         let app_for_action = app.clone();
         add("home-back", Box::new(move || app_for_action.home_back()));
@@ -2062,15 +1742,15 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         add("close-card", Box::new(move || app_for_action.home_back()));
     }
     {
-        // Open a project's board inside Home.
+        // Open a project's own view inside Home.
         let action = gio::SimpleAction::new(
-            "home-board",
+            "home-project",
             Some(glib::VariantTy::new("x").expect("a project ID")),
         );
         let app_for_action = app.clone();
         action.connect_activate(move |_, parameter| {
             if let Some(project_id) = parameter.and_then(|value| value.get::<i64>()) {
-                app_for_action.open_home_board(project_id);
+                app_for_action.open_home_project(project_id);
             }
         });
         app.window.add_action(&action);
@@ -2118,7 +1798,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             if let Some((project_id, card_id, text)) =
                 parameter.and_then(|value| value.get::<(i64, String, String)>())
             {
-                app_for_action.comment_home_card(project_id, &card_id, &text);
+                app_for_action.message_card(project_id, &card_id, &text);
             }
         });
         app.window.add_action(&action);
@@ -2397,7 +2077,16 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
     }
     {
         let app = app.clone();
-        add("toggle-sidebar", Box::new(move || app.toggle_sidebar()));
+        add(
+            "workspace-project",
+            Box::new(move || {
+                let id = *app.current.borrow();
+                if let Some(id) = id {
+                    app.show_home();
+                    app.open_home_project(id);
+                }
+            }),
+        );
     }
     {
         // The home panel: the empty state, plus setup and the new-project
@@ -2411,19 +2100,16 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
     // Alt is radar's only modifier, so every Ctrl chord reaches the programs
     // in the panels the way their authors wrote them. The one exception is
     // cycling: the window manager owns Alt+Tab, so the cycle stays on Ctrl.
-    let accels: [(&str, &[&str]); 18] = [
-        ("win.find-projects", &["<Alt>n"]),
+    let accels: [(&str, &[&str]); 15] = [
         ("win.preferences", &["<Alt>comma"]),
         ("win.refresh", &["<Alt>r"]),
         ("win.quit", &["<Alt>q"]),
-        ("win.toggle-sidebar", &["<Alt>b"]),
         ("win.zoom", &["<Alt>f"]),
         ("win.hud", &["<Alt>h"]),
-        ("win.show-home", &["<Alt>Home"]),
+        ("win.show-home", &["<Alt>Home", "<Alt>b"]),
         ("win.primitive-toggle::editor", &["<Alt>e"]),
         ("win.primitive-toggle::agent", &["<Alt>a"]),
         ("win.primitive-toggle::diff", &["<Alt>g"]),
-        ("win.primitive-toggle::board", &["<Alt>k"]),
         ("win.primitive-toggle::shell", &["<Alt>t"]),
         ("win.pane-program", &["<Alt>p"]),
         ("win.primitive-focus::editor", &["<Alt>1"]),
@@ -2592,15 +2278,6 @@ impl App {
         menu
     }
 
-    /// Which project does a sidebar row belong to?
-    fn id_for_row(&self, row: &gtk::ListBoxRow) -> Option<i64> {
-        self.rows
-            .borrow()
-            .iter()
-            .find(|project_row| project_row.row == *row)
-            .map(|project_row| project_row.id)
-    }
-
     fn current_project(&self) -> Option<Project> {
         let id = (*self.current.borrow())?;
         self.projects.borrow().iter().find(|p| p.id == id).cloned()
@@ -2632,15 +2309,15 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Confirm, then remove a project from the sidebar. Never touches the disk.
+    /// Confirm, then archive a project without deleting its state or files.
     fn confirm_remove(self: &Rc<Self>, id: i64) {
         let Some(project) = self.db.project(id).ok().flatten() else {
             return;
         };
         let dialog = gtk::AlertDialog::builder()
-            .message(format!("Remove {}?", project.name))
-            .detail("It leaves the sidebar. Nothing on disk is touched.")
-            .buttons(["Cancel", "Remove"])
+            .message(format!("Archive {}?", project.name))
+            .detail("It leaves Home, but its tasks, settings and sessions are kept. Nothing on disk is touched. Add the folder again to restore it.")
+            .buttons(["Cancel", "Archive"])
             .cancel_button(0)
             .default_button(0)
             .build();
@@ -2653,15 +2330,82 @@ impl App {
                 if result != Ok(1) {
                     return;
                 }
-                if let Err(error) = app.db.remove_project(project.id) {
-                    eprintln!("radar: {error}");
+                if let Err(error) = app.db.set_archived(project.id, true) {
+                    app.toast(&format!("Could not archive the project: {error}"));
+                    return;
                 }
                 // Rebuild the sidebar from a fresh read; this also drops the
                 // selection of the removed project.
                 App::refresh_projects(&app);
-                app.toasts.add_toast(adw::Toast::new("Project removed"));
+                app.show_home();
+                app.toast("Project archived");
             },
         );
+    }
+
+    fn project_defaults(self: &Rc<Self>, id: i64) {
+        let Some(project) = self.db.project(id).ok().flatten() else {
+            return;
+        };
+        let app = Rc::downgrade(self);
+        dialogs::project_preferences(&self.window, &self.db, id, &project.name, move || {
+            if let Some(app) = app.upgrade() {
+                app.sync_toggles();
+                app.refresh_menus();
+                app.toast("Project defaults saved");
+            }
+        });
+    }
+
+    fn edit_project_name(self: &Rc<Self>, id: i64) {
+        let Some(project) = self.db.project(id).ok().flatten() else {
+            return;
+        };
+        let entry = gtk::Entry::new();
+        entry.set_text(&project.name);
+        let dialog = gtk::Window::builder()
+            .title("Edit project name")
+            .modal(true)
+            .default_width(420)
+            .transient_for(&self.window)
+            .build();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(18);
+        content.set_margin_bottom(18);
+        content.set_margin_start(18);
+        content.set_margin_end(18);
+        content.append(&entry);
+        let save = gtk::Button::with_label("Save");
+        save.add_css_class("suggested-action");
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        buttons.set_halign(gtk::Align::End);
+        let cancel = gtk::Button::with_label("Cancel");
+        let dialog_for_cancel = dialog.clone();
+        cancel.connect_clicked(move |_| dialog_for_cancel.close());
+        buttons.append(&cancel);
+        buttons.append(&save);
+        content.append(&buttons);
+        dialog.set_child(Some(&content));
+        let app = self.clone();
+        let dialog_for_save = dialog.clone();
+        let entry_for_save = entry.clone();
+        save.connect_clicked(move |_| {
+            let name = entry_for_save.text().trim().to_string();
+            if name.is_empty() {
+                app.toast("Project name cannot be empty");
+                return;
+            }
+            if let Err(error) = app.db.rename_project(id, &name) {
+                app.toast(&format!("Could not rename the project: {error}"));
+                return;
+            }
+            App::refresh_projects(&app);
+            app.refresh_home();
+            dialog_for_save.close();
+        });
+        entry.connect_activate(move |_| save.emit_clicked());
+        dialog.present();
+        entry.grab_focus();
     }
 
     fn reload_theme(&self) {
@@ -2695,6 +2439,7 @@ impl App {
             resume: false,
             session: None,
             agent_instance: None,
+            card: None,
         }
     }
 
@@ -2713,7 +2458,6 @@ impl App {
                 watcher.stop();
             }
             self.activity_online.borrow_mut().remove(&project_id);
-            self.board_panes.borrow_mut().remove(&project_id);
         }
         for project_id in wanted {
             if watchers.contains_key(&project_id) {
@@ -2797,15 +2541,6 @@ impl App {
         } else {
             self.board_summaries.borrow_mut().remove(&project_id);
         }
-        if let Some(pane) = self
-            .board_panes
-            .borrow()
-            .get(&project_id)
-            .and_then(std::rc::Weak::upgrade)
-        {
-            pane.refresh();
-        }
-        self.apply_status_labels();
         self.refresh_home();
     }
 
@@ -2864,33 +2599,81 @@ impl App {
         match result {
             Ok(_) => {
                 self.refresh_board_summary(project_id);
-                self.toast(if done {
-                    "To-do reopened"
+                if done {
+                    self.toast("To-do reopened");
                 } else {
-                    "To-do closed"
-                });
+                    // Done cards leave the lanes; the burst is the send-off.
+                    self.confetti.celebrate();
+                    self.toast("Done. 🎉");
+                }
             }
             Err(error) => self.toast(&format!("Could not update the to-do: {error}")),
         }
     }
 
-    /// Open a card as a conversation in Home's right-hand rail.
-    fn open_home_card(&self, project_id: i64, card_id: &str) {
-        self.home_nav
-            .borrow_mut()
-            .push(HomeView::Card(project_id, card_id.to_string()));
-        self.refresh_home();
+    /// Add a to-do from Home: a new card on the project's board, in the store's
+    /// default lane (Todo). Home is rebuilt so the lane shows it, and the
+    /// input that submitted it gets the keys back for the next one.
+    fn add_home_todo(&self, project_id: i64, title: &str) {
+        let title = title.trim();
+        if title.is_empty() {
+            return;
+        }
+        if !self
+            .projects
+            .borrow()
+            .iter()
+            .any(|project| project.id == project_id)
+        {
+            return;
+        }
+        let command = gui_command_id("todo");
+        match crate::session::daemon::board_card_add(
+            &self.session_home,
+            project_id,
+            None,
+            title,
+            "",
+            None,
+            &command,
+        ) {
+            Ok(_) => {
+                self.home_focus_todo.set(Some(project_id));
+                self.home_todo_drafts.borrow_mut().remove(&project_id);
+                self.refresh_board_summary(project_id);
+            }
+            Err(error) => self.toast(&format!("Could not add the to-do: {error}")),
+        }
     }
 
-    /// Drill into a project's board inside Home.
-    fn open_home_board(&self, project_id: i64) {
-        self.home_nav.borrow_mut().push(HomeView::Board(project_id));
-        self.refresh_home();
+    /// Open a card as a conversation inside Home.
+    fn open_home_card(&self, project_id: i64, card_id: &str) {
+        self.enter_home_view(HomeView::Card(project_id, card_id.to_string()));
+    }
+
+    /// Drill into a project's own view inside Home.
+    fn open_home_project(&self, project_id: i64) {
+        self.enter_home_view(HomeView::Project(project_id));
+    }
+
+    fn enter_home_view(&self, view: HomeView) {
+        gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
+        self.home_shown.set(true);
+        *self.current.borrow_mut() = None;
+        self.home_nav.borrow_mut().push(view);
+        self.stack.set_visible_child_name("_home");
+        self.sync_toggles();
     }
 
     /// Leave the current Home drill-down and return to the cockpit.
-    fn home_back(&self) {
+    fn home_back(self: &Rc<Self>) {
+        gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
         self.home_nav.borrow_mut().pop();
+        if self.home_nav.borrow().is_empty() {
+            self.show_home();
+            return;
+        }
+        self.stack.set_visible_child_name("_home");
         self.refresh_home();
     }
 
@@ -2992,8 +2775,12 @@ impl App {
         }
     }
 
-    /// Post a reply on the open card's thread.
-    fn comment_home_card(&self, project_id: i64, card_id: &str, text: &str) {
+    /// Route a human message on a card: a **live** claimed agent gets it typed
+    /// into its terminal (only when it is not mid-turn); a **dormant** claimed
+    /// agent is resumed — first on the exact conversation bound to the claim,
+    /// else its last; a **to-do** starts the project's default agent attached
+    /// to the card and claims it. The comment is always recorded on the thread.
+    fn message_card(&self, project_id: i64, card_id: &str, text: &str) {
         card::publish_comment(
             &self.session_home,
             &self.activity_tx,
@@ -3001,6 +2788,122 @@ impl App {
             card_id,
             text.to_string(),
         );
+        let card = self
+            .board_states
+            .borrow()
+            .get(&project_id)
+            .and_then(|state| state.cards.iter().find(|card| card.id == card_id).cloned());
+        let Some(card) = card else {
+            self.toast("That card is no longer on the board");
+            return;
+        };
+        let prompt = format!(
+            "A human sent a message on board card \"{}\":\n\n{}\n\nRead the card and its \
+             thread with `radar card show \"{}\"` and continue.",
+            card.title, text, card.id
+        );
+        if self.current.borrow().as_ref() != Some(&project_id) {
+            self.select_project(project_id);
+        }
+        let Some(workspace) = self.current_workspace() else {
+            return;
+        };
+
+        if let Some(claim) = card.claim.clone() {
+            let live = workspace.tabs_of_kind(Slot::Agent).into_iter().find(|key| {
+                workspace
+                    .tab(*key)
+                    .and_then(|primitive| {
+                        primitive.pane.as_ref().and_then(|pane| pane.session_pid())
+                    })
+                    .and_then(programs::launch::radar_agent_of)
+                    .is_some_and(|agent| agent == claim)
+            });
+            if let Some(key) = live {
+                self.show_agent_session(&workspace, key);
+                self.inject_if_idle(project_id, &workspace, key, text);
+                return;
+            }
+            // Dormant: resume the agent that holds the claim.
+            self.open_agent_session_with(&workspace, &claim, Some(prompt));
+            self.toast("Message sent; resuming the agent on this card");
+            return;
+        }
+
+        // No claim: a to-do. Start the project's default agent attached to it.
+        let global = self.db.preferences().unwrap_or_default();
+        let preferences = self
+            .db
+            .project_settings(project_id)
+            .unwrap_or_default()
+            .apply_to(&global);
+        let Some(program) = programs::for_slot(Slot::Agent, &preferences) else {
+            self.toast("No agent installed — set one in Preferences");
+            return;
+        };
+        let key = workspace.next_key(Slot::Agent);
+        let stamp = crate::programs::launch::now_stamp();
+        let claim = format!("{}-{}", program.id, stamp);
+        let extras = Extras {
+            prompt: Some(prompt),
+            card: Some(card_id.to_string()),
+            instance: Some(stamp),
+        };
+        if self
+            .ensure_primitive_with(&workspace, key, Some(&program.id), Resume::No, &extras)
+            .is_none()
+        {
+            self.toast("The agent is not installed");
+            return;
+        }
+        self.show_agent_session(&workspace, key);
+        // Claim it for the new instance, so its gate passes and the next
+        // message routes straight back to it.
+        let _ = crate::session::daemon::board_card_claim(
+            &self.session_home,
+            project_id,
+            card_id,
+            Some(&claim),
+            None,
+            &gui_command_id("claim"),
+        );
+        self.refresh_board_summary(project_id);
+        self.toast("Started an agent on this to-do");
+    }
+
+    /// Type a message into a running agent's terminal, but only when it is not
+    /// mid-turn; otherwise the message stays in the thread for its next turn.
+    fn inject_if_idle(&self, project_id: i64, workspace: &Rc<Workspace>, key: TabKey, text: &str) {
+        let Some(primitive) = workspace.tab(key) else {
+            return;
+        };
+        let session_id = stable_session_id(project_id, key, &primitive.program_id);
+        let state = self
+            .agent_sessions
+            .borrow()
+            .by_project
+            .get(&project_id)
+            .and_then(|sessions| {
+                sessions
+                    .iter()
+                    .find(|session| {
+                        session.radar_session_id.as_deref() == Some(session_id.as_str())
+                    })
+                    .cloned()
+            })
+            .and_then(|session| self.latest_agent_activity(project_id, &session))
+            .map(|(state, _, _)| state);
+        if matches!(state, Some(crate::session::activity::AgentState::Working)) {
+            self.toast("Agent is working; the message is in the card thread");
+            return;
+        }
+        let command = crate::session::daemon::Command::Input {
+            id: session_id,
+            bytes: format!("{text}\r").into_bytes(),
+        };
+        if let Err(error) = crate::session::daemon::Client::request(&self.session_home, command) {
+            self.toast(&format!("Could not reach the agent: {error}"));
+        }
     }
 
     fn apply_activity_notice(&self, notice: ActivityNotice) -> i64 {
@@ -3148,59 +3051,14 @@ impl App {
                         if let Some(request_id) = resolved_request_id {
                             self.withdraw_attention_notification(project_id, &request_id);
                         }
-                        if let Some(pane) = self
-                            .board_panes
-                            .borrow()
-                            .get(&project_id)
-                            .and_then(std::rc::Weak::upgrade)
-                        {
-                            pane.finish_attention_change(&request_id, Ok(attention));
-                        }
                     }
-                    Err(error) => {
-                        if let Some(pane) = self
-                            .board_panes
-                            .borrow()
-                            .get(&project_id)
-                            .and_then(std::rc::Weak::upgrade)
-                        {
-                            pane.finish_attention_change(&request_id, Err(error));
-                        }
-                    }
+                    Err(error) => self.toast(&format!("Could not respond: {error}")),
                 }
                 project_id
             }
         };
 
         project_id
-    }
-
-    fn refresh_activity_pane(&self, project_id: i64) {
-        if let Some(pane) = self
-            .board_panes
-            .borrow()
-            .get(&project_id)
-            .and_then(std::rc::Weak::upgrade)
-        {
-            let activity = self.activity.borrow();
-            let snapshot = activity
-                .get(&project_id)
-                .map(|activity| activity.snapshot.clone())
-                .unwrap_or_else(|| crate::session::activity::ActivitySnapshot {
-                    project_id,
-                    watermark: 0,
-                    events: Vec::new(),
-                    attention: Vec::new(),
-                    has_more: false,
-                });
-            let online = self
-                .activity_online
-                .borrow()
-                .get(&project_id)
-                .copied()
-                .unwrap_or(false);
-            pane.set_activity_state(snapshot, online);
-        }
     }
 
     fn notify_attention(
@@ -3237,8 +3095,12 @@ impl App {
         notification.set_body(Some(&reason));
         notification.set_priority(gio::NotificationPriority::High);
         let target = project_id.to_variant();
-        notification.set_default_action_and_target_value("app.open-board", Some(&target));
-        notification.add_button_with_target_value("Open Board", "app.open-board", Some(&target));
+        notification.set_default_action_and_target_value("app.open-project", Some(&target));
+        notification.add_button_with_target_value(
+            "Open Project",
+            "app.open-project",
+            Some(&target),
+        );
         application.send_notification(
             Some(&format!("attention-{project_id}-{request_id}")),
             &notification,
@@ -3266,51 +3128,17 @@ impl App {
         app.reconcile_activity_watchers(&projects);
         app.reconcile_board_monitors(&projects);
 
-        while let Some(child) = app.sidebar_list.first_child() {
-            app.sidebar_list.remove(&child);
-        }
-        app.find_rows.borrow_mut().clear();
-        app.rows.borrow_mut().clear();
         if projects.is_empty() {
-            // A quiet hint, not a selectable row.
-            let empty = gtk::ListBoxRow::new();
-            empty.set_selectable(false);
-            empty.set_activatable(false);
-            empty.add_css_class("sidebar-empty");
-            let hint_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-            hint_box.set_halign(gtk::Align::Center);
-            hint_box.set_margin_top(32);
-            hint_box.set_margin_bottom(24);
-            let icon = gtk::Image::from_icon_name("folder-open-symbolic");
-            icon.add_css_class("dim-label");
-            icon.set_pixel_size(28);
-            let title = gtk::Label::new(Some("No projects yet"));
-            title.add_css_class("caption-heading");
-            let hint = gtk::Label::new(Some("Search above for a directory to add"));
-            hint.add_css_class("caption");
-            hint.add_css_class("dim-label");
-            hint.set_wrap(true);
-            hint.set_justify(gtk::Justification::Center);
-            hint_box.append(&icon);
-            hint_box.append(&title);
-            hint_box.append(&hint);
-            empty.set_child(Some(&hint_box));
-            app.sidebar_list.append(&empty);
-            // Even with no projects, a search can already offer directories.
-            App::show_candidates(app, &app.sidebar_search.text());
-            app.show_home();
+            // With no projects Home is the empty state — unless a drill-down
+            // (New project) is up over it.
+            if matches!(app.home_nav.borrow().last(), Some(HomeView::NewProject)) {
+                app.sync_toggles();
+            } else {
+                app.show_home();
+            }
             return;
         }
 
-        for project in &projects {
-            let row = app.build_project_row(project);
-            app.sidebar_list.append(&row.row);
-            app.rows.borrow_mut().push(row);
-        }
-        app.filter_sidebar(&app.sidebar_search.text());
-        // Candidate directories for the query go under the project rows.
-        App::show_candidates(app, &app.sidebar_search.text());
-        app.apply_status_labels();
         app.refresh_status();
         // Warm the board cache for every project, so Home's lanes have
         // summaries the first time it is shown. This also imports a legacy
@@ -3319,195 +3147,14 @@ impl App {
             app.refresh_board_summary(project.id);
         }
 
-        if let Some(id) = selected {
-            app.select_row_for(id);
-        }
-        // Nothing selected picks the first project — unless the user is on
-        // the home panel on purpose, which a refresh must not disturb.
+        // A removed project returns to Home rather than launching another.
         if !app.home_shown.get()
             && (selected.is_none()
                 || selected.is_some_and(|id| !projects.iter().any(|p| p.id == id)))
         {
-            if let Some(first) = projects.first() {
-                app.select_project(first.id);
-            }
+            app.show_home();
         }
-    }
-
-    fn build_project_row(self: &Rc<Self>, project: &Project) -> ProjectRow {
-        let row = gtk::ListBoxRow::new();
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        // One calm line per project: icon, name and status badges, then the
-        // row's own controls. Sessions and board work live on Home now.
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        actions.add_css_class("row-actions");
-
-        let missing = project.is_missing();
-        let icon = gtk::Image::from_icon_name(if missing {
-            "dialog-warning-symbolic"
-        } else {
-            "folder-symbolic"
-        });
-        icon.add_css_class("row-icon");
-        icon.set_pixel_size(14);
-        icon.set_valign(gtk::Align::Center);
-        if missing {
-            icon.add_css_class("missing");
-        }
-        header.append(&icon);
-
-        let texts = gtk::Box::new(gtk::Orientation::Vertical, 1);
-        texts.set_valign(gtk::Align::Center);
-        texts.set_hexpand(true);
-        let name_line = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        let name = gtk::Label::new(Some(&project.name));
-        name.set_xalign(0.0);
-        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        name_line.append(&name);
-        if project.pinned {
-            let pin = gtk::Image::from_icon_name("starred-symbolic");
-            pin.add_css_class("pin-icon");
-            pin.set_pixel_size(10);
-            pin.set_valign(gtk::Align::Center);
-            pin.set_tooltip_text(Some("Pinned"));
-            name_line.append(&pin);
-        }
-        texts.append(&name_line);
-
-        let parent = project
-            .path
-            .parent()
-            .map(crate::db::abbreviate)
-            .unwrap_or_else(|| project.display_path());
-        let summary = gtk::Label::new(None);
-        summary.set_xalign(0.0);
-        summary.add_css_class("caption");
-        summary.add_css_class("dim-label");
-        summary.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-        texts.append(&summary);
-
-        header.append(&texts);
-
-        let badge = gtk::Label::new(None);
-        badge.add_css_class("badge");
-        badge.set_valign(gtk::Align::Center);
-        badge.set_visible(false);
-        header.append(&badge);
-
-        let attention_badge = gtk::Label::new(None);
-        attention_badge.add_css_class("badge");
-        attention_badge.add_css_class("attention-badge");
-        attention_badge.set_valign(gtk::Align::Center);
-        attention_badge.set_visible(false);
-        header.append(&attention_badge);
-
-        let agent_badge = gtk::Label::new(None);
-        agent_badge.add_css_class("badge");
-        agent_badge.add_css_class("agent-badge");
-        agent_badge.set_valign(gtk::Align::Center);
-        agent_badge.set_visible(false);
-        header.append(&agent_badge);
-
-        let project_defaults = gtk::Button::builder()
-            .icon_name("emblem-system-symbolic")
-            .tooltip_text("Project defaults")
-            .build();
-        if let Some(image) = project_defaults.child().and_downcast::<gtk::Image>() {
-            image.set_pixel_size(14);
-        }
-        project_defaults.add_css_class("flat");
-        project_defaults.add_css_class("row-action");
-        project_defaults.set_valign(gtk::Align::Center);
-        project_defaults.set_sensitive(!missing);
-        let settings_app = Rc::downgrade(self);
-        let settings_id = project.id;
-        let settings_name = project.name.clone();
-        project_defaults.connect_clicked(move |_| {
-            if let Some(app) = settings_app.upgrade() {
-                let changed_app = Rc::downgrade(&app);
-                dialogs::project_preferences(
-                    &app.window,
-                    &app.db,
-                    settings_id,
-                    &settings_name,
-                    move || {
-                        if let Some(app) = changed_app.upgrade() {
-                            app.sync_toggles();
-                            app.refresh_menus();
-                            app.toast("Project defaults saved");
-                        }
-                    },
-                );
-            }
-        });
-        actions.append(&project_defaults);
-        let create_agent = gtk::Button::builder()
-            .icon_name("list-add-symbolic")
-            .tooltip_text("Create an agent in this project")
-            .build();
-        if let Some(image) = create_agent.child().and_downcast::<gtk::Image>() {
-            image.set_pixel_size(14);
-        }
-        create_agent.add_css_class("flat");
-        create_agent.add_css_class("row-action");
-        create_agent.set_valign(gtk::Align::Center);
-        create_agent.set_sensitive(!missing);
-        create_agent.set_action_name(Some("win.project-agent-create"));
-        create_agent.set_action_target_value(Some(&project.id.to_variant()));
-        actions.append(&create_agent);
-
-        let remove = gtk::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .tooltip_text("Remove from sidebar")
-            .build();
-        if let Some(image) = remove.child().and_downcast::<gtk::Image>() {
-            image.set_pixel_size(14);
-        }
-        remove.add_css_class("flat");
-        remove.add_css_class("row-action");
-        remove.set_valign(gtk::Align::Center);
-        remove.set_action_name(Some("win.project-remove"));
-        remove.set_action_target_value(Some(&(project.id as i32).to_variant()));
-        actions.append(&remove);
-        header.append(&actions);
-
-        content.append(&header);
-        row.set_child(Some(&content));
-
-        set_row_action_target(&row, false);
-        let focus = gtk::EventControllerFocus::new();
-        let focused_row = row.clone();
-        focus.connect_enter(move |_| set_row_action_target(&focused_row, true));
-        let focused_row = row.clone();
-        focus.connect_leave(move |_| {
-            set_row_action_target(&focused_row, focused_row.is_selected());
-        });
-        row.add_controller(focus);
-        row.set_tooltip_text(Some(&if missing {
-            format!("{} (missing)", project.display_path())
-        } else {
-            project.display_path()
-        }));
-
-        let status = self.status.borrow().get(&project.id).cloned();
-        let text = match (&status, missing) {
-            (_, true) => "missing".to_string(),
-            (Some(status), _) => status.summary(),
-            (None, _) => "…".to_string(),
-        };
-        summary.set_text(&format!("{text}  ·  {parent}"));
-        badge.set_tooltip_text(Some("Active embedded tools in this project"));
-        attention_badge.set_tooltip_text(Some("Unresolved requests for human attention"));
-        agent_badge.set_tooltip_text(Some("Running agent sessions in this project"));
-        ProjectRow {
-            id: project.id,
-            row,
-            summary,
-            badge,
-            attention_badge,
-            agent_badge,
-        }
+        app.sync_toggles();
     }
 
     /// Which sidebar session (by id) the project's agent panel is showing:
@@ -3540,40 +3187,6 @@ impl App {
     /// the title of one of its running agent sessions — so typing an agent's
     /// conversation name still finds the project it lives in. Child session
     /// rows are gone; Home is where sessions are opened.
-    fn filter_sidebar(&self, query: &str) {
-        let matcher = fuzzy_matcher::skim::SkimMatcherV2::default().ignore_case();
-        use fuzzy_matcher::FuzzyMatcher;
-        let query = query.trim();
-        let projects = self.projects.borrow();
-        let sessions = self.agent_sessions.borrow();
-        let rows: Vec<_> = self
-            .rows
-            .borrow()
-            .iter()
-            .map(|row| (row.id, row.row.clone()))
-            .collect();
-        for (project_id, row) in rows {
-            let Some(project) = projects.iter().find(|project| project.id == project_id) else {
-                continue;
-            };
-            let project_matches = query.is_empty()
-                || matcher.fuzzy_match(&project.name, query).is_some()
-                || matcher
-                    .fuzzy_match(&project.display_path(), query)
-                    .is_some();
-            let agent_matches = !query.is_empty()
-                && sessions
-                    .by_project
-                    .get(&project_id)
-                    .is_some_and(|sessions| {
-                        sessions
-                            .iter()
-                            .any(|session| live_agents::matches_sidebar_query(session, query))
-                    });
-            row.set_visible(query.is_empty() || project_matches || agent_matches);
-        }
-    }
-
     fn activity_identity(session: &live_agents::AgentSession) -> Option<&str> {
         session
             .radar_session_id
@@ -3605,60 +3218,6 @@ impl App {
                     _ => None,
                 }
             })
-    }
-
-    fn apply_status_labels(&self) {
-        let projects = self.projects.borrow();
-        let rows = self.rows.borrow();
-        let activity = self.activity.borrow();
-        let statuses = self.status.borrow();
-        let workspaces = self.workspaces.borrow();
-        let sessions = self.agent_sessions.borrow();
-        for row in rows.iter() {
-            let Some(project) = projects.iter().find(|project| project.id == row.id) else {
-                continue;
-            };
-            let parent = project
-                .path
-                .parent()
-                .map(crate::db::abbreviate)
-                .unwrap_or_else(|| project.display_path());
-            let attention_count = activity
-                .get(&row.id)
-                .map_or(0, |activity| activity.snapshot.attention.len());
-            row.attention_badge.set_text(&attention_count.to_string());
-            row.attention_badge.set_visible(attention_count > 0);
-            let running_agents = sessions.by_project.get(&row.id).map_or(0, |sessions| {
-                sessions
-                    .iter()
-                    .filter(|session| live_agents::sidebar_session_is_live(session))
-                    .count()
-            });
-            row.agent_badge.set_text(&running_agents.to_string());
-            row.agent_badge.set_visible(running_agents > 0);
-            if project.is_missing() {
-                row.summary.set_text(&format!("missing  ·  {parent}"));
-                row.badge.set_visible(false);
-                continue;
-            }
-            match statuses.get(&row.id) {
-                Some(status) => {
-                    row.summary
-                        .set_text(&format!("{}  ·  {parent}", status.summary()));
-                }
-                None => row.summary.set_text(&format!("…  ·  {parent}")),
-            }
-            let count = workspaces.get(&row.id).map_or(0, |workspace| {
-                workspace
-                    .tabs
-                    .borrow()
-                    .values()
-                    .filter(|primitive| primitive.pane.as_ref().is_some_and(|pane| pane.is_live()))
-                    .count()
-            });
-            row.badge.set_text(&count.to_string());
-            row.badge.set_visible(count > 0);
-        }
     }
 
     fn refresh_status(&self) {
@@ -3694,17 +3253,6 @@ impl App {
             let _ = tx.send(result);
         });
     }
-    fn select_row_for(&self, id: i64) {
-        let target = self
-            .rows
-            .borrow()
-            .iter()
-            .find(|row| row.id == id)
-            .map(|row| row.row.clone());
-        if let Some(row) = target {
-            self.sidebar_list.select_row(Some(&row));
-        }
-    }
 
     /// The home panel: the empty state, rebuilt so its dropdowns say what the
     /// preferences say right now. Workspaces stay alive behind it — going
@@ -3714,9 +3262,6 @@ impl App {
         // Going Home always lands on the cockpit, not the last drill-down.
         self.home_nav.borrow_mut().clear();
         *self.current.borrow_mut() = None;
-        // The sidebar's selection stops meaning anything: no project is on
-        // screen. None is ignored by the row-selected handler.
-        self.sidebar_list.select_row(None::<&gtk::ListBoxRow>);
         while let Some(child) = self.stack.child_by_name("_home") {
             self.stack.remove(&child);
         }
@@ -3728,25 +3273,51 @@ impl App {
 
     /// Rebuild the Home cockpit in place while it is on screen. Attention,
     /// sessions and git keep arriving after Home is built; this keeps the
-    /// surface current without re-running show_home (which clears the sidebar
-    /// selection and forgets the last project). Only the cockpit is rebuilt
+    /// surface current without re-running show_home (which clears navigation
+    /// and forgets the last project). Only the cockpit is rebuilt
     /// from here — the empty state needs the `Rc` only show_home holds.
     fn refresh_home(&self) {
-        if !self.home_shown.get() || self.stack.visible_child_name().as_deref() != Some("_home") {
+        if !self.home_shown.get() {
             return;
         }
-        if self.projects.borrow().is_empty() {
+        if self.stack.visible_child_name().as_deref() != Some("_home") {
             return;
         }
-        // The rebuild destroys any focused widget inside Home. Clear the
-        // window's focus first (unless it is the sidebar's search, which must
-        // keep the keys) so GTK never holds a stale widget and criticals on
-        // the next focus query.
-        if let Some(focus) = self.window.focus_widget() {
-            if !focus.is_ancestor(&self.sidebar) {
-                gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
+        // With no projects the empty state stands in for the cockpit — but a
+        // drill-down (New project) can still be on screen above it.
+        if self.projects.borrow().is_empty() && self.home_nav.borrow().is_empty() {
+            return;
+        }
+        if matches!(self.home_nav.borrow().last(), Some(HomeView::NewProject))
+            && self
+                .stack
+                .child_by_name("_home")
+                .is_some_and(|view| view.has_css_class("home-new-project"))
+        {
+            // A form is not live status: keep its inputs even after they lose
+            // focus to Browse/Create or a status update arrives.
+            return;
+        }
+        // Passive updates must not destroy an unfinished to-do or reply.
+        // Navigation clears focus; a submitted to-do marks its focus handoff.
+        if self.home_focus_todo.get().is_none() {
+            if let (Some(focus), Some(home)) = (
+                self.window.focus_widget(),
+                self.stack.child_by_name("_home"),
+            ) {
+                if focus.is_ancestor(&home) {
+                    let mut widget = Some(focus);
+                    while let Some(current) = widget {
+                        if current.is::<gtk::Editable>() || current.is::<gtk::TextView>() {
+                            return;
+                        }
+                        widget = current.parent();
+                    }
+                }
             }
         }
+        // Clear focus before destroying the view so GTK holds no stale widget.
+        gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
         while let Some(child) = self.stack.child_by_name("_home") {
             self.stack.remove(&child);
         }
@@ -3754,74 +3325,36 @@ impl App {
         self.stack.set_visible_child_name("_home");
     }
 
-    // ---- the search is the add flow ----
-
-    /// Put the keys on the search: filter there, or type to find a directory.
-    fn focus_projects_search(&self) {
-        if !self.sidebar_shown.get() {
-            self.toggle_sidebar();
+    /// Open Home's New-project view, switching to Home from wherever we are.
+    fn open_home_new_project(self: &Rc<Self>) {
+        if !matches!(self.home_nav.borrow().last(), Some(HomeView::NewProject)) {
+            self.enter_home_view(HomeView::NewProject);
         }
-        self.sidebar_search.grab_focus();
     }
 
-    /// Scan the root for candidate directories, off the main thread. The
-    /// drainer refreshes the candidate section when the results arrive.
-    fn rescan_find(&self) {
-        let root = self.find_root.borrow().clone();
-        let tx = self.find_tx.clone();
-        std::thread::spawn(move || {
-            let found = discover::scan(&root, 3, 800);
-            let _ = tx.send((root, found));
+    /// Import/restore without deleting state or changing files.
+    fn import_home_project(self: &Rc<Self>, path: &Path) -> Option<Project> {
+        let result = self.db.add_project(path).and_then(|project| {
+            self.db.set_archived(project.id, false)?;
+            Ok(project)
         });
+        match result {
+            Ok(project) => {
+                App::refresh_projects(self);
+                self.toast(&format!("Added {}", project.name));
+                Some(project)
+            }
+            Err(error) => {
+                self.toast(&format!("Could not add project: {error}"));
+                None
+            }
+        }
     }
 
-    /// Rebuild the candidate section under the project rows: directories that
-    /// match the query and are not projects yet, each with its own add button.
-    /// An empty query leaves the sidebar a plain project list.
-    fn show_candidates(app: &SharedApp, query: &str) {
-        for row in app.find_rows.borrow_mut().drain(..) {
-            app.sidebar_list.remove(&row);
-        }
-        let query = query.trim();
-        // Where the results come from, and how to point the search elsewhere.
-        app.find_root_button.set_visible(!query.is_empty());
-        if query.is_empty() {
-            return;
-        }
-
-        let known: Vec<PathBuf> = app
-            .db
-            .projects()
-            .map(|projects| projects.into_iter().map(|p| p.path).collect())
-            .unwrap_or_default();
-        let mut all = app.find_candidates.borrow().clone();
-        discover::mark_known(&mut all, &known);
-        let matches: Vec<Candidate> = discover::filter(&all, query)
-            .into_iter()
-            .filter(|candidate| !candidate.known)
-            .collect();
-
-        for candidate in matches {
-            let (item, add) = candidate_row(
-                &candidate.name,
-                &candidate.display_path(),
-                candidate.is_repo,
-            );
-            let path = candidate.path.clone();
-            let db = app.db.clone();
-            let app_for_add = app.clone();
-            add.connect_clicked(move |_| match db.add_project(&path) {
-                Ok(project) => {
-                    app_for_add.toast(&format!("Added {}", project.name));
-                    // The rebuild puts the project among the rows above and
-                    // drops this candidate row; the search stays up, so more
-                    // can be added.
-                    App::refresh_projects(&app_for_add);
-                }
-                Err(error) => eprintln!("radar: {error}"),
-            });
-            app.sidebar_list.append(&item);
-            app.find_rows.borrow_mut().push(item);
+    fn add_home_project(self: &Rc<Self>, path: &Path) {
+        if let Some(project) = self.import_home_project(path) {
+            self.show_home();
+            self.open_home_project(project.id);
         }
     }
 
@@ -3852,50 +3385,18 @@ impl App {
         }
         self.sync_toggles();
         self.refresh_menus();
-        self.select_row_for(id);
     }
-    fn open_project_board(&self, project_id: i64, card_id: Option<&str>) {
-        if !self
+    fn open_project_home(&self, project_id: i64) {
+        if self
             .projects
             .borrow()
             .iter()
             .any(|project| project.id == project_id)
         {
-            self.toast("That project is no longer available");
-            return;
-        }
-        self.select_project(project_id);
-        let project = self
-            .projects
-            .borrow()
-            .iter()
-            .find(|project| project.id == project_id)
-            .cloned();
-        let Some(project) = project else {
-            return;
-        };
-        if !crate::board::enabled(&self.db, &project.path).unwrap_or(true) {
-            self.toast("Board is disabled for this project");
+            self.open_home_project(project_id);
             self.window.present();
-            return;
-        }
-        let Some(workspace) = self.workspaces.borrow().get(&project_id).cloned() else {
-            return;
-        };
-        let key = TabKey::first(Slot::Board);
-        self.show_primitive(&workspace, key);
-        self.activate_primitive(&workspace, key);
-        self.window.present();
-        if let Some(card_id) = card_id {
-            let focused = self
-                .board_panes
-                .borrow()
-                .get(&project_id)
-                .and_then(std::rc::Weak::upgrade)
-                .is_some_and(|pane| pane.focus_card(card_id));
-            if !focused {
-                self.toast("That card is no longer on the board");
-            }
+        } else {
+            self.toast("That project is no longer available");
         }
     }
 
@@ -3942,7 +3443,6 @@ impl App {
         }
 
         // Which primitives were on screen last time, and which program each ran.
-        let board_enabled = crate::board::enabled(&self.db, &project.path).unwrap_or(true);
         let ui_prefs = self.db.ui_prefs().ok();
         let restore = ui_prefs
             .as_ref()
@@ -3958,7 +3458,6 @@ impl App {
         } else {
             None
         };
-        let board_open = board_enabled && saved_state.as_ref().is_some_and(saved_board_open);
         if let Some(state) = &saved_state {
             workspace
                 .programs
@@ -3988,7 +3487,7 @@ impl App {
                     .and_then(|prefs| prefs.layout)
                     .unwrap_or(NewWorkspaceLayout::Agent);
                 for slot in layout.slots() {
-                    if *slot == Slot::Board && !board_enabled {
+                    if *slot == Slot::Board {
                         continue;
                     }
                     let key = workspace.next_key(*slot);
@@ -4003,7 +3502,7 @@ impl App {
             }
         } else {
             for tab in &stored {
-                if tab.slot == Slot::Board && !board_enabled {
+                if tab.slot == Slot::Board {
                     continue;
                 }
                 let key = workspace.next_key(tab.slot);
@@ -4014,10 +3513,6 @@ impl App {
                     .borrow_mut()
                     .insert(tab.slot, tab.program_id.clone());
             }
-        }
-        let board_key = TabKey::first(Slot::Board);
-        if board_open && !wanted.contains(&board_key) {
-            wanted.push(board_key);
         }
         wanted.sort_by_key(|key| {
             (
@@ -4095,16 +3590,6 @@ impl App {
                 *workspace.groups.borrow_mut() = vec![group.clone()];
             }
         }
-        if restore_plan.board_open {
-            if let Some(group) = groups.iter().find(|group| group.contains(board_key)) {
-                let current_zoom = workspace.zoom.borrow_mut().take();
-                let snapshot = current_zoom
-                    .unwrap_or_else(|| (groups.clone(), workspace.tree.borrow_mut().take()));
-                *workspace.zoom.borrow_mut() = Some(snapshot);
-                *workspace.groups.borrow_mut() = vec![group.clone()];
-            }
-        }
-
         self.layout(&workspace);
         self.sync_toggles();
         self.persist_primitives(&workspace);
@@ -4123,69 +3608,23 @@ impl App {
         program: Option<&str>,
         resume: Resume,
     ) -> Option<Rc<Primitive>> {
-        if key.slot == Slot::Board
-            && !crate::board::enabled(&self.db, &workspace.project.path).unwrap_or(true)
-        {
+        self.ensure_primitive_with(workspace, key, program, resume, &Extras::default())
+    }
+
+    fn ensure_primitive_with(
+        &self,
+        workspace: &Rc<Workspace>,
+        key: TabKey,
+        program: Option<&str>,
+        resume: Resume,
+        extras: &Extras,
+    ) -> Option<Rc<Primitive>> {
+        // Retained only in persisted data for migration, never a workspace tool.
+        if key.slot == Slot::Board {
             return None;
         }
         if let Some(existing) = workspace.tab(key) {
             return Some(existing);
-        }
-        // The board is the one primitive that runs nothing: the pane is
-        // radar's own widget over the project's BOARD.md. One per project —
-        // every board key resolves to the same pane.
-        if key.slot == Slot::Board {
-            let project_id = workspace.project.id;
-            let pane = board::BoardPane::new(
-                &workspace.project.path,
-                project_id,
-                &self.session_home,
-                self.activity_tx.clone(),
-                &self.window,
-            );
-            let snapshot = self
-                .activity
-                .borrow()
-                .get(&project_id)
-                .map(|activity| activity.snapshot.clone())
-                .unwrap_or_else(|| ProjectActivity::empty(project_id).snapshot);
-            let online = self
-                .activity_online
-                .borrow()
-                .get(&project_id)
-                .copied()
-                .unwrap_or(false);
-            pane.set_activity_state(snapshot, online);
-            self.board_panes
-                .borrow_mut()
-                .insert(project_id, Rc::downgrade(&pane));
-            // The board's header lives on the board's own counts.
-            let window = self.window.clone();
-            pane.set_info_observer(move |text| {
-                let _ = gtk::prelude::WidgetExt::activate_action(
-                    &window,
-                    "win.pane-info",
-                    Some(
-                        &(
-                            project_id,
-                            TabKey::first(Slot::Board).as_str(),
-                            text.unwrap_or_default(),
-                        )
-                            .to_variant(),
-                    ),
-                );
-            });
-            workspace
-                .programs
-                .borrow_mut()
-                .insert(key.slot, "board".to_string());
-            let primitive = Primitive::builtin(
-                "board",
-                pane.widget().clone(),
-                "Board\nbuilt into radar — the project's BOARD.md",
-            );
-            workspace.tabs.borrow_mut().insert(key, primitive.clone());
-            return Some(primitive);
         }
         let global_preferences = self.db.preferences().unwrap_or_default();
         let preferences = self
@@ -4211,6 +3650,8 @@ impl App {
             Resume::Last => options.resume = true,
             Resume::Session(id) => options.session = Some(id.clone()),
         }
+        options.prompt = extras.prompt.clone();
+        options.card = extras.card.clone();
         // An agent meets the board at launch: the board file and the skill
         // that makes it the convention are both in place before the agent
         // draws its first frame, and the launch claims work under a name
@@ -4230,7 +3671,10 @@ impl App {
                 Ok(false) => {}
                 Err(error) => eprintln!("radar: reading board policy: {error}"),
             }
-            let stamp = crate::programs::launch::now_stamp();
+            let stamp = extras
+                .instance
+                .clone()
+                .unwrap_or_else(crate::programs::launch::now_stamp);
             options.agent_instance = Some(stamp.clone());
             launch_record = Some((
                 format!("{}-{}", program.id, stamp),
@@ -4391,10 +3835,6 @@ impl App {
         if key.slot == Slot::Custom {
             return;
         }
-        if key.slot != Slot::Board && self.leave_board(workspace) && workspace.is_visible(key) {
-            self.activate_primitive(workspace, key);
-            return;
-        }
         self.restore_zoom(workspace);
         let opening = workspace.group_of(key).is_none();
         if let Some(group) = workspace.group_of(key) {
@@ -4428,7 +3868,6 @@ impl App {
         self.sync_toggles();
         self.refresh_workspace_menus(workspace);
         self.persist_primitives(workspace);
-        self.apply_status_labels();
         // Opening a panel is a claim on it: the chord, the dock button, the
         // menu — every "open" lands the keys in the panel it opened, ready to
         // type into. Hiding goes quietly.
@@ -4446,12 +3885,6 @@ impl App {
         if source.slot == Slot::Custom {
             return;
         }
-        // The board is one per project: nothing to add, just look at it.
-        if source.slot == Slot::Board {
-            self.show_primitive(workspace, TabKey::first(Slot::Board));
-            return;
-        }
-        self.leave_board(workspace);
         let key = workspace.next_key(source.slot);
         let Some(primitive) = self.ensure_primitive(workspace, key, Some(&program.id), Resume::No)
         else {
@@ -4481,7 +3914,6 @@ impl App {
         self.sync_toggles();
         self.refresh_workspace_menus(workspace);
         self.persist_primitives(workspace);
-        self.apply_status_labels();
         // A new tab is a claim: the keys land in it, ready to type into.
         if let Some(primitive) = workspace.tab(key) {
             primitive.focus();
@@ -4509,7 +3941,6 @@ impl App {
         self.sync_toggles();
         self.refresh_workspace_menus(workspace);
         self.persist_primitives(workspace);
-        self.apply_status_labels();
     }
 
     /// Leave zoom mode before changing the visible pane set.
@@ -4530,9 +3961,6 @@ impl App {
     /// Clicking a chip: switch that pane to the tab.
     fn activate_primitive(&self, workspace: &Rc<Workspace>, key: TabKey) {
         let key = workspace.resolve_tab(key);
-        if key.slot != Slot::Board {
-            self.leave_board(workspace);
-        }
         if let Some(group) = workspace.group_of(key) {
             group.activate(key);
             self.refresh_group_menu(&group);
@@ -4615,7 +4043,6 @@ impl App {
             self.sync_toggles();
             self.refresh_workspace_menus(workspace);
             self.persist_primitives(workspace);
-            self.apply_status_labels();
         }
         self.activate_primitive(workspace, key);
     }
@@ -4624,6 +4051,20 @@ impl App {
     /// process stamp nor a stored provider conversation identifies it, leave
     /// the current agent untouched rather than guessing from its program.
     fn open_agent_session(&self, workspace: &Rc<Workspace>, claim: &str) {
+        self.open_agent_session_with(workspace, claim, None);
+    }
+
+    fn open_agent_session_with(
+        &self,
+        workspace: &Rc<Workspace>,
+        claim: &str,
+        prompt: Option<String>,
+    ) {
+        let extras = Extras {
+            prompt,
+            card: None,
+            instance: None,
+        };
         let project_id = workspace.project.id;
         let exact_tab = workspace.tabs_of_kind(Slot::Agent).into_iter().find(|key| {
             workspace
@@ -4688,18 +4129,24 @@ impl App {
             if on_conversation {
                 self.show_agent_session(workspace, key);
             } else {
-                self.relaunch_agent(workspace, key, Resume::Session(provider_session_id));
+                self.relaunch_agent_with(
+                    workspace,
+                    key,
+                    Resume::Session(provider_session_id),
+                    &extras,
+                );
             }
             return;
         }
 
         let key = workspace.next_key(Slot::Agent);
         if self
-            .ensure_primitive(
+            .ensure_primitive_with(
                 workspace,
                 key,
                 Some(&program_id),
                 Resume::Session(provider_session_id),
+                &extras,
             )
             .is_some()
         {
@@ -4854,6 +4301,16 @@ impl App {
     /// conversation to see, and the displaced one stays in the CLI's own
     /// session store.
     fn relaunch_agent(&self, workspace: &Rc<Workspace>, key: TabKey, resume: Resume) {
+        self.relaunch_agent_with(workspace, key, resume, &Extras::default());
+    }
+
+    fn relaunch_agent_with(
+        &self,
+        workspace: &Rc<Workspace>,
+        key: TabKey,
+        resume: Resume,
+        extras: &Extras,
+    ) {
         let Some(primitive) = workspace.tab(key) else {
             return;
         };
@@ -4867,7 +4324,14 @@ impl App {
             Resume::Last => options.resume = true,
             Resume::Session(id) => options.session = Some(id.clone()),
         }
-        options.agent_instance = Some(programs::launch::now_stamp());
+        options.prompt = extras.prompt.clone();
+        options.card = extras.card.clone();
+        options.agent_instance = Some(
+            extras
+                .instance
+                .clone()
+                .unwrap_or_else(crate::programs::launch::now_stamp),
+        );
         let session_id = stable_session_id(workspace.project.id, key, &program.id);
         let mut spec = program.command_spec(&options);
         add_session_environment(
@@ -4937,7 +4401,7 @@ impl App {
         let source = workspace.resolve_tab(source);
         let target = workspace.resolve_tab(target);
         if source.slot == Slot::Board || target.slot == Slot::Board {
-            self.toast("The board has its own full-workspace panel");
+            self.toast("Project tasks live in Home");
             return;
         }
         if source == target || source.slot == Slot::Custom {
@@ -5064,7 +4528,7 @@ impl App {
         let dragged = workspace.resolve_tab(dragged);
         let target = workspace.resolve_tab(target);
         if dragged.slot == Slot::Board || target.slot == Slot::Board {
-            self.toast("The board has its own full-workspace panel");
+            self.toast("Project tasks live in Home");
             return;
         }
         if dragged == target || dragged.slot == Slot::Custom {
@@ -5190,7 +4654,6 @@ impl App {
             self.persist_primitives(workspace);
         }
         self.toast(&format!("{} → {}", key.label(), program.name));
-        self.apply_status_labels();
     }
 
     /// The HUD's kind-level program choice: land on the kind's tab that
@@ -5206,49 +4669,10 @@ impl App {
         self.set_tab_program(workspace, key, program, visible);
     }
 
-    /// Return from the board to the saved tool arrangement.
-    fn leave_board(&self, workspace: &Rc<Workspace>) -> bool {
-        let key = TabKey::first(Slot::Board);
-        if workspace.group_of(key).is_none() {
-            return false;
-        }
-        self.toggle_primitive(workspace, key);
-        true
-    }
-
     /// Arrange the panes: agent on the left, changes and editor stacked beside
     /// it, commands along the bottom. Whatever is not open is not there.
     fn layout(&self, workspace: &Rc<Workspace>) {
         workspace.dividers.borrow_mut().clear();
-        // The board is an attention surface, never a tile. Reuse zoom's saved
-        // arrangement so closing it restores the tools and their divider tree.
-        // Also migrate older layouts where the board shared a tab group.
-        let board_key = TabKey::first(Slot::Board);
-        if let Some(mut group) = workspace.group_of(board_key) {
-            if group.tabs().len() > 1 {
-                if let Some(primitive) = workspace.tab(board_key) {
-                    group.remove(board_key);
-                    group.rebuild_header();
-                    self.refresh_group_menu(&group);
-                    let own = Group::new();
-                    own.insert(board_key, &primitive.widget, true);
-                    own.rebuild_header();
-                    self.refresh_group_menu(&own);
-                    workspace.push_group(own.clone());
-                    group = own;
-                }
-            }
-            let groups = workspace.groups();
-            if groups.len() > 1 {
-                let tree = workspace.tree.borrow_mut().take();
-                *workspace.zoom.borrow_mut() = Some((groups.clone(), tree));
-                // Unmount the tool widgets without stopping their sessions.
-                for previous in &groups {
-                    previous.widget.unparent();
-                }
-                *workspace.groups.borrow_mut() = vec![group];
-            }
-        }
         let groups = workspace.groups();
 
         for group in &groups {
@@ -5426,9 +4850,6 @@ impl App {
         let Some(workspace) = self.current_workspace() else {
             return;
         };
-        if self.leave_board(&workspace) {
-            return;
-        }
         let previous_zoom = workspace.zoom.borrow_mut().take();
         if let Some((groups, tree)) = previous_zoom {
             *workspace.groups.borrow_mut() = groups;
@@ -5458,17 +4879,6 @@ impl App {
         self.persist_primitives(&workspace);
     }
 
-    fn toggle_sidebar(&self) {
-        let showing = !self.sidebar_shown.get();
-        self.splitter.set_start_child(if showing {
-            Some(&self.sidebar)
-        } else {
-            None::<&gtk::Widget>
-        });
-        self.sidebar_shown.set(showing);
-        self.projects_toggle.set_active(showing);
-    }
-
     /// Store the primitives on screen, so the next launch looks the same.
     /// The database snapshot also keeps grouping, active chips and the split
     /// tree so the project comes back in the same arrangement.
@@ -5495,9 +4905,6 @@ impl App {
             .current_workspace()
             .map(|workspace| workspace.visible_kinds())
             .unwrap_or_default();
-        let board_available = self.current_workspace().is_some_and(|workspace| {
-            crate::board::enabled(&self.db, &workspace.project.path).unwrap_or(true)
-        });
         let global_preferences = self.db.preferences().unwrap_or_default();
         let preferences = self.current_workspace().map_or_else(
             || global_preferences.clone(),
@@ -5508,16 +4915,18 @@ impl App {
                     .apply_to(&global_preferences)
             },
         );
-        self.projects_toggle.set_active(self.sidebar_shown.get());
-        self.home_toggle.set_active(self.home_shown.get());
+        self.workspace_bar.set_visible(!self.home_shown.get());
+        if let Some(project) = self.current_project() {
+            self.workspace_title.set_label(&project.name);
+            if let Some(label) = self.workspace_title.child().and_downcast::<gtk::Label>() {
+                label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                label.set_max_width_chars(32);
+            }
+        }
         for (slot, button) in self.toggles.borrow().iter() {
             button.set_active(visible.contains(slot));
-            if *slot == Slot::Board {
-                button.set_visible(board_available);
-            }
-            let available = *slot == Slot::Shell
-                || (*slot == Slot::Board && board_available)
-                || programs::for_slot(*slot, &preferences).is_some();
+            let available =
+                *slot == Slot::Shell || programs::for_slot(*slot, &preferences).is_some();
             button.set_sensitive(available);
         }
         // The sidebar's active-agent marks are arrangement-derived state,
@@ -5602,29 +5011,13 @@ impl App {
 /// Save one project's tabs and presentation state to SQLite.
 fn persist_workspace(db: &Db, workspace: &Workspace) {
     let zoom = workspace.zoom.borrow();
-    let board_key = TabKey::first(Slot::Board);
-    let board_open = workspace.group_of(board_key).is_some();
-    let (all_groups, tree) = match zoom.as_ref() {
+    let (groups, tree) = match zoom.as_ref() {
         Some((groups, tree)) => (groups.clone(), tree.clone()),
         None => (workspace.groups(), workspace.tree.borrow().clone()),
     };
-    let groups: Vec<Rc<Group>> = all_groups
-        .into_iter()
-        .filter(|group| !board_open || !group.contains(board_key))
-        .collect();
-    let tree = tree.and_then(|tree| {
-        if board_open {
-            tree.prune(&groups)
-        } else {
-            Some(tree)
-        }
-    });
-    let zoomed = if board_open {
-        None
-    } else {
-        zoom.as_ref()
-            .and_then(|_| workspace.groups().first().and_then(group_id))
-    };
+    let zoomed = zoom
+        .as_ref()
+        .and_then(|_| workspace.groups().first().and_then(group_id));
 
     // One row per tab, same-primitive tabs included: the second agent tab is
     // a second `agent` row, and its key comes back the same way on restore.
@@ -5668,7 +5061,7 @@ fn persist_workspace(db: &Db, workspace: &Workspace) {
         layout: tree.as_ref().and_then(save_layout),
         programs: workspace.programs.borrow().clone(),
         positions: workspace.positions.borrow().clone(),
-        board_open,
+        board_open: false,
         zoomed,
     };
 
@@ -5800,7 +5193,6 @@ struct WorkspaceRestorePlan {
     layout: Option<WorkspaceLayout>,
     layout_group_anchors: Vec<TabKey>,
     zoomed: Option<TabKey>,
-    board_open: bool,
 }
 
 fn saved_board_open(state: &WorkspaceState) -> bool {
@@ -5852,7 +5244,9 @@ fn workspace_restore_plan(
                 .slots
                 .iter()
                 .copied()
-                .filter(|key| wanted.contains(key) && assigned.insert(*key))
+                .filter(|key| {
+                    key.slot != Slot::Board && wanted.contains(key) && assigned.insert(*key)
+                })
                 .collect();
             if slots.is_empty() {
                 continue;
@@ -5865,7 +5259,7 @@ fn workspace_restore_plan(
             groups.push(WorkspaceGroup { slots, active });
         }
     }
-    for key in wanted {
+    for key in wanted.iter().filter(|key| key.slot != Slot::Board) {
         if assigned.insert(*key) {
             groups.push(WorkspaceGroup {
                 slots: vec![*key],
@@ -5900,7 +5294,6 @@ fn workspace_restore_plan(
         layout,
         layout_group_anchors,
         zoomed,
-        board_open,
     }
 }
 
@@ -6038,25 +5431,25 @@ fn fold_nodes(
 
 /// Dropping a pane on the project list pulls that primitive into a pane of its
 /// own: the natural counter-gesture to dropping it onto another pane.
-fn wire_sidebar_drop(app: &SharedApp) {
+fn wire_workspace_drop(app: &SharedApp) {
     let target = gtk::DropTarget::new(glib::types::Type::STRING, gtk::gdk::DragAction::MOVE);
     target.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let list = app.sidebar_list.clone();
+    let bar = app.workspace_bar.clone();
     target.connect_drop(move |_, value, _, _| {
         let Ok(payload) = value.get::<String>() else {
             return false;
         };
-        trace(&format!("drop: sidebar got payload={payload}"));
+        trace(&format!("drop: workspace toolbar got payload={payload}"));
         // Deferred one main-loop turn so the relayout happens after the drag
         // has fully finished — see the note in group.rs's drop handler.
-        let list = list.clone();
+        let bar = bar.clone();
         let variant = payload.to_variant();
         glib::idle_add_local_once(move || {
-            let _ = list.activate_action("win.primitive-split-out", Some(&variant));
+            let _ = bar.activate_action("win.primitive-split-out", Some(&variant));
         });
         true
     });
-    app.sidebar_list
+    app.workspace_bar
         .clone()
         .upcast::<gtk::Widget>()
         .add_controller(target);
@@ -6074,6 +5467,265 @@ fn trace(message: &str) {
         .open(path)
     {
         let _ = writeln!(file, "{message}");
+    }
+}
+
+#[cfg(test)]
+mod home_navigation_tests {
+    use super::*;
+
+    struct TestDaemon(std::process::Child);
+
+    impl Drop for TestDaemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for GUI/daemon response"
+            );
+            drain();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn widgets(root: &gtk::Widget) -> Vec<gtk::Widget> {
+        let mut result = vec![root.clone()];
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            result.extend(widgets(&widget));
+            child = widget.next_sibling();
+        }
+        result
+    }
+
+    fn drain() {
+        let context = glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+    }
+
+    fn activate(window: &adw::ApplicationWindow, action: &str, target: Option<&glib::Variant>) {
+        gtk::prelude::WidgetExt::activate_action(window, action, target).unwrap();
+        drain();
+    }
+
+    /// Run on a private session bus and GTK Broadway display (see
+    /// scripts/home-smoke.sh), never against the user's real application.
+    #[test]
+    #[ignore = "requires a private D-Bus session and GTK display"]
+    fn home_navigation_replaces_the_sidebar_without_losing_project_controls() {
+        gtk::init().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = Rc::new(Paths::with_root(scratch.path().join("state")));
+        paths.ensure().unwrap();
+        let db = Rc::new(Db::open(&paths).unwrap());
+        let _daemon = TestDaemon(
+            std::process::Command::new(
+                std::env::var("RADAR_TEST_BIN").expect("run scripts/home-smoke.sh"),
+            )
+            .arg("--home")
+            .arg(&paths.data_dir)
+            .arg("serve")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+        );
+        wait_until(|| {
+            crate::session::daemon::Client::request(
+                &paths.data_dir,
+                crate::session::daemon::Command::Ping,
+            )
+            .is_ok()
+        });
+        let folder = scratch.path().join("demo");
+        std::fs::create_dir(&folder).unwrap();
+        let project = db.add_project(&folder).unwrap();
+        db.set_workspace_state(project.id, &WorkspaceState::default())
+            .unwrap();
+        db.remember_last_project(Some(project.id)).unwrap();
+        let app = adw::Application::builder()
+            .application_id("dev.omarchy.Radar.HomeTest")
+            .build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        style::install(&Theme::load());
+        let window = build_window(&app, &paths, &db);
+        window.present();
+        drain();
+        let all = widgets(window.upcast_ref());
+        assert!(!all
+            .iter()
+            .any(|widget| widget.has_css_class("projects-sidebar")));
+        assert!(window.lookup_action("toggle-sidebar").is_none());
+        let stack = all
+            .iter()
+            .find_map(|widget| widget.clone().downcast::<gtk::Stack>().ok())
+            .unwrap();
+        let bar = all
+            .iter()
+            .find(|widget| widget.has_css_class("workspace-bar"))
+            .unwrap();
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        assert!(!bar.is_visible(), "tools are secondary to Home");
+        assert!(
+            db.tabs(project.id).unwrap().is_empty(),
+            "Home never launches tools"
+        );
+
+        activate(&window, "win.home-project", Some(&project.id.to_variant()));
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        let project_view = stack.child_by_name("_home").unwrap();
+        assert!(widgets(&project_view)
+            .iter()
+            .any(|widget| widget.has_css_class("project-view")));
+        activate(&window, "win.home-back", None);
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        assert!(widgets(&stack.child_by_name("_home").unwrap())
+            .iter()
+            .any(|widget| widget.has_css_class("home-cockpit")));
+
+        activate(
+            &window,
+            "win.home-project-pin",
+            Some(&project.id.to_variant()),
+        );
+        assert!(db.project(project.id).unwrap().unwrap().pinned);
+        activate(
+            &window,
+            "win.home-project-edit",
+            Some(&project.id.to_variant()),
+        );
+        let edit = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Window>().ok())
+            .find(|window| window.title().as_deref() == Some("Edit project name"))
+            .unwrap();
+        let edit_widgets = widgets(edit.upcast_ref());
+        let entry = edit_widgets
+            .iter()
+            .find_map(|widget| widget.clone().downcast::<gtk::Entry>().ok())
+            .unwrap();
+        entry.set_text("Renamed demo");
+        let save = edit_widgets
+            .iter()
+            .filter_map(|widget| widget.clone().downcast::<gtk::Button>().ok())
+            .find(|button| button.label().as_deref() == Some("Save"))
+            .unwrap();
+        save.emit_clicked();
+        drain();
+        assert_eq!(
+            db.project(project.id).unwrap().unwrap().name,
+            "Renamed demo"
+        );
+
+        activate(&window, "win.open-project", Some(&project.id.to_variant()));
+        assert_eq!(
+            stack.visible_child_name().as_deref(),
+            Some(format!("project-{}", project.id).as_str())
+        );
+        assert!(bar.is_visible());
+        activate(&window, "win.workspace-project", None);
+        assert!(!bar.is_visible());
+        assert!(widgets(&stack.child_by_name("_home").unwrap())
+            .iter()
+            .any(|widget| widget.has_css_class("project-view")));
+
+        activate(
+            &window,
+            "win.home-project-archive",
+            Some(&project.id.to_variant()),
+        );
+        let archive = gtk::Window::list_toplevels()
+            .into_iter()
+            .flat_map(|root| widgets(&root))
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| button.label().as_deref() == Some("Archive"))
+            .unwrap();
+        archive.emit_clicked();
+        wait_until(|| db.projects().unwrap().is_empty());
+        drain();
+        assert!(db.projects().unwrap().is_empty());
+        assert!(db.project(project.id).unwrap().unwrap().archived);
+        assert!(
+            db.workspace_state(project.id).unwrap().is_some(),
+            "archive preserves workspace settings"
+        );
+        assert!(folder.is_dir(), "archive never deletes project files");
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        activate(&window, "win.home-new-project", None);
+        assert!(stack
+            .child_by_name("_home")
+            .unwrap()
+            .has_css_class("home-new-project"));
+        let form = stack.child_by_name("_home").unwrap();
+        let name = widgets(&form)
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Entry>().ok())
+            .find(|entry| entry.placeholder_text().as_deref() == Some("Project name"))
+            .unwrap();
+        name.set_text("Draft project");
+        activate(&window, "win.refresh", None);
+        assert_eq!(name.text().as_str(), "Draft project");
+        assert_eq!(
+            stack.child_by_name("_home").unwrap(),
+            form,
+            "background refresh retains the form"
+        );
+        activate(&window, "win.home-back", None);
+        assert!(
+            !stack
+                .child_by_name("_home")
+                .unwrap()
+                .has_css_class("home-new-project"),
+            "Back on an empty workspace restores the empty Home"
+        );
+
+        activate(
+            &window,
+            "win.home-project-import",
+            Some(&folder.to_string_lossy().to_string().to_variant()),
+        );
+        assert_eq!(
+            db.projects().unwrap()[0].id,
+            project.id,
+            "import restores the original record"
+        );
+        assert!(db.workspace_state(project.id).unwrap().is_some());
+        assert!(
+            !folder.join(".git").exists(),
+            "import never initializes git"
+        );
+        assert_eq!(
+            db.project(project.id).unwrap().unwrap().name,
+            "Renamed demo"
+        );
+        activate(&window, "win.home-new-project", None);
+        activate(
+            &window,
+            "win.home-project-create",
+            Some(&("created", scratch.path().to_string_lossy().to_string()).to_variant()),
+        );
+        let created = db
+            .project_by_path(scratch.path().join("created"))
+            .unwrap()
+            .unwrap();
+        assert!(created.path.join(".git").is_dir());
+        assert!(
+            db.tabs(created.id).unwrap().is_empty(),
+            "creation stays in the human project view"
+        );
+        assert!(widgets(&stack.child_by_name("_home").unwrap())
+            .iter()
+            .any(|widget| widget.has_css_class("project-view")));
+        window.destroy();
     }
 }
 
@@ -6186,7 +5838,7 @@ mod activity_ui_tests {
     }
 
     #[test]
-    fn board_open_restore_preserves_tool_tree_for_dismissal() {
+    fn retired_board_restores_tool_tree_without_board_group() {
         let agent = TabKey::first(Slot::Agent);
         let diff = TabKey::first(Slot::Diff);
         let board = TabKey::first(Slot::Board);
@@ -6213,7 +5865,6 @@ mod activity_ui_tests {
         };
 
         let plan = workspace_restore_plan(Some(&state), &[agent, diff, board]);
-        assert!(plan.board_open);
         assert_eq!(plan.zoomed, None);
         assert_eq!(plan.layout_group_anchors, vec![agent, diff]);
         assert_eq!(
@@ -6221,7 +5872,7 @@ mod activity_ui_tests {
                 .iter()
                 .map(|group| group.slots[0])
                 .collect::<Vec<_>>(),
-            vec![agent, diff, board]
+            vec![agent, diff]
         );
 
         let layout = plan.layout.as_ref().unwrap();
@@ -6247,7 +5898,7 @@ mod activity_ui_tests {
     }
 
     #[test]
-    fn legacy_board_zoom_state_migrates_to_explicit_board_open() {
+    fn legacy_board_zoom_state_restores_only_tool_groups() {
         let agent = TabKey::first(Slot::Agent);
         let diff = TabKey::first(Slot::Diff);
         let board = TabKey::first(Slot::Board);
@@ -6284,7 +5935,6 @@ mod activity_ui_tests {
         };
 
         let plan = workspace_restore_plan(Some(&state), &[agent, diff, board]);
-        assert!(plan.board_open);
         assert_eq!(plan.zoomed, None);
         assert_eq!(plan.layout_group_anchors, vec![agent, diff]);
         assert_eq!(
@@ -6400,146 +6050,4 @@ mod agent_panel_tests {
         assert_eq!(choose(Some(k(1)), None, k(2)), k(1));
         assert_eq!(choose(None, None, k(2)), k(1), "k(0) is live");
     }
-}
-
-// Layout probe: drives the splitter across the full position range a drag
-// uses (set_position) — down to zero and up past the window — and logs
-// whether either pane ever allocates outside the window. GTK layout cannot
-// be unit-tested headless, so this is the regression check for splitter
-// bugs: run with
-//   RADAR_DEBUG_SIDEBAR_SWEEP=1 radar
-// and expect "sweep done: overflow ticks 0".
-#[cfg(feature = "vte")]
-fn debug_sidebar_sweep(window: &adw::ApplicationWindow) {
-    if std::env::var("RADAR_DEBUG_SIDEBAR_SWEEP").is_err() {
-        return;
-    }
-    fn find_paned(widget: &gtk::Widget) -> Option<gtk::Paned> {
-        if let Some(paned) = widget.downcast_ref::<gtk::Paned>() {
-            return Some(paned.clone());
-        }
-        let mut child = widget.first_child();
-        while let Some(next) = child {
-            if let Some(found) = find_paned(&next) {
-                return Some(found);
-            }
-            child = next.next_sibling();
-        }
-        None
-    }
-    let Some(paned) = find_paned(window.upcast_ref()) else {
-        eprintln!("[DEBUG-sb] no Paned under the window");
-        return;
-    };
-    eprintln!("[DEBUG-sb] found paned, waiting for map");
-    let window_for_alloc = window.clone();
-    glib::timeout_add_local(Duration::from_millis(400), move || {
-        let window = window_for_alloc.clone();
-        let window_w = window.allocation().width();
-        let start = paned.start_child();
-        let stack = paned
-            .end_child()
-            .map(|child| child.downcast::<gtk::Stack>().unwrap());
-        eprintln!("[DEBUG-sb] window width {window_w}");
-        // One-shot: which descendants demand the width on either side?
-        fn dump_min(widget: &gtk::Widget, depth: u32) {
-            let (_, min_w, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
-            if min_w > 100 {
-                eprintln!(
-                    "[DEBUG-sb] min-width offender: depth {depth} {} min={min_w}",
-                    widget.type_().name(),
-                );
-            }
-            let mut child = widget.first_child();
-            while let Some(next) = child {
-                dump_min(&next, depth + 1);
-                child = next.next_sibling();
-            }
-        }
-        if let Some(sidebar) = start.as_ref() {
-            eprintln!("[DEBUG-sb] --- start child (sidebar) minima ---");
-            dump_min(sidebar, 0);
-        }
-        if let Some(child) = stack.as_ref().and_then(|s| s.visible_child()) {
-            eprintln!("[DEBUG-sb] --- end child (content) minima ---");
-            dump_min(&child, 0);
-        }
-        let pos: Rc<Cell<i32>> = Rc::new(Cell::new(0));
-        let rising: Rc<Cell<bool>> = Rc::new(Cell::new(true));
-        let prev: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
-        let overflow: Rc<Cell<i32>> = Rc::new(Cell::new(0));
-        let paned = paned.clone();
-        glib::timeout_add_local(Duration::from_millis(16), move || {
-            // Allocations lag one frame: judge the position set last tick.
-            if let Some(prev_pos) = prev.borrow_mut().take() {
-                let actual = paned.position();
-                let (label, over) = if rising.get() {
-                    // Widening the sidebar must never push the content off
-                    // the window's right edge.
-                    match stack.as_ref() {
-                        Some(stack) => {
-                            let sa = stack.allocation();
-                            let over = sa.x() + sa.width() > window_w + 1;
-                            (
-                                format!(
-                                    "stack x={} w={} min_w={}",
-                                    sa.x(),
-                                    sa.width(),
-                                    stack.measure(gtk::Orientation::Horizontal, -1).1,
-                                ),
-                                over,
-                            )
-                        }
-                        None => (String::new(), false),
-                    }
-                } else {
-                    // Narrowing the sidebar must never push its own content
-                    // past the window's left edge.
-                    match start.as_ref() {
-                        Some(sidebar) => {
-                            let sa = sidebar.allocation();
-                            let over = sa.x() < -1;
-                            (format!("sidebar x={} w={}", sa.x(), sa.width()), over)
-                        }
-                        None => (String::new(), false),
-                    }
-                };
-                if over {
-                    overflow.set(overflow.get() + 1);
-                }
-                eprintln!(
-                    "[DEBUG-sb] pos {prev_pos} actual {actual} {label} win {window_w} {}",
-                    if over { "OVERFLOW" } else { "ok" },
-                );
-            }
-            let p = if rising.get() {
-                let p = pos.get() + 24;
-                if p > window_w * 3 / 2 || window_w == 0 {
-                    rising.set(false);
-                    eprintln!("[DEBUG-sb] --- sweeping down ---");
-                    p - 24
-                } else {
-                    p
-                }
-            } else {
-                let p = pos.get() - 24;
-                if p < 0 {
-                    eprintln!("[DEBUG-sb] sweep done: overflow ticks {}", overflow.get());
-                    if let Some(app) = window
-                        .application()
-                        .and_then(|a| a.downcast::<adw::Application>().ok())
-                    {
-                        app.quit();
-                    }
-                    return glib::ControlFlow::Break;
-                }
-                p
-            };
-            pos.set(p);
-            *prev.borrow_mut() = Some(p);
-            paned.set_position(p);
-            glib::ControlFlow::Continue
-        });
-        glib::ControlFlow::Break
-    });
 }

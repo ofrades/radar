@@ -14,7 +14,7 @@ use adw::prelude::*;
 use gtk::glib;
 
 use super::primitive::label_for;
-use super::{accel_hint, icon_name, primitive, SharedApp};
+use super::{accel_hint, icon_name, SharedApp};
 use crate::db::{Slot, TabKey};
 use crate::programs::{self, Program};
 
@@ -22,7 +22,8 @@ use crate::programs::{self, Program};
 /// Per-primitive toggles are not listed here — their keys are on the
 /// primitive rows themselves.
 const KEYMAP: &[(&str, &str)] = &[
-    ("Move between panes and the sidebar", "Alt+← → ↑ ↓"),
+    ("Move between panes", "Alt+← → ↑ ↓"),
+    ("Home / all projects", "Alt+Home / Alt+B"),
     ("Resize the focused divider", "← → ↑ ↓"),
     ("Cycle panes and dividers", "Ctrl+Tab / Ctrl+Shift+Tab"),
     ("This overlay", "Alt+H"),
@@ -323,22 +324,22 @@ impl Hud {
                 Kind::Primitive(slot),
             );
         }
-        let sidebar = self.row_widget(
-            Some(primitive::PROJECTS_ICON),
-            "Projects",
-            Some("Alt+B"),
-            app.sidebar_shown.get().then_some("on screen"),
-        );
-        self.push(
-            sidebar,
-            "projects sidebar project".to_string(),
-            Kind::Action("win.toggle-sidebar"),
-        );
 
         self.section("Actions");
         for (label, keys, action, extra) in [
-            ("Go home", "Alt+Home", "win.show-home", "empty state setup"),
-            ("Search projects", "Alt+N", "win.find-projects", "find add"),
+            (
+                "Go home",
+                "Alt+Home / Alt+B",
+                "win.show-home",
+                "all projects overview",
+            ),
+            ("New project…", "", "win.home-new-project", "create folder"),
+            (
+                "Add existing folder…",
+                "",
+                "win.home-add-project",
+                "import directory",
+            ),
             ("Preferences…", "Alt+,", "win.preferences", "settings prefs"),
             (
                 "Pane menu",

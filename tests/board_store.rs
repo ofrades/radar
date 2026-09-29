@@ -167,9 +167,9 @@ fn the_card_lifecycle_and_conversation_round_trip() {
     std::fs::create_dir_all(&project).unwrap();
     state(&daemon, 3, &project);
 
-    let added = add(&daemon, 3, "Backlog", "Fix login");
+    let added = add(&daemon, 3, "Todo", "Fix login");
     assert_eq!(added.action, "added");
-    assert_eq!(added.card.lane, "Backlog");
+    assert_eq!(added.card.lane, "Todo");
     let card_id = added.card.id.clone();
 
     // Edit (title and body) keeps the id.
@@ -271,7 +271,7 @@ fn a_stale_revision_is_refused_and_nothing_is_written() {
     let project = daemon.home.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     state(&daemon, 5, &project);
-    let card = add(&daemon, 5, "Backlog", "Task").card;
+    let card = add(&daemon, 5, "Todo", "Task").card;
 
     // A fresh revision succeeds.
     change(daemon.request(Request::CardUpdate {
@@ -308,7 +308,7 @@ fn the_board_survives_a_daemon_restart() {
     let project = daemon.home.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     state(&daemon, 9, &project);
-    add(&daemon, 9, "Backlog", "Persisted");
+    add(&daemon, 9, "Todo", "Persisted");
     let moved = add(&daemon, 9, "In progress", "Also here");
     change(daemon.request(Request::CardMove {
         project_id: 9,

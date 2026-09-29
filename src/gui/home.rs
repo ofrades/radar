@@ -5,12 +5,13 @@
 //!
 //!   * **Needs you** — every unresolved request for human attention, with the
 //!     actions to answer, approve, deny, or dismiss it in place.
-//!   * **Projects** — one Basecamp-style lane per project: its to-dos (the
-//!     board's cards, ticked once Done), its board's lane counts, and its
-//!     running and external sessions.
+//!   * **Projects** — a small, clickable card per project: its git state, its
+//!     board counts and its running sessions at a glance. The card opens the
+//!     project's own view, where its to-dos are grouped Todo / In progress /
+//!     Review and a new one can be typed; a to-do there opens its conversation.
 //!
-//! The sidebar is deliberately *not* this: it is a quiet project switcher with
-//! a liveness pulse. When there are no projects yet, Home falls back to the
+//! Home is the project navigator. Workspace tools live in a local toolbar,
+//! not a permanent sidebar. When there are no projects yet, Home falls back to the
 //! empty-state setup card — the same panel that gets a first project going.
 //!
 //! The cockpit is rebuilt whenever attention, sessions, git, or the layout
@@ -22,7 +23,7 @@ use std::path::Path;
 use super::board;
 use super::live_agents::{self, AgentSession};
 use super::{App, SharedApp};
-use crate::db::{NewWorkspaceLayout, Preferences, Project, Slot};
+use crate::db::Project;
 use crate::programs;
 use crate::session::activity::{
     AgentState, Attention, AttentionActionKind, AttentionChange, AttentionResponse,
@@ -88,6 +89,12 @@ pub fn cockpit(app: &App) -> gtk::Widget {
     counts.set_hexpand(true);
     counts.set_xalign(1.0);
     header.append(&counts);
+    let shortcuts = gtk::Button::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text("Tools and shortcuts · Alt+H")
+        .action_name("win.hud")
+        .build();
+    header.append(&shortcuts);
     content.append(&header);
 
     needs_you_section(app, &content, &needs);
@@ -100,108 +107,15 @@ pub fn cockpit(app: &App) -> gtk::Widget {
     scroll.upcast()
 }
 
-/// The current Home view: the cockpit, a project's board, or a card
+/// The current Home view: the cockpit, a project's own view, or a card
 /// conversation — the Basecamp drill-down, with a way back.
 pub fn view(app: &App) -> gtk::Widget {
     match app.home_nav.borrow().last().cloned() {
-        Some(super::HomeView::Board(project_id)) => board_view(app, project_id),
+        Some(super::HomeView::Project(project_id)) => project_view(app, project_id),
         Some(super::HomeView::Card(project_id, card_id)) => card_view(app, project_id, &card_id),
+        Some(super::HomeView::NewProject) => new_project_view(app),
         None => cockpit(app),
     }
-}
-
-/// A project's board, opened inside Home: a column per lane, a card per
-/// to-do. Clicking a card opens its conversation; Back returns to the cockpit.
-fn board_view(app: &App, project_id: i64) -> gtk::Widget {
-    let project = app
-        .projects
-        .borrow()
-        .iter()
-        .find(|project| project.id == project_id)
-        .cloned();
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    root.add_css_class("home-view");
-    let Some(project) = project else {
-        root.append(&view_header("Board", None));
-        root.append(&quiet("That project is no longer available"));
-        return root.upcast();
-    };
-    let git = app
-        .status
-        .borrow()
-        .get(&project_id)
-        .map(|status| status.summary());
-    root.append(&view_header(&project.name, git.as_deref()));
-    let Some(state) = app.board_states.borrow().get(&project_id).cloned() else {
-        root.append(&quiet("Loading the board…"));
-        return root.upcast();
-    };
-    let board = state.to_board();
-
-    let columns = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    columns.set_margin_top(14);
-    columns.set_margin_bottom(14);
-    columns.set_margin_start(16);
-    columns.set_margin_end(16);
-    columns.set_valign(gtk::Align::Fill);
-    for column in &board.columns {
-        let box_ = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        box_.add_css_class("board-column");
-        box_.set_valign(gtk::Align::Start);
-        box_.set_width_request(250);
-        box_.set_vexpand(true);
-        let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        let name = gtk::Label::new(Some(&column.name));
-        name.set_xalign(0.0);
-        name.set_hexpand(true);
-        name.add_css_class("caption-heading");
-        head.append(&name);
-        let count = gtk::Label::new(Some(&column.cards.len().to_string()));
-        count.add_css_class("caption");
-        count.add_css_class("dim-label");
-        head.append(&count);
-        box_.append(&head);
-        for card in &column.cards {
-            box_.append(&board_card_button(project_id, card));
-        }
-        columns.append(&box_);
-    }
-    let scroller = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .vscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&columns)
-        .build();
-    root.append(&scroller);
-    root.upcast()
-}
-
-fn board_card_button(project_id: i64, card: &crate::board::Card) -> gtk::Widget {
-    let button = gtk::Button::new();
-    button.add_css_class("board-card");
-    button.set_halign(gtk::Align::Fill);
-    button.add_css_class("flat");
-    button.set_tooltip_text(Some("Open this card"));
-    button.set_action_name(Some("win.open-card"));
-    button.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
-    let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    let title = gtk::Label::new(Some(&card.title));
-    title.set_xalign(0.0);
-    title.set_hexpand(true);
-    title.set_wrap(true);
-    if card.done {
-        title.add_css_class("todo-done");
-    }
-    body.append(&title);
-    if let Some(who) = &card.claimed_by {
-        let claim = gtk::Label::new(Some(&format!("@{who}")));
-        claim.set_xalign(0.0);
-        claim.add_css_class("caption");
-        claim.add_css_class("todo-claim");
-        body.append(&claim);
-    }
-    button.set_child(Some(&body));
-    button.upcast()
 }
 
 /// A card conversation, opened inside Home.
@@ -249,8 +163,166 @@ fn view_header(title: &str, meta: Option<&str>) -> gtk::Widget {
     bar.upcast()
 }
 
-// ---- Needs you ----
+// ---- New project ----
 
+/// Create a project as a Home drill-down: name it, choose the parent folder,
+/// and create. No dialog window — the form is a card, and **Create** runs the
+/// same store-backed flow the header button used to open.
+fn new_project_view(app: &App) -> gtk::Widget {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.add_css_class("home-view");
+    root.add_css_class("home-new-project");
+    root.append(&view_header(
+        "New project",
+        Some("A new folder with git initialized"),
+    ));
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.add_css_class("home-cockpit");
+    content.add_css_class("project-view");
+    content.set_vexpand(true);
+    content.set_margin_top(16);
+    content.set_margin_bottom(20);
+    content.set_margin_start(22);
+    content.set_margin_end(22);
+    content.set_halign(gtk::Align::Fill);
+    content.set_hexpand(true);
+
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    card.add_css_class("lane");
+    card.set_valign(gtk::Align::Start);
+    card.set_hexpand(true);
+
+    let name = gtk::Entry::builder()
+        .placeholder_text("Project name")
+        .build();
+    name.add_css_class("todo-add");
+    card.append(&name);
+
+    let parent_label = gtk::Label::new(Some("Parent folder"));
+    parent_label.add_css_class("lane-section");
+    parent_label.set_xalign(0.0);
+    card.append(&parent_label);
+
+    let parent = gtk::Entry::new();
+    let default_parent = app
+        .db
+        .ui_prefs()
+        .map(|prefs| prefs.resolved_add_root())
+        .unwrap_or_else(|_| crate::config::default_project_root());
+    parent.set_text(&default_parent.to_string_lossy());
+    parent.set_placeholder_text(Some("Parent folder"));
+    let parent_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    parent.set_hexpand(true);
+    parent_row.append(&parent);
+    let browse = gtk::Button::with_label("Choose…");
+    browse.add_css_class("flat");
+    parent_row.append(&browse);
+    card.append(&parent_row);
+
+    let note = gtk::Label::new(Some(
+        "Creates the folder and runs git init. No agent is started.",
+    ));
+    note.set_wrap(true);
+    note.set_xalign(0.0);
+    note.add_css_class("caption");
+    note.add_css_class("dim-label");
+    card.append(&note);
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    let create = gtk::Button::with_label("Create project");
+    create.add_css_class("suggested-action");
+    buttons.append(&create);
+    card.append(&buttons);
+
+    // Browse for the parent with the platform's folder chooser; the path stays
+    // editable, so typing is always an option.
+    let window = app.window.clone();
+    let parent_for_browse = parent.clone();
+    browse.connect_clicked(move |_| {
+        #[allow(deprecated)]
+        let chooser = gtk::FileChooserDialog::new(
+            Some("Choose parent folder"),
+            Some(&window),
+            gtk::FileChooserAction::SelectFolder,
+            &[
+                ("Cancel", gtk::ResponseType::Cancel),
+                ("Choose", gtk::ResponseType::Accept),
+            ],
+        );
+        let parent = parent_for_browse.clone();
+        #[allow(deprecated)]
+        chooser.connect_response(move |chooser, response| {
+            if response == gtk::ResponseType::Accept {
+                if let Some(path) = chooser.file().and_then(|file| file.path()) {
+                    parent.set_text(&path.to_string_lossy());
+                }
+            }
+            chooser.close();
+        });
+        chooser.present();
+    });
+
+    // The store-backed create runs as a window action: validation errors toast
+    // there, and success lands in the new project's own Home view.
+    let window = app.window.clone();
+    let name_for_create = name.clone();
+    let parent_for_create = parent.clone();
+    create.connect_clicked(move |_| {
+        let _ = gtk::prelude::WidgetExt::activate_action(
+            &window,
+            "win.home-project-create",
+            Some(
+                &(
+                    name_for_create.text().to_string(),
+                    parent_for_create.text().to_string(),
+                )
+                    .to_variant(),
+            ),
+        );
+    });
+    name.connect_activate(move |_| create.emit_clicked());
+
+    content.append(&card);
+
+    // Already have the folder? Import it without touching its files.
+    let have = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    have.add_css_class("lane");
+    have.set_valign(gtk::Align::Start);
+    have.set_hexpand(true);
+    let have_title = gtk::Label::new(Some("Already have a folder?"));
+    have_title.add_css_class("caption-heading");
+    have_title.set_xalign(0.0);
+    have.append(&have_title);
+    let have_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let have_sub = gtk::Label::new(Some(
+        "Add a folder you already have — its files are left untouched.",
+    ));
+    have_sub.add_css_class("caption");
+    have_sub.add_css_class("dim-label");
+    have_sub.set_xalign(0.0);
+    have_sub.set_hexpand(true);
+    have_sub.set_wrap(true);
+    have_row.append(&have_sub);
+    let import = gtk::Button::with_label("Add existing folder…");
+    import.add_css_class("flat");
+    import.set_valign(gtk::Align::Center);
+    import.set_action_name(Some("win.home-add-project"));
+    have_row.append(&import);
+    have.append(&have_row);
+    content.append(&have);
+
+    root.append(&content);
+
+    let name_for_focus = name.clone();
+    gtk::glib::idle_add_local_once(move || {
+        name_for_focus.grab_focus();
+    });
+    root.upcast()
+}
+
+// ---- Needs you ----
 /// Every unresolved request across every project, newest first.
 fn unresolved_attention(app: &App) -> Vec<(i64, Attention)> {
     let mut items = Vec::new();
@@ -354,7 +426,7 @@ fn attention_card(app: &App, project_id: i64, attention: &Attention) -> gtk::Wid
     if let Some(card_id) = &attention.card_id {
         let open = gtk::Button::with_label("Open card");
         open.add_css_class("flat");
-        open.set_action_name(Some("win.project-board-card"));
+        open.set_action_name(Some("win.open-card"));
         open.set_action_target_value(Some(&(project_id, card_id.as_str()).to_variant()));
         buttons.append(&open);
     }
@@ -488,13 +560,15 @@ fn projects_section(app: &App, content: &gtk::Box, projects: &[Project]) {
     };
     append_heading(content, "Projects", Some(&trailing));
 
+    // The way a project is born leads the section: a big plus card, above the
+    // project cards, that drills into Home's New-project form.
+    content.append(&new_project_card(app));
+
     let grid = gtk::FlowBox::new();
     grid.set_selection_mode(gtk::SelectionMode::None);
-    // Fill the width: one project takes the row, two split it, three+ form a
-    // Basecamp-style row of lanes. Both hints are pinned to the same count so
-    // FlowBox makes real columns instead of wrapping on natural widths.
+    // At most three columns, but allow a narrow window to wrap to one.
     let per_line = projects.len().clamp(1, 3) as u32;
-    grid.set_min_children_per_line(per_line);
+    grid.set_min_children_per_line(1);
     grid.set_max_children_per_line(per_line);
     grid.set_homogeneous(true);
     grid.set_row_spacing(14);
@@ -505,6 +579,41 @@ fn projects_section(app: &App, content: &gtk::Box, projects: &[Project]) {
         grid.insert(&project_lane(app, project), -1);
     }
     content.append(&grid);
+}
+
+/// The way a project is born, leading the Projects section: one big dashed
+/// card that drills into Home's **New project** form — no separate window.
+fn new_project_card(app: &App) -> gtk::Widget {
+    let _ = app;
+    let button = gtk::Button::new();
+    button.add_css_class("add-project-card");
+    button.set_halign(gtk::Align::Fill);
+    button.set_hexpand(true);
+    button.set_tooltip_text(Some("Create a folder and initialize a git repository"));
+    button.set_action_name(Some("win.home-new-project"));
+
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let plus = gtk::Image::from_icon_name("list-add-symbolic");
+    plus.set_pixel_size(24);
+    plus.set_valign(gtk::Align::Center);
+    row.append(&plus);
+
+    let texts = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    texts.set_hexpand(true);
+    texts.set_valign(gtk::Align::Center);
+    let title = gtk::Label::new(Some("New project"));
+    title.add_css_class("heading");
+    title.set_xalign(0.0);
+    texts.append(&title);
+    let sub = gtk::Label::new(Some("Create a folder and initialize a git repository"));
+    sub.add_css_class("caption");
+    sub.add_css_class("dim-label");
+    sub.set_xalign(0.0);
+    texts.append(&sub);
+    row.append(&texts);
+
+    button.set_child(Some(&row));
+    button.upcast()
 }
 
 /// Open to-dos across every project: the cards in non-Done lanes.
@@ -523,13 +632,39 @@ fn open_todo_count(app: &App) -> usize {
         .sum()
 }
 
-/// One project's lane: header, board counts, its open to-dos, its running
-/// sessions, and a way into the full board.
+/// One project's lane: its header, its board chips, a way to add a to-do, its
+/// to-dos, and its running sessions. The name opens the workspace; **Open
+/// project** drills into the project's own view; a to-do opens its card.
 fn project_lane(app: &App, project: &Project) -> gtk::Widget {
     let lane = gtk::Box::new(gtk::Orientation::Vertical, 8);
     lane.add_css_class("lane");
     lane.set_valign(gtk::Align::Start);
     lane.set_hexpand(true);
+
+    // The whole card is the way in: a click anywhere a control inside does not
+    // claim opens the project view. Buttons and the input claim their clicks,
+    // which denies this gesture, so the inline controls keep working.
+    let lane_widget: gtk::Widget = lane.clone().upcast();
+    let project_id = project.id;
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gtk::gdk::BUTTON_PRIMARY);
+    let lane_for_click = lane_widget.clone();
+    gesture.connect_released(move |_, _, x, y| {
+        // Whatever the click landed on that takes input wins; only the card's
+        // own chrome (labels, gaps, background) drills in.
+        if let Some(target) = lane_for_click.pick(x, y, gtk::PickFlags::DEFAULT) {
+            if takes_input(&target, &lane_for_click) {
+                return;
+            }
+        }
+        let _ = gtk::prelude::WidgetExt::activate_action(
+            &lane_for_click,
+            "win.home-project",
+            Some(&project_id.to_variant()),
+        );
+    });
+    lane.add_controller(gesture);
+    lane.set_cursor_from_name(Some("pointer"));
 
     lane.append(&lane_header(app, project));
 
@@ -542,24 +677,12 @@ fn project_lane(app: &App, project: &Project) -> gtk::Widget {
     let mut any_pill = false;
     if let Some(summary) = summary {
         for lane_summary in &summary.lanes {
-            if lane_summary.cards.is_empty() {
+            // Done is not a status we keep in view; it leaves the board.
+            if lane_summary.done || lane_summary.cards.is_empty() {
                 continue;
             }
             any_pill = true;
-            let pill = gtk::Label::new(Some(&format!(
-                "{} {}",
-                lane_summary.name,
-                lane_summary.cards.len()
-            )));
-            pill.add_css_class("pill");
-            if lane_summary.done {
-                pill.add_css_class("pill-done");
-            } else if lane_summary.name.eq_ignore_ascii_case("in progress") {
-                pill.add_css_class("pill-active");
-            } else if lane_summary.name.eq_ignore_ascii_case("review") {
-                pill.add_css_class("pill-review");
-            }
-            pills.append(&pill);
+            pills.append(&lane_pill(lane_summary));
         }
     }
     if !any_pill {
@@ -569,45 +692,24 @@ fn project_lane(app: &App, project: &Project) -> gtk::Widget {
     }
     lane.append(&pills);
 
+    // The human's way in sits right under the chips, above the list it feeds.
+    lane.append(&todo_add_entry(app, project.id));
+
+    // Done cards leave the lane: they are celebrated and gone, not listed.
     lane.append(&section_label("To-dos"));
     if let Some(summary) = summary {
-        let (open, done) = open_and_done(summary);
-        if open.is_empty() && done.is_empty() {
+        let (open, _done) = open_and_done(summary);
+        if open.is_empty() {
             lane.append(&quiet("No to-dos yet"));
-        }
-        for (lane_name, card) in open.iter().take(8) {
-            let note = latest_card_note(app, project.id, &card.id);
-            lane.append(&todo_row(project.id, lane_name, card, note.as_deref()));
-        }
-        if open.len() > 8 {
-            lane.append(&quiet(&format!("+{} more", open.len() - 8)));
-        }
-        if !done.is_empty() {
-            lane.append(&quiet(&format!("{} done", done.len())));
-            for card in done.iter().take(3) {
-                lane.append(&todo_row(project.id, "Done", card, None));
-            }
+        } else {
+            lane.append(&todo_scroll(app, project.id, &open));
         }
     } else {
         lane.append(&quiet("No board"));
     }
 
-    let mut sessions: Vec<(AgentSession, String)> = app
-        .agent_sessions
-        .borrow()
-        .by_project
-        .get(&project.id)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(live_agents::sidebar_session_is_live)
-        .map(|session| {
-            let title = session.title.clone();
-            (session, title)
-        })
-        .collect();
+    let sessions = live_sessions(app, project.id);
     if !sessions.is_empty() {
-        live_agents::sort_sidebar_sessions(&mut sessions);
         lane.append(&section_label("Sessions"));
         for (session, _) in sessions.iter().take(4) {
             lane.append(&session_row(app, project.id, session));
@@ -617,8 +719,43 @@ fn project_lane(app: &App, project: &Project) -> gtk::Widget {
         }
     }
 
-    lane.append(&lane_footer(project, sessions.len()));
+    lane.append(&lane_footer(sessions.len()));
     lane.upcast()
+}
+
+/// Whether a click that landed on `widget` should be handled by a control
+/// inside the card rather than by the card's own drill-in.
+fn takes_input(widget: &gtk::Widget, stop: &gtk::Widget) -> bool {
+    let mut current = Some(widget.clone());
+    while let Some(w) = current {
+        if w.is::<gtk::Button>()
+            || w.is::<gtk::MenuButton>()
+            || w.is::<gtk::Entry>()
+            || w.is::<gtk::DropDown>()
+            || w.is::<gtk::TextView>()
+            || w.is::<gtk::Range>()
+        {
+            return true;
+        }
+        if &w == stop {
+            break;
+        }
+        current = w.parent();
+    }
+    false
+}
+
+fn lane_pill(lane: &board::LaneSummary) -> gtk::Label {
+    let pill = gtk::Label::new(Some(&format!("{} {}", lane.name, lane.cards.len())));
+    pill.add_css_class("pill");
+    if lane.done {
+        pill.add_css_class("pill-done");
+    } else if lane.name.eq_ignore_ascii_case("in progress") {
+        pill.add_css_class("pill-active");
+    } else if lane.name.eq_ignore_ascii_case("review") {
+        pill.add_css_class("pill-review");
+    }
+    pill
 }
 
 fn lane_header(app: &App, project: &Project) -> gtk::Widget {
@@ -633,10 +770,16 @@ fn lane_header(app: &App, project: &Project) -> gtk::Widget {
     let name = gtk::Button::with_label(&project.name);
     name.add_css_class("flat");
     name.add_css_class("lane-name");
-    name.set_tooltip_text(Some("Open this project's workspace"));
-    name.set_action_name(Some("win.open-project"));
+    name.set_tooltip_text(Some("Open this project's tasks and conversations"));
+    name.set_action_name(Some("win.home-project"));
     name.set_action_target_value(Some(&project.id.to_variant()));
     header.append(&name);
+    if project.pinned {
+        let pin = gtk::Image::from_icon_name("starred-symbolic");
+        pin.set_tooltip_text(Some("Pinned project"));
+        pin.set_pixel_size(12);
+        header.append(&pin);
+    }
 
     let git = app
         .status
@@ -644,7 +787,11 @@ fn lane_header(app: &App, project: &Project) -> gtk::Widget {
         .get(&project.id)
         .map(|status| status.summary())
         .unwrap_or_else(|| "…".to_string());
-    let git = gtk::Label::new(Some(&git));
+    let git = gtk::Label::new(Some(if project.is_missing() {
+        "Folder missing"
+    } else {
+        &git
+    }));
     git.add_css_class("caption");
     git.add_css_class("dim-label");
     git.set_xalign(1.0);
@@ -664,8 +811,38 @@ fn lane_header(app: &App, project: &Project) -> gtk::Widget {
     create.set_valign(gtk::Align::Center);
     create.set_action_name(Some("win.project-agent-create"));
     create.set_action_target_value(Some(&project.id.to_variant()));
+    create.set_sensitive(!project.is_missing());
     header.append(&create);
+    header.append(&project_menu(project));
     header.upcast()
+}
+
+pub(super) fn project_menu(project: &Project) -> gtk::MenuButton {
+    let menu = gtk::gio::Menu::new();
+    for (label, action) in [
+        ("Edit project name…", "win.home-project-edit"),
+        ("Project defaults…", "win.home-project-defaults"),
+        (
+            if project.pinned {
+                "Unpin project"
+            } else {
+                "Pin project"
+            },
+            "win.home-project-pin",
+        ),
+        ("Move earlier", "win.home-project-up"),
+        ("Move later", "win.home-project-down"),
+        ("Archive project…", "win.home-project-archive"),
+    ] {
+        let item = gtk::gio::MenuItem::new(Some(label), None);
+        item.set_action_and_target_value(Some(action), Some(&project.id.to_variant()));
+        menu.append_item(&item);
+    }
+    gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text("Manage project")
+        .menu_model(&menu)
+        .build()
 }
 
 /// Split a board's lanes into open to-dos (in-progress, review, then the
@@ -697,11 +874,243 @@ fn lane_rank(name: &str, done: bool) -> u8 {
         0
     } else if name.eq_ignore_ascii_case("review") {
         1
-    } else if name.eq_ignore_ascii_case("backlog") {
+    } else if name.eq_ignore_ascii_case("todo") || name.eq_ignore_ascii_case("backlog") {
         2
     } else {
         3
     }
+}
+
+/// The open to-dos, in a scroller: a busy lane keeps a fixed height and every
+/// to-do stays reachable, instead of a "+N more" cut-off.
+fn todo_scroll(app: &App, project_id: i64, open: &[(String, board::WorkCard)]) -> gtk::Widget {
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    for (lane_name, card) in open {
+        let note = latest_card_note(app, project_id, &card.id);
+        list.append(&todo_row(project_id, lane_name, card, note.as_deref()));
+    }
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(240)
+        .child(&list)
+        .build();
+    scroll.add_css_class("todo-scroll");
+    scroll.upcast()
+}
+
+fn lane_footer(running: usize) -> gtk::Widget {
+    let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    footer.add_css_class("lane-foot");
+    let status = gtk::Label::new(Some(&match running {
+        0 => "no agents".to_string(),
+        1 => "1 running".to_string(),
+        count => format!("{count} running"),
+    }));
+    status.add_css_class("caption");
+    status.add_css_class("dim-label");
+    status.set_xalign(1.0);
+    status.set_hexpand(true);
+    footer.append(&status);
+    footer.upcast()
+}
+
+fn section_label(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.add_css_class("lane-section");
+    label.set_xalign(0.0);
+    label
+}
+
+/// A project, opened inside Home: its board grouped by lane — Todo, In
+/// progress, Review — with a way to add one, then its running sessions.
+fn project_view(app: &App, project_id: i64) -> gtk::Widget {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.add_css_class("home-view");
+    let project = app
+        .projects
+        .borrow()
+        .iter()
+        .find(|project| project.id == project_id)
+        .cloned();
+    let Some(project) = project else {
+        root.append(&view_header("Project", None));
+        root.append(&quiet("That project is no longer available"));
+        return root.upcast();
+    };
+    let git = app
+        .status
+        .borrow()
+        .get(&project_id)
+        .map(|status| status.summary());
+    root.append(&view_header(&project.name, git.as_deref()));
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.add_css_class("home-cockpit");
+    content.add_css_class("project-view");
+    content.set_vexpand(true);
+    content.set_margin_top(16);
+    content.set_margin_bottom(20);
+    content.set_margin_start(22);
+    content.set_margin_end(22);
+    content.set_halign(gtk::Align::Fill);
+    content.set_hexpand(true);
+
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let open_workspace = gtk::Button::with_label("Open workspace");
+    open_workspace.add_css_class("flat");
+    open_workspace.set_tooltip_text(Some(
+        "Open agent and developer tools; Home keeps running behind them",
+    ));
+    open_workspace.set_action_name(Some("win.open-project"));
+    open_workspace.set_action_target_value(Some(&project_id.to_variant()));
+    actions.append(&open_workspace);
+    open_workspace.set_sensitive(!project.is_missing());
+    let new_agent = gtk::Button::with_label("New agent");
+    new_agent.add_css_class("flat");
+    new_agent.set_action_name(Some("win.project-agent-create"));
+    new_agent.set_action_target_value(Some(&project_id.to_variant()));
+    actions.append(&new_agent);
+    new_agent.set_sensitive(!project.is_missing());
+    actions.append(&project_menu(&project));
+    content.append(&actions);
+    let path = gtk::Label::new(Some(&project.subtitle()));
+    path.set_xalign(0.0);
+    path.set_selectable(true);
+    path.add_css_class("caption");
+    path.add_css_class("dim-label");
+    content.append(&path);
+
+    content.append(&todo_add_entry(app, project_id));
+
+    // The board as columns, side by side: Todo, In progress, Review, Done —
+    // each scrolls on its own, and Sessions sits beside them.
+    let columns = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    columns.add_css_class("project-columns");
+    columns.set_vexpand(true);
+    columns.set_valign(gtk::Align::Fill);
+    columns.set_hexpand(true);
+    {
+        let summaries = app.board_summaries.borrow();
+        match summaries.get(&project_id) {
+            Some(summary) => {
+                // Done is gone the moment it is done; only live lanes show.
+                for lane in summary.lanes.iter().filter(|lane| !lane.done) {
+                    columns.append(&lane_column(app, project_id, lane));
+                }
+            }
+            None => content.append(&quiet("No board")),
+        }
+    }
+    let sessions = live_sessions(app, project_id);
+    if !sessions.is_empty() {
+        columns.append(&sessions_column(app, project_id, &sessions));
+    }
+    let hscroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&columns)
+        .build();
+    hscroll.add_css_class("project-columns-scroll");
+    content.append(&hscroll);
+
+    root.append(&content);
+    root.upcast()
+}
+
+/// One lane as a column: a heading with its count, then its cards in a scroller.
+fn lane_column(app: &App, project_id: i64, lane: &board::LaneSummary) -> gtk::Widget {
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    column.add_css_class("project-column");
+    column.set_width_request(270);
+    column.set_valign(gtk::Align::Fill);
+    column.set_vexpand(true);
+
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let name = gtk::Label::new(Some(&lane.name));
+    name.set_xalign(0.0);
+    name.set_hexpand(true);
+    name.add_css_class("caption-heading");
+    head.append(&name);
+    let count = gtk::Label::new(Some(&lane.cards.len().to_string()));
+    count.add_css_class("caption");
+    count.add_css_class("dim-label");
+    head.append(&count);
+    column.append(&head);
+
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    for card in &lane.cards {
+        let note = latest_card_note(app, project_id, &card.id);
+        let label = if lane.done { "Done" } else { "" };
+        list.append(&todo_row(project_id, label, card, note.as_deref()));
+    }
+    if lane.cards.is_empty() {
+        list.append(&quiet("Nothing here"));
+    }
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .child(&list)
+        .build();
+    column.append(&scroll);
+    column.upcast()
+}
+
+/// A project's running sessions, newest first, with their titles.
+fn live_sessions(app: &App, project_id: i64) -> Vec<(AgentSession, String)> {
+    let mut sessions: Vec<(AgentSession, String)> = app
+        .agent_sessions
+        .borrow()
+        .by_project
+        .get(&project_id)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(live_agents::sidebar_session_is_live)
+        .map(|session| {
+            let title = session.title.clone();
+            (session, title)
+        })
+        .collect();
+    live_agents::sort_sidebar_sessions(&mut sessions);
+    sessions
+}
+
+/// The Sessions column: the same rows the cockpit renders, beside the lanes.
+fn sessions_column(app: &App, project_id: i64, sessions: &[(AgentSession, String)]) -> gtk::Widget {
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    column.add_css_class("project-column");
+    column.set_width_request(230);
+    column.set_valign(gtk::Align::Fill);
+    column.set_vexpand(true);
+
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let name = gtk::Label::new(Some("Sessions"));
+    name.set_xalign(0.0);
+    name.set_hexpand(true);
+    name.add_css_class("caption-heading");
+    head.append(&name);
+    let count = gtk::Label::new(Some(&sessions.len().to_string()));
+    count.add_css_class("caption");
+    count.add_css_class("dim-label");
+    head.append(&count);
+    column.append(&head);
+
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    for (session, _) in sessions {
+        list.append(&session_row(app, project_id, session));
+    }
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .child(&list)
+        .build();
+    column.append(&scroll);
+    column.upcast()
 }
 
 /// One to-do: a checkbox that closes it, its title (which opens the card
@@ -758,10 +1167,14 @@ fn todo_row(
     texts.append(&title);
 
     let meta = gtk::Box::new(gtk::Orientation::Horizontal, 7);
-    let lane_label = gtk::Label::new(Some(lane_name));
-    lane_label.add_css_class("caption");
-    lane_label.add_css_class("dim-label");
-    meta.append(&lane_label);
+    // A grouped list already names the lane in its heading; only a lone row
+    // (the Done list) carries its own.
+    if !lane_name.is_empty() {
+        let lane_label = gtk::Label::new(Some(lane_name));
+        lane_label.add_css_class("caption");
+        lane_label.add_css_class("dim-label");
+        meta.append(&lane_label);
+    }
     if let Some(claim) = &card.claim {
         let claim_label = gtk::Label::new(Some(claim));
         claim_label.add_css_class("caption");
@@ -769,7 +1182,9 @@ fn todo_row(
         claim_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         meta.append(&claim_label);
     }
-    texts.append(&meta);
+    if meta.first_child().is_some() {
+        texts.append(&meta);
+    }
     if let Some(note) = note {
         let note_label = gtk::Label::new(Some(note));
         note_label.set_xalign(0.0);
@@ -781,6 +1196,51 @@ fn todo_row(
     button.set_child(Some(&texts));
     row.append(&button);
     row.upcast()
+}
+
+/// The human's way in: an underlined input just under a project's board chips.
+/// Type a title and press Enter to add the card; the store puts it in the
+/// default lane (Todo). Empty input is ignored.
+fn todo_add_entry(app: &App, project_id: i64) -> gtk::Entry {
+    let entry = gtk::Entry::builder()
+        .has_frame(false)
+        .placeholder_text("Add a to-do…")
+        .build();
+    entry.add_css_class("todo-add");
+    entry.set_hexpand(true);
+    entry.set_margin_top(2);
+    if let Some(draft) = app.home_todo_drafts.borrow().get(&project_id) {
+        entry.set_text(draft);
+    }
+    let drafts = app.home_todo_drafts.clone();
+    entry.connect_changed(move |entry| {
+        drafts
+            .borrow_mut()
+            .insert(project_id, entry.text().to_string());
+    });
+
+    let window = app.window.clone();
+    entry.connect_activate(move |entry| {
+        let title = entry.text().trim().to_string();
+        if title.is_empty() {
+            return;
+        }
+        let _ = gtk::prelude::WidgetExt::activate_action(
+            &window,
+            "win.home-add-todo",
+            Some(&(project_id, title).to_variant()),
+        );
+    });
+
+    // The rebuild after a submit destroyed the old input; hand the keys back.
+    if app.home_focus_todo.get() == Some(project_id) {
+        app.home_focus_todo.set(None);
+        let entry = entry.clone();
+        gtk::glib::idle_add_local_once(move || {
+            entry.grab_focus();
+        });
+    }
+    entry
 }
 
 /// The latest agent note on a card — the "what was done" a human gets to see
@@ -807,35 +1267,6 @@ fn shorten(text: &str, limit: usize) -> String {
     let mut short: String = text.chars().take(limit.saturating_sub(1)).collect();
     short.push('…');
     short
-}
-
-fn lane_footer(project: &Project, running: usize) -> gtk::Widget {
-    let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    footer.add_css_class("lane-foot");
-    let open_board = gtk::Button::with_label("Open board");
-    open_board.add_css_class("flat");
-    open_board.set_tooltip_text(Some("Open this project's board in Home"));
-    open_board.set_action_name(Some("win.home-board"));
-    open_board.set_action_target_value(Some(&project.id.to_variant()));
-    footer.append(&open_board);
-    let status = gtk::Label::new(Some(&match running {
-        0 => "no agents".to_string(),
-        1 => "1 running".to_string(),
-        count => format!("{count} running"),
-    }));
-    status.add_css_class("caption");
-    status.add_css_class("dim-label");
-    status.set_xalign(1.0);
-    status.set_hexpand(true);
-    footer.append(&status);
-    footer.upcast()
-}
-
-fn section_label(text: &str) -> gtk::Label {
-    let label = gtk::Label::new(Some(text));
-    label.add_css_class("lane-section");
-    label.set_xalign(0.0);
-    label
 }
 
 fn quiet(text: &str) -> gtk::Label {
@@ -992,10 +1423,8 @@ fn project_name(app: &App, project_id: i64) -> String {
 
 // ---- Empty state ----
 
-/// The empty state with something to do: the program each slot uses, the
-/// layout a new project opens with, and the two ways forward — the sidebar's
-/// search for directories that already exist, and **New project…** for a
-/// fresh folder with a `git init` in it.
+/// A project-first empty state: create new work or find an existing folder.
+/// Tool programs and layout remain in Preferences.
 fn empty_panel(app: &SharedApp) -> gtk::Widget {
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -1024,7 +1453,7 @@ fn empty_panel(app: &SharedApp) -> gtk::Widget {
     title.add_css_class("heading");
     brand.append(&title);
     let tagline = gtk::Label::new(Some(
-        "One workspace per project — an agent, live changes, commands and an editor.",
+        "Your projects, tasks and conversations — see what needs you, without opening a terminal.",
     ));
     tagline.add_css_class("caption");
     tagline.add_css_class("dim-label");
@@ -1034,28 +1463,6 @@ fn empty_panel(app: &SharedApp) -> gtk::Widget {
     brand.append(&tagline);
     content.append(&brand);
 
-    // Setup: the program per slot, and the layout a new project opens with.
-    let setup = gtk::ListBox::new();
-    setup.set_selection_mode(gtk::SelectionMode::None);
-    setup.add_css_class("boxed-list");
-    let prefs = app.db.preferences().unwrap_or_default();
-    for slot in [Slot::Agent, Slot::Diff, Slot::Shell, Slot::Editor] {
-        setup.append(&program_row(app, slot, &prefs));
-    }
-    setup.append(&layout_row(app));
-    content.append(&setup);
-
-    let note = gtk::Label::new(Some(
-        "Auto picks the best installed program, and these fill every new pane. \
-         The layout is what a new project opens with.",
-    ));
-    note.add_css_class("caption");
-    note.add_css_class("dim-label");
-    note.set_wrap(true);
-    note.set_justify(gtk::Justification::Center);
-    note.set_max_width_chars(46);
-    content.append(&note);
-
     // The two ways forward.
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     actions.set_halign(gtk::Align::Center);
@@ -1063,145 +1470,34 @@ fn empty_panel(app: &SharedApp) -> gtk::Widget {
     new_project.add_css_class("suggested-action");
     new_project.add_css_class("pill");
     new_project.set_tooltip_text(Some(
-        "Pick or create a folder, run git init in it, and open it as a project",
+        "Create a folder, run git init in it, and open it as a project",
     ));
-    {
-        let app = app.clone();
-        new_project.connect_clicked(move |_| new_project_dialog(&app));
-    }
+    new_project.set_action_name(Some("win.home-new-project"));
     actions.append(&new_project);
-    let find = gtk::Button::with_label("Find projects");
+    let find = gtk::Button::with_label("Add existing folder…");
     find.add_css_class("pill");
-    find.set_action_name(Some("win.find-projects"));
+    find.set_action_name(Some("win.home-add-project"));
     find.set_tooltip_text(Some(
-        "Search in the sidebar — matching directories under the scan root join the list with a +",
+        "Add a folder you already have — its files are left untouched",
     ));
     actions.append(&find);
     content.append(&actions);
+    footer(app, &content);
 
     scroll.set_child(Some(&content));
     scroll.upcast()
 }
 
-/// One setup row: the slot's icon and name, and a program dropdown, exactly
-/// the control the preferences dialog uses — it writes the same preference.
-fn program_row(app: &SharedApp, slot: Slot, prefs: &Preferences) -> gtk::ListBoxRow {
-    let candidates = programs::candidates_for_slot(slot, prefs);
-    let mut labels: Vec<String> = vec!["Auto (best installed)".to_string()];
-    labels.extend(candidates.iter().map(|p| format!("{} — {}", p.name, p.id)));
-    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-    let dropdown = gtk::DropDown::from_strings(&label_refs);
-    let selected = prefs
-        .get(slot)
-        .and_then(|id| candidates.iter().position(|p| p.id == id))
-        .map(|index| index as u32 + 1)
-        .unwrap_or(0);
-    dropdown.set_selected(selected);
-    dropdown.set_valign(gtk::Align::Center);
-
-    let item = gtk::ListBoxRow::new();
-    item.set_activatable(false);
-    let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    box_.set_margin_top(10);
-    box_.set_margin_bottom(10);
-    box_.set_margin_start(12);
-    box_.set_margin_end(12);
-    let icon = gtk::Image::from_icon_name(super::icon_name(slot));
-    icon.add_css_class("dim-label");
-    icon.set_pixel_size(16);
-    icon.set_valign(gtk::Align::Center);
-    box_.append(&icon);
-    let label = gtk::Label::new(Some(super::label_for(slot)));
-    label.set_xalign(0.0);
-    label.set_hexpand(true);
-    box_.append(&label);
-    box_.append(&dropdown);
-    item.set_child(Some(&box_));
-
-    let db = app.db.clone();
-    let app_for_change = app.clone();
-    dropdown.connect_selected_notify(move |dropdown| {
-        let index = dropdown.selected();
-        let program = if index == 0 {
-            None
-        } else {
-            candidates.get(index as usize - 1).map(|p| p.id.clone())
-        };
-        if let Err(error) = db.set_preference(slot, program.as_deref()) {
-            eprintln!("radar: {error}");
-        }
-        // The dock's availability and the pane menus follow the preference.
-        app_for_change.sync_toggles();
-        app_for_change.refresh_menus();
-    });
-    item
-}
-
-/// The layout row: what a brand-new workspace opens with.
-fn layout_row(app: &SharedApp) -> gtk::ListBoxRow {
-    let item = gtk::ListBoxRow::new();
-    item.set_activatable(false);
-    let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    box_.set_margin_top(10);
-    box_.set_margin_bottom(10);
-    box_.set_margin_start(12);
-    box_.set_margin_end(12);
-    let icon = gtk::Image::from_icon_name("view-grid-symbolic");
-    icon.add_css_class("dim-label");
-    icon.set_pixel_size(16);
-    icon.set_valign(gtk::Align::Center);
-    box_.append(&icon);
-    let label = gtk::Label::new(Some("Layout"));
-    label.set_xalign(0.0);
-    label.set_hexpand(true);
-    box_.append(&label);
-
-    let strings: Vec<String> = NewWorkspaceLayout::ALL
-        .iter()
-        .map(|layout| layout.label().to_string())
-        .collect();
-    let label_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
-    let dropdown = gtk::DropDown::from_strings(&label_refs);
-    let selected = app
-        .db
-        .ui_prefs()
-        .ok()
-        .and_then(|prefs| prefs.layout)
-        .and_then(|layout| {
-            NewWorkspaceLayout::ALL
-                .iter()
-                .position(|candidate| *candidate == layout)
-        })
-        .unwrap_or(0) as u32;
-    dropdown.set_selected(selected);
-    dropdown.set_valign(gtk::Align::Center);
-    box_.append(&dropdown);
-    item.set_child(Some(&box_));
-    item.set_tooltip_text(Some("What a new project opens with"));
-
-    let db = app.db.clone();
-    dropdown.connect_selected_notify(move |dropdown| {
-        let layout = NewWorkspaceLayout::ALL[dropdown.selected() as usize];
-        let mut prefs = db.ui_prefs().unwrap_or_default();
-        prefs.layout = Some(layout);
-        if let Err(error) = db.set_ui_prefs(&prefs) {
-            eprintln!("radar: {error}");
-        }
-    });
-    item
-}
-
-/// Pick or create a folder, then make it a project: created if missing,
-/// `git init` when it is not a repository already, added and opened.
-fn new_project_dialog(app: &SharedApp) {
+/// Import an existing folder without changing files or initializing git.
+pub(super) fn add_project_dialog(app: &SharedApp) {
     #[allow(deprecated)]
     let dialog = gtk::FileChooserDialog::new(
-        Some("New project — pick or create a folder"),
+        Some("Add an existing project folder"),
         Some(&app.window),
         gtk::FileChooserAction::SelectFolder,
         &[
             ("Cancel", gtk::ResponseType::Cancel),
-            ("Create project", gtk::ResponseType::Accept),
+            ("Add project", gtk::ResponseType::Accept),
         ],
     );
     let app = app.clone();
@@ -1212,10 +1508,42 @@ fn new_project_dialog(app: &SharedApp) {
             .and_then(|file| file.and_then(|file| file.path()));
         dialog.close();
         if let Some(path) = path {
-            create_project(&app, path);
+            let _ = gtk::prelude::WidgetExt::activate_action(
+                &app.window,
+                "win.home-project-import",
+                Some(&path.to_string_lossy().to_string().to_variant()),
+            );
         }
     });
     dialog.present();
+}
+
+/// Validate the New-project view's fields and create the project. A bare name
+/// under an existing parent — the same rules the dialog enforced, now without
+/// the dialog. Errors toast; success lands in the new project's Home view.
+pub(super) fn create_project_from_fields(app: &SharedApp, name: &str, parent: &str) {
+    let name = name.trim();
+    let parent = parent.trim();
+    if !valid_project_folder_name(name) || parent.is_empty() {
+        app.toast("Enter a project name (not a path) and a parent folder");
+        return;
+    }
+    let path = match crate::db::normalize_path(Path::new(parent)) {
+        Ok(parent) => parent.join(name),
+        Err(error) => {
+            app.toast(&format!("Invalid parent folder: {error}"));
+            return;
+        }
+    };
+    if path.exists() {
+        app.toast("That folder already exists. Use Add existing folder instead.");
+        return;
+    }
+    create_project(app, path);
+}
+
+fn valid_project_folder_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }
 
 /// The chosen folder becomes a project: directory if missing, git if bare.
@@ -1229,7 +1557,7 @@ pub(super) fn create_project(app: &SharedApp, path: std::path::PathBuf) {
         ));
         return;
     }
-    let existing_repo = path.join(".git").is_dir();
+    let existing_repo = path.join(".git").exists();
     let initialised = existing_repo || git_init(&path);
     let project = match app.db.add_project(&path) {
         Ok(project) => project,
@@ -1239,7 +1567,11 @@ pub(super) fn create_project(app: &SharedApp, path: std::path::PathBuf) {
         }
     };
     super::App::refresh_projects(app);
-    app.select_project(project.id);
+    app.show_home();
+    app.home_nav
+        .borrow_mut()
+        .push(super::HomeView::Project(project.id));
+    app.refresh_home();
     let detail = if existing_repo {
         "already a git repository"
     } else if initialised {
@@ -1257,4 +1589,19 @@ fn git_init(path: &Path) -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_project_folder_name;
+
+    #[test]
+    fn new_project_names_cannot_escape_the_parent_folder() {
+        for name in ["", ".", "..", "../other", "a/b", "/absolute", "null\0name"] {
+            assert!(!valid_project_folder_name(name), "{name:?}");
+        }
+        for name in ["my-project", "Project with spaces", "café"] {
+            assert!(valid_project_folder_name(name), "{name:?}");
+        }
+    }
 }

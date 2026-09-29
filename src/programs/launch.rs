@@ -24,6 +24,9 @@ pub struct LaunchOptions {
     /// A unique instance name for an agent launch, folded into `RADAR_AGENT`
     /// (see [`command_spec`]). Irrelevant for non-agents.
     pub agent_instance: Option<String>,
+    /// The board card this launch is attached to, if any. Reaches the program
+    /// as `RADAR_CARD_ID`, so its comments and claims default to that card.
+    pub card: Option<String>,
 }
 
 /// A resolved command line.
@@ -55,17 +58,32 @@ pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
     // instances of the same agent never hold each other's cards. Unique per
     // launch (see [`agent_instance_name`]); the `omarchy` wrapper execs the
     // agent, so the variable reaches it either way.
-    let env_set = match (program.kind, &options.agent_instance) {
+    let mut env_set = match (program.kind, &options.agent_instance) {
         (Kind::Agent, Some(instance)) => vec![(
             "RADAR_AGENT".to_string(),
             format!("{}-{instance}", program.id),
         )],
         _ => Vec::new(),
     };
+    if let Some(card) = &options.card {
+        env_set.push(("RADAR_CARD_ID".to_string(), card.clone()));
+    }
 
     // A resumed launch bypasses the omarchy wrapper (it always starts a
     // fresh agent) and the permission flags: the conversation being
     // reopened had its own. An exact session id wins over "the last one".
+    // A prompt (and extra args) still append after the resume flags, so a
+    // resumed agent is handed the card message that woke it.
+    let append_tail = |argv: &mut Vec<String>| {
+        if let Some(prompt) = options
+            .prompt
+            .as_deref()
+            .filter(|prompt| !prompt.is_empty())
+        {
+            argv.push(prompt.to_string());
+        }
+        argv.extend(options.extra_args.iter().cloned());
+    };
     let resumed_argv = || {
         let mut argv = vec![program.command.clone()];
         argv.extend(program.args.iter().cloned());
@@ -78,12 +96,14 @@ pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
                         .split_whitespace()
                         .map(str::to_string),
                 );
+                append_tail(&mut argv);
                 return Some(argv);
             }
             return None;
         }
         if options.resume && !program.resume_args.is_empty() {
             argv.extend(program.resume_args.iter().cloned());
+            append_tail(&mut argv);
             return Some(argv);
         }
         None
@@ -408,5 +428,31 @@ mod tests {
             command_spec(&by_id("cursor-agent"), &exact).argv,
             vec!["cursor-agent", "--resume", "session-42"]
         );
+    }
+
+    #[test]
+    fn a_resumed_launch_carries_the_card_prompt_and_card_env() {
+        let mut agent = program("opencode", "opencode");
+        agent.resume_session = "--session {id}".to_string();
+        let options = LaunchOptions {
+            session: Some("ses_1".into()),
+            prompt: Some("a message from the human".into()),
+            card: Some("card-1".into()),
+            agent_instance: Some("stamp".into()),
+            ..Default::default()
+        };
+        let spec = command_spec(&agent, &options);
+        assert_eq!(
+            spec.argv,
+            vec!["opencode", "--session", "ses_1", "a message from the human"]
+        );
+        assert!(spec
+            .env_set
+            .iter()
+            .any(|(key, value)| key == "RADAR_CARD_ID" && value == "card-1"));
+        assert!(spec
+            .env_set
+            .iter()
+            .any(|(key, value)| key == "RADAR_AGENT" && value == "opencode-stamp"));
     }
 }

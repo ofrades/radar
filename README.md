@@ -2,14 +2,12 @@
 
 <img src="packaging/radar.svg" alt="radar logo" width="96">
 
-A native workspace manager: **projects in a sidebar, tabs for every tool**.
+A native, project-first workspace: **human overview at Home, tools on demand**.
 
-Open radar and you get a real window. The **sidebar** is a quiet project
-switcher: one line per project with its git state and a pulse — a count of its
-running agents, and a warning mark when something needs you. Picking a project
-shows its tabs. Search matches project names and paths as well as an agent's
-conversation title, so typing an agent's name still finds the project it lives
-in.
+Radar opens on **Home**, without a permanent sidebar. Project cards lead to
+tasks and conversations, not straight into a terminal. A **New project** card
+leads the project grid; **Add existing folder…** imports a folder you already
+have.
 
 **Home** is the cockpit — the whole workspace understood without diving into a
 terminal. It gathers every project into Basecamp-style lanes:
@@ -18,17 +16,20 @@ terminal. It gathers every project into Basecamp-style lanes:
   each with the actions to answer, approve, deny or dismiss it in place.
 - **Projects** — a lane per project: its to-dos (the board's cards, ticked once
   Done), its board's lane counts, and its running and external sessions. A
-  to-do opens its card; **Open board** opens the project's full kanban.
+  to-do opens its card; **Open board** opens the project's full kanban. A big
+  **New project** card leads the grid and drills into a Home form (name, parent
+  folder, **Create**) — inside Home, no separate window.
 
-Opening a session or a card drills into its workspace; going home never stops a
-program. Session rows prefer a meaningful terminal title and fall back to the
+Cards open conversations inside Home; opening a session or **Open workspace**
+is an explicit step into developer tools. Going Home never stops a program.
+Session rows prefer a meaningful terminal title and fall back to the
 provider's conversation title, retaining it when the terminal reports only a
 generic program name.
 
 Radar keeps **one agent panel**: selecting an openable session shows it there —
 its tab joins the panel's header as a chip, and the agent that was on screen is
 hidden but never stopped, its process and pty safe in the session layer. A tab
-dragged out for a side-by-side goes home on the next sidebar selection. External
+dragged out for a side-by-side goes home on the next session selection. External
 CLI sessions under terminal windows are discovered by working directory and
 show the CLI or terminal-window title; selecting one focuses its terminal.
 History reopens only when the provider reports an exact session id and the
@@ -98,16 +99,14 @@ the program. That keeps radar usable on a machine where you cannot install VTE.
 | Action | Shortcut |
 | --- | --- |
 | Keys & primitives overlay (open a primitive, read the keymap) | `Alt+H` |
-| Home panel — programs, layout, new project | `Alt+Home` |
+| Home — projects, tasks and conversations | `Alt+Home` / `Alt+B` |
 | Move between the panes on screen | `Alt+Arrows` |
-| Cycle panes — the sidebar included | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| Cycle panes and dividers | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | The focused pane's menu (group, move, zoom, close) | `Menu` / `Shift+F10` |
-| Search projects (filter, or find one to add) | `Alt+N` |
 | Show or hide a primitive | `Alt+E` / `A` / `G` / `K` / `T` |
 | Change the focused pane's program | `Alt+P` |
 | Focus Editor / Agent / Changes / Commands | `Alt+1` – `4` |
 | Preferences | `Alt+,` |
-| Toggle sidebar | `Alt+B` |
 | Zoom the focused pane's font | `Alt+=` / `Alt+-` (or `Ctrl+scroll`); `Alt+0` resets |
 | Zoom the focused pane to the whole window | `Alt+F` |
 | Refresh status | `Alt+R` |
@@ -119,7 +118,7 @@ manager owns `Alt+Tab`, so it never reaches the app at all. And `Alt+Arrows`
 come with a rule: a text cursor — in a search box, a dialog, an agent
 prompt — keeps them. radar takes the chord only when the keys belong to a
 pane. Opening a panel — with a chord, the dock, or the HUD — puts the keys
-straight into it. Panes and the sidebar wear a quiet ring while they hold
+straight into it. Panes wear a quiet ring while they hold
 the keys, so you can see where they are.
 
 **The overlay** (`Alt+H`, also in the workspace menu) floats over the
@@ -129,23 +128,22 @@ screen — the settings, and the whole keymap. Type to filter, arrows to move,
 Changing a pane's program from its menu or with `Alt+P` opens program
 choices in this same overlay.
 
-**Home** (`Alt+Home`, the button by the logo, or the first dock toggle) is the
+**Home** (`Alt+Home` / `Alt+B`, or the workspace's Home button) is the
 cockpit when you have projects: a needs-you inbox over a row of project lanes,
 each with its to-dos, board counts and running sessions, and the actions to
-drive them without opening a terminal. With no projects yet it is instead the
-setup card — the program each slot uses, the layout a new project opens with,
-**Find projects** (the sidebar's search) and **New project…**, which picks or
-creates a folder, runs `git init` in it, and opens it. (When projects exist,
-that setup lives in **Preferences**.) Going home never stops a program; the
-panes keep running behind it.
+drive them without opening a terminal. A big **New project** card above the
+lanes opens a Home form that names a folder, runs `git init` in it, and opens
+its project view without starting an agent; the form also offers **Add existing
+folder…** to import a folder you already have. With no projects yet Home offers
+the same two ways forward. Tool programs and workspace layout live in
+**Preferences**, not first-run navigation. Going home
+never stops a program; the panes keep running behind it.
 
-**Adding a project** needs no dialog and no button: the sidebar's search box
-does both jobs. It filters your projects, and below them it lists directories
-under the scan root (usually `~/Work`) that match — repositories marked `git`,
-each with its own **+**, so several projects can be added in one search.
-Adding never leaves the search: the project joins the rows above the moment
-it is added. The small `from ~/Work` label picks another directory to scan,
-and `Esc` empties the search.
+Project **⋮** menus provide name editing, project defaults, pinning, ordering,
+and archive. Archive hides the project while preserving its tasks, settings
+and sessions; adding its folder again restores it. No project files are deleted.
+Inside a workspace, the compact top toolbar exposes tools and shortcuts;
+clicking the project name returns to its tasks and conversations.
 
 **Every pane header carries its own controls, right on the chip**: the
 program's live info beside its name, a ▾ dropdown to change that program —
@@ -291,17 +289,15 @@ guide](docs/web-client.md) for details.
 
 ## The board
 
-The Board (Alt+K) opens as a full-width, full-height workspace panel. Its
-columns expand with the window; it cannot be grouped or split into a tool tile.
-Select a tool from the dock to return to the saved tool arrangement, or close
-the board with Alt+K, its close button, or Alt+F. That arrangement is restored
-when you reopen the project, even if you left Board open. Sessions keep running
-while the board is open.
+Project boards live in **Home**: open a project to see its lanes, then a card
+to read its conversation. There is no separate workspace Board tool. Sessions
+keep running when you return Home. Older saved Board panels restore their
+tool arrangement instead.
 
 The client/server direction is **board-first interaction**: the server owns
 session state, explicit agent activity and durable attention; the board presents
 the live project feed, explicit agent states and actionable human requests.
-Sidebar badges show unresolved requests across projects. The activity panel can
+Home shows unresolved requests across projects. Its attention controls can
 mark requests seen, acknowledge them, answer questions, approve/deny, dismiss,
 and open the linked session. Agents can block on `radar activity request --wait`
 to receive that typed response. Vendor-specific adapters and exact terminal-state
@@ -310,18 +306,18 @@ import remain follow-up work. See
 
 Projects use an optional board radar owns. Cards are records in radar's store —
 the same daemon database the activity thread and attention live in — not a file.
-Boards are enabled by default. Toggle **Board** on a project's sidebar row to
+Boards are enabled by default. Toggle **Board** on a project's ⋮ menu to
 opt that project out; the setting is stored in Radar's global database, not the
 project tree.
 
-Open **Project defaults** from a project's sidebar row to set its default
+Open **Project defaults** from a project's ⋮ menu to set its default
 Editor, Agent, Diff, and Shell programs. Each pane inherits the corresponding
 global **Preferences** choice until a project override is selected. Board and
 pane defaults are per-project Radar settings and are never written to project
 files.
 
 When disabled, Radar does not create or open the board and its claim guards
-allow edits and commits. A lane is a named status (`Backlog`, `In progress`,
+allow edits and commits. A lane is a named status (`Todo`, `In progress`,
 `Review`, `Done`, or your own); a card has a title, a markdown body, a claim,
 and a lane, and it is done exactly while it sits in a done lane. Cards carry
 real ids, so moves, claims and edits are exact. For users upgrading from a
@@ -330,7 +326,7 @@ and leaves the file untouched; the file is not read again.
 
 The board is driveable from the CLI and the app alike: an agent claims work and
 moves it along with `radar card …`, and radar's **Board** renders the same
-store — Home's board view and the workspace Board pane (Alt+K) both read it,
+store in Home's project view,
 and every change is published so all clients follow. There is no file to keep
 in sync and no parsing.
 
@@ -378,7 +374,7 @@ Enabling a board installs the whole convention **once per machine, globally**
 
 Everything lives in `$HOME` or git's own local config, so nothing is added to a
 repository's tracked tree — no `.opencode/`, `.claude/` or `.cursor/` files.
-The gates fail open (no radar, no daemon, project not in the sidebar, or board
+The gates fail open (no radar, no daemon, project not registered, or board
 disabled → allow) and act only for radar-launched agents (`RADAR_AGENT`) in
 board-enabled projects, so a machine-wide install is inert everywhere else. The
 setup never changes `AGENTS.md`. A unique `RADAR_AGENT` environment variable —
@@ -451,7 +447,7 @@ src/skill.rs     the convention: skill install, the pre-edit guard
 src/programs/    program registry, omarchy agent knowledge, argv building
 src/discover/    directory discovery: fd or walk, fuzzy filtering
 src/git.rs       branch / ahead / behind / changed, read-only
-src/gui/         window, sidebar, panes, dialogs, theme, terminal panes
+src/gui/         Home, project finder, workspaces, dialogs, theme, terminal panes
 src/main.rs      CLI
 ```
 

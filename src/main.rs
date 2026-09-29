@@ -306,7 +306,7 @@ enum ActivityResponseAction {
 
 #[derive(Subcommand, Debug)]
 enum CardAction {
-    /// Add a card (default column: Backlog)
+    /// Add a card (default column: Todo)
     Add {
         /// Project directory (default: the current directory)
         #[arg(long)]
@@ -1762,6 +1762,7 @@ fn launch_options(preferences: &Preferences, safe: bool) -> LaunchOptions {
         resume: false,
         session: None,
         agent_instance: None,
+        card: None,
     }
 }
 

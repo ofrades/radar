@@ -71,7 +71,10 @@ async fn async_run(home: PathBuf, port: u16) -> Result<()> {
             get(sessions).post(create_shell),
         )
         .route("/api/projects/{project_id}/activity", get(activity))
-        .route("/api/projects/{project_id}/board", get(board_snapshot))
+        .route(
+            "/api/projects/{project_id}/board",
+            get(board_snapshot).post(add_card),
+        )
         .route(
             "/api/projects/{project_id}/attention/{request_id}",
             post(respond_attention),
@@ -434,6 +437,77 @@ async fn board_snapshot(
     }
 
     // The board lives in the daemon's store, not a file.
+    match Client::request(
+        &state.home,
+        Command::BoardState {
+            project_id,
+            path: project.path.clone(),
+        },
+    )
+    .map_err(ApiError::internal)?
+    {
+        Response::BoardState(board) => Ok(Json(Some(board.to_board()))),
+        _ => Err(ApiError::internal(
+            "daemon returned an unexpected board response",
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct NewCard {
+    title: String,
+    #[serde(default)]
+    lane: Option<String>,
+}
+
+/// Add a to-do from the browser — the human's way in, mirroring the native
+/// Home input. Returns the refreshed board so the client renders in one trip.
+async fn add_card(
+    RoutePath(project_id): RoutePath<i64>,
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(card): Json<NewCard>,
+) -> ApiResult<Json<Option<crate::board::Board>>> {
+    require_same_origin(&headers)?;
+    let db = open_db(&state.home)?;
+    let Some(project) = db.project(project_id).map_err(ApiError::internal)? else {
+        return Err(ApiError::not_found("no such project"));
+    };
+    if !db
+        .project_settings(project.id)
+        .map_err(ApiError::internal)?
+        .board_enabled
+    {
+        return Err(ApiError::bad_request("this project has no enabled board"));
+    }
+    let title = card.title.trim();
+    if title.is_empty() {
+        return Err(ApiError::bad_request("a title is required"));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    match Client::request(
+        &state.home,
+        Command::CardAdd {
+            project_id,
+            lane: card.lane,
+            title: title.to_string(),
+            body: String::new(),
+            claim: None,
+            command_id: format!("web-{}-{now:x}", std::process::id()),
+        },
+    )
+    .map_err(ApiError::internal)?
+    {
+        Response::CardChanged(_) => {}
+        _ => {
+            return Err(ApiError::internal(
+                "daemon returned an unexpected card response",
+            ))
+        }
+    }
     match Client::request(
         &state.home,
         Command::BoardState {

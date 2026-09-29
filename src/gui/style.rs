@@ -53,134 +53,8 @@ paned.divider-focus > separator {
 paned > separator:hover {
   background-color: alpha(@radar_accent, 0.55);
 }
-.projects-sidebar > separator,
 .group-pane separator {
   background-color: @radar_hairline;
-}
-
-/* Sidebar: one calm surface, with a softly inset search and compact rows. */
-.projects-sidebar {
-  background-color: alpha(@radar_fg, 0.025);
-  /* The focus ring recolors this edge exactly like a pane's; the transparent
-     border only reserves it, so gaining focus never shifts the layout. */
-  border: 1px solid transparent;
-}
-/* The sidebar header is a strip like the pane headers: no surface of its own,
-   content inset to the sidebar's shared 8px, height matched to the search
-   field below it. */
-.projects-sidebar .group-header {
-  min-height: 32px;
-  padding: 2px 8px;
-  background-color: transparent;
-}
-/* The search is one of the sidebar's three floating surfaces (search, rows,
-   dock): same 8px inset, same control radius. GtkSearchEntry renders through
-   its inner `entry` node, so both nodes get the surface treatment. */
-.projects-sidebar searchentry,
-.projects-sidebar entry {
-  margin: 6px 8px;
-  min-height: 32px;
-  padding: 0 8px;
-  border-radius: {control_radius};
-  background-color: @radar_surface;
-  background-image: none;
-  box-shadow: inset 0 0 0 1px @radar_hairline;
-}
-.projects-sidebar searchentry:focus-within,
-.projects-sidebar entry:focus-within {
-  box-shadow: inset 0 0 0 1px alpha(@radar_accent, 0.72);
-}
-.projects-sidebar list {
-  padding: 4px 8px 8px;
-  background: none;
-}
-.projects-sidebar list > row {
-  padding: 3px 6px;
-  margin: 2px 0;
-  border-radius: {control_radius};
-  transition: background-color 120ms ease;
-}
-.projects-sidebar list > row > box {
-  background: none;
-}
-.projects-sidebar list > row:hover {
-  background-color: @radar_surface;
-}
-.projects-sidebar list > row:selected {
-  color: @radar_fg;
-  background-color: @radar_accent_soft;
-}
-.projects-sidebar list > row:selected:hover {
-  background-color: @radar_accent_soft;
-}
-.projects-sidebar row > box {
-  min-height: 36px;
-}
-.projects-sidebar .agent-list {
-  margin-bottom: 3px;
-  padding-left: 4px;
-  border-left: 1px solid @radar_hairline;
-}
-.projects-sidebar button.agent-child {
-  min-height: 28px;
-  padding: 2px 4px;
-  border-radius: {control_radius};
-  color: @radar_muted;
-}
-.projects-sidebar button.agent-child:hover {
-  color: @radar_fg;
-  background-color: @radar_surface;
-}
-/* The session the project's agent panel is showing: the quiet accent a
-   chip wears while it is the tab on screen. */
-.projects-sidebar button.agent-child.agent-active {
-  color: @radar_fg;
-  background-color: @radar_accent_soft;
-}
-.projects-sidebar button.agent-child.agent-active .row-icon {
-  color: @radar_accent;
-}
-.projects-sidebar button.agent-claim-link {
-  min-height: 24px;
-  padding: 1px 5px;
-  color: @radar_accent;
-}
-.projects-sidebar button.agent-claim-link:hover {
-  color: @radar_fg;
-  background-color: @radar_accent_soft;
-}
-
-/* Icons and metadata stay quiet until they carry useful state. */
-.projects-sidebar row .row-icon {
-  color: @radar_muted;
-}
-.projects-sidebar row:selected .row-icon {
-  color: @radar_accent;
-}
-.projects-sidebar row .row-icon.missing {
-  color: @radar_warning;
-}
-.projects-sidebar row .pin-icon {
-  color: @radar_muted;
-}
-.projects-sidebar row .badge {
-  min-width: 12px;
-  padding: 1px 6px;
-  border-radius: 999px;
-  font-size: 0.85em;
-  font-weight: 700;
-  color: @radar_accent;
-  background-color: @radar_accent_soft;
-}
-.projects-sidebar row .attention-badge {
-  color: @radar_warning;
-  background-color: alpha(@radar_warning, 0.16);
-}
-/* Running agents: a quieter count than the tool badge, so the sidebar reads
-   as liveness rather than decoration. */
-.projects-sidebar row .agent-badge {
-  color: @radar_fg;
-  background-color: alpha(@radar_fg, 0.1);
 }
 
 /* Pane framing is intentionally thin; the running tool remains the focal point.
@@ -255,8 +129,7 @@ paned > separator:hover {
   color: @radar_fg;
   background-color: @radar_surface_hover;
 }
-.group-header button.flat,
-.projects-sidebar button.flat {
+.group-header button.flat {
   min-height: 26px;
   min-width: 26px;
   padding: 0 4px;
@@ -275,10 +148,14 @@ paned > separator:hover {
   background-color: alpha(@radar_accent, 0.2);
 }
 
-/* The bottom dock is the third floating surface: same inset, same radius,
-   its toggles spreading evenly across the full width. */
+/* Workspace-only navigation and tools; Home gets the whole window. */
+.workspace-bar {
+  padding: 6px 12px;
+  border-bottom: 1px solid @radar_hairline;
+  background-color: @radar_bg;
+}
 .dock {
-  margin: 0 8px;
+  margin: 0;
   padding: 4px;
   border-radius: {control_radius};
   background-color: @radar_surface;
@@ -311,11 +188,38 @@ paned > separator:hover {
 .home-cockpit .cockpit-heading {
   margin-top: 6px;
 }
+/* One project's lane card: header, chips, its to-dos and its sessions. */
 .home-cockpit .lane {
   padding: 12px;
   border: 1px solid @radar_hairline;
   border-radius: {panel_radius_inner};
   background-color: alpha(@radar_fg, 0.025);
+}
+.home-cockpit .lane:hover {
+  border-color: alpha(@radar_accent, 0.5);
+  background-color: alpha(@radar_fg, 0.04);
+}
+/* The New-project card that leads the Projects section: a big, dashed, inviting
+   button in the same card language as the lanes. */
+.home-cockpit button.add-project-card {
+  padding: 16px;
+  border: 1px dashed alpha(@radar_fg, 0.30);
+  border-radius: {panel_radius_inner};
+  background: none;
+}
+.home-cockpit button.add-project-card:hover {
+  border-color: alpha(@radar_accent, 0.6);
+  background-color: alpha(@radar_fg, 0.035);
+}
+/* The to-dos list scroller: flat, and only as tall as its contents allow. */
+.home-cockpit .todo-scroll {
+  background: none;
+  border: none;
+}
+/* The project view: the board's lanes as side-by-side columns. */
+.home-cockpit .project-column {
+  padding-top: 8px;
+  border-top: 1px solid @radar_hairline;
 }
 .home-cockpit .lane-dot {
   border-radius: 99px;
@@ -433,6 +337,20 @@ paned > separator:hover {
 .home-cockpit label.todo-note {
   color: alpha(@radar_fg, 0.55);
 }
+/* The human's way in: an underlined input under a project's board chips. */
+.home-cockpit entry.todo-add {
+  padding: 3px 1px;
+  min-height: 0;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  border-bottom: 1px solid alpha(@radar_fg, 0.22);
+  border-radius: 0;
+  box-shadow: none;
+}
+.home-cockpit entry.todo-add:focus {
+  border-bottom-color: @radar_accent;
+}
 
 /* Card panel: a card opened as a conversation — thread, reply, controls. */
 .card-panel {
@@ -528,97 +446,6 @@ paned > separator:hover {
 }
 
 /* Board: quiet columns, lightly outlined cards, and a single warm claim marker. */
-.board-pane {
-  background-color: @radar_bg;
-}
-.board-activity-panel {
-  min-width: 290px;
-  padding: 12px;
-  border-left: 1px solid @radar_hairline;
-  background-color: alpha(@radar_fg, 0.025);
-}
-.board-activity-panel .activity-section-heading {
-  margin-top: 10px;
-}
-.board-activity-panel .attention-card {
-  border: 1px solid alpha(@radar_warning, 0.32);
-  border-radius: {control_radius};
-  background-color: alpha(@radar_warning, 0.06);
-}
-.board-activity-panel .activity-row {
-  padding: 4px 0;
-  border-bottom: 1px solid @radar_hairline;
-}
-.board-activity-panel .error {
-  color: @radar_warning;
-}
-.board-column {
-  border: 1px solid @radar_hairline;
-  border-radius: {panel_radius_inner};
-  background-color: @radar_surface;
-  padding: 10px;
-}
-.board-column.drop-hint {
-  border-color: alpha(@radar_accent, 0.65);
-  background-color: @radar_accent_soft;
-}
-.board-card {
-  border: 1px solid alpha(@radar_fg, 0.06);
-  border-radius: {control_radius};
-  background-color: alpha(@radar_fg, 0.055);
-  padding: 8px 9px;
-}
-.board-card:hover {
-  border-color: alpha(@radar_accent, 0.35);
-  background-color: alpha(@radar_fg, 0.09);
-}
-.board-card:focus,
-.board-card.board-card-target {
-  border-color: alpha(@radar_accent, 0.7);
-  background-color: @radar_accent_soft;
-  box-shadow: inset 0 0 0 1px alpha(@radar_accent, 0.2);
-}
-.board-card-done {
-  text-decoration: line-through;
-  color: alpha(@radar_fg, 0.55);
-}
-.board-claim {
-  color: @radar_accent;
-  font-weight: 700;
-  background-color: @radar_accent_soft;
-  border-radius: 999px;
-  padding: 1px 6px;
-}
-
-/* The @claim is a link: the button vanishes, the pill stays. */
-button.board-claim-button {
-  padding: 0;
-  min-height: 0;
-}
-
-/* Row actions appear on selected or keyboard-focused rows, never on hover. */
-.projects-sidebar row .row-action {
-  opacity: 0;
-  min-height: 22px;
-  min-width: 22px;
-  padding: 0 3px;
-  margin-left: 2px;
-  transition: opacity 120ms ease;
-}
-.projects-sidebar row:selected .row-action,
-.projects-sidebar row:focus-within .row-action {
-  opacity: 1;
-}
-/* The meta line pairs the board's one-line stats with the row's controls,
-   indented to the name like the other caption lines. Its quiet controls
-   collapse on unselected rows; the always-visible Board button keeps the
-   line's height, so selection never reflows the list. */
-.projects-sidebar .row-meta {
-  margin-left: 22px;
-}
-.projects-sidebar row.sidebar-empty {
-  background: none;
-}
 /* Text on the accent flips by luminance, so light and dark themes both read. */
 .suggested-action {
   color: {accent_text};
@@ -648,10 +475,6 @@ toast {
 /* Keyboard: the pane (or sidebar) holding the keys wears a quiet ring, and
    the overlay panel floats above the workspace while the keyboard drives. */
 .group-pane.kbd-focus {
-  box-shadow: inset 0 0 0 1px alpha(@radar_accent, 0.7);
-}
-.projects-sidebar.kbd-focus {
-  border-color: alpha(@radar_accent, 0.82);
   box-shadow: inset 0 0 0 1px alpha(@radar_accent, 0.7);
 }
 /* Menus follow the omarchy menu card: the theme's canvas and panel
@@ -899,19 +722,6 @@ mod tests {
         let css = stylesheet(&square);
         assert!(css.contains("border-radius: 0px;"));
         assert!(!css.contains("border-radius: -"));
-    }
-
-    #[test]
-    fn the_active_panel_session_row_wears_the_accent() {
-        let css = stylesheet(&Theme::load());
-        // The sidebar marks the session the agent panel is showing with
-        // the same soft accent a chip wears, and accents its icon.
-        assert!(css.contains(
-            ".projects-sidebar button.agent-child.agent-active {\n  color: @radar_fg;\n  background-color: @radar_accent_soft;\n"
-        ));
-        assert!(css.contains(
-            ".projects-sidebar button.agent-child.agent-active .row-icon {\n  color: @radar_accent;\n"
-        ));
     }
 
     #[test]

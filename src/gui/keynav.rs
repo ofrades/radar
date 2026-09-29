@@ -4,7 +4,7 @@
 //! of the programs in the panels reaches them the way their authors wrote
 //! it — and passes every other key through untouched:
 //!
-//! - `Alt+Arrows` move focus between panes, the sidebar, and dividers. Plain
+//! - `Alt+Arrows` move focus between panes. Plain
 //!   arrows resize a focused divider. The chord is taken here, in the capture
 //!   phase on the window, so the terminal program never sees it. Text fields
 //!   keep the chord too: radar never competes with a text cursor.
@@ -93,7 +93,6 @@ pub fn pick(current: &Rect, candidates: &[(usize, Rect)], direction: Direction) 
 
 /// One thing the keys can land on.
 enum Target {
-    Sidebar,
     Pane(Rc<Group>),
     Divider(gtk::Paned),
 }
@@ -163,14 +162,9 @@ fn keys_are_free(window: &adw::ApplicationWindow) -> bool {
 }
 
 /// Directional navigation lands on panels only; divider hit areas are kept out
-/// so Alt+Arrows always moves between the sidebar and panes.
+/// so Alt+Arrows always moves between panes.
 fn panel_targets(app: &SharedApp, workspace: &super::Workspace) -> Vec<(Target, Rect)> {
     let mut targets = Vec::new();
-    if app.sidebar_shown.get() {
-        if let Some(rect) = rect_of(&app.sidebar, &app.window) {
-            targets.push((Target::Sidebar, rect));
-        }
-    }
     for group in workspace.groups() {
         if let Some(rect) = rect_of(group.widget.upcast_ref(), &app.window) {
             targets.push((Target::Pane(group), rect));
@@ -223,13 +217,12 @@ fn divider_rect_of(paned: &gtk::Paned, window: &adw::ApplicationWindow) -> Optio
 /// Where the keys are now: an index into the supplied navigation targets, if
 /// they are in the workspace at all.
 fn current_index(
-    app: &SharedApp,
+    _app: &SharedApp,
     targets: &[(Target, Rect)],
     focus: Option<&gtk::Widget>,
 ) -> Option<usize> {
     let focus = focus?;
     targets.iter().position(|(target, _)| match target {
-        Target::Sidebar => focus.is_ancestor(&app.sidebar),
         Target::Pane(group) => focus.is_ancestor(&group.widget),
         Target::Divider(divider) => *focus == divider.clone().upcast::<gtk::Widget>(),
     })
@@ -295,47 +288,9 @@ fn cycle_focus(app: &SharedApp, backwards: bool) {
     focus_target(app, &workspace, &targets[next].0);
 }
 
-/// The row the keys should land on in the sidebar: the current selection if
-/// the filter still shows it, else the first visible selectable row. The
-/// empty-list hint row is skipped — it is not selectable.
-pub(super) fn sidebar_focus_row(list: &gtk::ListBox) -> Option<gtk::ListBoxRow> {
-    if let Some(row) = list.selected_row() {
-        if row.get_visible() {
-            return Some(row);
-        }
-    }
-    let mut child = list.first_child();
-    while let Some(widget) = child {
-        if let Some(row) = widget.downcast_ref::<gtk::ListBoxRow>() {
-            if row.get_visible() && row.is_selectable() {
-                return Some(row.clone());
-            }
-        }
-        child = widget.next_sibling();
-    }
-    None
-}
-
-/// Give the keys to a target: the primitive that is showing in the pane, or
-/// the project list. Arrow keys inside the sidebar switch projects — the
-/// list's own selection change does that.
-fn focus_target(app: &SharedApp, workspace: &Rc<super::Workspace>, target: &Target) {
+/// Give the keys to a pane or a keyboard-resizable divider.
+fn focus_target(_app: &SharedApp, workspace: &Rc<super::Workspace>, target: &Target) {
     match target {
-        Target::Sidebar => {
-            // grab_focus on the list itself would park the keys on the bare
-            // list, which keeps no cursor row: arrows would be dead and no
-            // row would look focused. Focus a row instead — the list's cursor
-            // follows it, so plain arrows then walk the projects and the
-            // selection change switches them.
-            match sidebar_focus_row(&app.sidebar_list) {
-                Some(row) => {
-                    row.grab_focus();
-                }
-                None => {
-                    app.sidebar_list.grab_focus();
-                }
-            }
-        }
         Target::Pane(group) => {
             if let Some(key) = group.active_key() {
                 group.activate(key);
@@ -368,9 +323,6 @@ fn install_ring(app: &SharedApp) {
     let window = app.window.clone();
     window.connect_focus_widget_notify(move |window| {
         let focus = window.focus_widget();
-        let in_sidebar = focus
-            .as_ref()
-            .is_some_and(|focus| focus.is_ancestor(&app.sidebar));
         let workspace = app.current_workspace();
         if let (Some(workspace), Some(focus)) = (&workspace, focus.as_ref()) {
             for group in workspace.groups() {
@@ -383,13 +335,9 @@ fn install_ring(app: &SharedApp) {
                 }
             }
         }
-        let focused = if in_sidebar {
-            None
-        } else {
-            workspace
-                .as_ref()
-                .and_then(|workspace| app.focused_group(workspace))
-        };
+        let focused = workspace
+            .as_ref()
+            .and_then(|workspace| app.focused_group(workspace));
         for group in workspace
             .as_ref()
             .map(|workspace| workspace.groups())
@@ -413,10 +361,6 @@ fn install_ring(app: &SharedApp) {
             if on {
                 divider.add_css_class("divider-focus");
             }
-        }
-        app.sidebar.remove_css_class("kbd-focus");
-        if in_sidebar {
-            app.sidebar.add_css_class("kbd-focus");
         }
     });
 }

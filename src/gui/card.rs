@@ -78,7 +78,8 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
         .map(|who| format!(" · @{who}"))
         .unwrap_or_default();
     let done = if card.done { " · done" } else { "" };
-    let meta = gtk::Label::new(Some(&format!("{lane}{claim}{done}")));
+    let lane_shown = board::lane_label(&lane);
+    let meta = gtk::Label::new(Some(&format!("{lane_shown}{claim}{done}")));
     meta.set_xalign(0.0);
     meta.add_css_class("caption");
     meta.add_css_class("dim-label");
@@ -104,7 +105,13 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
     finish.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
     controls.append(&finish);
 
-    let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+    // Display the rename (Backlog -> Todo) but keep the store's real name for
+    // the move: the dropdown's integers index into `columns`.
+    let labels: Vec<String> = columns
+        .iter()
+        .map(|name| board::lane_label(name).to_string())
+        .collect();
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     let lanes = gtk::DropDown::from_strings(&refs);
     lanes.set_valign(gtk::Align::Center);
     lanes.set_tooltip_text(Some("Move to another lane"));
@@ -131,10 +138,10 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
     }
     controls.append(&lanes);
 
-    let open_board = gtk::Button::with_label("Open board");
+    let open_board = gtk::Button::with_label("Open project");
     open_board.add_css_class("flat");
-    open_board.set_tooltip_text(Some("Open the board in Home"));
-    open_board.set_action_name(Some("win.home-board"));
+    open_board.set_tooltip_text(Some("Open this project in Home"));
+    open_board.set_action_name(Some("win.home-project"));
     open_board.set_action_target_value(Some(&project_id.to_variant()));
     controls.append(&open_board);
     inner.append(&controls);
