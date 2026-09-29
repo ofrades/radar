@@ -5,9 +5,9 @@
 A native, project-first workspace: **human overview at Home, tools on demand**.
 
 Radar opens on **Home**, without a permanent sidebar. Project cards lead to
-tasks and conversations, not straight into a terminal. A **New project** card
-leads the project grid; **Add existing folder…** imports a folder you already
-have.
+tasks and conversations, not straight into a terminal. One **Add a project**
+card leads the grid: it searches the folders you already have and creates a new
+one from a typed name.
 
 **Home** is the cockpit — the whole workspace understood without diving into a
 terminal. It gathers every project into Basecamp-style lanes:
@@ -17,8 +17,9 @@ terminal. It gathers every project into Basecamp-style lanes:
 - **Projects** — a lane per project: its to-dos (the board's cards, ticked once
   Done), its board's lane counts, and its running and external sessions. A
   to-do opens its card; **Open board** opens the project's full kanban. A big
-  **New project** card leads the grid and drills into a Home form (name, parent
-  folder, **Create**) — inside Home, no separate window.
+  **Add a project** card leads the grid and opens one picker for both: folders
+  it finds under the scan root get **Add**, and a typed name that is not on
+  disk gets **Create** (a new folder with `git init`) — all inside Home.
 
 Cards open conversations inside Home; opening a session or **Open workspace**
 is an explicit step into developer tools. Going Home never stops a program.
@@ -131,13 +132,12 @@ choices in this same overlay.
 **Home** (`Alt+Home` / `Alt+B`, or the workspace's Home button) is the
 cockpit when you have projects: a needs-you inbox over a row of project lanes,
 each with its to-dos, board counts and running sessions, and the actions to
-drive them without opening a terminal. A big **New project** card above the
-lanes opens a Home form that names a folder, runs `git init` in it, and opens
-its project view without starting an agent; the form also offers **Add existing
-folder…** to import a folder you already have. With no projects yet Home offers
-the same two ways forward. Tool programs and workspace layout live in
-**Preferences**, not first-run navigation. Going home
-never stops a program; the panes keep running behind it.
+drive them without opening a terminal. A big **Add a project** card above the
+lanes opens one picker: search the scan root for a folder to add, or type a
+name to create a new folder with `git init` in it — the new project's view
+opens without starting an agent. With no projects yet Home offers the same.
+Tool programs and workspace layout live in **Preferences** (`Alt+,`), not on
+Home. Going home never stops a program; the panes keep running behind it.
 
 Project **⋮** menus provide name editing, project defaults, pinning, ordering,
 and archive. Archive hides the project while preserving its tasks, settings

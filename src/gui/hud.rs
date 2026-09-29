@@ -333,12 +333,11 @@ impl Hud {
                 "win.show-home",
                 "all projects overview",
             ),
-            ("New project…", "", "win.home-new-project", "create folder"),
             (
-                "Add existing folder…",
+                "Add a project…",
                 "",
                 "win.home-add-project",
-                "import directory",
+                "create or add",
             ),
             ("Preferences…", "Alt+,", "win.preferences", "settings prefs"),
             (

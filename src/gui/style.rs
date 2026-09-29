@@ -211,6 +211,41 @@ paned > separator:hover {
   border-color: alpha(@radar_accent, 0.6);
   background-color: alpha(@radar_fg, 0.035);
 }
+/* The Add-a-project picker: one card holding the search and its rows. */
+.add-project-view .lane {
+  padding: 10px 12px;
+}
+.add-project-view searchentry,
+.add-project-view entry {
+  margin: 2px 0 6px;
+  min-height: 32px;
+  padding: 0 8px;
+  border-radius: {control_radius};
+  background-color: @radar_surface;
+  background-image: none;
+  box-shadow: inset 0 0 0 1px @radar_hairline;
+}
+.add-project-view searchentry:focus-within,
+.add-project-view entry:focus-within {
+  box-shadow: inset 0 0 0 1px alpha(@radar_accent, 0.72);
+}
+.add-project-view list {
+  background: none;
+}
+.add-project-view list > row {
+  padding: 0;
+  background: none;
+}
+.add-project-view .add-row button {
+  padding: 7px 8px;
+  border-radius: {control_radius};
+}
+.add-project-view .add-row button:hover {
+  background-color: @radar_surface;
+}
+.add-project-view .add-row-hint {
+  color: @radar_accent;
+}
 /* The to-dos list scroller: flat, and only as tall as its contents allow. */
 .home-cockpit .todo-scroll {
   background: none;

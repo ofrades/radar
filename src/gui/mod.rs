@@ -52,6 +52,7 @@ use crate::db::{
     Db, NewWorkspaceLayout, Project, Slot, TabKey, WorkspaceAxis, WorkspaceGroup, WorkspaceLayout,
     WorkspaceState,
 };
+use crate::discover::{self, Candidate};
 use crate::programs::{self, CommandSpec, Kind, LaunchOptions, Program};
 
 use group::Group;
@@ -292,6 +293,15 @@ struct App {
     /// live title, or its exit — keyed by (project, tab).
     header_info: RefCell<HashMap<(i64, TabKey), String>>,
     current: RefCell<Option<i64>>,
+    // "Add a project": a search over the scan root that adds folders it finds,
+    // and creates a folder for a typed name.
+    add_list: gtk::ListBox,
+    add_search: gtk::SearchEntry,
+    add_root_button: gtk::Button,
+    add_root: RefCell<PathBuf>,
+    add_candidates: RefCell<Vec<Candidate>>,
+    add_tx: std::sync::mpsc::Sender<(PathBuf, Vec<Candidate>)>,
+    add_rx: RefCell<std::sync::mpsc::Receiver<(PathBuf, Vec<Candidate>)>>,
     /// Last real pointer movement over the window, in milliseconds of the
     /// glib monotonic clock. Enter events a mapped widget synthesizes under a
     /// parked pointer must not read as mouse intent.
@@ -302,8 +312,8 @@ struct App {
 enum HomeView {
     Project(i64),
     Card(i64, String),
-    /// Home's New-project drill-down: no dialog window.
-    NewProject,
+    /// Home's combined "Add a project" picker (its own stack page).
+    AddProject,
 }
 
 #[derive(Debug)]
@@ -688,14 +698,82 @@ fn build_window(
     workspace_bar.append(&tools);
     workspace_bar.set_visible(false);
 
+    // Add a project: one Home view for both new and existing folders. Search
+    // the scan root to add a folder you already have, or type a name to create
+    // one there. Persistent widgets, so typing and scrolling keep their state.
+    let add_list = gtk::ListBox::new();
+    add_list.set_selection_mode(gtk::SelectionMode::None);
+    let add_search = gtk::SearchEntry::new();
+    add_search.set_placeholder_text(Some("Search folders, or type a new name…"));
+    add_search.set_tooltip_text(Some(
+        "Filter folders to add, or type a name to create a project there",
+    ));
+    add_search.set_hexpand(true);
+    let add_root_button = gtk::Button::new();
+    add_root_button.add_css_class("flat");
+    add_root_button.add_css_class("caption");
+    add_root_button.set_halign(gtk::Align::Start);
+    add_root_button.set_tooltip_text(Some("Choose another folder to search"));
+
+    let adder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    adder.add_css_class("home-view");
+    adder.add_css_class("add-project-view");
+    let adder_header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    adder_header.add_css_class("home-view-bar");
+    let adder_back = gtk::Button::builder()
+        .icon_name("go-previous-symbolic")
+        .tooltip_text("Back to Home")
+        .build();
+    adder_back.add_css_class("flat");
+    adder_back.set_action_name(Some("win.home-back"));
+    adder_header.append(&adder_back);
+    let adder_title = gtk::Label::new(Some("Add a project"));
+    adder_title.add_css_class("heading");
+    adder_title.set_hexpand(true);
+    adder_title.set_xalign(0.0);
+    adder_header.append(&adder_title);
+    let adder_choose = gtk::Button::with_label("Choose folder…");
+    adder_choose.add_css_class("flat");
+    adder_choose.set_tooltip_text(Some("Add a folder anywhere, with the system chooser"));
+    adder_choose.set_action_name(Some("win.home-import-dialog"));
+    adder_header.append(&adder_choose);
+
+    let adder_body = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    adder_body.add_css_class("home-cockpit");
+    adder_body.add_css_class("project-view");
+    adder_body.set_vexpand(true);
+    adder_body.set_margin_top(6);
+    adder_body.set_margin_bottom(16);
+    adder_body.set_margin_start(22);
+    adder_body.set_margin_end(22);
+    adder_body.set_halign(gtk::Align::Fill);
+    adder_body.set_hexpand(true);
+
+    let adder_card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    adder_card.add_css_class("lane");
+    adder_card.set_vexpand(true);
+    adder_card.set_hexpand(true);
+    adder_card.append(&add_search);
+    adder_card.append(&add_root_button);
+    let add_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&add_list)
+        .build();
+    adder_card.append(&add_scroll);
+    adder_body.append(&adder_card);
+    adder.append(&adder_header);
+    adder.append(&adder_body);
+
     // ---- main area ----
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
         .vexpand(true)
         .build();
+    stack.add_named(&adder, Some("_add"));
     // The home panel takes the empty states' place: it is what shows with no
     // projects and no panes. It needs the finished app — its dropdowns write
-    // preferences and its new-project flow selects — so it joins the stack
+    // preferences and its add-project flow selects — so it joins the stack
     // once the state exists, just before it can first be shown.
 
     let main = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -724,6 +802,7 @@ fn build_window(
     let (status_tx, status_rx) = std::sync::mpsc::channel();
     let (activity_tx, activity_rx) = std::sync::mpsc::sync_channel(512);
     let (agent_tx, agent_rx) = std::sync::mpsc::channel();
+    let (add_tx, add_rx) = std::sync::mpsc::channel();
     let state = Rc::new(App {
         db: db.clone(),
         session_home: paths.data_dir.clone(),
@@ -761,6 +840,17 @@ fn build_window(
         confetti,
         header_info: RefCell::new(HashMap::new()),
         current: RefCell::new(None),
+        add_list,
+        add_search: add_search.clone(),
+        add_root_button: add_root_button.clone(),
+        add_root: RefCell::new(
+            db.ui_prefs()
+                .map(|prefs| prefs.resolved_add_root())
+                .unwrap_or_else(|_| crate::config::default_project_root()),
+        ),
+        add_candidates: RefCell::new(Vec::new()),
+        add_tx,
+        add_rx: RefCell::new(add_rx),
         pointer_motion_ms: Cell::new(0),
     });
 
@@ -783,8 +873,13 @@ fn build_window(
     start_status_drainer(&state);
     start_activity_drainer(&state);
     start_agent_session_drainer(&state);
+    start_add_drainer(&state);
     wire_workspace_drop(&state);
     watch_theme(&state);
+    state.add_root_button.set_label(&format!(
+        "from {}",
+        crate::db::abbreviate(&state.add_root.borrow())
+    ));
     App::refresh_projects(&state);
     state.request_agent_scan();
     start_agent_session_polling(&state);
@@ -857,12 +952,14 @@ fn build_window(
             });
         }
     }
-    // Development aid: open Home's New-project view on startup.
-    // RADAR_OPEN_NEW_PROJECT=1.
-    if std::env::var("RADAR_OPEN_NEW_PROJECT").is_ok() {
+    // Development aid: open Home's Add-a-project picker on startup.
+    // RADAR_OPEN_ADD_PROJECT=1 (RADAR_OPEN_NEW_PROJECT still accepted).
+    if std::env::var("RADAR_OPEN_ADD_PROJECT").is_ok()
+        || std::env::var("RADAR_OPEN_NEW_PROJECT").is_ok()
+    {
         let state_for_new = state.clone();
         glib::timeout_add_local_once(Duration::from_millis(1700), move || {
-            state_for_new.open_home_new_project();
+            state_for_new.open_home_add();
         });
     }
     // Development aid: throw the completion confetti on startup, so the burst
@@ -922,6 +1019,79 @@ fn status_page(
 
 fn connect_widgets(app: &SharedApp) {
     {
+        // The picker's search: filter what is on disk, offer to create a typed
+        // name, and rescan a moment after typing stops.
+        let entry = app.add_search.clone();
+        let app = app.clone();
+        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        entry.connect_search_changed(move |entry| {
+            App::render_add_results(&app, &entry.text());
+            if let Some(id) = pending.borrow_mut().take() {
+                id.remove();
+            }
+            if !entry.text().trim().is_empty() {
+                let app = app.clone();
+                let pending_for_cb = pending.clone();
+                let id = glib::timeout_add_local_once(Duration::from_millis(250), move || {
+                    app.rescan_add();
+                    *pending_for_cb.borrow_mut() = None;
+                });
+                *pending.borrow_mut() = Some(id);
+            }
+        });
+    }
+    {
+        // Esc empties the picker's search.
+        let entry = app.add_search.clone();
+        let entry_for_clear = entry.clone();
+        let controller = gtk::EventControllerKey::new();
+        controller.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape && !entry_for_clear.text().is_empty() {
+                entry_for_clear.set_text("");
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        entry.add_controller(controller);
+    }
+    {
+        // Pick another folder for the picker to search.
+        let app = app.clone();
+        let root_button = app.add_root_button.clone();
+        root_button.connect_clicked(move |_| {
+            #[allow(deprecated)]
+            let dialog = gtk::FileChooserDialog::new(
+                Some("Choose a folder to search"),
+                Some(&app.window),
+                gtk::FileChooserAction::SelectFolder,
+                &[
+                    ("Cancel", gtk::ResponseType::Cancel),
+                    ("Search", gtk::ResponseType::Accept),
+                ],
+            );
+            let app = app.clone();
+            #[allow(deprecated)]
+            dialog.connect_response(move |dialog, response| {
+                if response == gtk::ResponseType::Accept {
+                    if let Some(path) = dialog.file().and_then(|file| file.path()) {
+                        let mut prefs = app.db.ui_prefs().unwrap_or_default();
+                        prefs.add_root = Some(path.clone());
+                        if let Err(error) = app.db.set_ui_prefs(&prefs) {
+                            eprintln!("radar: could not store the scan root: {error}");
+                        }
+                        *app.add_root.borrow_mut() = path.clone();
+                        app.add_root_button
+                            .set_label(&format!("from {}", crate::db::abbreviate(&path)));
+                        app.rescan_add();
+                    }
+                }
+                dialog.close();
+            });
+            dialog.present();
+        });
+    }
+    {
         // Real pointer motion, anywhere over the window: the clock hover-focus
         // checks. Capture phase, so primitives that consume motion (the
         // terminal among them) cannot starve the clock. Enter events a mapped
@@ -937,6 +1107,76 @@ fn connect_widgets(app: &SharedApp) {
         });
         app.window.add_controller(controller);
     }
+}
+
+/// A picker row: icon, name, path, and a trailing hint. The row is inert; the
+/// whole row is a flat button the caller wires to its action.
+fn add_row(
+    title: &str,
+    subtitle: &str,
+    trailing: &str,
+    icon: &str,
+) -> (gtk::ListBoxRow, gtk::Button) {
+    let row = gtk::ListBoxRow::new();
+    row.set_activatable(false);
+    row.add_css_class("add-row");
+
+    let button = gtk::Button::new();
+    button.add_css_class("flat");
+    button.set_halign(gtk::Align::Fill);
+    button.set_hexpand(true);
+
+    let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let image = gtk::Image::from_icon_name(icon);
+    image.add_css_class("dim-label");
+    image.set_pixel_size(16);
+    image.set_valign(gtk::Align::Center);
+    box_.append(&image);
+
+    let texts = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    texts.set_hexpand(true);
+    texts.set_valign(gtk::Align::Center);
+    let name = gtk::Label::new(Some(title));
+    name.set_xalign(0.0);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    texts.append(&name);
+    let sub = gtk::Label::new(Some(subtitle));
+    sub.set_xalign(0.0);
+    sub.add_css_class("caption");
+    sub.add_css_class("dim-label");
+    sub.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    texts.append(&sub);
+    box_.append(&texts);
+
+    let hint = gtk::Label::new(Some(trailing));
+    hint.add_css_class("caption");
+    hint.add_css_class("add-row-hint");
+    hint.set_valign(gtk::Align::Center);
+    box_.append(&hint);
+
+    button.set_child(Some(&box_));
+    row.set_child(Some(&button));
+    (row, button)
+}
+
+/// Apply folder scans that arrived from the worker thread.
+fn start_add_drainer(app: &SharedApp) {
+    let app = app.clone();
+    glib::timeout_add_local(Duration::from_millis(120), move || {
+        let batch = {
+            let rx = app.add_rx.borrow();
+            rx.try_recv().ok()
+        };
+        if let Some((root, found)) = batch {
+            if root != *app.add_root.borrow() {
+                return glib::ControlFlow::Continue;
+            }
+            *app.add_candidates.borrow_mut() = found;
+            let query = app.add_search.text();
+            App::render_add_results(&app, &query);
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 /// Apply git statuses that arrived from the worker thread.
@@ -1264,14 +1504,12 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
 
     // ---- projects ----
     {
+        // Open the combined Add-a-project picker.
         let app = app.clone();
-        add(
-            "home-new-project",
-            Box::new(move || app.open_home_new_project()),
-        );
+        add("home-add-project", Box::new(move || app.open_home_add()));
     }
     {
-        // Home's New-project form: (name, parent) → create, validate, toast.
+        // Create a project from the picker's typed name: (name, parent).
         let action = gio::SimpleAction::new(
             "home-project-create",
             Some(glib::VariantTy::new("(ss)").expect("a (name, parent) tuple")),
@@ -1287,9 +1525,10 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         app.window.add_action(&action);
     }
     {
+        // The picker's "Choose folder…": add a folder anywhere.
         let app = app.clone();
         add(
-            "home-add-project",
+            "home-import-dialog",
             Box::new(move || home::add_project_dialog(&app)),
         );
     }
@@ -2665,7 +2904,8 @@ impl App {
         self.sync_toggles();
     }
 
-    /// Leave the current Home drill-down and return to the cockpit.
+    /// Leave the current Home drill-down and return to the cockpit. The picker
+    /// is a separate stack page, so Back from it shows the cockpit explicitly.
     fn home_back(self: &Rc<Self>) {
         gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
         self.home_nav.borrow_mut().pop();
@@ -2673,8 +2913,12 @@ impl App {
             self.show_home();
             return;
         }
-        self.stack.set_visible_child_name("_home");
-        self.refresh_home();
+        if matches!(self.home_nav.borrow().last(), Some(HomeView::AddProject)) {
+            self.stack.set_visible_child_name("_add");
+        } else {
+            self.stack.set_visible_child_name("_home");
+            self.refresh_home();
+        }
     }
 
     /// Edit a card's title and body through a small store-backed dialog.
@@ -3131,7 +3375,7 @@ impl App {
         if projects.is_empty() {
             // With no projects Home is the empty state — unless a drill-down
             // (New project) is up over it.
-            if matches!(app.home_nav.borrow().last(), Some(HomeView::NewProject)) {
+            if matches!(app.home_nav.borrow().last(), Some(HomeView::AddProject)) {
                 app.sync_toggles();
             } else {
                 app.show_home();
@@ -3280,22 +3524,17 @@ impl App {
         if !self.home_shown.get() {
             return;
         }
+        // The Add-a-project picker is its own stack page and keeps its own
+        // state (search text, scroll); refresh it by staying on it.
+        if matches!(self.home_nav.borrow().last(), Some(HomeView::AddProject)) {
+            self.stack.set_visible_child_name("_add");
+            return;
+        }
         if self.stack.visible_child_name().as_deref() != Some("_home") {
             return;
         }
-        // With no projects the empty state stands in for the cockpit — but a
-        // drill-down (New project) can still be on screen above it.
+        // With no projects the empty state stands in for the cockpit.
         if self.projects.borrow().is_empty() && self.home_nav.borrow().is_empty() {
-            return;
-        }
-        if matches!(self.home_nav.borrow().last(), Some(HomeView::NewProject))
-            && self
-                .stack
-                .child_by_name("_home")
-                .is_some_and(|view| view.has_css_class("home-new-project"))
-        {
-            // A form is not live status: keep its inputs even after they lose
-            // focus to Browse/Create or a status update arrives.
             return;
         }
         // Passive updates must not destroy an unfinished to-do or reply.
@@ -3325,10 +3564,122 @@ impl App {
         self.stack.set_visible_child_name("_home");
     }
 
-    /// Open Home's New-project view, switching to Home from wherever we are.
-    fn open_home_new_project(self: &Rc<Self>) {
-        if !matches!(self.home_nav.borrow().last(), Some(HomeView::NewProject)) {
-            self.enter_home_view(HomeView::NewProject);
+    /// Open Home's combined Add-a-project picker, switching to Home from
+    /// wherever we are. Existing folders it finds get an Add; a typed name
+    /// that is not an existing folder gets a Create.
+    fn open_home_add(self: &Rc<Self>) {
+        gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
+        self.home_shown.set(true);
+        *self.current.borrow_mut() = None;
+        if !matches!(self.home_nav.borrow().last(), Some(HomeView::AddProject)) {
+            self.home_nav.borrow_mut().push(HomeView::AddProject);
+        }
+        self.stack.set_visible_child_name("_add");
+        self.sync_toggles();
+        self.rescan_add();
+        App::render_add_results(self, &self.add_search.text());
+        self.add_search.grab_focus();
+    }
+
+    /// Scan the picker's root for folders to add, off the main thread. The
+    /// drainer re-renders the list when the results arrive.
+    fn rescan_add(&self) {
+        let root = self.add_root.borrow().clone();
+        let tx = self.add_tx.clone();
+        std::thread::spawn(move || {
+            let found = discover::scan(&root, 3, 800);
+            let _ = tx.send((root, found));
+        });
+    }
+
+    /// Rebuild the picker's list for the query: registered projects it matches
+    /// (open), a Create row for a typed name that does not exist yet, and
+    /// folders found under the scan root that are not projects yet (add).
+    fn render_add_results(app: &SharedApp, query: &str) {
+        while let Some(child) = app.add_list.first_child() {
+            app.add_list.remove(&child);
+        }
+        let query = query.trim();
+        let root = app.add_root.borrow().clone();
+
+        // Create: a bare, valid folder name that is not already on disk.
+        if !query.is_empty() && home::valid_project_folder_name(query) && !root.join(query).exists()
+        {
+            let (row, create) = add_row(
+                &format!("Create “{query}”"),
+                &format!("new folder in {}", crate::db::abbreviate(&root)),
+                "Create",
+                "folder-new-symbolic",
+            );
+            let app_for_create = app.clone();
+            let name = query.to_string();
+            create.connect_clicked(move |_| {
+                let parent = app_for_create
+                    .add_root
+                    .borrow()
+                    .to_string_lossy()
+                    .to_string();
+                home::create_project_from_fields(&app_for_create, &name, &parent);
+            });
+            app.add_list.append(&row);
+        }
+
+        // Registered projects that match the query: open them.
+        let matcher = fuzzy_matcher::skim::SkimMatcherV2::default().ignore_case();
+        use fuzzy_matcher::FuzzyMatcher;
+        let projects = app.projects.borrow();
+        for project in projects.iter() {
+            if !query.is_empty()
+                && matcher.fuzzy_match(&project.name, query).is_none()
+                && matcher
+                    .fuzzy_match(&project.display_path(), query)
+                    .is_none()
+            {
+                continue;
+            }
+            let (row, open) = add_row(
+                &project.name,
+                &project.display_path(),
+                "Open",
+                "folder-symbolic",
+            );
+            let app_for_open = app.clone();
+            let project_id = project.id;
+            open.connect_clicked(move |_| app_for_open.open_home_project(project_id));
+            app.add_list.append(&row);
+        }
+        drop(projects);
+
+        // Folders under the root that are not projects yet: add them.
+        let known: Vec<PathBuf> = app
+            .db
+            .projects()
+            .map(|projects| projects.into_iter().map(|p| p.path).collect())
+            .unwrap_or_default();
+        let mut all = app.add_candidates.borrow().clone();
+        discover::mark_known(&mut all, &known);
+        let matches: Vec<Candidate> = discover::filter(&all, query)
+            .into_iter()
+            .filter(|candidate| !candidate.known)
+            .collect();
+        for candidate in matches {
+            let trailing = if candidate.is_repo {
+                "git · Add"
+            } else {
+                "Add"
+            };
+            let (row, add) = add_row(
+                &candidate.name,
+                &candidate.display_path(),
+                trailing,
+                "folder-symbolic",
+            );
+            let app_for_add = app.clone();
+            let path = candidate.path.clone();
+            add.connect_clicked(move |_| {
+                app_for_add.import_home_project(&path);
+            });
+            app.add_list.append(&row);
         }
     }
 
@@ -5660,33 +6011,32 @@ mod home_navigation_tests {
         );
         assert!(folder.is_dir(), "archive never deletes project files");
         assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
-        activate(&window, "win.home-new-project", None);
-        assert!(stack
-            .child_by_name("_home")
-            .unwrap()
-            .has_css_class("home-new-project"));
-        let form = stack.child_by_name("_home").unwrap();
-        let name = widgets(&form)
+        // The combined picker covers new and existing: it opens as its own
+        // Home view, and typing a name that is not on disk offers Create.
+        activate(&window, "win.home-add-project", None);
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_add"));
+        let add_view = stack.child_by_name("_add").unwrap();
+        let search = widgets(&add_view)
             .into_iter()
-            .filter_map(|widget| widget.downcast::<gtk::Entry>().ok())
-            .find(|entry| entry.placeholder_text().as_deref() == Some("Project name"))
+            .find_map(|widget| widget.downcast::<gtk::SearchEntry>().ok())
             .unwrap();
-        name.set_text("Draft project");
-        activate(&window, "win.refresh", None);
-        assert_eq!(name.text().as_str(), "Draft project");
-        assert_eq!(
-            stack.child_by_name("_home").unwrap(),
-            form,
-            "background refresh retains the form"
+        search.set_text("picker-created-xyz");
+        search.emit_by_name::<()>("search-changed", &[]);
+        drain();
+        assert!(
+            widgets(&add_view)
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                .any(|button| {
+                    widgets(button.upcast_ref())
+                        .into_iter()
+                        .filter_map(|widget| widget.downcast::<gtk::Label>().ok())
+                        .any(|label| label.text().as_str() == "Create")
+                }),
+            "a typed new name offers a Create row"
         );
         activate(&window, "win.home-back", None);
-        assert!(
-            !stack
-                .child_by_name("_home")
-                .unwrap()
-                .has_css_class("home-new-project"),
-            "Back on an empty workspace restores the empty Home"
-        );
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
 
         activate(
             &window,
@@ -5707,7 +6057,6 @@ mod home_navigation_tests {
             db.project(project.id).unwrap().unwrap().name,
             "Renamed demo"
         );
-        activate(&window, "win.home-new-project", None);
         activate(
             &window,
             "win.home-project-create",

@@ -33,7 +33,7 @@ use crate::session::activity::{
 /// state when there is not.
 pub fn panel(app: &SharedApp) -> gtk::Widget {
     if app.projects.borrow().is_empty() {
-        empty_panel(app)
+        empty_panel()
     } else {
         view(app)
     }
@@ -99,7 +99,6 @@ pub fn cockpit(app: &App) -> gtk::Widget {
 
     needs_you_section(app, &content, &needs);
     projects_section(app, &content, &projects);
-    footer(app, &content);
 
     scroll.set_child(Some(&content));
     scroll.set_hexpand(true);
@@ -113,7 +112,7 @@ pub fn view(app: &App) -> gtk::Widget {
     match app.home_nav.borrow().last().cloned() {
         Some(super::HomeView::Project(project_id)) => project_view(app, project_id),
         Some(super::HomeView::Card(project_id, card_id)) => card_view(app, project_id, &card_id),
-        Some(super::HomeView::NewProject) => new_project_view(app),
+        Some(super::HomeView::AddProject) => cockpit(app),
         None => cockpit(app),
     }
 }
@@ -161,165 +160,6 @@ fn view_header(title: &str, meta: Option<&str>) -> gtk::Widget {
         bar.append(&meta);
     }
     bar.upcast()
-}
-
-// ---- New project ----
-
-/// Create a project as a Home drill-down: name it, choose the parent folder,
-/// and create. No dialog window — the form is a card, and **Create** runs the
-/// same store-backed flow the header button used to open.
-fn new_project_view(app: &App) -> gtk::Widget {
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    root.add_css_class("home-view");
-    root.add_css_class("home-new-project");
-    root.append(&view_header(
-        "New project",
-        Some("A new folder with git initialized"),
-    ));
-
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.add_css_class("home-cockpit");
-    content.add_css_class("project-view");
-    content.set_vexpand(true);
-    content.set_margin_top(16);
-    content.set_margin_bottom(20);
-    content.set_margin_start(22);
-    content.set_margin_end(22);
-    content.set_halign(gtk::Align::Fill);
-    content.set_hexpand(true);
-
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    card.add_css_class("lane");
-    card.set_valign(gtk::Align::Start);
-    card.set_hexpand(true);
-
-    let name = gtk::Entry::builder()
-        .placeholder_text("Project name")
-        .build();
-    name.add_css_class("todo-add");
-    card.append(&name);
-
-    let parent_label = gtk::Label::new(Some("Parent folder"));
-    parent_label.add_css_class("lane-section");
-    parent_label.set_xalign(0.0);
-    card.append(&parent_label);
-
-    let parent = gtk::Entry::new();
-    let default_parent = app
-        .db
-        .ui_prefs()
-        .map(|prefs| prefs.resolved_add_root())
-        .unwrap_or_else(|_| crate::config::default_project_root());
-    parent.set_text(&default_parent.to_string_lossy());
-    parent.set_placeholder_text(Some("Parent folder"));
-    let parent_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    parent.set_hexpand(true);
-    parent_row.append(&parent);
-    let browse = gtk::Button::with_label("Choose…");
-    browse.add_css_class("flat");
-    parent_row.append(&browse);
-    card.append(&parent_row);
-
-    let note = gtk::Label::new(Some(
-        "Creates the folder and runs git init. No agent is started.",
-    ));
-    note.set_wrap(true);
-    note.set_xalign(0.0);
-    note.add_css_class("caption");
-    note.add_css_class("dim-label");
-    card.append(&note);
-
-    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    buttons.set_halign(gtk::Align::End);
-    let create = gtk::Button::with_label("Create project");
-    create.add_css_class("suggested-action");
-    buttons.append(&create);
-    card.append(&buttons);
-
-    // Browse for the parent with the platform's folder chooser; the path stays
-    // editable, so typing is always an option.
-    let window = app.window.clone();
-    let parent_for_browse = parent.clone();
-    browse.connect_clicked(move |_| {
-        #[allow(deprecated)]
-        let chooser = gtk::FileChooserDialog::new(
-            Some("Choose parent folder"),
-            Some(&window),
-            gtk::FileChooserAction::SelectFolder,
-            &[
-                ("Cancel", gtk::ResponseType::Cancel),
-                ("Choose", gtk::ResponseType::Accept),
-            ],
-        );
-        let parent = parent_for_browse.clone();
-        #[allow(deprecated)]
-        chooser.connect_response(move |chooser, response| {
-            if response == gtk::ResponseType::Accept {
-                if let Some(path) = chooser.file().and_then(|file| file.path()) {
-                    parent.set_text(&path.to_string_lossy());
-                }
-            }
-            chooser.close();
-        });
-        chooser.present();
-    });
-
-    // The store-backed create runs as a window action: validation errors toast
-    // there, and success lands in the new project's own Home view.
-    let window = app.window.clone();
-    let name_for_create = name.clone();
-    let parent_for_create = parent.clone();
-    create.connect_clicked(move |_| {
-        let _ = gtk::prelude::WidgetExt::activate_action(
-            &window,
-            "win.home-project-create",
-            Some(
-                &(
-                    name_for_create.text().to_string(),
-                    parent_for_create.text().to_string(),
-                )
-                    .to_variant(),
-            ),
-        );
-    });
-    name.connect_activate(move |_| create.emit_clicked());
-
-    content.append(&card);
-
-    // Already have the folder? Import it without touching its files.
-    let have = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    have.add_css_class("lane");
-    have.set_valign(gtk::Align::Start);
-    have.set_hexpand(true);
-    let have_title = gtk::Label::new(Some("Already have a folder?"));
-    have_title.add_css_class("caption-heading");
-    have_title.set_xalign(0.0);
-    have.append(&have_title);
-    let have_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let have_sub = gtk::Label::new(Some(
-        "Add a folder you already have — its files are left untouched.",
-    ));
-    have_sub.add_css_class("caption");
-    have_sub.add_css_class("dim-label");
-    have_sub.set_xalign(0.0);
-    have_sub.set_hexpand(true);
-    have_sub.set_wrap(true);
-    have_row.append(&have_sub);
-    let import = gtk::Button::with_label("Add existing folder…");
-    import.add_css_class("flat");
-    import.set_valign(gtk::Align::Center);
-    import.set_action_name(Some("win.home-add-project"));
-    have_row.append(&import);
-    have.append(&have_row);
-    content.append(&have);
-
-    root.append(&content);
-
-    let name_for_focus = name.clone();
-    gtk::glib::idle_add_local_once(move || {
-        name_for_focus.grab_focus();
-    });
-    root.upcast()
 }
 
 // ---- Needs you ----
@@ -561,8 +401,8 @@ fn projects_section(app: &App, content: &gtk::Box, projects: &[Project]) {
     append_heading(content, "Projects", Some(&trailing));
 
     // The way a project is born leads the section: a big plus card, above the
-    // project cards, that drills into Home's New-project form.
-    content.append(&new_project_card(app));
+    // project cards, that opens Home's Add-a-project picker.
+    content.append(&add_project_card(app));
 
     let grid = gtk::FlowBox::new();
     grid.set_selection_mode(gtk::SelectionMode::None);
@@ -582,15 +422,16 @@ fn projects_section(app: &App, content: &gtk::Box, projects: &[Project]) {
 }
 
 /// The way a project is born, leading the Projects section: one big dashed
-/// card that drills into Home's **New project** form — no separate window.
-fn new_project_card(app: &App) -> gtk::Widget {
+/// card that opens Home's combined Add-a-project picker — add a folder you
+/// already have, or type a name to create one.
+fn add_project_card(app: &App) -> gtk::Widget {
     let _ = app;
     let button = gtk::Button::new();
     button.add_css_class("add-project-card");
     button.set_halign(gtk::Align::Fill);
     button.set_hexpand(true);
-    button.set_tooltip_text(Some("Create a folder and initialize a git repository"));
-    button.set_action_name(Some("win.home-new-project"));
+    button.set_tooltip_text(Some("Create a new folder, or add one you already have"));
+    button.set_action_name(Some("win.home-add-project"));
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     let plus = gtk::Image::from_icon_name("list-add-symbolic");
@@ -601,11 +442,11 @@ fn new_project_card(app: &App) -> gtk::Widget {
     let texts = gtk::Box::new(gtk::Orientation::Vertical, 0);
     texts.set_hexpand(true);
     texts.set_valign(gtk::Align::Center);
-    let title = gtk::Label::new(Some("New project"));
+    let title = gtk::Label::new(Some("Add a project"));
     title.add_css_class("heading");
     title.set_xalign(0.0);
     texts.append(&title);
-    let sub = gtk::Label::new(Some("Create a folder and initialize a git repository"));
+    let sub = gtk::Label::new(Some("Create a new folder, or find one you already have"));
     sub.add_css_class("caption");
     sub.add_css_class("dim-label");
     sub.set_xalign(0.0);
@@ -1391,27 +1232,6 @@ fn append_heading(content: &gtk::Box, text: &str, trailing: Option<&str>) {
     content.append(&row);
 }
 
-/// A quiet setup affordance at the foot of the cockpit: the everyday Home is
-/// the work, but the first-run tools stay one click away.
-fn footer(app: &App, content: &gtk::Box) {
-    let _ = app;
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    row.set_margin_top(8);
-    let hint = gtk::Label::new(Some(
-        "Workspace setup, programs and layout live in Preferences",
-    ));
-    hint.add_css_class("caption");
-    hint.add_css_class("dim-label");
-    hint.set_xalign(0.0);
-    hint.set_hexpand(true);
-    row.append(&hint);
-    let prefs = gtk::Button::with_label("Preferences");
-    prefs.add_css_class("flat");
-    prefs.set_action_name(Some("win.preferences"));
-    row.append(&prefs);
-    content.append(&row);
-}
-
 fn project_name(app: &App, project_id: i64) -> String {
     app.projects
         .borrow()
@@ -1425,7 +1245,7 @@ fn project_name(app: &App, project_id: i64) -> String {
 
 /// A project-first empty state: create new work or find an existing folder.
 /// Tool programs and layout remain in Preferences.
-fn empty_panel(app: &SharedApp) -> gtk::Widget {
+fn empty_panel() -> gtk::Widget {
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
@@ -1463,26 +1283,16 @@ fn empty_panel(app: &SharedApp) -> gtk::Widget {
     brand.append(&tagline);
     content.append(&brand);
 
-    // The two ways forward.
+    // One way forward: the Add-a-project picker covers new and existing.
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     actions.set_halign(gtk::Align::Center);
-    let new_project = gtk::Button::with_label("New project…");
-    new_project.add_css_class("suggested-action");
-    new_project.add_css_class("pill");
-    new_project.set_tooltip_text(Some(
-        "Create a folder, run git init in it, and open it as a project",
-    ));
-    new_project.set_action_name(Some("win.home-new-project"));
-    actions.append(&new_project);
-    let find = gtk::Button::with_label("Add existing folder…");
-    find.add_css_class("pill");
-    find.set_action_name(Some("win.home-add-project"));
-    find.set_tooltip_text(Some(
-        "Add a folder you already have — its files are left untouched",
-    ));
-    actions.append(&find);
+    let add = gtk::Button::with_label("Add a project…");
+    add.add_css_class("suggested-action");
+    add.add_css_class("pill");
+    add.set_tooltip_text(Some("Create a new folder, or add one you already have"));
+    add.set_action_name(Some("win.home-add-project"));
+    actions.append(&add);
     content.append(&actions);
-    footer(app, &content);
 
     scroll.set_child(Some(&content));
     scroll.upcast()
@@ -1542,7 +1352,7 @@ pub(super) fn create_project_from_fields(app: &SharedApp, name: &str, parent: &s
     create_project(app, path);
 }
 
-fn valid_project_folder_name(name: &str) -> bool {
+pub(super) fn valid_project_folder_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }
 
