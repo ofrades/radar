@@ -18,10 +18,11 @@ use parking_lot::Mutex;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use super::activity::{
-    ActivityEvent, ActivityJournal, ActivityReceiveError, ActivitySnapshot, ActivitySubscription,
-    Attention, AttentionMutationResult, ChangeAttention, CreateAttention, CreateAttentionResult,
-    PublishActivity, WatchResult,
+    ActivityEvent, ActivityJournal, ActivityKind, ActivityPayload, ActivityReceiveError,
+    ActivitySnapshot, ActivitySubscription, Attention, AttentionMutationResult, ChangeAttention,
+    CreateAttention, CreateAttentionResult, PublishActivity, WatchResult,
 };
+use super::board_store::{BoardChange, BoardState, BoardStore};
 use super::catalog::{self, CatalogFilter, SessionCatalog};
 use super::registry::{
     Feedback, History, Lifecycle, Output, ReceiveError, Registry, Sequenced, Snapshot, Spawn,
@@ -116,6 +117,66 @@ pub enum Command {
         provider: String,
         provider_session_id: String,
     },
+    /// The whole board for a project: its lanes and cards, from the store.
+    /// `path` is the project root, used once to import a legacy `BOARD.md`.
+    BoardState {
+        project_id: i64,
+        path: PathBuf,
+    },
+    CardAdd {
+        project_id: i64,
+        lane: Option<String>,
+        title: String,
+        body: String,
+        claim: Option<String>,
+        command_id: String,
+    },
+    CardUpdate {
+        project_id: i64,
+        card_id: String,
+        title: Option<String>,
+        body: Option<String>,
+        expected_revision: Option<u64>,
+        command_id: String,
+    },
+    CardMove {
+        project_id: i64,
+        card_id: String,
+        lane: String,
+        expected_revision: Option<u64>,
+        command_id: String,
+    },
+    CardClaim {
+        project_id: i64,
+        card_id: String,
+        claim: Option<String>,
+        expected_revision: Option<u64>,
+        command_id: String,
+    },
+    CardComplete {
+        project_id: i64,
+        card_id: String,
+        expected_revision: Option<u64>,
+        command_id: String,
+    },
+    CardReopen {
+        project_id: i64,
+        card_id: String,
+        expected_revision: Option<u64>,
+        command_id: String,
+    },
+    CardRemove {
+        project_id: i64,
+        card_id: String,
+        command_id: String,
+    },
+    /// Claim the first unclaimed card, optionally within one lane.
+    CardNext {
+        project_id: i64,
+        who: String,
+        lane: Option<String>,
+        command_id: String,
+    },
 }
 
 /// A project as the catalog knows it: the client supplies the roster, since
@@ -155,6 +216,9 @@ pub enum Response {
     AttentionChanged(AttentionMutationResult),
     AttentionStatus(Attention),
     Catalog(Vec<super::catalog::Entry>),
+    BoardState(BoardState),
+    CardChanged(Box<BoardChange>),
+    CardNext(Option<Box<BoardChange>>),
 }
 
 /// Socket directory is private even when the surrounding RADAR_HOME is shared.
@@ -169,6 +233,7 @@ pub struct Server {
     registry: Arc<Registry>,
     activity: Arc<ActivityJournal>,
     catalog: Arc<SessionCatalog>,
+    board: Arc<BoardStore>,
     /// Last provider-history refresh per project root.
     imports: Arc<Mutex<HashMap<PathBuf, Instant>>>,
     stopping: Arc<AtomicBool>,
@@ -194,6 +259,7 @@ impl Server {
         }
         let activity = Arc::new(ActivityJournal::open(&directory.join("activity.sqlite"))?);
         let catalog = Arc::new(SessionCatalog::open(&directory.join("catalog.sqlite"))?);
+        let board = Arc::new(BoardStore::open(&directory.join("board.sqlite"))?);
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -209,23 +275,13 @@ impl Server {
             registry: Arc::new(Registry::default()),
             activity,
             catalog,
+            board,
             imports: Arc::new(Mutex::new(HashMap::new())),
             stopping: Arc::new(AtomicBool::new(false)),
         })
     }
 
     pub fn run(self) -> Result<()> {
-        let home = self
-            .path
-            .parent()
-            .and_then(|run_dir| run_dir.parent())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        let monitor_activity = self.activity.clone();
-        let monitor_stopping = self.stopping.clone();
-        let board_monitor = std::thread::Builder::new()
-            .name("radar-board-monitor".into())
-            .spawn(move || super::board_monitor::run(&home, monitor_activity, monitor_stopping))?;
         let mut workers = Vec::new();
         while !self.stopping.load(Ordering::Acquire) {
             workers.retain(|worker: &std::thread::JoinHandle<()>| !worker.is_finished());
@@ -241,13 +297,20 @@ impl Server {
                     let registry = self.registry.clone();
                     let activity = self.activity.clone();
                     let catalog = self.catalog.clone();
+                    let board = self.board.clone();
                     let imports = self.imports.clone();
                     let stopping = self.stopping.clone();
                     workers.push(std::thread::spawn(move || {
                         let mut stream = stream;
-                        if let Err(error) =
-                            serve(&mut stream, registry, activity, catalog, imports, stopping)
-                        {
+                        if let Err(error) = serve(
+                            &mut stream,
+                            registry,
+                            activity,
+                            catalog,
+                            board,
+                            imports,
+                            stopping,
+                        ) {
                             let _ = write_frame(
                                 &mut stream,
                                 &Response::Error(error.to_string()),
@@ -266,7 +329,6 @@ impl Server {
         for worker in workers {
             let _ = worker.join();
         }
-        let _ = board_monitor.join();
         Ok(())
     }
 }
@@ -284,6 +346,7 @@ fn serve(
     registry: Arc<Registry>,
     activity: Arc<ActivityJournal>,
     catalog: Arc<SessionCatalog>,
+    board: Arc<BoardStore>,
     imports: Arc<Mutex<HashMap<PathBuf, Instant>>>,
     stopping: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -416,6 +479,110 @@ fn serve(
             )?;
             Response::Ok
         }
+        Command::BoardState { project_id, path } => {
+            // Import a legacy markdown board once, before the first read.
+            if !board.is_initialized(project_id).unwrap_or(true) {
+                if let Ok(parsed) = crate::board::load(&path) {
+                    let _ = board.import(project_id, &parsed);
+                }
+            }
+            Response::BoardState(board.state(project_id)?)
+        }
+        Command::CardAdd {
+            project_id,
+            lane,
+            title,
+            body,
+            claim,
+            command_id,
+        } => {
+            let change =
+                board.add_card(project_id, lane.as_deref(), &title, &body, claim.as_deref())?;
+            publish_board_change(&activity, project_id, &command_id, &change)?;
+            Response::CardChanged(Box::new(change))
+        }
+        Command::CardUpdate {
+            project_id,
+            card_id,
+            title,
+            body,
+            expected_revision,
+            command_id,
+        } => {
+            let change = board.update_card(
+                project_id,
+                &card_id,
+                title.as_deref(),
+                body.as_deref(),
+                expected_revision,
+            )?;
+            publish_board_change(&activity, project_id, &command_id, &change)?;
+            Response::CardChanged(Box::new(change))
+        }
+        Command::CardMove {
+            project_id,
+            card_id,
+            lane,
+            expected_revision,
+            command_id,
+        } => {
+            let change = board.move_card(project_id, &card_id, &lane, expected_revision)?;
+            publish_board_change(&activity, project_id, &command_id, &change)?;
+            Response::CardChanged(Box::new(change))
+        }
+        Command::CardClaim {
+            project_id,
+            card_id,
+            claim,
+            expected_revision,
+            command_id,
+        } => {
+            let change =
+                board.claim_card(project_id, &card_id, claim.as_deref(), expected_revision)?;
+            publish_board_change(&activity, project_id, &command_id, &change)?;
+            Response::CardChanged(Box::new(change))
+        }
+        Command::CardComplete {
+            project_id,
+            card_id,
+            expected_revision,
+            command_id,
+        } => {
+            let change = board.complete_card(project_id, &card_id, expected_revision)?;
+            publish_board_change(&activity, project_id, &command_id, &change)?;
+            Response::CardChanged(Box::new(change))
+        }
+        Command::CardReopen {
+            project_id,
+            card_id,
+            expected_revision,
+            command_id,
+        } => {
+            let change = board.reopen_card(project_id, &card_id, expected_revision)?;
+            publish_board_change(&activity, project_id, &command_id, &change)?;
+            Response::CardChanged(Box::new(change))
+        }
+        Command::CardRemove {
+            project_id,
+            card_id,
+            command_id,
+        } => {
+            let change = board.remove_card(project_id, &card_id)?;
+            publish_board_change(&activity, project_id, &command_id, &change)?;
+            Response::CardChanged(Box::new(change))
+        }
+        Command::CardNext {
+            project_id,
+            who,
+            lane,
+            command_id,
+        } => {
+            let result = board.next_card(project_id, &who, lane.as_deref())?;
+            if let Some(change) = &result {
+                publish_board_change(&activity, project_id, &command_id, change)?;
+            }
+            Response::CardNext(result.map(Box::new))
+        }
         Command::PublishActivity(input) => Response::ActivityPublished(activity.publish(input)?),
         Command::CreateAttention(input) => {
             Response::AttentionCreated(activity.create_attention(input)?)
@@ -495,6 +662,32 @@ fn serve(
         }
     };
     write_frame(stream, &response, MAX_RESPONSE)
+}
+
+/// Publish the `BoardChanged` activity event a card mutation produced, so
+/// every watcher — Home, the board pane, the web client — refreshes through
+/// the stream it already listens to.
+fn publish_board_change(
+    activity: &ActivityJournal,
+    project_id: i64,
+    command_id: &str,
+    change: &BoardChange,
+) -> Result<()> {
+    activity.publish(PublishActivity {
+        project_id,
+        command_id: command_id.to_string(),
+        session_id: None,
+        card_id: Some(change.card.id.clone()),
+        kind: ActivityKind::BoardChanged,
+        payload: ActivityPayload::BoardChanged {
+            action: change.action.clone(),
+            card_id: Some(change.card.id.clone()),
+            title: Some(change.card.title.clone()),
+            column: Some(change.card.lane.clone()),
+            from_column: change.from_lane.clone(),
+        },
+    })?;
+    Ok(())
 }
 
 fn stream_events<T>(
@@ -758,6 +951,224 @@ fn read_frame<T: DeserializeOwned>(reader: &mut impl Read, limit: usize) -> Resu
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Client helpers for the board store, so CLI, GUI and guard share one call
+/// shape. Each ensures the daemon is running first.
+fn board_request(home: &Path, command: Command) -> Result<Response> {
+    ensure_running(home)?;
+    match Client::request(home, command)? {
+        Response::Error(message) => bail!("{message}"),
+        response => Ok(response),
+    }
+}
+
+pub fn board_state(home: &Path, project_id: i64, path: &Path) -> Result<BoardState> {
+    match board_request(
+        home,
+        Command::BoardState {
+            project_id,
+            path: path.to_path_buf(),
+        },
+    )? {
+        Response::BoardState(state) => Ok(state),
+        other => bail!("unexpected board response: {other:?}"),
+    }
+}
+
+/// Like [`board_state`], but never starts the daemon. An edit-time gate runs on
+/// every tool call and must fail open rather than pay to spawn a daemon; a
+/// connection error means "cannot judge", and the caller allows the edit.
+pub fn board_state_quick(home: &Path, project_id: i64, path: &Path) -> Result<BoardState> {
+    match Client::request(
+        home,
+        Command::BoardState {
+            project_id,
+            path: path.to_path_buf(),
+        },
+    )? {
+        Response::BoardState(state) => Ok(state),
+        Response::Error(message) => bail!("{message}"),
+        other => bail!("unexpected board response: {other:?}"),
+    }
+}
+
+pub fn board_card_add(
+    home: &Path,
+    project_id: i64,
+    lane: Option<&str>,
+    title: &str,
+    body: &str,
+    claim: Option<&str>,
+    command_id: &str,
+) -> Result<BoardChange> {
+    match board_request(
+        home,
+        Command::CardAdd {
+            project_id,
+            lane: lane.map(str::to_string),
+            title: title.to_string(),
+            body: body.to_string(),
+            claim: claim.map(str::to_string),
+            command_id: command_id.to_string(),
+        },
+    )? {
+        Response::CardChanged(change) => Ok(*change),
+        other => bail!("unexpected board response: {other:?}"),
+    }
+}
+
+pub fn board_card_update(
+    home: &Path,
+    project_id: i64,
+    card_id: &str,
+    title: Option<&str>,
+    body: Option<&str>,
+    expected_revision: Option<u64>,
+    command_id: &str,
+) -> Result<BoardChange> {
+    match board_request(
+        home,
+        Command::CardUpdate {
+            project_id,
+            card_id: card_id.to_string(),
+            title: title.map(str::to_string),
+            body: body.map(str::to_string),
+            expected_revision,
+            command_id: command_id.to_string(),
+        },
+    )? {
+        Response::CardChanged(change) => Ok(*change),
+        other => bail!("unexpected board response: {other:?}"),
+    }
+}
+
+pub fn board_card_move(
+    home: &Path,
+    project_id: i64,
+    card_id: &str,
+    lane: &str,
+    expected_revision: Option<u64>,
+    command_id: &str,
+) -> Result<BoardChange> {
+    match board_request(
+        home,
+        Command::CardMove {
+            project_id,
+            card_id: card_id.to_string(),
+            lane: lane.to_string(),
+            expected_revision,
+            command_id: command_id.to_string(),
+        },
+    )? {
+        Response::CardChanged(change) => Ok(*change),
+        other => bail!("unexpected board response: {other:?}"),
+    }
+}
+
+pub fn board_card_claim(
+    home: &Path,
+    project_id: i64,
+    card_id: &str,
+    claim: Option<&str>,
+    expected_revision: Option<u64>,
+    command_id: &str,
+) -> Result<BoardChange> {
+    match board_request(
+        home,
+        Command::CardClaim {
+            project_id,
+            card_id: card_id.to_string(),
+            claim: claim.map(str::to_string),
+            expected_revision,
+            command_id: command_id.to_string(),
+        },
+    )? {
+        Response::CardChanged(change) => Ok(*change),
+        other => bail!("unexpected board response: {other:?}"),
+    }
+}
+
+pub fn board_card_complete(
+    home: &Path,
+    project_id: i64,
+    card_id: &str,
+    expected_revision: Option<u64>,
+    command_id: &str,
+) -> Result<BoardChange> {
+    match board_request(
+        home,
+        Command::CardComplete {
+            project_id,
+            card_id: card_id.to_string(),
+            expected_revision,
+            command_id: command_id.to_string(),
+        },
+    )? {
+        Response::CardChanged(change) => Ok(*change),
+        other => bail!("unexpected board response: {other:?}"),
+    }
+}
+
+pub fn board_card_reopen(
+    home: &Path,
+    project_id: i64,
+    card_id: &str,
+    expected_revision: Option<u64>,
+    command_id: &str,
+) -> Result<BoardChange> {
+    match board_request(
+        home,
+        Command::CardReopen {
+            project_id,
+            card_id: card_id.to_string(),
+            expected_revision,
+            command_id: command_id.to_string(),
+        },
+    )? {
+        Response::CardChanged(change) => Ok(*change),
+        other => bail!("unexpected board response: {other:?}"),
+    }
+}
+
+pub fn board_card_remove(
+    home: &Path,
+    project_id: i64,
+    card_id: &str,
+    command_id: &str,
+) -> Result<BoardChange> {
+    match board_request(
+        home,
+        Command::CardRemove {
+            project_id,
+            card_id: card_id.to_string(),
+            command_id: command_id.to_string(),
+        },
+    )? {
+        Response::CardChanged(change) => Ok(*change),
+        other => bail!("unexpected board response: {other:?}"),
+    }
+}
+
+pub fn board_card_next(
+    home: &Path,
+    project_id: i64,
+    who: &str,
+    lane: Option<&str>,
+    command_id: &str,
+) -> Result<Option<BoardChange>> {
+    match board_request(
+        home,
+        Command::CardNext {
+            project_id,
+            who: who.to_string(),
+            lane: lane.map(str::to_string),
+            command_id: command_id.to_string(),
+        },
+    )? {
+        Response::CardNext(change) => Ok(change.map(|change| *change)),
+        other => bail!("unexpected board response: {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +1239,7 @@ mod tests {
             Arc::new(Registry::default()),
             Arc::new(ActivityJournal::open_in_memory().unwrap()),
             Arc::new(SessionCatalog::open_in_memory().unwrap()),
+            Arc::new(BoardStore::open_in_memory().unwrap()),
             Arc::new(Mutex::new(HashMap::new())),
             stopping.clone(),
         )
@@ -854,6 +1266,7 @@ mod tests {
             registry.clone(),
             Arc::new(ActivityJournal::open_in_memory().unwrap()),
             Arc::new(SessionCatalog::open_in_memory().unwrap()),
+            Arc::new(BoardStore::open_in_memory().unwrap()),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(AtomicBool::new(false)),
         )
@@ -872,5 +1285,56 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(registry.list().is_empty());
+    }
+
+    #[test]
+    fn a_card_add_round_trips_and_publishes_a_board_event() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let board = Arc::new(BoardStore::open_in_memory().unwrap());
+        let activity = Arc::new(ActivityJournal::open_in_memory().unwrap());
+        write_frame(
+            &mut client,
+            &Request {
+                version: VERSION,
+                command: Command::CardAdd {
+                    project_id: 4,
+                    lane: None,
+                    title: "Fix login".into(),
+                    body: "the 302 loop".into(),
+                    claim: None,
+                    command_id: "cmd-add-1".into(),
+                },
+            },
+            MAX_REQUEST,
+        )
+        .unwrap();
+        serve(
+            &mut server,
+            Arc::new(Registry::default()),
+            activity.clone(),
+            Arc::new(SessionCatalog::open_in_memory().unwrap()),
+            board.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let response = read_frame::<Response>(&mut client, MAX_RESPONSE).unwrap();
+        let Response::CardChanged(change) = response else {
+            panic!("unexpected response: {response:?}");
+        };
+        assert_eq!(change.action, "added");
+        assert_eq!(change.card.title, "Fix login");
+        assert_eq!(change.card.lane, "Backlog");
+
+        // The mutation is visible in the store and published to the journal,
+        // which is how every watcher hears about it.
+        let state = board.state(4).unwrap();
+        assert_eq!(state.cards.len(), 1);
+        let snapshot = activity.snapshot(4, None, 50).unwrap();
+        assert!(snapshot.events.iter().any(|event| matches!(
+            &event.payload,
+            ActivityPayload::BoardChanged { action, column, .. }
+                if action == "added" && column.as_deref() == Some("Backlog")
+        )));
     }
 }

@@ -90,6 +90,52 @@ pub fn now_millis() -> i64 {
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
 }
+pub(crate) fn is_generic_session_title(
+    title: &str,
+    program: Option<&crate::programs::Program>,
+) -> bool {
+    let title = title.trim();
+    title.is_empty()
+        || [
+            "terminal",
+            "foot",
+            "ghostty",
+            "kitty",
+            "alacritty",
+            "wezterm",
+            "xterm",
+            "radar",
+        ]
+        .iter()
+        .any(|generic| title.eq_ignore_ascii_case(generic))
+        || program.is_some_and(|program| {
+            title.eq_ignore_ascii_case(&program.name)
+                || title.eq_ignore_ascii_case(&program.command)
+        })
+}
+
+/// Bump when the table below changes; add the next step to `SCHEMA_STEPS`.
+const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_STEPS: [&str; 1] = [r#"
+    CREATE TABLE IF NOT EXISTS sessions (
+        id                 INTEGER PRIMARY KEY,
+        project_id         INTEGER NOT NULL,
+        provider           TEXT NOT NULL,
+        provider_session_id TEXT NOT NULL,
+        radar_session_id   TEXT,
+        source             TEXT NOT NULL,
+        title              TEXT,
+        cwd                TEXT NOT NULL,
+        created_at         INTEGER NOT NULL,
+        last_activity_at   INTEGER NOT NULL,
+        ended_at           INTEGER,
+        lifecycle          TEXT NOT NULL,
+        archived_at        INTEGER,
+        UNIQUE(project_id, provider, provider_session_id)
+    );
+    CREATE INDEX IF NOT EXISTS sessions_activity
+        ON sessions(project_id, last_activity_at DESC);
+"#];
 
 impl SessionCatalog {
     pub fn open(path: &Path) -> Result<Self> {
@@ -113,26 +159,7 @@ impl SessionCatalog {
 
     fn initialize(conn: rusqlite::Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sessions (
-                id                 INTEGER PRIMARY KEY,
-                project_id         INTEGER NOT NULL,
-                provider           TEXT NOT NULL,
-                provider_session_id TEXT NOT NULL,
-                radar_session_id   TEXT,
-                source             TEXT NOT NULL,
-                title              TEXT,
-                cwd                TEXT NOT NULL,
-                created_at         INTEGER NOT NULL,
-                last_activity_at   INTEGER NOT NULL,
-                ended_at           INTEGER,
-                lifecycle          TEXT NOT NULL,
-                archived_at        INTEGER,
-                UNIQUE(project_id, provider, provider_session_id)
-            );
-            CREATE INDEX IF NOT EXISTS sessions_activity
-                ON sessions(project_id, last_activity_at DESC);",
-        )?;
+        super::schema::migrate(&conn, SCHEMA_VERSION, &SCHEMA_STEPS)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -175,9 +202,10 @@ impl SessionCatalog {
             .iter()
             .map(|status| (status.id.as_str(), status))
             .collect();
+        let mut programs = None;
         let stale = conn
             .prepare(
-                "SELECT id, radar_session_id, title, lifecycle FROM sessions
+                "SELECT id, radar_session_id, title, lifecycle, provider FROM sessions
                  WHERE radar_session_id IS NOT NULL",
             )?
             .query_map([], |row| {
@@ -186,11 +214,11 @@ impl SessionCatalog {
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        for (id, radar_id, title, lifecycle) in stale {
+        for (id, radar_id, title, lifecycle, provider) in stale {
             let Some(status) = live_by_id.get(radar_id.as_str()) else {
                 if lifecycle == "running" {
                     conn.execute(
@@ -200,16 +228,26 @@ impl SessionCatalog {
                 }
                 continue;
             };
-            let fresh_title = status
+            if let Some(fresh_title) = status
                 .title
                 .as_deref()
                 .map(str::trim)
-                .filter(|t| !t.is_empty());
-            if fresh_title != title.as_deref() {
-                conn.execute(
-                    "UPDATE sessions SET title = ?2, last_activity_at = ?3 WHERE id = ?1",
-                    params![id, fresh_title, now_ms],
-                )?;
+                .filter(|t| !t.is_empty())
+            {
+                if Some(fresh_title) != title.as_deref() {
+                    let programs = programs.get_or_insert_with(crate::programs::registry);
+                    let program = programs.iter().find(|program| program.id == provider);
+                    let replaces_real_title = is_generic_session_title(fresh_title, program)
+                        && title
+                            .as_deref()
+                            .is_some_and(|current| !is_generic_session_title(current, program));
+                    if !replaces_real_title {
+                        conn.execute(
+                            "UPDATE sessions SET title = ?2, last_activity_at = ?3 WHERE id = ?1",
+                            params![id, fresh_title, now_ms],
+                        )?;
+                    }
+                }
             }
             let record = match &status.lifecycle {
                 super::registry::Lifecycle::Running => {
@@ -312,28 +350,45 @@ impl SessionCatalog {
         let cwd_text = cwd.to_string_lossy().into_owned();
         let conn = self.conn.lock();
         let mut imported = 0;
+        let mut program = None;
+        let mut program_loaded = false;
         for session in sessions {
             let created = normalize_created_ms(session.created_ms);
             let activity = normalize_created_ms(session.last_activity_ms);
-            let bound = conn.execute(
-                "UPDATE sessions SET provider_session_id = ?4,
-                                       title = COALESCE(title, ?5),
-                                       last_activity_at = MAX(last_activity_at, ?6),
-                                       cwd = CASE WHEN cwd = '' THEN ?7 ELSE cwd END
-                 WHERE project_id = ?1 AND provider = ?2 AND source = 'radar'
-                   AND lifecycle = 'running'
-                   AND ABS(created_at - ?3) < 15000",
-                params![
-                    project_id,
-                    provider,
-                    created,
-                    session.id,
-                    session.title,
-                    activity,
-                    cwd_text
-                ],
-            )? > 0;
-            if bound {
+            // Provider history fills a generic terminal title, but leaves meaningful live
+            // titles authoritative.
+            let bound = conn
+                .query_row(
+                    "UPDATE sessions SET provider_session_id = ?4,
+                                         last_activity_at = MAX(last_activity_at, ?5),
+                                         cwd = CASE WHEN cwd = '' THEN ?6 ELSE cwd END
+                     WHERE project_id = ?1 AND provider = ?2 AND source = 'radar'
+                       AND lifecycle = 'running'
+                       AND ABS(created_at - ?3) < 15000
+                     RETURNING id, title",
+                    params![project_id, provider, created, session.id, activity, cwd_text],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?;
+            if let Some((id, existing_title)) = bound {
+                let replace_title = session.title.is_some()
+                    && match existing_title.as_deref() {
+                        None => true,
+                        Some(title) if is_generic_session_title(title, None) => true,
+                        Some(title) => {
+                            if !program_loaded {
+                                program = crate::programs::by_id(provider);
+                                program_loaded = true;
+                            }
+                            is_generic_session_title(title, program.as_ref())
+                        }
+                    };
+                if replace_title {
+                    conn.execute(
+                        "UPDATE sessions SET title = ?2 WHERE id = ?1",
+                        params![id, session.title],
+                    )?;
+                }
                 imported += 1;
                 continue;
             }
@@ -484,6 +539,16 @@ mod tests {
     use super::*;
     use crate::session::registry::Lifecycle;
 
+    #[test]
+    fn the_schema_is_versioned() {
+        let catalog = SessionCatalog::open_in_memory().unwrap();
+        let conn = catalog.conn.lock();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
     fn status(id: &str, lifecycle: Lifecycle, title: Option<&str>) -> Status {
         Status {
             id: id.to_string(),
@@ -578,6 +643,110 @@ mod tests {
         let rows = catalog.list(&[3], CatalogFilter::Active, None, 10).unwrap();
         assert_eq!(rows[0].lifecycle, "ended");
         assert_eq!(rows[0].ended_at, Some(3200));
+    }
+    #[test]
+    fn reconcile_keeps_conversation_title_over_generic_live_title() {
+        let catalog = catalog();
+        let radar_id = "project-3-agent-0-opencode";
+        let created_at = 1_700_000_050_000;
+        catalog
+            .record_radar(3, radar_id, "opencode", Path::new("/w"), created_at)
+            .unwrap();
+        catalog
+            .import_provider(
+                3,
+                "opencode",
+                Path::new("/w"),
+                &[Imported {
+                    id: "ses_42".into(),
+                    title: Some("Earlier work".into()),
+                    created_ms: created_at + 2_000,
+                    last_activity_ms: created_at + 2_000,
+                }],
+                created_at + 2_000,
+            )
+            .unwrap();
+
+        catalog
+            .reconcile(
+                &[status(radar_id, Lifecycle::Running, Some("OpenCode"))],
+                created_at + 3_000,
+            )
+            .unwrap();
+        let rows = catalog.list(&[3], CatalogFilter::Active, None, 10).unwrap();
+        assert_eq!(rows[0].title.as_deref(), Some("Earlier work"));
+
+        catalog
+            .reconcile(
+                &[status(radar_id, Lifecycle::Running, None)],
+                created_at + 4_000,
+            )
+            .unwrap();
+        let rows = catalog.list(&[3], CatalogFilter::Active, None, 10).unwrap();
+        assert_eq!(rows[0].title.as_deref(), Some("Earlier work"));
+
+        catalog
+            .reconcile(
+                &[status(radar_id, Lifecycle::Running, Some("New task"))],
+                created_at + 5_000,
+            )
+            .unwrap();
+        let rows = catalog.list(&[3], CatalogFilter::Active, None, 10).unwrap();
+        assert_eq!(rows[0].title.as_deref(), Some("New task"));
+    }
+    #[test]
+    fn provider_import_replaces_generic_but_preserves_real_live_title() {
+        let catalog = catalog();
+        let radar_id = "project-3-agent-0-opencode";
+        let created_at = 1_700_000_050_000;
+        catalog
+            .record_radar(3, radar_id, "opencode", Path::new("/w"), created_at)
+            .unwrap();
+        catalog
+            .reconcile(
+                &[status(radar_id, Lifecycle::Running, Some("OpenCode"))],
+                created_at + 1_000,
+            )
+            .unwrap();
+        catalog
+            .import_provider(
+                3,
+                "opencode",
+                Path::new("/w"),
+                &[Imported {
+                    id: "ses_42".into(),
+                    title: Some("Earlier work".into()),
+                    created_ms: created_at + 2_000,
+                    last_activity_ms: created_at + 2_000,
+                }],
+                created_at + 2_000,
+            )
+            .unwrap();
+
+        let rows = catalog.list(&[3], CatalogFilter::Active, None, 10).unwrap();
+        assert_eq!(rows[0].title.as_deref(), Some("Earlier work"));
+        catalog
+            .reconcile(
+                &[status(radar_id, Lifecycle::Running, Some("New task"))],
+                created_at + 3_000,
+            )
+            .unwrap();
+        catalog
+            .import_provider(
+                3,
+                "opencode",
+                Path::new("/w"),
+                &[Imported {
+                    id: "ses_42".into(),
+                    title: Some("Earlier work".into()),
+                    created_ms: created_at + 2_000,
+                    last_activity_ms: created_at + 3_000,
+                }],
+                created_at + 3_000,
+            )
+            .unwrap();
+        let rows = catalog.list(&[3], CatalogFilter::Active, None, 10).unwrap();
+        assert_eq!(rows[0].title.as_deref(), Some("New task"));
     }
 
     #[test]

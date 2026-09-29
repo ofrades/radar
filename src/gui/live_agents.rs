@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
+use anyhow::Context;
 use serde::Deserialize;
 
 use crate::db::Project;
@@ -11,6 +12,13 @@ use crate::session::daemon::{self, Client, Command, Response};
 use crate::session::registry::{Lifecycle, Status};
 
 use super::{parse_stable_session_id, Slot};
+
+pub(super) const ACTIVE_CATALOG_LIMIT: usize = 500;
+pub(super) const ARCHIVED_CATALOG_LIMIT: usize = 200;
+
+pub(super) fn catalog_history_is_limited(active_count: usize, archived_count: usize) -> bool {
+    active_count >= ACTIVE_CATALOG_LIMIT || archived_count >= ARCHIVED_CATALOG_LIMIT
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AgentSession {
@@ -35,17 +43,45 @@ pub(super) struct AgentSession {
     pub archived: bool,
 }
 
-/// How the sidebar orders and presents entries: the newest activity first,
-/// then title, then stable id — deterministic when timestamps tie.
+/// Whether an entry belongs in the running section of the sidebar.
+pub(super) fn sidebar_session_is_live(session: &AgentSession) -> bool {
+    session.running || session.external.is_some()
+}
+
+/// Sidebar ordering keeps running agents before recent history and archived
+/// history, then orders each section by activity and title.
 pub(super) fn sort_sidebar_sessions(sessions: &mut [(AgentSession, String)]) {
     sessions.sort_by_cached_key(|(session, title)| {
         (
+            !sidebar_session_is_live(session),
+            session.archived,
             std::cmp::Reverse(session.last_activity_at),
             title.to_lowercase(),
             session.program_id.to_lowercase(),
             session.id.clone(),
         )
     });
+}
+
+/// Match an agent's conversation title or provider name using the sidebar's
+/// fuzzy, case-insensitive search semantics.
+pub(super) fn matches_sidebar_query(session: &AgentSession, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+    use fuzzy_matcher::FuzzyMatcher;
+    let matcher = fuzzy_matcher::skim::SkimMatcherV2::default().ignore_case();
+    matcher.fuzzy_match(&session.title, query).is_some()
+        || matcher.fuzzy_match(&session.program_id, query).is_some()
+}
+
+/// History can only reopen when the provider supplied an exact conversation
+/// id and the selected program has a resume command.
+pub(super) fn can_open_sidebar_session(session: &AgentSession, program_can_resume: bool) -> bool {
+    session.external.is_some()
+        || (session.running && session.radar_session_id.is_some())
+        || (program_can_resume && exact_provider_session_id(session).is_some())
 }
 
 fn fallback_title(program_id: &str) -> String {
@@ -116,15 +152,81 @@ pub(super) struct ExternalTarget {
     pub window_pid: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DiscoverySnapshot {
+    pub sessions: Vec<AgentSession>,
+    pub history_limited: bool,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct SessionIndex {
+    pub by_project: HashMap<i64, Vec<AgentSession>>,
+    pub history_limited: bool,
+    pub has_snapshot: bool,
+    pub error: Option<String>,
+}
+
+impl SessionIndex {
+    /// Replace rows only after a complete discovery succeeds; failures keep
+    /// the last usable snapshot and report that it may be stale.
+    pub(super) fn apply(&mut self, result: Result<DiscoverySnapshot, String>) -> bool {
+        match result {
+            Ok(snapshot) => {
+                let mut by_project: HashMap<i64, Vec<AgentSession>> = HashMap::new();
+                for session in snapshot.sessions {
+                    by_project
+                        .entry(session.project_id)
+                        .or_default()
+                        .push(session);
+                }
+                let changed = by_project != self.by_project;
+                self.by_project = by_project;
+                self.history_limited = snapshot.history_limited;
+                self.has_snapshot = true;
+                self.error = None;
+                changed
+            }
+            Err(error) => {
+                self.error = Some(error);
+                false
+            }
+        }
+    }
+
+    /// What the index wants the human to know: discovery failures, or a
+    /// history slice too large to have fetched completely. The sidebar used
+    /// to surface this as a banner; the running-only list has no place for
+    /// it now, so the strings live here for the tests and the next reader.
+    #[allow(dead_code)]
+    pub(super) fn notice(&self) -> Option<&'static str> {
+        if self.error.is_some() {
+            Some(if self.has_snapshot {
+                "Session discovery failed; showing the last successful results."
+            } else {
+                "Session discovery failed; no session snapshot is available."
+            })
+        } else if self.history_limited {
+            Some("Session history is limited; older entries may be omitted.")
+        } else {
+            None
+        }
+    }
+}
+
 /// Everything a project's sidebar should list: live Radar-managed agents,
 /// the durable catalog history, and (Linux) agents running in external
 /// terminals. Catalog rows carry the archive flag; rendering decides which
 /// slice is visible.
-pub(super) fn discover(projects: &[Project], session_home: &Path) -> Vec<AgentSession> {
+pub(super) fn discover(
+    projects: &[Project],
+    session_home: &Path,
+) -> anyhow::Result<DiscoverySnapshot> {
     let now = crate::session::catalog::now_millis();
-    let statuses = match Client::request(session_home, Command::List) {
-        Ok(Response::Sessions(sessions)) => sessions,
-        _ => Vec::new(),
+    let statuses = match Client::request(session_home, Command::List)
+        .context("requesting live sessions from the daemon")?
+    {
+        Response::Sessions(sessions) => sessions,
+        _ => anyhow::bail!("daemon returned an unexpected response to List"),
     };
     let project_ids: HashSet<i64> = projects.iter().map(|project| project.id).collect();
     let roster: Vec<daemon::CatalogProject> = projects
@@ -134,21 +236,27 @@ pub(super) fn discover(projects: &[Project], session_home: &Path) -> Vec<AgentSe
             path: project.path.clone(),
         })
         .collect();
-    let entries = |filter, limit| match Client::request(
-        session_home,
-        Command::CatalogList {
-            projects: roster.clone(),
-            filter,
-            query: None,
-            limit,
-        },
-    ) {
-        Ok(Response::Catalog(entries)) => entries,
-        _ => Vec::new(),
+    let entries = |filter, limit| -> anyhow::Result<Vec<catalog::Entry>> {
+        match Client::request(
+            session_home,
+            Command::CatalogList {
+                projects: roster.clone(),
+                filter,
+                query: None,
+                limit,
+            },
+        )? {
+            Response::Catalog(entries) => Ok(entries),
+            _ => anyhow::bail!("daemon returned an unexpected response to CatalogList"),
+        }
     };
-    // History is bounded per slice so one list can never bury the other.
-    let mut catalog_entries = entries(CatalogFilter::Active, 500);
-    catalog_entries.extend(entries(CatalogFilter::Archived, 200));
+    let active_entries = entries(CatalogFilter::Active, ACTIVE_CATALOG_LIMIT as u32)
+        .context("requesting active session history")?;
+    let archived_entries = entries(CatalogFilter::Archived, ARCHIVED_CATALOG_LIMIT as u32)
+        .context("requesting archived session history")?;
+    let history_limited = catalog_history_is_limited(active_entries.len(), archived_entries.len());
+    let mut catalog_entries = active_entries;
+    catalog_entries.extend(archived_entries);
 
     let mut sessions = Vec::new();
     let mut managed_ids = HashSet::new();
@@ -263,21 +371,15 @@ pub(super) fn discover(projects: &[Project], session_home: &Path) -> Vec<AgentSe
         now,
     ));
 
-    sessions
+    Ok(DiscoverySnapshot {
+        sessions,
+        history_limited,
+    })
 }
 
 fn session_title(title: Option<&str>, program: Option<&Program>) -> Option<String> {
     let title = title?.trim();
-    if generic_window_title(title)
-        || program.is_some_and(|program| {
-            title.eq_ignore_ascii_case(&program.name)
-                || title.eq_ignore_ascii_case(&program.command)
-        })
-    {
-        None
-    } else {
-        Some(title.to_string())
-    }
+    (!catalog::is_generic_session_title(title, program)).then(|| title.to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -491,7 +593,7 @@ fn process_context_title(
             }
         }
         if let Some(title) = windows.get(&current).map(|window| window.title.as_str()) {
-            if !generic_window_title(title) {
+            if !catalog::is_generic_session_title(title, None) {
                 return Some(title.trim().to_string());
             }
         }
@@ -533,23 +635,6 @@ fn has_interactive_terminal(directory: &Path) -> bool {
 #[cfg(target_os = "linux")]
 fn is_terminal_device(device: &Path) -> bool {
     device == Path::new("/dev/tty") || device.starts_with("/dev/pts")
-}
-
-fn generic_window_title(title: &str) -> bool {
-    let title = title.trim();
-    title.is_empty()
-        || [
-            "terminal",
-            "foot",
-            "ghostty",
-            "kitty",
-            "alacritty",
-            "wezterm",
-            "xterm",
-            "radar",
-        ]
-        .iter()
-        .any(|generic| title.eq_ignore_ascii_case(generic))
 }
 
 fn compositor_windows() -> HashMap<u32, CompositorWindow> {
@@ -645,9 +730,137 @@ fn parse_process_stat(stat: &str) -> Option<(u32, u64)> {
 mod tests {
     #[cfg(target_os = "linux")]
     use super::{
-        explicit_session_id, generic_window_title, is_terminal_device, parse_process_stat,
-        process_window_pid, session_title, CompositorWindow,
+        explicit_session_id, is_terminal_device, parse_process_stat, process_window_pid,
+        session_title, CompositorWindow,
     };
+    struct DiscoveryDaemon {
+        home: tempfile::TempDir,
+        server: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    }
+
+    impl DiscoveryDaemon {
+        fn start() -> Self {
+            use std::time::{Duration, Instant};
+
+            let home = tempfile::tempdir().unwrap();
+            let server = super::daemon::Server::bind(home.path()).unwrap();
+            let server = std::thread::spawn(move || server.run());
+            let daemon = Self {
+                home,
+                server: Some(server),
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !matches!(
+                super::daemon::Client::request(daemon.home.path(), super::daemon::Command::Ping),
+                Ok(super::daemon::Response::Hello {
+                    version: super::daemon::VERSION
+                })
+            ) {
+                assert!(Instant::now() < deadline, "session daemon did not start");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            daemon
+        }
+    }
+
+    impl Drop for DiscoveryDaemon {
+        fn drop(&mut self) {
+            let _ =
+                super::daemon::Client::request(self.home.path(), super::daemon::Command::Shutdown);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_uses_catalog_title_when_live_terminal_title_is_generic() {
+        use std::time::{Duration, Instant};
+
+        let daemon = DiscoveryDaemon::start();
+        let project_path = daemon.home.path().join("project");
+        std::fs::create_dir(&project_path).unwrap();
+        let project = crate::db::Project {
+            id: 3,
+            path: project_path.clone(),
+            name: "project".to_string(),
+            pinned: false,
+            sort_order: 0,
+            added_at: 0,
+            last_opened_at: None,
+            open_count: 0,
+            archived: false,
+        };
+        let radar_id = "project-3-agent-0-opencode";
+        let response = super::daemon::Client::request(
+            daemon.home.path(),
+            super::daemon::Command::Create(crate::session::registry::Spawn {
+                id: radar_id.to_string(),
+                cwd: project_path.clone(),
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf '\\033]0;OpenCode\\007'; sleep 30".to_string(),
+                ],
+                dims: crate::session::Dims { cols: 80, rows: 24 },
+                env: Vec::new(),
+                env_remove: Vec::new(),
+            }),
+        )
+        .unwrap();
+        assert!(matches!(response, super::daemon::Response::Status(_)));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let has_generic_title = matches!(
+                super::daemon::Client::request(daemon.home.path(), super::daemon::Command::List),
+                Ok(super::daemon::Response::Sessions(statuses))
+                    if statuses.iter().any(|status| {
+                        status.id == radar_id && status.title.as_deref() == Some("OpenCode")
+                    })
+            );
+            if has_generic_title {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "session did not publish its terminal title"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let _initial = super::discover(std::slice::from_ref(&project), daemon.home.path()).unwrap();
+        let imported_at = super::catalog::now_millis();
+        let catalog =
+            super::catalog::SessionCatalog::open(&daemon.home.path().join("run/catalog.sqlite"))
+                .unwrap();
+        assert_eq!(
+            catalog
+                .import_provider(
+                    project.id,
+                    "opencode",
+                    &project_path,
+                    &[super::catalog::Imported {
+                        id: "ses_42".to_string(),
+                        title: Some("Earlier work".to_string()),
+                        created_ms: imported_at,
+                        last_activity_ms: imported_at,
+                    }],
+                    imported_at,
+                )
+                .unwrap(),
+            1
+        );
+        drop(catalog);
+
+        let snapshot = super::discover(std::slice::from_ref(&project), daemon.home.path()).unwrap();
+        let live = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == radar_id)
+            .expect("live session should appear in discovery");
+        assert_eq!(live.title, "Earlier work");
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -694,7 +907,7 @@ mod tests {
             session_title(Some("Investigate the flaky test"), Some(&program)),
             Some("Investigate the flaky test".to_string())
         );
-        assert!(generic_window_title("Ghostty"));
+        assert_eq!(session_title(Some("Ghostty"), None), None);
     }
 
     #[cfg(target_os = "linux")]
@@ -772,6 +985,172 @@ mod tests {
             ["new", "tie-a", "tie-b", "old"],
             "newest activity first; title breaks timestamp ties case-insensitively"
         );
+    }
+
+    #[test]
+    fn sidebar_sessions_sort_running_agents_before_recent_history() {
+        let session = |id: &str, last_activity_at: i64| super::AgentSession {
+            project_id: 1,
+            id: id.to_string(),
+            title: String::new(),
+            program_id: "codex".to_string(),
+            tab_key: None,
+            external: None,
+            catalog_id: None,
+            radar_session_id: None,
+            provider_session_id: None,
+            claim_id: None,
+            last_activity_at,
+            running: false,
+            archived: false,
+        };
+        let mut running = session("running", 100);
+        running.running = true;
+        running.radar_session_id = Some("project-1-agent-0-codex".to_string());
+        let mut archived = session("archived", 950);
+        archived.archived = true;
+        let mut sessions = vec![
+            (session("recent", 900), "Recent".to_string()),
+            (archived, "Archived".to_string()),
+            (running, "Running".to_string()),
+        ];
+
+        super::sort_sidebar_sessions(&mut sessions);
+
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|(session, _)| session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["running", "recent", "archived"]
+        );
+    }
+
+    #[test]
+    fn sidebar_search_matches_session_titles_and_program_names() {
+        let session = super::AgentSession {
+            project_id: 1,
+            id: "catalog-1".to_string(),
+            title: "Repair fuzzy search".to_string(),
+            program_id: "opencode".to_string(),
+            tab_key: None,
+            external: None,
+            catalog_id: Some(1),
+            radar_session_id: None,
+            provider_session_id: Some("ses-1".to_string()),
+            claim_id: None,
+            last_activity_at: 0,
+            running: false,
+            archived: false,
+        };
+
+        assert!(super::matches_sidebar_query(&session, "fuzzy"));
+        assert!(super::matches_sidebar_query(&session, "openc"));
+        assert!(!super::matches_sidebar_query(&session, "codex"));
+        assert!(super::matches_sidebar_query(&session, "   "));
+    }
+
+    #[test]
+    fn history_opens_only_with_an_exact_provider_resume_target() {
+        let session = || super::AgentSession {
+            project_id: 1,
+            id: "catalog-1".to_string(),
+            title: "Old conversation".to_string(),
+            program_id: "opencode".to_string(),
+            tab_key: None,
+            external: None,
+            catalog_id: Some(1),
+            radar_session_id: None,
+            provider_session_id: None,
+            claim_id: None,
+            last_activity_at: 0,
+            running: false,
+            archived: false,
+        };
+        let history = session();
+        assert!(!super::can_open_sidebar_session(&history, true));
+
+        let mut exact = session();
+        exact.provider_session_id = Some("ses-42".to_string());
+        assert!(super::can_open_sidebar_session(&exact, true));
+        assert!(!super::can_open_sidebar_session(&exact, false));
+
+        let mut live = session();
+        live.running = true;
+        live.radar_session_id = Some("project-1-agent-0-opencode".to_string());
+        assert!(super::can_open_sidebar_session(&live, false));
+
+        let mut external = session();
+        external.external = Some(super::ExternalTarget {
+            pid: 42,
+            start_ticks: 1,
+            window_pid: 42,
+        });
+        assert!(super::can_open_sidebar_session(&external, false));
+    }
+
+    #[test]
+    fn initial_session_scan_failure_does_not_claim_to_show_previous_results() {
+        let mut index = super::SessionIndex::default();
+
+        assert!(!index.apply(Err("daemon unavailable".to_string())));
+        assert_eq!(
+            index.notice(),
+            Some("Session discovery failed; no session snapshot is available.")
+        );
+    }
+    #[test]
+    fn catalog_history_limit_is_triggered_at_the_slice_boundary() {
+        assert!(!super::catalog_history_is_limited(499, 199));
+        assert!(super::catalog_history_is_limited(500, 0));
+        assert!(super::catalog_history_is_limited(0, 200));
+        assert!(super::catalog_history_is_limited(501, 201));
+    }
+    #[test]
+    fn failed_session_discovery_keeps_the_last_snapshot_and_cap_notice() {
+        let session = super::AgentSession {
+            project_id: 7,
+            id: "catalog-7".to_string(),
+            title: "Saved conversation".to_string(),
+            program_id: "codex".to_string(),
+            tab_key: None,
+            external: None,
+            catalog_id: Some(7),
+            radar_session_id: None,
+            provider_session_id: Some("thread-7".to_string()),
+            claim_id: None,
+            last_activity_at: 0,
+            running: false,
+            archived: false,
+        };
+        let mut index = super::SessionIndex::default();
+
+        assert!(index.apply(Ok(super::DiscoverySnapshot {
+            sessions: vec![session],
+            history_limited: true,
+        })));
+        assert_eq!(index.by_project[&7][0].id, "catalog-7");
+        assert_eq!(
+            index.notice(),
+            Some("Session history is limited; older entries may be omitted.")
+        );
+
+        assert!(!index.apply(Err("daemon unavailable".to_string())));
+        assert_eq!(index.by_project[&7][0].id, "catalog-7");
+        assert_eq!(
+            index.notice(),
+            Some("Session discovery failed; showing the last successful results.")
+        );
+        assert_eq!(index.error.as_deref(), Some("daemon unavailable"));
+        assert!(index.history_limited);
+
+        assert!(index.apply(Ok(super::DiscoverySnapshot {
+            sessions: Vec::new(),
+            history_limited: false,
+        })));
+        assert!(index.by_project.is_empty());
+        assert_eq!(index.notice(), None);
+        assert!(index.error.is_none());
     }
 
     #[test]

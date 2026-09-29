@@ -433,17 +433,21 @@ async fn board_snapshot(
         return Ok(Json(None));
     }
 
-    let path = crate::board::file_path(&project.path);
-    if !path.is_file() {
-        return Ok(Json(None));
+    // The board lives in the daemon's store, not a file.
+    match Client::request(
+        &state.home,
+        Command::BoardState {
+            project_id,
+            path: project.path.clone(),
+        },
+    )
+    .map_err(ApiError::internal)?
+    {
+        Response::BoardState(board) => Ok(Json(Some(board.to_board()))),
+        _ => Err(ApiError::internal(
+            "daemon returned an unexpected board response",
+        )),
     }
-    crate::board::ensure_card_ids(&project.path).map_err(ApiError::internal)?;
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Json(None)),
-        Err(error) => return Err(ApiError::internal(error)),
-    };
-    Ok(Json(Some(crate::board::parse(&text))))
 }
 
 #[derive(Deserialize)]

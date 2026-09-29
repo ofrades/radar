@@ -232,23 +232,31 @@ fn font_from_config(path: &Path, text: &str) -> Option<(String, f64)> {
     let family = text
         .lines()
         .filter_map(|line| {
-            let (key, value) = line.split_once('=')?;
-            if key.trim() == "family" {
-                return Some(value.trim().trim_matches('"').to_string());
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
             }
-            // Inside an inline table: take what follows `family =`.
-            let after = value.split_once("family")?.1;
-            let inner = after.split_once('=')?.1;
-            Some(
-                inner
-                    .trim()
-                    .trim_end_matches('}')
-                    .trim()
-                    .trim_matches('"')
-                    .to_string(),
-            )
+            let (key, value) = line.split_once('=')?;
+            let value = if key.trim() == "family" {
+                value
+            } else {
+                value
+                    .split_once("family")?
+                    .1
+                    .split_once('=')?
+                    .1
+                    .split(',')
+                    .next()?
+            };
+            let family = value
+                .trim()
+                .trim_end_matches('}')
+                .trim()
+                .trim_matches('"')
+                .trim();
+            (!family.is_empty()).then(|| family.to_string())
         })
-        .find(|family| !family.is_empty())?;
+        .next()?;
     let size = text
         .lines()
         .filter_map(|line| line.split_once('='))
@@ -346,6 +354,18 @@ size = 8.0
         .unwrap();
         assert_eq!(family, "JetBrainsMono Nerd Font");
         assert_eq!(size, 8.0);
+    }
+
+    #[test]
+    fn alacritty_inline_table_with_style_parses_only_the_family() {
+        let config = "[font]\nnormal = { family = \"JetBrainsMono Nerd Font\", style = \"Regular\" }\nsize = 9\n";
+        let (family, size) = font_from_config(
+            Path::new("/home/u/.config/alacritty/alacritty.toml"),
+            config,
+        )
+        .unwrap();
+        assert_eq!(family, "JetBrainsMono Nerd Font");
+        assert_eq!(size, 9.0);
     }
 
     #[test]

@@ -17,12 +17,15 @@
 //! the agent away for a moment never interrupts it.
 
 mod board;
+mod card;
 mod dialogs;
 mod group;
 mod home;
 mod hud;
 mod keynav;
 mod live_agents;
+mod markdown;
+mod notify;
 mod pane;
 mod primitive;
 mod split;
@@ -90,6 +93,8 @@ pub fn run(paths: Paths, db: Db) -> Result<()> {
         let window = build_window(app, &paths, &db);
         *window_for_activate.borrow_mut() = Some(window.clone());
         window.present();
+        #[cfg(feature = "vte")]
+        debug_sidebar_sweep(&window); // [DEBUG-sb] temporary
     });
     // Closing the window hides the UI but leaves terminal children and their
     // PTYs running. Launching Radar again activates this same application.
@@ -266,13 +271,10 @@ struct App {
     workspaces: RefCell<HashMap<i64, Rc<Workspace>>>,
     projects: RefCell<Vec<Project>>,
     rows: RefCell<Vec<ProjectRow>>,
-    agent_sessions: RefCell<HashMap<i64, Vec<live_agents::AgentSession>>>,
-    agent_tx: std::sync::mpsc::Sender<Vec<live_agents::AgentSession>>,
-    agent_rx: RefCell<std::sync::mpsc::Receiver<Vec<live_agents::AgentSession>>>,
+    agent_sessions: RefCell<live_agents::SessionIndex>,
+    agent_tx: std::sync::mpsc::Sender<Result<live_agents::DiscoverySnapshot, String>>,
+    agent_rx: RefCell<std::sync::mpsc::Receiver<Result<live_agents::DiscoverySnapshot, String>>>,
     agent_scan_pending: Cell<bool>,
-    expanded_projects: RefCell<HashSet<i64>>,
-    /// Projects whose agent list currently shows archived sessions.
-    archived_views: RefCell<HashSet<i64>>,
     status: RefCell<HashMap<i64, crate::git::Status>>,
     status_tx: std::sync::mpsc::Sender<Vec<(i64, crate::git::Status)>>,
     status_rx: RefCell<std::sync::mpsc::Receiver<Vec<(i64, crate::git::Status)>>>,
@@ -282,9 +284,18 @@ struct App {
     activity_tx: std::sync::mpsc::SyncSender<ActivityNotice>,
     activity_rx: RefCell<std::sync::mpsc::Receiver<ActivityNotice>>,
     board_panes: RefCell<HashMap<i64, std::rc::Weak<board::BoardPane>>>,
+    /// The last board store state per project, so Home and the board pane
+    /// render without re-fetching on every rebuild.
+    board_states: RefCell<HashMap<i64, crate::session::board_store::BoardState>>,
+    /// Where Home is drilled in: empty means the cockpit, otherwise a stack of
+    /// board/card views with a way back.
+    home_nav: RefCell<Vec<HomeView>>,
     board_summaries: RefCell<HashMap<i64, board::BoardSummary>>,
     board_monitors: RefCell<HashMap<i64, gio::FileMonitor>>,
     notified_attention: RefCell<HashSet<(i64, String)>>,
+    /// Attention responses the Home cockpit has sent but not yet heard back
+    /// about. Home is rebuilt often, so the pending set outlives its widgets.
+    home_pending_attention: Rc<RefCell<HashSet<String>>>,
     /// What each pane's program last said about itself — its name and its own
     /// live title, or its exit — keyed by (project, tab).
     header_info: RefCell<HashMap<(i64, TabKey), String>>,
@@ -303,6 +314,12 @@ struct App {
     pointer_motion_ms: Cell<i64>,
 }
 
+#[derive(Clone)]
+enum HomeView {
+    Board(i64),
+    Card(i64, String),
+}
+
 #[derive(Debug)]
 enum ActivityNotice {
     Snapshot {
@@ -319,6 +336,11 @@ enum ActivityNotice {
         project_id: i64,
         request_id: String,
         result: std::result::Result<Box<crate::session::activity::AttentionMutationResult>, String>,
+    },
+    /// A card comment sent from the GUI came back from the daemon (or failed).
+    CardComment {
+        project_id: i64,
+        error: Option<String>,
     },
 }
 
@@ -511,14 +533,30 @@ struct ProjectRow {
     id: i64,
     row: gtk::ListBoxRow,
     summary: gtk::Label,
-    board_summary: gtk::Label,
     badge: gtk::Label,
     attention_badge: gtk::Label,
-    agents: gtk::Box,
-    agent_toggle: gtk::ToggleButton,
-    /// The agent-session buttons this row shows, by session id — how the
-    /// active-panel highlight finds its row without rebuilding it.
-    agent_buttons: RefCell<Vec<(String, gtk::Button)>>,
+    agent_badge: gtk::Label,
+}
+
+fn set_row_action_target(row: &gtk::ListBoxRow, target: bool) {
+    fn update(widget: &gtk::Widget, target: bool) {
+        if widget.has_css_class("row-action") {
+            widget.set_can_target(target);
+            widget.set_focusable(target);
+        }
+        // The meta line's quiet controls take no space on quiet rows, so the
+        // board summary breathes; the line itself never changes height.
+        if widget.has_css_class("row-actions") {
+            widget.set_visible(target);
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            child = current.next_sibling();
+            update(&current, target);
+        }
+    }
+
+    update(row.upcast_ref(), target);
 }
 
 /// How an agent tab's program starts: fresh, on the project's last
@@ -528,6 +566,15 @@ enum Resume {
     No,
     Last,
     Session(String),
+}
+
+/// A unique command id for a board mutation issued by the GUI.
+fn gui_command_id(prefix: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("gui-{prefix}-{}-{now:x}", std::process::id())
 }
 
 fn stable_session_id(project_id: i64, key: TabKey, program_id: &str) -> String {
@@ -551,21 +598,6 @@ fn parse_stable_session_id(session_id: &str) -> Option<(i64, TabKey, String)> {
         return None;
     }
     Some((project_id, TabKey { slot, instance }, program_id))
-}
-
-/// A compact age for sidebar subtitles: coarse, monotonic, no clock-format
-/// churn. Beyond a week the exact day matters less than the order.
-fn relative_time(millis: i64) -> String {
-    let now = crate::session::catalog::now_millis();
-    let seconds = (now.saturating_sub(millis)).max(0) / 1000;
-    match seconds {
-        0..=59 => "now".to_string(),
-        60..=3_599 => format!("{}m", seconds / 60),
-        3_600..=86_399 => format!("{}h", seconds / 3_600),
-        86_400..=604_799 => format!("{}d", seconds / 86_400),
-        604_800..=2_591_999 => format!("{}w", seconds / 604_800),
-        _ => format!("{}mo", seconds / 2_592_000),
-    }
 }
 
 fn add_session_environment(
@@ -682,7 +714,7 @@ fn build_window(
     home_toggle.set_hexpand(true);
     home_toggle.set_action_name(Some("win.show-home"));
     if let Some(image) = home_toggle.child().and_downcast::<gtk::Image>() {
-        image.set_pixel_size(16);
+        image.set_pixel_size(14);
     }
     toggles.append(&home_toggle);
 
@@ -706,7 +738,7 @@ fn build_window(
         button.set_hexpand(true);
         // Smaller icon than the default: the dock is a compact control strip.
         if let Some(image) = button.child().and_downcast::<gtk::Image>() {
-            image.set_pixel_size(16);
+            image.set_pixel_size(14);
         }
         if project {
             button.set_action_name(Some("win.toggle-sidebar"));
@@ -735,9 +767,9 @@ fn build_window(
     let projects_toggle = projects_toggle.expect("the project toggle is in the row");
 
     let search = gtk::SearchEntry::new();
-    search.set_placeholder_text(Some("Search projects…"));
+    search.set_placeholder_text(Some("Search projects and sessions…"));
     search.set_tooltip_text(Some(
-        "Filter your projects, or type to find a directory to add",
+        "Filter projects or agent sessions, or type to find a directory to add",
     ));
     search.set_hexpand(true);
 
@@ -745,7 +777,7 @@ fn build_window(
     let sidebar_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     sidebar_header.add_css_class("group-header");
     let header_icon = gtk::Image::from_icon_name("radar");
-    header_icon.set_pixel_size(20);
+    header_icon.set_pixel_size(16);
     header_icon.set_tooltip_text(Some("Radar"));
     sidebar_header.append(&header_icon);
     let sidebar_title = gtk::Label::new(Some("Radar"));
@@ -760,6 +792,9 @@ fn build_window(
         .build();
     home_button.add_css_class("flat");
     home_button.set_action_name(Some("win.show-home"));
+    if let Some(image) = home_button.child().and_downcast::<gtk::Image>() {
+        image.set_pixel_size(14);
+    }
     sidebar_header.append(&home_button);
 
     // The search goes straight into the sidebar box; its margins come from the
@@ -773,6 +808,7 @@ fn build_window(
     find_root_button.set_margin_start(8);
     find_root_button.set_margin_bottom(2);
     find_root_button.set_tooltip_text(Some("Choose another directory to scan"));
+
     find_root_button.set_visible(false);
 
     let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -799,7 +835,14 @@ fn build_window(
     splitter.set_start_child(Some(&sidebar_box));
     splitter.set_end_child(Some(&stack));
     splitter.set_resize_start_child(false);
+    // Both children keep their minimum width: the handle stops at the
+    // sidebar's dock floor on the left and at the content's minimum on the
+    // right. With either shrink flag GTK drags the handle past the pane's
+    // minimum and paints the overflow off the window's edge. Rows still
+    // ellipsize smoothly down to the floor; the floor itself is the dock of
+    // icons, which cannot shrink without being clipped anyway.
     splitter.set_shrink_start_child(false);
+    splitter.set_shrink_end_child(false);
     splitter.set_wide_handle(true);
     splitter.set_vexpand(true);
     splitter.set_position(
@@ -848,12 +891,10 @@ fn build_window(
         workspaces: RefCell::new(HashMap::new()),
         projects: RefCell::new(Vec::new()),
         rows: RefCell::new(Vec::new()),
-        agent_sessions: RefCell::new(HashMap::new()),
+        agent_sessions: RefCell::new(live_agents::SessionIndex::default()),
         agent_tx,
         agent_rx: RefCell::new(agent_rx),
         agent_scan_pending: Cell::new(false),
-        expanded_projects: RefCell::new(HashSet::new()),
-        archived_views: RefCell::new(HashSet::new()),
         status: RefCell::new(HashMap::new()),
         status_tx,
         status_rx: RefCell::new(status_rx),
@@ -863,9 +904,12 @@ fn build_window(
         activity_rx: RefCell::new(activity_rx),
         activity_tx,
         board_panes: RefCell::new(HashMap::new()),
+        board_states: RefCell::new(HashMap::new()),
+        home_nav: RefCell::new(Vec::new()),
         board_summaries: RefCell::new(HashMap::new()),
         board_monitors: RefCell::new(HashMap::new()),
         notified_attention: RefCell::new(HashSet::new()),
+        home_pending_attention: Rc::new(RefCell::new(HashSet::new())),
         header_info: RefCell::new(HashMap::new()),
         current: RefCell::new(None),
         find_root: RefCell::new(
@@ -951,6 +995,37 @@ fn build_window(
             }
         });
     }
+    // Development aid: open Home's cockpit on startup, so the cross-project
+    // surface can be checked without pressing Alt+Home. RADAR_HOME_PANEL=1.
+    if std::env::var("RADAR_HOME_PANEL").is_ok() {
+        let state_for_home = state.clone();
+        glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+            state_for_home.show_home();
+        });
+    }
+    // Development aid: open a card panel on startup, so the panel can be
+    // checked without clicking. RADAR_OPEN_CARD=<project_id>:<card_id>.
+    if let Ok(value) = std::env::var("RADAR_OPEN_CARD") {
+        if let Some((project, card_id)) = value.split_once(':') {
+            if let Ok(project_id) = project.parse::<i64>() {
+                let card_id = card_id.to_string();
+                let state_for_card = state.clone();
+                glib::timeout_add_local_once(Duration::from_millis(1700), move || {
+                    state_for_card.open_home_card(project_id, &card_id);
+                });
+            }
+        }
+    }
+    // Development aid: open a project's board inside Home.
+    // RADAR_OPEN_BOARD=<project_id>.
+    if let Ok(value) = std::env::var("RADAR_OPEN_BOARD") {
+        if let Ok(project_id) = value.parse::<i64>() {
+            let state_for_board = state.clone();
+            glib::timeout_add_local_once(Duration::from_millis(1700), move || {
+                state_for_board.open_home_board(project_id);
+            });
+        }
+    }
     window
 }
 
@@ -1008,7 +1083,7 @@ fn candidate_row(title: &str, subtitle: &str, is_repo: bool) -> (gtk::ListBoxRow
 
     let icon = gtk::Image::from_icon_name("folder-symbolic");
     icon.add_css_class("row-icon");
-    icon.set_pixel_size(16);
+    icon.set_pixel_size(14);
     icon.set_valign(gtk::Align::Center);
     box_.append(&icon);
 
@@ -1038,6 +1113,9 @@ fn candidate_row(title: &str, subtitle: &str, is_repo: bool) -> (gtk::ListBoxRow
         .icon_name("list-add-symbolic")
         .tooltip_text("Add project")
         .build();
+    if let Some(image) = add.child().and_downcast::<gtk::Image>() {
+        image.set_pixel_size(14);
+    }
     add.add_css_class("flat");
     add.set_valign(gtk::Align::Center);
     box_.append(&add);
@@ -1051,8 +1129,12 @@ fn connect_widgets(app: &SharedApp) {
         let list = app.sidebar_list.clone();
         let app = app.clone();
         list.connect_row_selected(move |_, row| {
+            let selected_id = row.and_then(|row| app.id_for_row(row));
+            for project_row in app.rows.borrow().iter() {
+                set_row_action_target(&project_row.row, Some(project_row.id) == selected_id);
+            }
             let Some(row) = row else { return };
-            let Some(id) = app.id_for_row(row) else {
+            let Some(id) = selected_id else {
                 return;
             };
             // Switching projects must not take the keys out of the sidebar:
@@ -1110,44 +1192,6 @@ fn connect_widgets(app: &SharedApp) {
                 .set(glib::monotonic_time() / 1000);
         });
         app.window.add_controller(controller);
-    }
-    {
-        // Hover is focus for the sidebar as a whole, matching the panes:
-        // the pointer entering the projects panel puts the keys on its
-        // selected row — the same ring a pane wears. Same gate as the panes:
-        // the sidebar mapping under a parked pointer must not grab.
-        let app_for_hover = app.clone();
-        let controller = gtk::EventControllerMotion::new();
-        controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-        controller.connect_enter(move |_, _, _| {
-            let app = &app_for_hover;
-            if !app.pointer_is_live() {
-                return;
-            }
-            if let Some(row) = keynav::sidebar_focus_row(&app.sidebar_list) {
-                row.grab_focus();
-            }
-        });
-        app.sidebar.add_controller(controller);
-    }
-    {
-        // Inside the panel, walking the rows with the pointer keeps the keys
-        // on the row under it — the row the user would arrow from.
-        let app_for_hover = app.clone();
-        let controller = gtk::EventControllerMotion::new();
-        controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-        controller.connect_enter(move |_, _, y| {
-            let app = &app_for_hover;
-            if !app.pointer_is_live() {
-                return;
-            }
-            if let Some(row) = app.sidebar_list.row_at_y(y as i32) {
-                if app.id_for_row(&row).is_some() {
-                    row.grab_focus();
-                }
-            }
-        });
-        app.sidebar_list.add_controller(controller);
     }
     {
         // Esc empties the search, the way a browser's address bar does.
@@ -1275,6 +1319,7 @@ fn start_status_drainer(app: &SharedApp) {
         }
         if changed {
             app.apply_status_labels();
+            app.refresh_home();
         }
         glib::ControlFlow::Continue
     });
@@ -1290,30 +1335,17 @@ fn start_agent_session_drainer(app: &SharedApp) {
             }
             latest
         };
-        let Some(sessions) = latest else {
+        let Some(result) = latest else {
             return glib::ControlFlow::Continue;
         };
         app.agent_scan_pending.set(false);
-
-        let mut grouped: HashMap<i64, Vec<live_agents::AgentSession>> = HashMap::new();
-        for session in sessions {
-            grouped.entry(session.project_id).or_default().push(session);
+        let sessions_changed = app.agent_sessions.borrow_mut().apply(result);
+        if sessions_changed {
+            let query = app.sidebar_search.text();
+            app.filter_sidebar(&query);
+            app.apply_status_labels();
+            app.refresh_home();
         }
-        if *app.agent_sessions.borrow() == grouped {
-            return glib::ControlFlow::Continue;
-        }
-        *app.agent_sessions.borrow_mut() = grouped;
-        let rows: Vec<(i64, gtk::Box)> = app
-            .rows
-            .borrow()
-            .iter()
-            .map(|row| (row.id, row.agents.clone()))
-            .collect();
-        for (project_id, agents) in rows {
-            app.populate_project_agents(project_id, &agents);
-        }
-        let query = app.sidebar_search.text();
-        app.filter_sidebar(&query);
         glib::ControlFlow::Continue
     });
 }
@@ -1542,10 +1574,10 @@ fn start_activity_drainer(app: &SharedApp) {
         }
         for project_id in &changed_projects {
             app.refresh_activity_pane(*project_id);
-            app.refresh_project_agents(*project_id);
         }
         if !changed_projects.is_empty() {
             app.apply_status_labels();
+            app.refresh_home();
         }
         glib::ControlFlow::Continue
     });
@@ -1920,58 +1952,6 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
     }
     {
         let action = gio::SimpleAction::new(
-            "project-session-archive",
-            Some(glib::VariantTy::new("(xb)").expect("a catalog row and archive flag")),
-        );
-        let app_for_action = app.clone();
-        action.connect_activate(move |_, parameter| {
-            let Some((catalog_id, archived)) =
-                parameter.and_then(|value| value.get::<(i64, bool)>())
-            else {
-                return;
-            };
-            use crate::session::daemon::{Client, Command};
-            let request = Command::CatalogArchive {
-                id: catalog_id,
-                archived,
-            };
-            match Client::request(&app_for_action.session_home, request) {
-                Ok(_) => app_for_action.request_agent_scan(),
-                Err(error) => {
-                    app_for_action.toast(&format!("Could not update the session: {error}"))
-                }
-            }
-        });
-        app.window.add_action(&action);
-    }
-    {
-        let action = gio::SimpleAction::new(
-            "project-archived-view",
-            Some(glib::VariantTy::new("(xb)").expect("a project and archived-view flag")),
-        );
-        let app_for_action = app.clone();
-        action.connect_activate(move |_, parameter| {
-            let Some((project_id, show)) = parameter.and_then(|value| value.get::<(i64, bool)>())
-            else {
-                return;
-            };
-            if show {
-                app_for_action
-                    .archived_views
-                    .borrow_mut()
-                    .insert(project_id);
-            } else {
-                app_for_action
-                    .archived_views
-                    .borrow_mut()
-                    .remove(&project_id);
-            }
-            app_for_action.refresh_project_agents(project_id);
-        });
-        app.window.add_action(&action);
-    }
-    {
-        let action = gio::SimpleAction::new(
             "project-agent-create",
             Some(glib::VariantTy::new("x").expect("a project ID")),
         );
@@ -1998,6 +1978,148 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
                 return;
             };
             app_for_action.add_tab(&workspace, TabKey::first(Slot::Agent), &program);
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // Home's project header: bring the project's workspace on screen.
+        let action = gio::SimpleAction::new(
+            "open-project",
+            Some(glib::VariantTy::new("x").expect("a project ID")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            if let Some(project_id) = parameter.and_then(|value| value.get::<i64>()) {
+                app_for_action.select_project(project_id);
+                app_for_action.window.present();
+            }
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // Home's claim chip: open the agent the claim names, the same
+        // resolution the board's @claim link uses.
+        let action = gio::SimpleAction::new(
+            "open-claim",
+            Some(glib::VariantTy::new("(xs)").expect("a project and claim")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((project_id, claim)) =
+                parameter.and_then(|value| value.get::<(i64, String)>())
+            else {
+                return;
+            };
+            app_for_action.select_project(project_id);
+            if let Some(workspace) = app_for_action.current_workspace() {
+                app_for_action.open_agent_session(&workspace, &claim);
+            }
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // Home's to-do row: open the card's panel — its thread and controls.
+        let action = gio::SimpleAction::new(
+            "open-card",
+            Some(glib::VariantTy::new("(xs)").expect("a project and card ID")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((project_id, card_id)) =
+                parameter.and_then(|value| value.get::<(i64, String)>())
+            else {
+                return;
+            };
+            app_for_action.open_home_card(project_id, &card_id);
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // Home's to-do checkbox: close an open to-do, or reopen a done one.
+        let action = gio::SimpleAction::new(
+            "card-toggle-done",
+            Some(glib::VariantTy::new("(xs)").expect("a project and card ID")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((project_id, card_id)) =
+                parameter.and_then(|value| value.get::<(i64, String)>())
+            else {
+                return;
+            };
+            app_for_action.toggle_card_done(project_id, &card_id);
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // Home's Back: leave a board/card drill-down for the cockpit.
+        let app_for_action = app.clone();
+        add("home-back", Box::new(move || app_for_action.home_back()));
+    }
+    {
+        // The card detail's × (same as Back).
+        let app_for_action = app.clone();
+        add("close-card", Box::new(move || app_for_action.home_back()));
+    }
+    {
+        // Open a project's board inside Home.
+        let action = gio::SimpleAction::new(
+            "home-board",
+            Some(glib::VariantTy::new("x").expect("a project ID")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            if let Some(project_id) = parameter.and_then(|value| value.get::<i64>()) {
+                app_for_action.open_home_board(project_id);
+            }
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // The card detail's Edit control: the board's card dialog.
+        let action = gio::SimpleAction::new(
+            "card-edit",
+            Some(glib::VariantTy::new("(xs)").expect("a project and card ID")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            if let Some((project_id, card_id)) =
+                parameter.and_then(|value| value.get::<(i64, String)>())
+            {
+                app_for_action.edit_home_card(project_id, &card_id);
+            }
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // The card detail's lane dropdown.
+        let action = gio::SimpleAction::new(
+            "card-move",
+            Some(glib::VariantTy::new("(xss)").expect("a project, card and column")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            if let Some((project_id, card_id, column)) =
+                parameter.and_then(|value| value.get::<(i64, String, String)>())
+            {
+                app_for_action.move_home_card(project_id, &card_id, &column);
+            }
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // The card detail's reply box.
+        let action = gio::SimpleAction::new(
+            "card-reply",
+            Some(glib::VariantTy::new("(xss)").expect("a project, card and text")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            if let Some((project_id, card_id, text)) =
+                parameter.and_then(|value| value.get::<(i64, String, String)>())
+            {
+                app_for_action.comment_home_card(project_id, &card_id, &text);
+            }
         });
         app.window.add_action(&action);
     }
@@ -2666,15 +2788,219 @@ impl App {
         };
         if project.is_missing() {
             self.board_summaries.borrow_mut().remove(&project_id);
-        } else if let Ok(board) = crate::board::load(&project.path) {
+            self.board_states.borrow_mut().remove(&project_id);
+        } else if let Some(state) = self.fetch_board_state(project_id) {
             self.board_summaries
                 .borrow_mut()
-                .insert(project_id, board::summarize(&board));
+                .insert(project_id, board::summarize(&state.to_board()));
+            self.board_states.borrow_mut().insert(project_id, state);
         } else {
             self.board_summaries.borrow_mut().remove(&project_id);
         }
+        if let Some(pane) = self
+            .board_panes
+            .borrow()
+            .get(&project_id)
+            .and_then(std::rc::Weak::upgrade)
+        {
+            pane.refresh();
+        }
         self.apply_status_labels();
-        self.refresh_project_agents(project_id);
+        self.refresh_home();
+    }
+
+    /// Fetch a project's board from the daemon store, with the project root the
+    /// store needs to import a legacy `BOARD.md` once.
+    fn fetch_board_state(
+        &self,
+        project_id: i64,
+    ) -> Option<crate::session::board_store::BoardState> {
+        let path = self
+            .projects
+            .borrow()
+            .iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.path.clone())?;
+        match crate::session::daemon::board_state(&self.session_home, project_id, &path) {
+            Ok(state) => Some(state),
+            Err(error) => {
+                eprintln!("radar: board state: {error}");
+                None
+            }
+        }
+    }
+
+    /// Close an open to-do or reopen a done one, straight from Home. Goes
+    /// through the board store, then re-reads the summary so the lane updates.
+    fn toggle_card_done(&self, project_id: i64, card_id: &str) {
+        let done = self
+            .board_states
+            .borrow()
+            .get(&project_id)
+            .and_then(|state| state.cards.iter().find(|card| card.id == card_id))
+            .map(|card| card.done);
+        let Some(done) = done else {
+            self.toast("That to-do is no longer on the board");
+            return;
+        };
+        let command = gui_command_id("toggle");
+        let result = if done {
+            crate::session::daemon::board_card_reopen(
+                &self.session_home,
+                project_id,
+                card_id,
+                None,
+                &command,
+            )
+        } else {
+            crate::session::daemon::board_card_complete(
+                &self.session_home,
+                project_id,
+                card_id,
+                None,
+                &command,
+            )
+        };
+        match result {
+            Ok(_) => {
+                self.refresh_board_summary(project_id);
+                self.toast(if done {
+                    "To-do reopened"
+                } else {
+                    "To-do closed"
+                });
+            }
+            Err(error) => self.toast(&format!("Could not update the to-do: {error}")),
+        }
+    }
+
+    /// Open a card as a conversation in Home's right-hand rail.
+    fn open_home_card(&self, project_id: i64, card_id: &str) {
+        self.home_nav
+            .borrow_mut()
+            .push(HomeView::Card(project_id, card_id.to_string()));
+        self.refresh_home();
+    }
+
+    /// Drill into a project's board inside Home.
+    fn open_home_board(&self, project_id: i64) {
+        self.home_nav.borrow_mut().push(HomeView::Board(project_id));
+        self.refresh_home();
+    }
+
+    /// Leave the current Home drill-down and return to the cockpit.
+    fn home_back(&self) {
+        self.home_nav.borrow_mut().pop();
+        self.refresh_home();
+    }
+
+    /// Edit a card's title and body through a small store-backed dialog.
+    fn edit_home_card(self: &Rc<Self>, project_id: i64, card_id: &str) {
+        let card = self
+            .board_states
+            .borrow()
+            .get(&project_id)
+            .and_then(|state| state.cards.iter().find(|card| card.id == card_id))
+            .cloned();
+        let Some(card) = card else {
+            self.toast("That card is no longer on the board");
+            return;
+        };
+        let window = gtk::Window::builder()
+            .title("Edit card")
+            .transient_for(&self.window)
+            .modal(true)
+            .resizable(false)
+            .default_width(460)
+            .build();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        content.set_margin_top(14);
+        content.set_margin_bottom(14);
+        content.set_margin_start(14);
+        content.set_margin_end(14);
+        let title = gtk::Entry::new();
+        title.set_text(&card.title);
+        title.set_placeholder_text(Some("Title"));
+        content.append(&title);
+        let body = gtk::TextView::new();
+        body.buffer().set_text(&card.body);
+        body.set_wrap_mode(gtk::WrapMode::WordChar);
+        let scroll = gtk::ScrolledWindow::builder()
+            .height_request(160)
+            .child(&body)
+            .build();
+        content.append(&scroll);
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        buttons.set_halign(gtk::Align::End);
+        let cancel = gtk::Button::with_label("Cancel");
+        let window_for_cancel = window.clone();
+        cancel.connect_clicked(move |_| window_for_cancel.close());
+        buttons.append(&cancel);
+        let save = gtk::Button::with_label("Save");
+        save.add_css_class("suggested-action");
+        buttons.append(&save);
+        content.append(&buttons);
+        window.set_child(Some(&content));
+
+        let app = self.clone();
+        let card_id = card.id.clone();
+        let revision = card.revision;
+        let window_for_save = window.clone();
+        save.connect_clicked(move |_| {
+            let buffer = body.buffer();
+            let text = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                .to_string();
+            let new_title = title.text().trim().to_string();
+            if new_title.is_empty() {
+                title.grab_focus();
+                return;
+            }
+            let command = gui_command_id("edit");
+            match crate::session::daemon::board_card_update(
+                &app.session_home,
+                project_id,
+                &card_id,
+                Some(&new_title),
+                Some(&text),
+                Some(revision),
+                &command,
+            ) {
+                Ok(_) => {
+                    window_for_save.close();
+                    app.refresh_board_summary(project_id);
+                }
+                Err(error) => eprintln!("radar: editing the card: {error}"),
+            }
+        });
+        window.present();
+    }
+
+    /// Move a card to another lane through the store.
+    fn move_home_card(&self, project_id: i64, card_id: &str, column: &str) {
+        let command = gui_command_id("move");
+        match crate::session::daemon::board_card_move(
+            &self.session_home,
+            project_id,
+            card_id,
+            column,
+            None,
+            &command,
+        ) {
+            Ok(_) => self.refresh_board_summary(project_id),
+            Err(error) => self.toast(&format!("Could not move the card: {error}")),
+        }
+    }
+
+    /// Post a reply on the open card's thread.
+    fn comment_home_card(&self, project_id: i64, card_id: &str, text: &str) {
+        card::publish_comment(
+            &self.session_home,
+            &self.activity_tx,
+            project_id,
+            card_id,
+            text.to_string(),
+        );
     }
 
     fn apply_activity_notice(&self, notice: ActivityNotice) -> i64 {
@@ -2685,40 +3011,20 @@ impl App {
                 replace_events,
             } => {
                 let outstanding = snapshot.attention.clone();
-                let outstanding_ids: HashSet<String> = outstanding
-                    .iter()
-                    .map(|attention| attention.id.clone())
-                    .collect();
                 self.activity
                     .borrow_mut()
                     .entry(project_id)
                     .or_insert_with(|| ProjectActivity::empty(project_id))
                     .merge_snapshot(snapshot, replace_events);
-                let resolved: Vec<String> = self
-                    .notified_attention
-                    .borrow()
-                    .iter()
-                    .filter(|(id, request_id)| {
-                        *id == project_id && !outstanding_ids.contains(request_id)
-                    })
-                    .map(|(_, request_id)| request_id.clone())
-                    .collect();
-                for request_id in resolved {
+                let (withdraw, raise) = {
+                    let notified = self.notified_attention.borrow();
+                    notify::plan_snapshot(project_id, &notified, &outstanding)
+                };
+                for request_id in withdraw {
                     self.withdraw_attention_notification(project_id, &request_id);
                 }
-                for attention in outstanding {
-                    if attention.seen_at_millis.is_some()
-                        || attention.acknowledged_at_millis.is_some()
-                        || !attention.is_unresolved()
-                    {
-                        continue;
-                    }
-                    self.notify_attention(
-                        project_id,
-                        attention.id,
-                        attention.kind,
-                        attention.reason,
-                    );
+                for item in raise {
+                    self.notify_attention(project_id, item.request_id, item.kind, item.reason);
                 }
                 project_id
             }
@@ -2740,12 +3046,15 @@ impl App {
                                         attention.id.as_str() == request_id.as_str()
                                     })
                                 });
-                        (!already_outstanding
-                            && !self
-                                .notified_attention
-                                .borrow()
-                                .contains(&(project_id, request_id.clone())))
-                        .then(|| (request_id.clone(), *attention_kind, reason.clone()))
+                        let notified = self.notified_attention.borrow();
+                        notify::plan_request(
+                            project_id,
+                            &notified,
+                            already_outstanding,
+                            request_id,
+                            *attention_kind,
+                            reason,
+                        )
                     }
                     _ => None,
                 };
@@ -2765,20 +3074,18 @@ impl App {
                     .entry(project_id)
                     .or_insert_with(|| ProjectActivity::empty(project_id))
                     .apply_event(event);
-                if let Some((request_id, kind, reason)) = request {
+                if let Some(item) = request {
                     let outstanding =
                         self.activity
                             .borrow()
                             .get(&project_id)
                             .is_some_and(|activity| {
-                                activity
-                                    .snapshot
-                                    .attention
-                                    .iter()
-                                    .any(|attention| attention.id.as_str() == request_id.as_str())
+                                activity.snapshot.attention.iter().any(|attention| {
+                                    attention.id.as_str() == item.request_id.as_str()
+                                })
                             });
                     if outstanding {
-                        self.notify_attention(project_id, request_id, kind, reason);
+                        self.notify_attention(project_id, item.request_id, item.kind, item.reason);
                     }
                 }
                 if let Some(request_id) = resolved_request {
@@ -2793,11 +3100,22 @@ impl App {
                 self.activity_online.borrow_mut().insert(project_id, online);
                 project_id
             }
+            ActivityNotice::CardComment {
+                project_id, error, ..
+            } => {
+                if let Some(error) = &error {
+                    self.toast(&format!("Could not post the comment: {error}"));
+                }
+                project_id
+            }
             ActivityNotice::Mutation {
                 project_id,
                 request_id,
                 result,
             } => {
+                // Home's cockpit shares the response path: clear its pending
+                // mark whichever widget sent the change.
+                self.home_pending_attention.borrow_mut().remove(&request_id);
                 match result {
                     Ok(result) => {
                         let result = *result;
@@ -2994,6 +3312,12 @@ impl App {
         App::show_candidates(app, &app.sidebar_search.text());
         app.apply_status_labels();
         app.refresh_status();
+        // Warm the board cache for every project, so Home's lanes have
+        // summaries the first time it is shown. This also imports a legacy
+        // BOARD.md once per project.
+        for project in &projects {
+            app.refresh_board_summary(project.id);
+        }
 
         if let Some(id) = selected {
             app.select_row_for(id);
@@ -3013,7 +3337,11 @@ impl App {
     fn build_project_row(self: &Rc<Self>, project: &Project) -> ProjectRow {
         let row = gtk::ListBoxRow::new();
         let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        // One calm line per project: icon, name and status badges, then the
+        // row's own controls. Sessions and board work live on Home now.
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        actions.add_css_class("row-actions");
 
         let missing = project.is_missing();
         let icon = gtk::Image::from_icon_name(if missing {
@@ -3022,12 +3350,12 @@ impl App {
             "folder-symbolic"
         });
         icon.add_css_class("row-icon");
-        icon.set_pixel_size(16);
+        icon.set_pixel_size(14);
         icon.set_valign(gtk::Align::Center);
         if missing {
             icon.add_css_class("missing");
         }
-        box_.append(&icon);
+        header.append(&icon);
 
         let texts = gtk::Box::new(gtk::Orientation::Vertical, 1);
         texts.set_valign(gtk::Align::Center);
@@ -3040,7 +3368,7 @@ impl App {
         if project.pinned {
             let pin = gtk::Image::from_icon_name("starred-symbolic");
             pin.add_css_class("pin-icon");
-            pin.set_pixel_size(12);
+            pin.set_pixel_size(10);
             pin.set_valign(gtk::Align::Center);
             pin.set_tooltip_text(Some("Pinned"));
             name_line.append(&pin);
@@ -3058,124 +3386,36 @@ impl App {
         summary.add_css_class("dim-label");
         summary.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         texts.append(&summary);
-        let board_summary = gtk::Label::new(None);
-        board_summary.set_xalign(0.0);
-        board_summary.add_css_class("caption");
-        board_summary.add_css_class("dim-label");
-        board_summary.set_wrap(true);
-        board_summary.set_lines(2);
-        board_summary.set_max_width_chars(36);
-        texts.append(&board_summary);
-        box_.append(&texts);
-        let board_button = gtk::Button::with_label("Board");
-        board_button.add_css_class("flat");
-        board_button.add_css_class("board-open-button");
-        board_button.set_tooltip_text(Some("Open this project's board"));
-        board_button.set_action_name(Some("app.open-board"));
-        board_button.set_action_target_value(Some(&project.id.to_variant()));
-        box_.append(&board_button);
+
+        header.append(&texts);
 
         let badge = gtk::Label::new(None);
         badge.add_css_class("badge");
         badge.set_valign(gtk::Align::Center);
         badge.set_visible(false);
-        box_.append(&badge);
+        header.append(&badge);
 
         let attention_badge = gtk::Label::new(None);
         attention_badge.add_css_class("badge");
         attention_badge.add_css_class("attention-badge");
         attention_badge.set_valign(gtk::Align::Center);
         attention_badge.set_visible(false);
-        box_.append(&attention_badge);
+        header.append(&attention_badge);
 
-        let agents_revealer = gtk::Revealer::new();
-        agents_revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
-        agents_revealer.set_transition_duration(120);
-        let agents = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        agents.add_css_class("agent-list");
-        agents.set_margin_start(8);
-        let agent_buttons = self.populate_project_agents(project.id, &agents);
-        agents_revealer.set_child(Some(&agents));
+        let agent_badge = gtk::Label::new(None);
+        agent_badge.add_css_class("badge");
+        agent_badge.add_css_class("agent-badge");
+        agent_badge.set_valign(gtk::Align::Center);
+        agent_badge.set_visible(false);
+        header.append(&agent_badge);
 
-        let agent_toggle = gtk::ToggleButton::new();
-        agent_toggle.add_css_class("flat");
-        agent_toggle.add_css_class("agent-toggle");
-        agent_toggle.set_tooltip_text(Some("Show agents in this project"));
-        agent_toggle.set_valign(gtk::Align::Center);
-        let toggle_icon = gtk::Image::from_icon_name("pan-end-symbolic");
-        agent_toggle.set_child(Some(&toggle_icon));
-        let expanded = self.expanded_projects.borrow().contains(&project.id);
-        agent_toggle.set_active(expanded);
-        agents_revealer.set_reveal_child(expanded);
-        let expanded_projects = self.expanded_projects.clone();
-        let project_id = project.id;
-        let revealer = agents_revealer.clone();
-        agent_toggle.connect_toggled(move |button| {
-            let expanded = button.is_active();
-            revealer.set_reveal_child(expanded);
-            toggle_icon.set_icon_name(Some(if expanded {
-                "pan-down-symbolic"
-            } else {
-                "pan-end-symbolic"
-            }));
-            button.set_tooltip_text(Some(if expanded {
-                "Hide agents in this project"
-            } else {
-                "Show agents in this project"
-            }));
-            if expanded {
-                expanded_projects.borrow_mut().insert(project_id);
-            } else {
-                expanded_projects.borrow_mut().remove(&project_id);
-            }
-        });
-        box_.append(&agent_toggle);
-        let board_toggle = gtk::ToggleButton::with_label("Board");
-        board_toggle.add_css_class("flat");
-        board_toggle.add_css_class("row-action");
-        board_toggle.set_valign(gtk::Align::Center);
-        let board_enabled = crate::board::enabled(&self.db, &project.path).unwrap_or(true);
-        board_toggle.set_active(board_enabled);
-        board_toggle.set_sensitive(!missing);
-        board_toggle.set_tooltip_text(Some(if board_enabled {
-            "Disable board for this project"
-        } else {
-            "Enable board for this project"
-        }));
-        let project_path = project.path.clone();
-        let project_id = project.id;
-        let db = self.db.clone();
-        let app = Rc::downgrade(self);
-        let changing = Rc::new(Cell::new(false));
-        let changing_signal = changing.clone();
-        board_toggle.connect_toggled(move |button| {
-            if changing_signal.get() {
-                return;
-            }
-            let enabled = button.is_active();
-            if let Err(error) = crate::board::set_enabled(&db, &project_path, enabled) {
-                changing_signal.set(true);
-                button.set_active(!enabled);
-                changing_signal.set(false);
-                if let Some(app) = app.upgrade() {
-                    app.toast(&format!("Could not update board setting: {error}"));
-                }
-                return;
-            }
-            button.set_tooltip_text(Some(if enabled {
-                "Disable board for this project"
-            } else {
-                "Enable board for this project"
-            }));
-            if let Some(app) = app.upgrade() {
-                app.project_board_setting_changed(project_id, &project_path, enabled);
-            }
-        });
-        box_.append(&board_toggle);
         let project_defaults = gtk::Button::builder()
             .icon_name("emblem-system-symbolic")
             .tooltip_text("Project defaults")
             .build();
+        if let Some(image) = project_defaults.child().and_downcast::<gtk::Image>() {
+            image.set_pixel_size(14);
+        }
         project_defaults.add_css_class("flat");
         project_defaults.add_css_class("row-action");
         project_defaults.set_valign(gtk::Align::Center);
@@ -3201,33 +3441,49 @@ impl App {
                 );
             }
         });
-        box_.append(&project_defaults);
+        actions.append(&project_defaults);
         let create_agent = gtk::Button::builder()
             .icon_name("list-add-symbolic")
             .tooltip_text("Create an agent in this project")
             .build();
+        if let Some(image) = create_agent.child().and_downcast::<gtk::Image>() {
+            image.set_pixel_size(14);
+        }
         create_agent.add_css_class("flat");
         create_agent.add_css_class("row-action");
         create_agent.set_valign(gtk::Align::Center);
         create_agent.set_sensitive(!missing);
         create_agent.set_action_name(Some("win.project-agent-create"));
         create_agent.set_action_target_value(Some(&project.id.to_variant()));
-        box_.append(&create_agent);
+        actions.append(&create_agent);
 
         let remove = gtk::Button::builder()
             .icon_name("user-trash-symbolic")
             .tooltip_text("Remove from sidebar")
             .build();
+        if let Some(image) = remove.child().and_downcast::<gtk::Image>() {
+            image.set_pixel_size(14);
+        }
         remove.add_css_class("flat");
         remove.add_css_class("row-action");
         remove.set_valign(gtk::Align::Center);
         remove.set_action_name(Some("win.project-remove"));
         remove.set_action_target_value(Some(&(project.id as i32).to_variant()));
-        box_.append(&remove);
+        actions.append(&remove);
+        header.append(&actions);
 
-        content.append(&box_);
-        content.append(&agents_revealer);
+        content.append(&header);
         row.set_child(Some(&content));
+
+        set_row_action_target(&row, false);
+        let focus = gtk::EventControllerFocus::new();
+        let focused_row = row.clone();
+        focus.connect_enter(move |_| set_row_action_target(&focused_row, true));
+        let focused_row = row.clone();
+        focus.connect_leave(move |_| {
+            set_row_action_target(&focused_row, focused_row.is_selected());
+        });
+        row.add_controller(focus);
         row.set_tooltip_text(Some(&if missing {
             format!("{} (missing)", project.display_path())
         } else {
@@ -3241,260 +3497,17 @@ impl App {
             (None, _) => "…".to_string(),
         };
         summary.set_text(&format!("{text}  ·  {parent}"));
-        if let Some(stats) = self.board_summaries.borrow().get(&project.id) {
-            let text = format!(
-                "Board · {}/{} done · {} claimed · {} active · {} review",
-                stats.done, stats.total, stats.claimed, stats.in_progress, stats.review
-            );
-            board_summary.set_text(&text);
-            board_summary.set_tooltip_text(Some(&text));
-        } else {
-            board_summary.set_text("Board activity unavailable");
-        }
         badge.set_tooltip_text(Some("Active embedded tools in this project"));
         attention_badge.set_tooltip_text(Some("Unresolved requests for human attention"));
+        agent_badge.set_tooltip_text(Some("Running agent sessions in this project"));
         ProjectRow {
             id: project.id,
             row,
             summary,
-            board_summary,
             badge,
             attention_badge,
-            agents,
-            agent_toggle,
-            agent_buttons: RefCell::new(agent_buttons),
+            agent_badge,
         }
-    }
-
-    fn project_board_setting_changed(&self, id: i64, path: &std::path::Path, enabled: bool) {
-        if enabled {
-            if let Err(error) = crate::board::ensure_enabled_file(&self.db, path) {
-                self.toast(&format!("Board enabled, but setup failed: {error}"));
-            }
-        } else if let Some(workspace) = self.workspaces.borrow().get(&id).cloned() {
-            self.restore_zoom(&workspace);
-            let key = TabKey::first(Slot::Board);
-            if workspace.is_visible(key) {
-                self.toggle_primitive(&workspace, key);
-            }
-        }
-        self.sync_toggles();
-        self.refresh_board_summary(id);
-    }
-
-    fn populate_project_agents(
-        &self,
-        project_id: i64,
-        container: &gtk::Box,
-    ) -> Vec<(String, gtk::Button)> {
-        while let Some(child) = container.first_child() {
-            container.remove(&child);
-        }
-
-        // The session this project's agent panel is showing, if any: its
-        // row wears the active mark.
-        let active = self.active_panel_session_id(project_id);
-        let mut buttons = Vec::new();
-        let archived_view = self.archived_views.borrow().contains(&project_id);
-        let mut sessions: Vec<_> = self
-            .agent_sessions
-            .borrow()
-            .get(&project_id)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|session| session.archived == archived_view)
-            .map(|session| {
-                let title = session.title.clone();
-                (session, title)
-            })
-            .collect();
-        live_agents::sort_sidebar_sessions(&mut sessions);
-
-        let has_archived = self
-            .agent_sessions
-            .borrow()
-            .get(&project_id)
-            .is_some_and(|rows| rows.iter().any(|session| session.archived));
-        if has_archived {
-            let filter = gtk::ToggleButton::with_label(if archived_view {
-                "Showing archived"
-            } else {
-                "Archived"
-            });
-            filter.add_css_class("flat");
-            filter.add_css_class("caption");
-            filter.add_css_class("agent-archived-toggle");
-            filter.set_halign(gtk::Align::Start);
-            filter.set_margin_start(12);
-            filter.set_active(archived_view);
-            filter.set_action_name(Some("win.project-archived-view"));
-            filter.set_action_target_value(Some(&(project_id, !archived_view).to_variant()));
-            container.append(&filter);
-        }
-
-        for (session, title) in &sessions {
-            let program = programs::by_id(&session.program_id);
-            let program_name = program
-                .as_ref()
-                .map(|program| program.name.clone())
-                .unwrap_or_else(|| session.program_id.clone());
-            let lifecycle = if session.external.is_some() {
-                "external terminal"
-            } else if session.running {
-                "running"
-            } else {
-                "ended"
-            };
-            let (activity_text, activity_message) = if let Some((state, at_millis, message)) =
-                self.latest_agent_activity(project_id, session)
-            {
-                let state = match state {
-                    crate::session::activity::AgentState::Unknown => "Unknown",
-                    crate::session::activity::AgentState::Working => "Working",
-                    crate::session::activity::AgentState::WaitingForInput => "Waiting for input",
-                    crate::session::activity::AgentState::WaitingForApproval => {
-                        "Waiting for approval"
-                    }
-                    crate::session::activity::AgentState::Idle => "Idle",
-                };
-                (format!("{state} · {}", relative_time(at_millis)), message)
-            } else {
-                ("Activity unknown".to_string(), None)
-            };
-            let attention_count = self.session_attention_count(project_id, session);
-            let request_text = match attention_count {
-                0 => String::new(),
-                1 => " · 1 request".to_string(),
-                count => format!(" · {count} requests"),
-            };
-            let subtitle = format!("{program_name} · {lifecycle} · {activity_text}{request_text}");
-            let linked_claims = self.claims_for_session(project_id, session);
-
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-            let button = gtk::Button::new();
-            button.add_css_class("flat");
-            button.add_css_class("agent-child");
-            if active.as_deref() == Some(session.id.as_str()) {
-                button.add_css_class("agent-active");
-            }
-            buttons.push((session.id.clone(), button.clone()));
-            button.set_halign(gtk::Align::Fill);
-            button.set_hexpand(true);
-            let action = if session.external.is_some() {
-                "Focus terminal for"
-            } else {
-                "Open session:"
-            };
-            button.set_tooltip_text(Some(&format!(
-                "{action} {title}{}",
-                if archived_view { " (archived)" } else { "" }
-            )));
-
-            let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            let icon = gtk::Image::from_icon_name("application-x-executable-symbolic");
-            icon.add_css_class("row-icon");
-            if session.running {
-                icon.add_css_class("agent-running");
-            }
-            icon.set_pixel_size(12);
-            icon.set_valign(gtk::Align::Center);
-            let texts = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            let label = gtk::Label::new(Some(title));
-            label.set_xalign(0.0);
-            label.set_hexpand(true);
-            label.set_single_line_mode(true);
-            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            let detail = gtk::Label::new(Some(&subtitle));
-            detail.set_xalign(0.0);
-            detail.add_css_class("caption");
-            detail.add_css_class("dim-label");
-            detail.set_single_line_mode(true);
-            detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            detail.set_tooltip_text(activity_message.as_deref());
-            texts.append(&label);
-            texts.append(&detail);
-            content.append(&icon);
-            content.append(&texts);
-            button.set_child(Some(&content));
-            if let Some(target) = &session.external {
-                button.set_action_name(Some("win.project-agent-open-external"));
-                button.set_action_target_value(Some(
-                    &(
-                        project_id,
-                        target.pid,
-                        target.start_ticks,
-                        target.window_pid,
-                    )
-                        .to_variant(),
-                ));
-            } else {
-                button.set_action_name(Some("win.project-session-open"));
-                button
-                    .set_action_target_value(Some(&(project_id, session.id.as_str()).to_variant()));
-            }
-            row.append(&button);
-
-            if let Some(catalog_id) = session.catalog_id {
-                let archive = gtk::Button::builder()
-                    .icon_name(if session.archived {
-                        "view-restore-symbolic"
-                    } else {
-                        "mail-archive-symbolic"
-                    })
-                    .tooltip_text(if session.archived {
-                        "Unarchive this session"
-                    } else {
-                        "Archive this session"
-                    })
-                    .build();
-                archive.add_css_class("flat");
-                archive.add_css_class("row-action");
-                archive.set_valign(gtk::Align::Center);
-                archive.set_action_name(Some("win.project-session-archive"));
-                archive
-                    .set_action_target_value(Some(&(catalog_id, !session.archived).to_variant()));
-                row.append(&archive);
-            }
-            container.append(&row);
-            for claim in linked_claims {
-                let claim_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-                claim_row.set_margin_start(24);
-                let open_card = gtk::Button::with_label(&format!("Board · {}", claim.title));
-                open_card.add_css_class("flat");
-                open_card.add_css_class("agent-claim-link");
-                open_card.set_halign(gtk::Align::Fill);
-                open_card.set_hexpand(true);
-                open_card.set_tooltip_text(Some("Open this claimed board card"));
-                open_card.set_action_name(Some("win.project-board-card"));
-                open_card
-                    .set_action_target_value(Some(&(project_id, claim.id.as_str()).to_variant()));
-                claim_row.append(&open_card);
-                container.append(&claim_row);
-            }
-        }
-
-        if sessions.is_empty() {
-            let empty = gtk::Label::new(Some(if archived_view {
-                "No archived sessions"
-            } else {
-                "No agent sessions yet"
-            }));
-            empty.add_css_class("caption");
-            empty.add_css_class("dim-label");
-            empty.set_xalign(0.0);
-            empty.set_margin_start(12);
-            empty.set_margin_top(3);
-            empty.set_margin_bottom(3);
-            container.append(&empty);
-        }
-        // Keep the row's button index current — the active-panel highlight
-        // re-marks these buttons without rebuilding them. A row being built
-        // is not registered yet, so its builder takes the list instead.
-        if let Some(row) = self.rows.borrow().iter().find(|row| row.id == project_id) {
-            *row.agent_buttons.borrow_mut() = buttons.clone();
-        }
-        buttons
     }
 
     /// Which sidebar session (by id) the project's agent panel is showing:
@@ -3515,6 +3528,7 @@ impl App {
         let sessions = self
             .agent_sessions
             .borrow()
+            .by_project
             .get(&project_id)
             .cloned()
             .unwrap_or_default();
@@ -3522,31 +3536,41 @@ impl App {
             .map(|session| session.id.clone())
     }
 
-    /// Re-mark the sidebar row each project's agent panel is showing.
-    /// Chips, board claims, hovers and program swaps move the panel
-    /// without any session data changing; this toggles the marks on the
-    /// buttons a populate built instead of rebuilding them.
-    fn refresh_active_agent_highlights(&self) {
-        for row in self.rows.borrow().iter() {
-            let active = self.active_panel_session_id(row.id);
-            for (session_id, button) in row.agent_buttons.borrow().iter() {
-                if active.as_deref() == Some(session_id.as_str()) {
-                    button.add_css_class("agent-active");
-                } else {
-                    button.remove_css_class("agent-active");
-                }
-            }
-        }
-    }
-    fn refresh_project_agents(&self, project_id: i64) {
-        let container = self
+    /// Filter the project list. A query matches a project's name or path, or
+    /// the title of one of its running agent sessions — so typing an agent's
+    /// conversation name still finds the project it lives in. Child session
+    /// rows are gone; Home is where sessions are opened.
+    fn filter_sidebar(&self, query: &str) {
+        let matcher = fuzzy_matcher::skim::SkimMatcherV2::default().ignore_case();
+        use fuzzy_matcher::FuzzyMatcher;
+        let query = query.trim();
+        let projects = self.projects.borrow();
+        let sessions = self.agent_sessions.borrow();
+        let rows: Vec<_> = self
             .rows
             .borrow()
             .iter()
-            .find(|row| row.id == project_id)
-            .map(|row| row.agents.clone());
-        if let Some(container) = container {
-            self.populate_project_agents(project_id, &container);
+            .map(|row| (row.id, row.row.clone()))
+            .collect();
+        for (project_id, row) in rows {
+            let Some(project) = projects.iter().find(|project| project.id == project_id) else {
+                continue;
+            };
+            let project_matches = query.is_empty()
+                || matcher.fuzzy_match(&project.name, query).is_some()
+                || matcher
+                    .fuzzy_match(&project.display_path(), query)
+                    .is_some();
+            let agent_matches = !query.is_empty()
+                && sessions
+                    .by_project
+                    .get(&project_id)
+                    .is_some_and(|sessions| {
+                        sessions
+                            .iter()
+                            .any(|session| live_agents::matches_sidebar_query(session, query))
+                    });
+            row.set_visible(query.is_empty() || project_matches || agent_matches);
         }
     }
 
@@ -3583,85 +3607,13 @@ impl App {
             })
     }
 
-    fn session_attention_count(
-        &self,
-        project_id: i64,
-        session: &live_agents::AgentSession,
-    ) -> usize {
-        let Some(identity) = Self::activity_identity(session) else {
-            return 0;
-        };
-        self.activity
-            .borrow()
-            .get(&project_id)
-            .map_or(0, |activity| {
-                activity
-                    .snapshot
-                    .attention
-                    .iter()
-                    .filter(|attention| attention.session_id.as_deref() == Some(identity))
-                    .count()
-            })
-    }
-
-    fn claims_for_session(
-        &self,
-        project_id: i64,
-        session: &live_agents::AgentSession,
-    ) -> Vec<board::ClaimedWork> {
-        self.board_summaries
-            .borrow()
-            .get(&project_id)
-            .map(|summary| {
-                summary
-                    .claims
-                    .iter()
-                    .filter(|claim| {
-                        if session.claim_id.as_deref() == Some(claim.claim.as_str()) {
-                            return true;
-                        }
-                        let Some(provider_session_id) = session.provider_session_id.as_deref()
-                        else {
-                            return false;
-                        };
-                        self.db
-                            .bound_session(project_id, &claim.claim)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|(program_id, bound_session_id)| {
-                                session.program_id.as_str() == program_id.as_str()
-                                    && provider_session_id == bound_session_id.as_str()
-                            })
-                    })
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn set_project_expanded(&self, project_id: i64, expanded: bool) {
-        let toggle = self
-            .rows
-            .borrow()
-            .iter()
-            .find(|row| row.id == project_id)
-            .map(|row| row.agent_toggle.clone());
-        if let Some(toggle) = toggle {
-            toggle.set_active(expanded);
-        } else if expanded {
-            self.expanded_projects.borrow_mut().insert(project_id);
-        } else {
-            self.expanded_projects.borrow_mut().remove(&project_id);
-        }
-    }
-
     fn apply_status_labels(&self) {
         let projects = self.projects.borrow();
         let rows = self.rows.borrow();
         let activity = self.activity.borrow();
         let statuses = self.status.borrow();
         let workspaces = self.workspaces.borrow();
-        let board_summaries = self.board_summaries.borrow();
+        let sessions = self.agent_sessions.borrow();
         for row in rows.iter() {
             let Some(project) = projects.iter().find(|project| project.id == row.id) else {
                 continue;
@@ -3676,11 +3628,16 @@ impl App {
                 .map_or(0, |activity| activity.snapshot.attention.len());
             row.attention_badge.set_text(&attention_count.to_string());
             row.attention_badge.set_visible(attention_count > 0);
+            let running_agents = sessions.by_project.get(&row.id).map_or(0, |sessions| {
+                sessions
+                    .iter()
+                    .filter(|session| live_agents::sidebar_session_is_live(session))
+                    .count()
+            });
+            row.agent_badge.set_text(&running_agents.to_string());
+            row.agent_badge.set_visible(running_agents > 0);
             if project.is_missing() {
                 row.summary.set_text(&format!("missing  ·  {parent}"));
-                row.board_summary.set_text("Board activity unavailable");
-                row.board_summary
-                    .set_tooltip_text(Some("Board activity unavailable"));
                 row.badge.set_visible(false);
                 continue;
             }
@@ -3690,18 +3647,6 @@ impl App {
                         .set_text(&format!("{}  ·  {parent}", status.summary()));
                 }
                 None => row.summary.set_text(&format!("…  ·  {parent}")),
-            }
-            if let Some(stats) = board_summaries.get(&row.id) {
-                let text = format!(
-                    "Board · {}/{} done · {} claimed · {} active · {} review",
-                    stats.done, stats.total, stats.claimed, stats.in_progress, stats.review
-                );
-                row.board_summary.set_text(&text);
-                row.board_summary.set_tooltip_text(Some(&text));
-            } else {
-                row.board_summary.set_text("Board activity unavailable");
-                row.board_summary
-                    .set_tooltip_text(Some("Board activity unavailable"));
             }
             let count = workspaces.get(&row.id).map_or(0, |workspace| {
                 workspace
@@ -3744,11 +3689,11 @@ impl App {
         let session_home = self.session_home.clone();
         let tx = self.agent_tx.clone();
         std::thread::spawn(move || {
-            let sessions = live_agents::discover(&projects, &session_home);
-            let _ = tx.send(sessions);
+            let result =
+                live_agents::discover(&projects, &session_home).map_err(|error| error.to_string());
+            let _ = tx.send(result);
         });
     }
-
     fn select_row_for(&self, id: i64) {
         let target = self
             .rows
@@ -3761,36 +3706,13 @@ impl App {
         }
     }
 
-    fn filter_sidebar(&self, query: &str) {
-        let matcher = fuzzy_matcher::skim::SkimMatcherV2::default().ignore_case();
-        use fuzzy_matcher::FuzzyMatcher;
-        let query = query.trim();
-        let projects = self.projects.borrow();
-        let agent_sessions = self.agent_sessions.borrow();
-        for row in self.rows.borrow().iter() {
-            let Some(project) = projects.iter().find(|p| p.id == row.id) else {
-                continue;
-            };
-            let project_matches = matcher.fuzzy_match(&project.name, query).is_some()
-                || matcher
-                    .fuzzy_match(&project.display_path(), query)
-                    .is_some();
-            let agent_matches = agent_sessions.get(&row.id).is_some_and(|sessions| {
-                sessions.iter().any(|session| {
-                    matcher.fuzzy_match(&session.title, query).is_some()
-                        || matcher.fuzzy_match(&session.program_id, query).is_some()
-                })
-            });
-            row.row
-                .set_visible(query.is_empty() || project_matches || agent_matches);
-        }
-    }
-
     /// The home panel: the empty state, rebuilt so its dropdowns say what the
     /// preferences say right now. Workspaces stay alive behind it — going
     /// home looks away, it never stops anything.
     fn show_home(self: &Rc<Self>) {
         self.home_shown.set(true);
+        // Going Home always lands on the cockpit, not the last drill-down.
+        self.home_nav.borrow_mut().clear();
         *self.current.borrow_mut() = None;
         // The sidebar's selection stops meaning anything: no project is on
         // screen. None is ignored by the row-selected handler.
@@ -3802,6 +3724,34 @@ impl App {
         self.stack.set_visible_child_name("_home");
         let _ = self.db.remember_last_project(None);
         self.sync_toggles();
+    }
+
+    /// Rebuild the Home cockpit in place while it is on screen. Attention,
+    /// sessions and git keep arriving after Home is built; this keeps the
+    /// surface current without re-running show_home (which clears the sidebar
+    /// selection and forgets the last project). Only the cockpit is rebuilt
+    /// from here — the empty state needs the `Rc` only show_home holds.
+    fn refresh_home(&self) {
+        if !self.home_shown.get() || self.stack.visible_child_name().as_deref() != Some("_home") {
+            return;
+        }
+        if self.projects.borrow().is_empty() {
+            return;
+        }
+        // The rebuild destroys any focused widget inside Home. Clear the
+        // window's focus first (unless it is the sidebar's search, which must
+        // keep the keys) so GTK never holds a stale widget and criticals on
+        // the next focus query.
+        if let Some(focus) = self.window.focus_widget() {
+            if !focus.is_ancestor(&self.sidebar) {
+                gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
+            }
+        }
+        while let Some(child) = self.stack.child_by_name("_home") {
+            self.stack.remove(&child);
+        }
+        self.stack.add_named(&home::view(self), Some("_home"));
+        self.stack.set_visible_child_name("_home");
     }
 
     // ---- the search is the add flow ----
@@ -3893,20 +3843,16 @@ impl App {
         self.stack.set_visible_child_name(&format!("project-{id}"));
         let _ = self.db.touch_project(id);
         let _ = self.db.remember_last_project(Some(id));
-        // Initialize the board only when enabled in global project settings.
+        // Load the board from the store — importing a legacy BOARD.md once —
+        // only when the project's board is enabled.
         match crate::board::enabled(&self.db, &project.path) {
-            Ok(true) => {
-                if let Err(error) = crate::board::ensure_file(&project.path) {
-                    eprintln!("radar: setting up the board: {error}");
-                }
-            }
+            Ok(true) => self.refresh_board_summary(id),
             Ok(false) => {}
             Err(error) => eprintln!("radar: reading board policy: {error}"),
         }
         self.sync_toggles();
         self.refresh_menus();
         self.select_row_for(id);
-        self.set_project_expanded(id, true);
     }
     fn open_project_board(&self, project_id: i64, card_id: Option<&str>) {
         if !self
@@ -4594,7 +4540,7 @@ impl App {
                 primitive.focus();
             }
             self.persist_primitives(workspace);
-            self.refresh_active_agent_highlights();
+            self.refresh_home();
             return;
         }
         self.show_primitive(workspace, key);
@@ -4605,7 +4551,7 @@ impl App {
                 primitive.focus();
             }
             self.persist_primitives(workspace);
-            self.refresh_active_agent_highlights();
+            self.refresh_home();
         }
     }
 
@@ -4693,6 +4639,7 @@ impl App {
         let sessions = self
             .agent_sessions
             .borrow()
+            .by_project
             .get(&project_id)
             .cloned()
             .unwrap_or_default();
@@ -4768,6 +4715,7 @@ impl App {
         let session = self
             .agent_sessions
             .borrow()
+            .by_project
             .get(&project_id)
             .and_then(|rows| rows.iter().find(|session| session.id == identity))
             .cloned();
@@ -4960,7 +4908,7 @@ impl App {
             group.activate(key);
             self.refresh_group_menu(&group);
             self.persist_primitives(workspace);
-            self.refresh_active_agent_highlights();
+            self.refresh_home();
         }
         if let Some(primitive) = workspace.tab(key) {
             let focused_here = self.window.focus_widget().is_some_and(|focus| {
@@ -5526,7 +5474,7 @@ impl App {
     /// tree so the project comes back in the same arrangement.
     fn persist_primitives(&self, workspace: &Rc<Workspace>) {
         persist_workspace(&self.db, workspace);
-        self.refresh_project_agents(workspace.project.id);
+        self.refresh_home();
     }
 
     /// Save every project before the window is closed. Most changes are saved
@@ -5574,7 +5522,7 @@ impl App {
         }
         // The sidebar's active-agent marks are arrangement-derived state,
         // like the dock: every path that relayouts panes lands here.
-        self.refresh_active_agent_highlights();
+        self.refresh_home();
     }
 
     /// The pane menu belongs to whichever tab its header is showing — and so
@@ -6452,4 +6400,146 @@ mod agent_panel_tests {
         assert_eq!(choose(Some(k(1)), None, k(2)), k(1));
         assert_eq!(choose(None, None, k(2)), k(1), "k(0) is live");
     }
+}
+
+// Layout probe: drives the splitter across the full position range a drag
+// uses (set_position) — down to zero and up past the window — and logs
+// whether either pane ever allocates outside the window. GTK layout cannot
+// be unit-tested headless, so this is the regression check for splitter
+// bugs: run with
+//   RADAR_DEBUG_SIDEBAR_SWEEP=1 radar
+// and expect "sweep done: overflow ticks 0".
+#[cfg(feature = "vte")]
+fn debug_sidebar_sweep(window: &adw::ApplicationWindow) {
+    if std::env::var("RADAR_DEBUG_SIDEBAR_SWEEP").is_err() {
+        return;
+    }
+    fn find_paned(widget: &gtk::Widget) -> Option<gtk::Paned> {
+        if let Some(paned) = widget.downcast_ref::<gtk::Paned>() {
+            return Some(paned.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(next) = child {
+            if let Some(found) = find_paned(&next) {
+                return Some(found);
+            }
+            child = next.next_sibling();
+        }
+        None
+    }
+    let Some(paned) = find_paned(window.upcast_ref()) else {
+        eprintln!("[DEBUG-sb] no Paned under the window");
+        return;
+    };
+    eprintln!("[DEBUG-sb] found paned, waiting for map");
+    let window_for_alloc = window.clone();
+    glib::timeout_add_local(Duration::from_millis(400), move || {
+        let window = window_for_alloc.clone();
+        let window_w = window.allocation().width();
+        let start = paned.start_child();
+        let stack = paned
+            .end_child()
+            .map(|child| child.downcast::<gtk::Stack>().unwrap());
+        eprintln!("[DEBUG-sb] window width {window_w}");
+        // One-shot: which descendants demand the width on either side?
+        fn dump_min(widget: &gtk::Widget, depth: u32) {
+            let (_, min_w, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+            if min_w > 100 {
+                eprintln!(
+                    "[DEBUG-sb] min-width offender: depth {depth} {} min={min_w}",
+                    widget.type_().name(),
+                );
+            }
+            let mut child = widget.first_child();
+            while let Some(next) = child {
+                dump_min(&next, depth + 1);
+                child = next.next_sibling();
+            }
+        }
+        if let Some(sidebar) = start.as_ref() {
+            eprintln!("[DEBUG-sb] --- start child (sidebar) minima ---");
+            dump_min(sidebar, 0);
+        }
+        if let Some(child) = stack.as_ref().and_then(|s| s.visible_child()) {
+            eprintln!("[DEBUG-sb] --- end child (content) minima ---");
+            dump_min(&child, 0);
+        }
+        let pos: Rc<Cell<i32>> = Rc::new(Cell::new(0));
+        let rising: Rc<Cell<bool>> = Rc::new(Cell::new(true));
+        let prev: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
+        let overflow: Rc<Cell<i32>> = Rc::new(Cell::new(0));
+        let paned = paned.clone();
+        glib::timeout_add_local(Duration::from_millis(16), move || {
+            // Allocations lag one frame: judge the position set last tick.
+            if let Some(prev_pos) = prev.borrow_mut().take() {
+                let actual = paned.position();
+                let (label, over) = if rising.get() {
+                    // Widening the sidebar must never push the content off
+                    // the window's right edge.
+                    match stack.as_ref() {
+                        Some(stack) => {
+                            let sa = stack.allocation();
+                            let over = sa.x() + sa.width() > window_w + 1;
+                            (
+                                format!(
+                                    "stack x={} w={} min_w={}",
+                                    sa.x(),
+                                    sa.width(),
+                                    stack.measure(gtk::Orientation::Horizontal, -1).1,
+                                ),
+                                over,
+                            )
+                        }
+                        None => (String::new(), false),
+                    }
+                } else {
+                    // Narrowing the sidebar must never push its own content
+                    // past the window's left edge.
+                    match start.as_ref() {
+                        Some(sidebar) => {
+                            let sa = sidebar.allocation();
+                            let over = sa.x() < -1;
+                            (format!("sidebar x={} w={}", sa.x(), sa.width()), over)
+                        }
+                        None => (String::new(), false),
+                    }
+                };
+                if over {
+                    overflow.set(overflow.get() + 1);
+                }
+                eprintln!(
+                    "[DEBUG-sb] pos {prev_pos} actual {actual} {label} win {window_w} {}",
+                    if over { "OVERFLOW" } else { "ok" },
+                );
+            }
+            let p = if rising.get() {
+                let p = pos.get() + 24;
+                if p > window_w * 3 / 2 || window_w == 0 {
+                    rising.set(false);
+                    eprintln!("[DEBUG-sb] --- sweeping down ---");
+                    p - 24
+                } else {
+                    p
+                }
+            } else {
+                let p = pos.get() - 24;
+                if p < 0 {
+                    eprintln!("[DEBUG-sb] sweep done: overflow ticks {}", overflow.get());
+                    if let Some(app) = window
+                        .application()
+                        .and_then(|a| a.downcast::<adw::Application>().ok())
+                    {
+                        app.quit();
+                    }
+                    return glib::ControlFlow::Break;
+                }
+                p
+            };
+            pos.set(p);
+            *prev.borrow_mut() = Some(p);
+            paned.set_position(p);
+            glib::ControlFlow::Continue
+        });
+        glib::ControlFlow::Break
+    });
 }

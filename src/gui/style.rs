@@ -104,7 +104,7 @@ paned > separator:hover {
   background: none;
 }
 .projects-sidebar list > row:hover {
-  background-color: @radar_surface_hover;
+  background-color: @radar_surface;
 }
 .projects-sidebar list > row:selected {
   color: @radar_fg;
@@ -129,7 +129,7 @@ paned > separator:hover {
 }
 .projects-sidebar button.agent-child:hover {
   color: @radar_fg;
-  background-color: @radar_surface_hover;
+  background-color: @radar_surface;
 }
 /* The session the project's agent panel is showing: the quiet accent a
    chip wears while it is the tab on screen. */
@@ -145,20 +145,9 @@ paned > separator:hover {
   padding: 1px 5px;
   color: @radar_accent;
 }
-.projects-sidebar button.agent-claim-link:hover,
-.projects-sidebar button.board-open-button:hover {
+.projects-sidebar button.agent-claim-link:hover {
   color: @radar_fg;
   background-color: @radar_accent_soft;
-}
-.projects-sidebar button.board-open-button {
-  min-height: 26px;
-  padding: 1px 6px;
-  color: @radar_muted;
-}
-.projects-sidebar button.agent-toggle {
-  min-width: 24px;
-  min-height: 24px;
-  padding: 0;
 }
 
 /* Icons and metadata stay quiet until they carry useful state. */
@@ -186,6 +175,12 @@ paned > separator:hover {
 .projects-sidebar row .attention-badge {
   color: @radar_warning;
   background-color: alpha(@radar_warning, 0.16);
+}
+/* Running agents: a quieter count than the tool badge, so the sidebar reads
+   as liveness rather than decoration. */
+.projects-sidebar row .agent-badge {
+  color: @radar_fg;
+  background-color: alpha(@radar_fg, 0.1);
 }
 
 /* Pane framing is intentionally thin; the running tool remains the focal point.
@@ -311,6 +306,227 @@ paned > separator:hover {
   background: none;
 }
 
+/* Home cockpit: a Basecamp-style portfolio. Projects are lanes; each lane
+   carries its board counts, its open to-dos and its running sessions. */
+.home-cockpit .cockpit-heading {
+  margin-top: 6px;
+}
+.home-cockpit .lane {
+  padding: 12px;
+  border: 1px solid @radar_hairline;
+  border-radius: {panel_radius_inner};
+  background-color: alpha(@radar_fg, 0.025);
+}
+.home-cockpit .lane-dot {
+  border-radius: 99px;
+  background-color: @radar_accent;
+}
+.home-cockpit button.lane-name {
+  padding: 2px 6px;
+  font-weight: 700;
+  color: @radar_fg;
+}
+.home-cockpit button.lane-name:hover {
+  background-color: @radar_surface_hover;
+}
+.home-cockpit .lane-pills {
+  margin-bottom: 2px;
+}
+.home-cockpit .pill {
+  padding: 1px 7px;
+  border-radius: 99px;
+  font-size: 0.85em;
+  color: @radar_muted;
+  background-color: alpha(@radar_fg, 0.07);
+}
+.home-cockpit .pill-active {
+  color: @radar_accent;
+  background-color: @radar_accent_soft;
+}
+.home-cockpit .pill-review {
+  color: @radar_warning;
+  background-color: alpha(@radar_warning, 0.14);
+}
+.home-cockpit .pill-done {
+  color: alpha(@radar_fg, 0.5);
+  background-color: alpha(@radar_fg, 0.04);
+}
+/* The quiet "To-dos" / "Sessions" mini-heading inside a lane. */
+.home-cockpit .lane-section {
+  margin-top: 4px;
+  color: alpha(@radar_fg, 0.6);
+  font-size: 0.85em;
+  font-weight: 700;
+}
+.home-cockpit button.todo {
+  padding: 3px 5px;
+  border-radius: {control_radius};
+}
+.home-cockpit button.todo:hover {
+  background-color: @radar_surface_hover;
+}
+.home-cockpit .todo-box {
+  border: 1.5px solid alpha(@radar_fg, 0.35);
+  border-radius: 4px;
+}
+.home-cockpit .todo-box.done {
+  border-color: @radar_accent;
+  background-color: @radar_accent;
+}
+.home-cockpit label.todo-done {
+  color: @radar_muted;
+  text-decoration-line: line-through;
+}
+.home-cockpit label.todo-claim {
+  color: @radar_accent;
+}
+.home-cockpit .lane-foot {
+  margin-top: 4px;
+  padding-top: 7px;
+  border-top: 1px solid @radar_hairline;
+}
+.home-cockpit .cockpit-row {
+  padding: 2px 0;
+}
+.home-cockpit button.cockpit-action {
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0 4px;
+  color: alpha(@radar_fg, 0.55);
+}
+.home-cockpit button.cockpit-action:hover {
+  color: @radar_fg;
+  background-color: @radar_surface_hover;
+}
+.home-cockpit .attention-card {
+  border: 1px solid alpha(@radar_warning, 0.32);
+  border-radius: {control_radius};
+  background-color: alpha(@radar_warning, 0.06);
+}
+.home-cockpit .agent-state-dot {
+  font-size: 0.8em;
+}
+.home-cockpit .agent-state-working {
+  color: @radar_accent;
+}
+.home-cockpit .agent-state-waiting {
+  color: @radar_warning;
+}
+.home-cockpit .agent-state-idle {
+  color: @radar_muted;
+}
+.home-cockpit .agent-state-unknown {
+  color: alpha(@radar_fg, 0.28);
+}
+.home-cockpit label.cockpit-active {
+  color: @radar_accent;
+}
+.home-cockpit button.todo-tick {
+  min-width: 22px;
+  min-height: 22px;
+  padding: 2px 4px;
+  border-radius: {control_radius};
+}
+.home-cockpit button.todo-tick:hover {
+  background-color: @radar_surface_hover;
+}
+.home-cockpit label.todo-note {
+  color: alpha(@radar_fg, 0.55);
+}
+
+/* Card panel: a card opened as a conversation — thread, reply, controls. */
+.card-panel {
+  background-color: @radar_bg;
+}
+.card-panel-title {
+  font-size: 1.15em;
+  font-weight: 700;
+}
+.card-panel-body {
+  color: alpha(@radar_fg, 0.75);
+}
+.card-panel .card-thread {
+  border-top: 1px solid @radar_hairline;
+}
+.card-panel .thread-row {
+  padding: 6px 8px;
+  border-radius: {control_radius};
+  background-color: alpha(@radar_fg, 0.04);
+}
+.card-panel .thread-you {
+  background-color: @radar_accent_soft;
+}
+.card-panel .thread-agent {
+  background-color: alpha(@radar_fg, 0.05);
+}
+.card-panel .thread-author {
+  font-weight: 700;
+  font-size: 0.9em;
+  color: @radar_muted;
+}
+.card-panel .thread-system {
+  padding: 1px 2px;
+}
+.card-panel .attention-card {
+  border: 1px solid alpha(@radar_warning, 0.32);
+  border-radius: {control_radius};
+  background-color: alpha(@radar_warning, 0.06);
+}
+.card-panel .error {
+  color: @radar_warning;
+}
+/* The card detail is Home's right-hand rail. */
+.card-panel-top {
+  padding: 8px 10px;
+  border-bottom: 1px solid @radar_hairline;
+}
+/* Home drill-downs: the board or a card opened inside Home, with Back. */
+.home-view {
+  background-color: @radar_bg;
+}
+.home-view-bar {
+  padding: 12px 16px 6px;
+}
+.home-view-bar button {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0 4px;
+}
+.home-cockpit button.session-item {
+  padding: 3px 5px;
+  border-radius: {control_radius};
+}
+.home-cockpit button.session-item:hover {
+  background-color: @radar_surface_hover;
+}
+/* Markdown rendered inside a card. */
+.markdown .md-heading {
+  font-weight: 700;
+}
+.markdown .md-h1 {
+  font-size: 1.3em;
+}
+.markdown .md-h2 {
+  font-size: 1.15em;
+}
+.markdown .md-h3 {
+  font-size: 1.05em;
+}
+.markdown .md-code-block {
+  padding: 6px 8px;
+  border-radius: {control_radius};
+  background-color: alpha(@radar_fg, 0.06);
+  font-family: monospace;
+}
+.markdown .md-quote {
+  padding-left: 10px;
+  border-left: 2px solid alpha(@radar_accent, 0.6);
+  color: @radar_muted;
+}
+.markdown .md-bullet {
+  color: @radar_muted;
+}
+
 /* Board: quiet columns, lightly outlined cards, and a single warm claim marker. */
 .board-pane {
   background-color: @radar_bg;
@@ -380,7 +596,7 @@ button.board-claim-button {
   min-height: 0;
 }
 
-/* Row actions stay out of the way until needed. */
+/* Row actions appear on selected or keyboard-focused rows, never on hover. */
 .projects-sidebar row .row-action {
   opacity: 0;
   min-height: 22px;
@@ -389,9 +605,16 @@ button.board-claim-button {
   margin-left: 2px;
   transition: opacity 120ms ease;
 }
-.projects-sidebar row:hover .row-action,
+.projects-sidebar row:selected .row-action,
 .projects-sidebar row:focus-within .row-action {
   opacity: 1;
+}
+/* The meta line pairs the board's one-line stats with the row's controls,
+   indented to the name like the other caption lines. Its quiet controls
+   collapse on unselected rows; the always-visible Board button keeps the
+   line's height, so selection never reflows the list. */
+.projects-sidebar .row-meta {
+  margin-left: 22px;
 }
 .projects-sidebar row.sidebar-empty {
   background: none;

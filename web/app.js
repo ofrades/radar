@@ -31,6 +31,18 @@ let refreshInFlight = null;
 const noticedAttention = new Set();
 const initializedAttention = new Set();
 
+function syncAppViewport() {
+  const viewport = window.visualViewport;
+  if (!viewport) return;
+  appShell.style.setProperty("--visual-viewport-height", `${viewport.height}px`);
+  appShell.style.setProperty("--visual-viewport-offset-top", `${viewport.offsetTop}px`);
+}
+
+syncAppViewport();
+window.addEventListener("resize", syncAppViewport);
+window.visualViewport?.addEventListener("resize", syncAppViewport);
+window.visualViewport?.addEventListener("scroll", syncAppViewport);
+
 function updateAttentionShortcut() {
   let count = 0;
   for (const project of projects) {

@@ -13,6 +13,10 @@ Opening a session switches to an immersive terminal view that hides project
 navigation so the terminal uses the available viewport; **Workspace** returns
 to the project view.
 
+On mobile, the app shell follows the browser's visual viewport. When the
+on-screen keyboard opens, the terminal reflows into the remaining space above
+it.
+
 The session endpoint also includes durable catalog history. Catalog-only rows
 are sorted by their provider activity time and marked **ended**; they are
 deliberately inert because the daemon no longer has a terminal to attach to.

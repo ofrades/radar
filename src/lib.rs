@@ -18,6 +18,7 @@ pub mod git;
 pub mod gui;
 pub mod programs;
 pub mod session;
+pub mod setup;
 pub mod skill;
 pub mod web;
 

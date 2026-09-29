@@ -18,6 +18,41 @@ const WATCH_QUEUE: usize = 64;
 const MAX_TEXT: usize = 16 * 1024;
 const MAX_ID: usize = 200;
 
+/// Bump when the tables below change; add the next step to `SCHEMA_STEPS`.
+const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_STEPS: [&str; 1] = [r#"
+    CREATE TABLE IF NOT EXISTS activity_events (
+        project_id INTEGER NOT NULL,
+        sequence INTEGER NOT NULL,
+        event_id TEXT NOT NULL UNIQUE,
+        data TEXT NOT NULL,
+        PRIMARY KEY(project_id, sequence)
+    );
+    CREATE INDEX IF NOT EXISTS activity_recent
+        ON activity_events(project_id, sequence DESC);
+    CREATE TABLE IF NOT EXISTS attention_requests (
+        project_id INTEGER NOT NULL,
+        request_id TEXT NOT NULL UNIQUE,
+        revision INTEGER NOT NULL,
+        resolved INTEGER NOT NULL DEFAULT 0,
+        data TEXT NOT NULL,
+        PRIMARY KEY(project_id, request_id)
+    );
+    CREATE INDEX IF NOT EXISTS attention_unresolved
+        ON attention_requests(project_id, resolved, request_id);
+    CREATE TABLE IF NOT EXISTS activity_commands (
+        project_id INTEGER NOT NULL,
+        command_id TEXT NOT NULL,
+        command_type TEXT NOT NULL,
+        result TEXT NOT NULL,
+        PRIMARY KEY(project_id, command_id)
+    );
+    CREATE TABLE IF NOT EXISTS board_snapshots (
+        project_id INTEGER PRIMARY KEY,
+        board_json TEXT
+    );
+"#];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "kebab-case")]
@@ -314,38 +349,7 @@ impl ActivityJournal {
     }
 
     fn from_connection(connection: Connection) -> Result<Self> {
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS activity_events (
-                project_id INTEGER NOT NULL,
-                sequence INTEGER NOT NULL,
-                event_id TEXT NOT NULL UNIQUE,
-                data TEXT NOT NULL,
-                PRIMARY KEY(project_id, sequence)
-            );
-            CREATE INDEX IF NOT EXISTS activity_recent
-                ON activity_events(project_id, sequence DESC);
-            CREATE TABLE IF NOT EXISTS attention_requests (
-                project_id INTEGER NOT NULL,
-                request_id TEXT NOT NULL UNIQUE,
-                revision INTEGER NOT NULL,
-                resolved INTEGER NOT NULL DEFAULT 0,
-                data TEXT NOT NULL,
-                PRIMARY KEY(project_id, request_id)
-            );
-            CREATE INDEX IF NOT EXISTS attention_unresolved
-                ON attention_requests(project_id, resolved, request_id);
-            CREATE TABLE IF NOT EXISTS activity_commands (
-                project_id INTEGER NOT NULL,
-                command_id TEXT NOT NULL,
-                command_type TEXT NOT NULL,
-                result TEXT NOT NULL,
-                PRIMARY KEY(project_id, command_id)
-            );
-            CREATE TABLE IF NOT EXISTS board_snapshots (
-                project_id INTEGER PRIMARY KEY,
-                board_json TEXT
-            );",
-        )?;
+        super::schema::migrate(&connection, SCHEMA_VERSION, &SCHEMA_STEPS)?;
         Ok(Self {
             inner: Mutex::new(Inner {
                 connection,
@@ -1096,6 +1100,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = ActivityJournal::open(&dir.path().join("activity.db")).unwrap();
         (dir, journal)
+    }
+
+    #[test]
+    fn the_schema_is_versioned() {
+        let journal = ActivityJournal::open_in_memory().unwrap();
+        let inner = journal.inner.lock();
+        let version: i64 = inner
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     fn request(command_id: &str) -> CreateAttention {

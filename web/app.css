@@ -27,7 +27,14 @@ button, select, textarea { font: inherit; }
 button { color: inherit; }
 .hidden { display: none !important; }
 
-.app-shell { height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
+.app-shell {
+  position: fixed;
+  inset: var(--visual-viewport-offset-top, 0px) 0 auto;
+  height: var(--visual-viewport-height, 100dvh);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
 .app-shell.session-open > .topbar,
 .app-shell.session-open .project-sidebar { display: none; }
 .app-shell.session-open .main-content { max-width: none; padding: 0; overflow: hidden; }

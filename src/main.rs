@@ -12,6 +12,7 @@ use radar::board;
 use radar::config::Paths;
 use radar::db::{Db, Preferences, Slot, Tab};
 use radar::programs::{self, agents, Kind, LaunchOptions};
+use radar::session::board_store::{BoardState, StoredCard};
 use radar::{discover, git};
 
 #[derive(Parser, Debug)]
@@ -133,6 +134,12 @@ enum Command {
         #[command(subcommand)]
         action: HookAction,
     },
+    /// Install radar's board skill into the user's global skills home
+    /// (`~/.agents/skills`), which cursor, opencode and omp discover
+    Skill,
+    /// Install the whole board convention globally: skill, harness edit-gate
+    /// plugins, and the git commit-gate dispatcher — nothing in a repository
+    Setup,
     /// Open the native app (needs a build with --features gui)
     Gui,
 }
@@ -365,6 +372,41 @@ enum CardAction {
         /// Only look in this column — how a reviewer picks up review work
         #[arg(long = "in")]
         in_column: Option<String>,
+    },
+    /// Show a card and its conversation thread (by id or title)
+    Show {
+        /// Project directory (default: the current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Stable card ID (from BOARD.md) or its title
+        card: String,
+    },
+    /// Post a message on a card's thread — how an agent reports to the human
+    Comment {
+        /// Project directory (default: the current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Stable card ID (from BOARD.md) or its title
+        card: String,
+        /// The message
+        text: String,
+        /// Stable daemon session ID (defaults to RADAR_SESSION_ID)
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+    /// Edit a card's title and/or notes
+    Edit {
+        /// Project directory (default: the current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Stable card ID (from BOARD.md) or its title
+        card: String,
+        /// New title
+        #[arg(long)]
+        title: Option<String>,
+        /// New notes; repeat for multiple lines
+        #[arg(long)]
+        body: Option<String>,
     },
 }
 
@@ -852,7 +894,7 @@ fn main() -> Result<()> {
             find(&db, &query.join(" "), root, depth, limit, cli.json)
         }
         Some(Command::Doctor) => doctor(&paths, &db),
-        Some(Command::Board { path }) => show_board(&db, path, cli.json),
+        Some(Command::Board { path }) => show_board(&paths, &db, path, cli.json),
         Some(Command::Card { action }) => match action {
             CardAction::Add {
                 path,
@@ -861,6 +903,7 @@ fn main() -> Result<()> {
                 body,
                 by,
             } => card_add(
+                &paths,
                 &db,
                 path,
                 &title,
@@ -869,26 +912,98 @@ fn main() -> Result<()> {
                 by.as_deref(),
             ),
             CardAction::Claim { path, title, by } => {
-                card_claim(&db, path, &title, Some(&by), cli.json)
+                card_claim(&paths, &db, path, &title, Some(&by), cli.json)
             }
-            CardAction::Release { path, title } => card_claim(&db, path, &title, None, cli.json),
-            CardAction::Move { path, title, to } => card_move(&db, path, &title, &to, cli.json),
-            CardAction::Done { path, title } => card_done(&db, path, &title, cli.json),
+            CardAction::Release { path, title } => {
+                card_claim(&paths, &db, path, &title, None, cli.json)
+            }
+            CardAction::Move { path, title, to } => {
+                card_move(&paths, &db, path, &title, &to, cli.json)
+            }
+            CardAction::Done { path, title } => card_done(&paths, &db, path, &title, cli.json),
             CardAction::Next {
                 path,
                 by,
                 in_column,
-            } => card_next(&db, path, &by, in_column.as_deref(), cli.json),
+            } => card_next(&paths, &db, path, &by, in_column.as_deref(), cli.json),
+            CardAction::Show { path, card } => card_show(&paths, &db, path, &card, cli.json),
+            CardAction::Comment {
+                path,
+                card,
+                text,
+                session_id,
+            } => card_comment(&paths, &db, path, &card, &text, session_id),
+            CardAction::Edit {
+                path,
+                card,
+                title,
+                body,
+            } => card_edit(
+                &paths,
+                &db,
+                path,
+                &card,
+                title.as_deref(),
+                body.as_deref(),
+                cli.json,
+            ),
         },
         Some(Command::Hook { action }) => match action {
             HookAction::Guard { file, commit, path } => {
                 if commit {
-                    hook_commit_guard(&db, path)
+                    hook_commit_guard(&paths, &db, path)
                 } else {
-                    hook_guard(&db, file, path)
+                    hook_guard(&paths, &db, file, path)
                 }
             }
         },
+        Some(Command::Skill) => {
+            let path = radar::skill::install_default_skill()?;
+            if cli.json {
+                println!("{}", serde_json::json!({ "skill": path }).to_string());
+            } else {
+                println!("board skill: {}", path.display());
+            }
+            Ok(())
+        }
+        Some(Command::Setup) => {
+            let installed = radar::setup::install_default()?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "skill": installed.skill,
+                        "opencode": installed.opencode,
+                        "omp": installed.omp,
+                        "claude": installed.claude,
+                        "git_hooks_dir": installed.git_hooks_dir,
+                        "git_hooks_path_set": installed.git_hooks_path_set,
+                    })
+                    .to_string()
+                );
+                return Ok(());
+            }
+            println!("installed the board convention globally:");
+            if let Some(path) = installed.skill {
+                println!("  skill           {}", path.display());
+            }
+            if let Some(path) = installed.opencode {
+                println!("  opencode plugin {}", path.display());
+            }
+            if let Some(path) = installed.omp {
+                println!("  omp extension   {}", path.display());
+            }
+            if let Some(path) = installed.claude {
+                println!("  claude hook     {}", path.display());
+            }
+            if let Some(dir) = installed.git_hooks_dir {
+                println!("  git gate        {}", dir.join("pre-commit").display());
+            }
+            if !installed.git_hooks_path_set {
+                println!("  note: core.hooksPath already set — radar's git gate not activated");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -897,38 +1012,82 @@ fn require_project(db: &Db, path: &PathBuf) -> Result<radar::db::Project> {
         .with_context(|| format!("{} is not in the sidebar", path.display()))
 }
 
-/// The directory a board command works on: the given path or the current
-/// directory — agents run with the project as their working directory, so
-/// `radar card next` just works from inside a pane.
+/// The directory a board command works on: the given path, `RADAR_PROJECT_ROOT`
+/// for a radar-launched pane, or the current directory.
 fn board_dir(path: Option<PathBuf>) -> Result<PathBuf> {
-    radar::db::normalize_path(path.unwrap_or_else(|| PathBuf::from(".")))
+    let requested = path
+        .or_else(|| std::env::var_os("RADAR_PROJECT_ROOT").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+    radar::db::normalize_path(requested)
 }
 
-/// Log a board change against the project, when it is in the sidebar. A board
-/// works in any directory; the event log is a bonus, not a requirement.
-fn log_board(db: &Db, dir: &PathBuf, kind: &str, data: serde_json::Value) {
-    if let Ok(Some(project)) = db.project_by_path(dir) {
-        let _ = db.log_event(kind, Some(project.id), &data);
-    }
-}
-
-fn show_board(db: &Db, path: Option<PathBuf>, json: bool) -> Result<()> {
+/// A board command's project: its id and root directory. Prefers the
+/// `RADAR_PROJECT_ID` a radar-launched pane carries, else the sidebar lookup.
+fn board_context(db: &Db, path: Option<PathBuf>) -> Result<(i64, PathBuf)> {
     let dir = board_dir(path)?;
-    board::ensure_enabled_file(db, &dir)?;
-    let b = board::load(&dir)?;
+    if let Ok(raw) = std::env::var("RADAR_PROJECT_ID") {
+        if let Ok(project_id) = raw.parse::<i64>() {
+            return Ok((project_id, dir));
+        }
+    }
+    let project = db.project_by_path(&dir)?.with_context(|| {
+        format!(
+            "{} is not in the sidebar — add it to radar, or run from a radar pane",
+            dir.display()
+        )
+    })?;
+    Ok((project.id, project.path))
+}
+
+fn board_command_id(prefix: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("cli-{prefix}-{}-{now:x}", std::process::id())
+}
+
+fn find_stored<'a>(state: &'a BoardState, needle: &str) -> Option<&'a StoredCard> {
+    state
+        .cards
+        .iter()
+        .find(|card| card.id == needle)
+        .or_else(|| state.cards.iter().find(|card| card.title == needle))
+}
+
+fn find_stored_mut<'a>(state: &'a BoardState, needle: &str) -> Result<&'a StoredCard> {
+    find_stored(state, needle).with_context(|| format!("no card matching \"{needle}\""))
+}
+
+fn print_stored(card: &StoredCard) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(card)?);
+    Ok(())
+}
+
+fn show_board(paths: &Paths, db: &Db, path: Option<PathBuf>, json: bool) -> Result<()> {
+    use radar::session::daemon as board_api;
+
+    let (project_id, root) = board_context(db, path)?;
+    board::require_enabled(db, &root)?;
+    let state = board_api::board_state(&paths.data_dir, project_id, &root)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&b)?);
+        println!("{}", serde_json::to_string_pretty(&state)?);
         return Ok(());
     }
-    for column in &b.columns {
-        println!("{} ({})", column.name, column.cards.len());
-        for card in &column.cards {
-            match &card.claimed_by {
+    for lane in &state.lanes {
+        let cards: Vec<&StoredCard> = state
+            .cards
+            .iter()
+            .filter(|card| card.lane_id == lane.id)
+            .collect();
+        println!("{} ({})", lane.name, cards.len());
+        for card in cards {
+            match &card.claim {
                 Some(who) => println!("  · {}  @{}", card.title, who),
                 None => println!("  · {}", card.title),
             }
-            for note in &card.body {
-                println!("      {}", note);
+            for note in card.body.lines().filter(|line| !line.trim().is_empty()) {
+                println!("      {note}");
             }
         }
     }
@@ -936,6 +1095,7 @@ fn show_board(db: &Db, path: Option<PathBuf>, json: bool) -> Result<()> {
 }
 
 fn card_add(
+    paths: &Paths,
     db: &Db,
     path: Option<PathBuf>,
     title: &str,
@@ -943,142 +1103,399 @@ fn card_add(
     body: Option<&str>,
     by: Option<&str>,
 ) -> Result<()> {
-    let dir = board_dir(path)?;
-    board::ensure_enabled_file(db, &dir)?;
-    board::add_card(&dir, column, title, body.unwrap_or(""), by)?;
-    log_board(
-        db,
-        &dir,
-        "board_card_added",
-        serde_json::json!({ "title": title, "column": column, "by": by }),
-    );
-    println!("added \"{}\"", title);
+    use radar::session::daemon as board_api;
+
+    let (project_id, root) = board_context(db, path)?;
+    board::require_enabled(db, &root)?;
+    // Ensure the store's board exists (and a legacy BOARD.md is imported)
+    // before the first card lands, so an add cannot seed empty defaults first.
+    let _ = board_api::board_state(&paths.data_dir, project_id, &root)?;
+    let change = board_api::board_card_add(
+        &paths.data_dir,
+        project_id,
+        column,
+        title,
+        body.unwrap_or(""),
+        by,
+        &board_command_id("add"),
+    )?;
+    println!("added \"{}\"", change.card.title);
     Ok(())
 }
 
 fn card_claim(
+    paths: &Paths,
     db: &Db,
     path: Option<PathBuf>,
-    title: &str,
+    needle: &str,
     by: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let dir = board_dir(path)?;
-    board::require_enabled(db, &dir)?;
-    let found = board::claim_card(&dir, title, by)?;
-    if !found {
-        anyhow::bail!("no card titled \"{}\"", title);
-    }
-    log_board(
-        db,
-        &dir,
-        if by.is_some() {
-            "board_card_claimed"
-        } else {
-            "board_card_released"
-        },
-        serde_json::json!({ "title": title, "by": by }),
-    );
+    use radar::session::daemon as board_api;
+
+    let (project_id, root) = board_context(db, path)?;
+    board::require_enabled(db, &root)?;
+    let state = board_api::board_state(&paths.data_dir, project_id, &root)?;
+    let card_id = find_stored_mut(&state, needle)?.id.clone();
+    let change = board_api::board_card_claim(
+        &paths.data_dir,
+        project_id,
+        &card_id,
+        by,
+        None,
+        &board_command_id("claim"),
+    )?;
     if json {
-        print_card(&dir, title)?;
-    } else {
-        match by {
-            Some(who) => println!("\"{}\" claimed by {}", title, who),
-            None => println!("\"{}\" released", title),
-        }
+        return print_stored(&change.card);
+    }
+    match by {
+        Some(who) => println!("\"{}\" claimed by {}", change.card.title, who),
+        None => println!("\"{}\" released", change.card.title),
     }
     Ok(())
 }
 
-fn card_move(db: &Db, path: Option<PathBuf>, title: &str, to: &str, json: bool) -> Result<()> {
-    let dir = board_dir(path)?;
-    board::require_enabled(db, &dir)?;
-    let found = board::move_card(&dir, title, to)?;
-    if !found {
-        anyhow::bail!("no card titled \"{}\"", title);
-    }
-    log_board(
-        db,
-        &dir,
-        "board_card_moved",
-        serde_json::json!({ "title": title, "to": to }),
-    );
+fn card_move(
+    paths: &Paths,
+    db: &Db,
+    path: Option<PathBuf>,
+    needle: &str,
+    to: &str,
+    json: bool,
+) -> Result<()> {
+    use radar::session::daemon as board_api;
+
+    let (project_id, root) = board_context(db, path)?;
+    board::require_enabled(db, &root)?;
+    let state = board_api::board_state(&paths.data_dir, project_id, &root)?;
+    let card_id = find_stored_mut(&state, needle)?.id.clone();
+    let change = board_api::board_card_move(
+        &paths.data_dir,
+        project_id,
+        &card_id,
+        to,
+        None,
+        &board_command_id("move"),
+    )?;
     if json {
-        print_card(&dir, title)?;
-    } else {
-        println!("\"{}\" moved to {}", title, to);
+        return print_stored(&change.card);
     }
+    println!("\"{}\" moved to {}", change.card.title, to);
     Ok(())
 }
 
-fn card_done(db: &Db, path: Option<PathBuf>, title: &str, json: bool) -> Result<()> {
-    let dir = board_dir(path)?;
-    board::require_enabled(db, &dir)?;
-    let found = board::finish_card(&dir, title)?;
-    if !found {
-        anyhow::bail!("no card titled \"{}\"", title);
-    }
-    log_board(
-        db,
-        &dir,
-        "board_card_done",
-        serde_json::json!({ "title": title }),
-    );
+fn card_done(
+    paths: &Paths,
+    db: &Db,
+    path: Option<PathBuf>,
+    needle: &str,
+    json: bool,
+) -> Result<()> {
+    use radar::session::daemon as board_api;
+
+    let (project_id, root) = board_context(db, path)?;
+    board::require_enabled(db, &root)?;
+    let state = board_api::board_state(&paths.data_dir, project_id, &root)?;
+    let card_id = find_stored_mut(&state, needle)?.id.clone();
+    let change = board_api::board_card_complete(
+        &paths.data_dir,
+        project_id,
+        &card_id,
+        None,
+        &board_command_id("done"),
+    )?;
     if json {
-        print_card(&dir, title)?;
-    } else {
-        println!("\"{}\" done", title);
+        return print_stored(&change.card);
     }
+    println!("\"{}\" done", change.card.title);
     Ok(())
 }
 
 /// The work primitive: hand the agent the next unclaimed card, claimed in its
 /// name. An agent's whole loop is `card next` → do it → move to Review. This
-/// is also where an agent meets the convention: the skill that teaches the
-/// loop is installed into the project here, so the first `card next` from a
-/// fresh clone sets the board up on its own.
+/// is also where an agent meets the convention: the first `card next` installs
+/// the board skill into the user's global skills home and the repository's git
+/// gate, so the convention arrives with the first claimed card.
 fn card_next(
+    paths: &Paths,
     db: &Db,
     path: Option<PathBuf>,
     by: &str,
     in_column: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let dir = board_dir(path)?;
-    board::ensure_enabled_file(db, &dir)?;
-    if let Err(error) = radar::skill::install(db, &dir) {
+    use radar::session::daemon as board_api;
+
+    let (project_id, root) = board_context(db, path)?;
+    board::require_enabled(db, &root)?;
+    if let Err(error) = radar::skill::install(db, &root) {
         eprintln!("radar: could not install the board skill: {error}");
     }
-    let Some(card) = board::next_card(&dir, by, in_column)? else {
+    let Some(change) = board_api::board_card_next(
+        &paths.data_dir,
+        project_id,
+        by,
+        in_column,
+        &board_command_id("next"),
+    )?
+    else {
         anyhow::bail!("no unclaimed cards");
     };
-    log_board(
-        db,
-        &dir,
-        "board_card_claimed",
-        serde_json::json!({ "title": card.title, "by": by, "via": "next" }),
-    );
     if json {
-        println!("{}", serde_json::to_string_pretty(&card)?);
-    } else {
-        println!("\"{}\" — claimed for {}", card.title, by);
-        for note in &card.body {
-            println!("      {}", note);
+        return print_stored(&change.card);
+    }
+    println!("\"{}\" — claimed for {}", change.card.title, by);
+    for note in change
+        .card
+        .body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
+        println!("      {note}");
+    }
+    Ok(())
+}
+
+fn human_age(at_millis: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(at_millis);
+    let seconds = (now.saturating_sub(at_millis)).max(0) / 1000;
+    match seconds {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{}m ago", seconds / 60),
+        3_600..=86_399 => format!("{}h ago", seconds / 3_600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
+}
+
+/// A card's thread as flat entries, for `card show`.
+fn thread_json(
+    snapshot: &radar::session::activity::ActivitySnapshot,
+    card_id: &str,
+) -> Vec<serde_json::Value> {
+    use radar::session::activity::ActivityPayload;
+    let mut events: Vec<_> = snapshot
+        .events
+        .iter()
+        .filter(|event| event.card_id.as_deref() == Some(card_id))
+        .collect();
+    events.sort_by_key(|event| event.sequence);
+    events
+        .into_iter()
+        .filter_map(|event| {
+            let (author, text) = match &event.payload {
+                ActivityPayload::Message { text } => (
+                    if event.session_id.is_some() {
+                        "agent"
+                    } else {
+                        "human"
+                    },
+                    text.clone(),
+                ),
+                ActivityPayload::AttentionRequested { reason, .. } => ("agent", reason.clone()),
+                ActivityPayload::AttentionResolved { response, .. } => {
+                    ("system", format!("answered: {response:?}"))
+                }
+                ActivityPayload::BoardChanged { action, column, .. } => ("system", {
+                    let label = match action.as_str() {
+                        "added" | "board_card_added" => "added",
+                        "moved" | "board_card_moved" => "moved",
+                        "claimed" | "board_card_claimed" => "claimed",
+                        "released" | "board_card_released" => "released",
+                        "done" | "board_card_done" => "closed",
+                        "edited" | "board_card_edited" => "edited",
+                        "removed" | "board_card_removed" => "removed",
+                        other => other,
+                    };
+                    match column {
+                        Some(column) => format!("{label} · {column}"),
+                        None => label.to_string(),
+                    }
+                }),
+                _ => return None,
+            };
+            Some(serde_json::json!({
+                "author": author,
+                "text": text,
+                "at_millis": event.at_millis,
+                "sequence": event.sequence,
+            }))
+        })
+        .collect()
+}
+
+/// Read a card and its thread. The thread is a bonus: a card still shows
+/// when the daemon is down or the project is not in the sidebar.
+fn card_show(
+    paths: &Paths,
+    db: &Db,
+    path: Option<PathBuf>,
+    needle: &str,
+    json: bool,
+) -> Result<()> {
+    use radar::session::daemon as board_api;
+    use radar::session::daemon::{Client, Command as Request, Response};
+
+    let (project_id, root) = board_context(db, path)?;
+    board::require_enabled(db, &root)?;
+    let state = board_api::board_state(&paths.data_dir, project_id, &root)?;
+    let card = find_stored_mut(&state, needle)?.clone();
+    let lane = state
+        .lanes
+        .iter()
+        .find(|lane| lane.id == card.lane_id)
+        .map(|lane| lane.name.clone())
+        .unwrap_or_default();
+
+    let thread = match Client::request(
+        &paths.data_dir,
+        Request::ActivitySnapshot {
+            project_id,
+            after_sequence: None,
+            limit: 200,
+        },
+    ) {
+        Ok(Response::ActivitySnapshot(snapshot)) => Some(snapshot),
+        _ => None,
+    };
+
+    if json {
+        let entries = thread
+            .as_ref()
+            .map(|snapshot| thread_json(snapshot, &card.id))
+            .unwrap_or_default();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "card": card,
+                "lane": lane,
+                "thread": entries,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("{}  [{}]", card.title, lane);
+    if let Some(who) = &card.claim {
+        println!("  @{who}");
+    }
+    for note in card.body.lines().filter(|line| !line.trim().is_empty()) {
+        println!("  {note}");
+    }
+    if let Some(snapshot) = &thread {
+        let entries = thread_json(snapshot, &card.id);
+        if !entries.is_empty() {
+            println!();
+            for entry in entries {
+                let who = entry["author"].as_str().unwrap_or("");
+                let text = entry["text"].as_str().unwrap_or("");
+                let at = entry["at_millis"].as_i64().unwrap_or(0);
+                println!("  {who} ({}): {text}", human_age(at));
+            }
         }
     }
     Ok(())
 }
 
+/// Post a message on a card's thread — how an agent reports back to the human
+/// without burying it in terminal output. The thread lives in the daemon
+/// journal keyed by the card's stable id.
+fn card_comment(
+    paths: &Paths,
+    db: &Db,
+    path: Option<PathBuf>,
+    needle: &str,
+    text: &str,
+    session_id: Option<String>,
+) -> Result<()> {
+    use radar::session::activity::{ActivityKind, ActivityPayload, PublishActivity};
+    use radar::session::daemon as board_api;
+    use radar::session::daemon::{Client, Command as Request, Response};
+
+    let (project_id, root) = board_context(db, path)?;
+    board::require_enabled(db, &root)?;
+    let state = board_api::board_state(&paths.data_dir, project_id, &root)?;
+    let card_id = find_stored_mut(&state, needle)?.id.clone();
+    let command = Request::PublishActivity(PublishActivity {
+        project_id,
+        command_id: board_command_id("comment"),
+        session_id: session_id.or_else(|| std::env::var("RADAR_SESSION_ID").ok()),
+        card_id: Some(card_id.clone()),
+        kind: ActivityKind::Reported,
+        payload: ActivityPayload::Message {
+            text: text.to_string(),
+        },
+    });
+    match Client::request(&paths.data_dir, command)? {
+        Response::ActivityPublished(event) => {
+            println!("commented on {:?} (event {})", needle, event.sequence)
+        }
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Edit a card's title and/or notes in the store, preserving its id, claim,
+/// lane and done state.
+fn card_edit(
+    paths: &Paths,
+    db: &Db,
+    path: Option<PathBuf>,
+    needle: &str,
+    title: Option<&str>,
+    body: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use radar::session::daemon as board_api;
+
+    let (project_id, root) = board_context(db, path)?;
+    board::require_enabled(db, &root)?;
+    let state = board_api::board_state(&paths.data_dir, project_id, &root)?;
+    let card_id = find_stored_mut(&state, needle)?.id.clone();
+    let change = board_api::board_card_update(
+        &paths.data_dir,
+        project_id,
+        &card_id,
+        title,
+        body,
+        None,
+        &board_command_id("edit"),
+    )?;
+    if json {
+        return print_stored(&change.card);
+    }
+    println!("\"{}\" updated", change.card.title);
+    Ok(())
+}
+
+/// Whether the agent holds a live claim, read from the board store. `None`
+/// means it could not be judged (daemon down, project not in the sidebar) and
+/// the guard lets the call through.
+fn claim_holds(paths: &Paths, db: &Db, dir: &Path, who: &str) -> Option<bool> {
+    let (project_id, root) = board_context(db, Some(dir.to_path_buf())).ok()?;
+    // Never spawn a daemon here: an edit-time gate must fail open.
+    let state =
+        radar::session::daemon::board_state_quick(&paths.data_dir, project_id, &root).ok()?;
+    Some(
+        state
+            .cards
+            .iter()
+            .any(|card| card.claim.as_deref() == Some(who) && !card.done),
+    )
+}
+
 /// The hook half of the convention: an agent harness asks, before an edit
-/// lands, whether the agent holds a board claim. Denied calls come back to
-/// the model as a tool error whose text is the remedy — claim work, then
-/// retry — so the guard enforces without stranding the agent.
+/// lands, whether the agent holds a board claim. Denied calls come back to the
+/// model as a tool error whose text is the remedy — claim work, then retry —
+/// so the guard enforces without stranding the agent.
 ///
 /// Claude Code's PreToolUse hook is a subprocess: it pipes the tool call as
 /// JSON and reads the exit code (2 denies, stderr goes to the model). The
 /// opencode plugin calls the same check in-process. `--file` covers both and
 /// the human running it by hand.
-fn hook_guard(db: &Db, file: Option<PathBuf>, path: Option<PathBuf>) -> Result<()> {
+fn hook_guard(paths: &Paths, db: &Db, file: Option<PathBuf>, path: Option<PathBuf>) -> Result<()> {
     use std::io::IsTerminal;
 
     let mut input = String::new();
@@ -1089,21 +1506,33 @@ fn hook_guard(db: &Db, file: Option<PathBuf>, path: Option<PathBuf>) -> Result<(
 
     let dir = board_dir(path)?;
     let who = std::env::var("RADAR_AGENT").ok().filter(|s| !s.is_empty());
-    guard_exit(radar::skill::guard_decision(
+    let holds = who
+        .as_deref()
+        .and_then(|who| claim_holds(paths, db, &dir, who));
+    guard_exit(radar::skill::guard_decision_for(
         db,
         &dir,
         who.as_deref(),
         file.as_deref(),
+        holds,
     ))
 }
 
 /// The commit gate: the git pre-commit hook's half of the convention. No file
 /// is weighed — the claim is the whole question, since whatever an agent
 /// edited with, the work enters the repository here.
-fn hook_commit_guard(db: &Db, path: Option<PathBuf>) -> Result<()> {
+fn hook_commit_guard(paths: &Paths, db: &Db, path: Option<PathBuf>) -> Result<()> {
     let dir = board_dir(path)?;
     let who = std::env::var("RADAR_AGENT").ok().filter(|s| !s.is_empty());
-    guard_exit(radar::skill::commit_decision(db, &dir, who.as_deref()))
+    let holds = who
+        .as_deref()
+        .and_then(|who| claim_holds(paths, db, &dir, who));
+    guard_exit(radar::skill::commit_decision_for(
+        db,
+        &dir,
+        who.as_deref(),
+        holds,
+    ))
 }
 
 fn guard_exit(decision: radar::skill::GuardDecision) -> Result<()> {
@@ -1125,17 +1554,6 @@ fn hook_file(input: &str) -> Option<PathBuf> {
         .get("file_path")?
         .as_str()
         .map(PathBuf::from)
-}
-
-/// Print one card's current state, for `--json` answers.
-fn print_card(dir: &Path, title: &str) -> Result<()> {
-    let b = board::load(dir)?;
-    let card = b
-        .find(title)
-        .map(|(c, i)| &b.columns[c].cards[i])
-        .with_context(|| format!("no card titled \"{}\"", title))?;
-    println!("{}", serde_json::to_string_pretty(card)?);
-    Ok(())
 }
 
 fn list(db: &Db, json: bool) -> Result<()> {

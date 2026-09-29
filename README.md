@@ -4,23 +4,43 @@
 
 A native workspace manager: **projects in a sidebar, tabs for every tool**.
 
-Open radar and you get a real window. The sidebar lists your projects with their
-git state; picking one shows that project's tabs. Expand a project to see its
-agent sessions, including ended conversations from the durable session catalog,
-sorted by recent activity. Radar keeps **one agent panel**: selecting a session
-shows it there — its tab joins the panel's header as a chip, and the agent
-that was on screen is hidden but never stopped, its process and pty safe in
-the session layer. A tab dragged out for a side-by-side goes home on the next
-sidebar selection. Whichever session the agent panel is showing is marked in
-the list, so the sidebar always says which agent is on screen. External
-CLI sessions under terminal windows are discovered by working directory and show
-the CLI or terminal-window title. Selecting an external session focuses its
-terminal window. Catalog rows with a provider resume id reopen that exact
-conversation; rows without one are kept as honest history instead of guessing.
-Ended or failed history older than seven days moves to the archived view
-automatically. The project's **+** starts another agent. Live sessions are
+Open radar and you get a real window. The **sidebar** is a quiet project
+switcher: one line per project with its git state and a pulse — a count of its
+running agents, and a warning mark when something needs you. Picking a project
+shows its tabs. Search matches project names and paths as well as an agent's
+conversation title, so typing an agent's name still finds the project it lives
+in.
+
+**Home** is the cockpit — the whole workspace understood without diving into a
+terminal. It gathers every project into Basecamp-style lanes:
+
+- **Needs you** — every unresolved approval, question or failure, newest first,
+  each with the actions to answer, approve, deny or dismiss it in place.
+- **Projects** — a lane per project: its to-dos (the board's cards, ticked once
+  Done), its board's lane counts, and its running and external sessions. A
+  to-do opens its card; **Open board** opens the project's full kanban.
+
+Opening a session or a card drills into its workspace; going home never stops a
+program. Session rows prefer a meaningful terminal title and fall back to the
+provider's conversation title, retaining it when the terminal reports only a
+generic program name.
+
+Radar keeps **one agent panel**: selecting an openable session shows it there —
+its tab joins the panel's header as a chip, and the agent that was on screen is
+hidden but never stopped, its process and pty safe in the session layer. A tab
+dragged out for a side-by-side goes home on the next sidebar selection. External
+CLI sessions under terminal windows are discovered by working directory and
+show the CLI or terminal-window title; selecting one focuses its terminal.
+History reopens only when the provider reports an exact session id and the
+program supports resuming it; other history remains visible but is not
+clickable. Ended or failed history older than seven days moves to the archived
+view automatically. The project's **+** starts another agent. Live sessions are
 rediscovered after a Radar restart, and tabs of projects you leave stay alive,
 so a running agent is never interrupted.
+
+If session discovery fails, Radar keeps the last successful session rows rather
+than going blank. Native catalog reads are capped at 500 active and 200 archived
+entries across all projects.
 
 ```
 ┌────────────────┬──────────────────────────────────────────────┐
@@ -60,6 +80,19 @@ cargo build --release --features vte     # full app, embedded terminals
 works — each tab then offers **Open in a terminal window** instead of embedding
 the program. That keeps radar usable on a machine where you cannot install VTE.
 
+## Testing
+
+- `cargo test --features vte` — unit tests, including the board store's schema
+  migrations and the desktop-notification policy.
+- `cargo test --features vte --test board_store` — the board store end to end
+  against a real daemon: import (leaving `BOARD.md` untouched), the card
+  lifecycle, the conversation thread, revision conflicts, and restart
+  durability.
+- `./scripts/smoke.sh [--notify]` — the GUI offscreen (broadway + chromium):
+  build, render Home's board, and, with `--notify`, raise a card question and
+  assert the GUI emits a desktop `Notify`. Runs against a scratch `RADAR_HOME`
+  and a private D-Bus session, so your real state and desktop are untouched.
+
 ## Using it
 
 | Action | Shortcut |
@@ -97,11 +130,14 @@ Changing a pane's program from its menu or with `Alt+P` opens program
 choices in this same overlay.
 
 **Home** (`Alt+Home`, the button by the logo, or the first dock toggle) is the
-workspace at rest — and the panel radar opens with when there are no projects
-yet. It holds the program each slot uses, the layout a new project opens with,
-and the two ways forward: **Find projects** (the sidebar's search) and **New
-project…**, which picks or creates a folder, runs `git init` in it, and opens
-it. Going home never stops a program; the panes keep running behind it.
+cockpit when you have projects: a needs-you inbox over a row of project lanes,
+each with its to-dos, board counts and running sessions, and the actions to
+drive them without opening a terminal. With no projects yet it is instead the
+setup card — the program each slot uses, the layout a new project opens with,
+**Find projects** (the sidebar's search) and **New project…**, which picks or
+creates a folder, runs `git init` in it, and opens it. (When projects exist,
+that setup lives in **Preferences**.) Going home never stops a program; the
+panes keep running behind it.
 
 **Adding a project** needs no dialog and no button: the sidebar's search box
 does both jobs. It filters your projects, and below them it lists directories
@@ -272,31 +308,31 @@ to receive that typed response. Vendor-specific adapters and exact terminal-stat
 import remain follow-up work. See
 [the review and delivery contracts](docs/board-interactivity.md).
 
-Projects use an optional kanban stored as `BOARD.md` in the project root.
+Projects use an optional board radar owns. Cards are records in radar's store —
+the same daemon database the activity thread and attention live in — not a file.
 Boards are enabled by default. Toggle **Board** on a project's sidebar row to
-opt that project out; the setting is stored in Radar's global database, not
-the project tree.
+opt that project out; the setting is stored in Radar's global database, not the
+project tree.
 
 Open **Project defaults** from a project's sidebar row to set its default
 Editor, Agent, Diff, and Shell programs. Each pane inherits the corresponding
 global **Preferences** choice until a project override is selected. Board and
-pane defaults are per-project Radar settings and are never written to files
-that need to be committed with the project.
+pane defaults are per-project Radar settings and are never written to project
+files.
 
-When disabled, Radar does not initialize or open the board and its claim
-guards allow edits and commits. Existing `BOARD.md` and skill files are left
-untouched. When enabled, the board file is initialized as the project opens.
-Columns are `## ` headings, cards are `- [ ]` lines, a claim
-is an `@name` on the card's line, and indented lines under a card are its
-notes. radar adds an invisible HTML comment with a stable card ID; ordinary
-markdown rendering does not show it.
+When disabled, Radar does not create or open the board and its claim guards
+allow edits and commits. A lane is a named status (`Backlog`, `In progress`,
+`Review`, `Done`, or your own); a card has a title, a markdown body, a claim,
+and a lane, and it is done exactly while it sits in a done lane. Cards carry
+real ids, so moves, claims and edits are exact. For users upgrading from a
+`BOARD.md`, radar imports it once (columns become lanes, cards become records)
+and leaves the file untouched; the file is not read again.
 
-That plainness is the point: an agent already running in the project claims
-work and moves it along by editing the file with the tools it already has — no
-radar API, no adapter. radar's **Board** pane (Alt+K) renders the same
-file as a native kanban: drag cards between columns, click to edit, and the
-pane re-reads the file whenever anyone — an agent, the CLI, `git checkout` —
-writes it. The file is the board; radar is one of its editors.
+The board is driveable from the CLI and the app alike: an agent claims work and
+moves it along with `radar card …`, and radar's **Board** renders the same
+store — Home's board view and the workspace Board pane (Alt+K) both read it,
+and every change is published so all clients follow. There is no file to keep
+in sync and no parsing.
 
 For scripts that want a lock-free answer to "what should I do next":
 
@@ -306,14 +342,48 @@ radar card next --in Review --by codex-9x3k1a   # a reviewer picks up review wor
 radar card move "Fix login" --to Review  # hands the card over: the claim drops
 ```
 
+Cards carry a conversation too. A card's thread lives in the daemon's durable
+activity journal, keyed by its stable card ID, so it survives agent runs and
+restarts and never clutters `BOARD.md`:
+
+```bash
+radar card show "Fix login"                                  # the card and its thread
+radar card comment "Fix login" "Overflow fixed; tests pass"  # an agent's update
+radar card edit "Fix login" --title "Fix login (v2)" --body "one note per line"
+radar activity request --card-id <id> --kind question \
+  --reason "Which branch should this land on?" --allow answer --wait  # ask, then block
+```
+
+A human reply is a comment with no session; an agent's carries its session, so
+the thread reads as a conversation. On **Home**, every to-do shows its latest
+agent note — the "what was done" — and its checkbox closes the to-do right
+there. Basecamp-style, **Home drills down in place**: clicking a to-do opens
+the **card** (its body rendered as Markdown, its thread, a reply box, and
+controls to edit, move and close it), and **Open board** opens the project's
+board as columns of cards — each with a **Back** arrow to the cockpit. Session
+rows are clickable too: the whole row opens the session.
+
 ### The convention
 
-When an agent pane opens in a board-enabled project, radar writes harness skill
-files for opencode and Claude Code (`.opencode/skills/board/SKILL.md` and
-`.claude/skills/board/SKILL.md`) and installs a pre-commit claim gate when the
-repository has no conflicting hook. The setup never changes `AGENTS.md`.
-A unique `RADAR_AGENT` environment variable — `claude-mx7k2b1f`, for example —
-distinguishes concurrent instances so each board claim identifies its owner.
+Enabling a board installs the whole convention **once per machine, globally**
+(`radar setup`), never into a repository:
+
+- the board **skill** at `~/.agents/skills/board/SKILL.md`, which cursor,
+  opencode and omp all discover;
+- **edit gates** — an opencode plugin and an omp extension, plus a
+  `PreToolUse` hook merged into `~/.claude/settings.json` — that call
+  `radar hook guard` before a file-editing tool runs;
+- a git **commit gate** via `git config --global core.hooksPath`, whose
+  dispatcher runs the claim check and then chains any repo-local hook.
+
+Everything lives in `$HOME` or git's own local config, so nothing is added to a
+repository's tracked tree — no `.opencode/`, `.claude/` or `.cursor/` files.
+The gates fail open (no radar, no daemon, project not in the sidebar, or board
+disabled → allow) and act only for radar-launched agents (`RADAR_AGENT`) in
+board-enabled projects, so a machine-wide install is inert everywhere else. The
+setup never changes `AGENTS.md`. A unique `RADAR_AGENT` environment variable —
+`claude-mx7k2b1f`, for example — distinguishes concurrent instances so each
+board claim identifies its owner.
 
 The loop the skill teaches: claim with `radar card next --by "$RADAR_AGENT"`,
 work one card at a time, hand over by moving to **Review** with a note for

@@ -394,8 +394,13 @@ pub fn parse(text: &str) -> Board {
 }
 
 /// `- [ ] Title @who`, `- [x] Title`, even `- Title`: all cards. A title that
-/// merely starts with `[` (say `- [WIP] refactor`) stays a title.
+/// merely starts with `[` (say `- [WIP] refactor`) stays a title. Only a line
+/// at column 0 is a card; an indented `- ` line is a note belonging to the
+/// card above it, so Markdown lists live in notes instead of spawning cards.
 fn parse_card_line(line: &str) -> Option<Card> {
+    if line.starts_with(char::is_whitespace) {
+        return None;
+    }
     let rest = line.trim_start().strip_prefix("- ")?;
     let mut rest = rest.trim_start();
     let mut done = false;
@@ -414,9 +419,24 @@ fn parse_card_line(line: &str) -> Option<Card> {
     }
     let (title, claimed_by) = split_claim(rest);
     let mut card = Card::new(title);
+    // A card line with no `radar:card-id` comment has no durable id yet. Give
+    // it a content-derived one rather than a fresh random id, so repeated
+    // parses agree and a thread keyed on it survives until the next write
+    // persists the id into the file.
+    card.id = stable_card_id(&card.title);
     card.done = done;
     card.claimed_by = claimed_by;
     Some(card)
+}
+
+/// A deterministic id for a card that has not been assigned one yet. The next
+/// board write persists it as a `radar:card-id` comment, after which the real
+/// id is read back.
+fn stable_card_id(title: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    title.hash(&mut hasher);
+    format!("card-auto-{:x}", hasher.finish())
 }
 
 fn parse_card_id(line: &str) -> Option<&str> {
@@ -737,6 +757,22 @@ pub fn finish_card(project: &Path, title: &str) -> Result<bool> {
             let card = board.columns[c].cards.remove(i);
             board.columns.last_mut().unwrap().cards.push(card);
         }
+        Ok(Some(true))
+    })?
+    .map_or(Ok(false), Ok)
+}
+
+/// Reopen a done card: unchecked, and moved back to the first column. The
+/// inverse of [`finish_card`], for ticking a done to-do back open.
+pub fn reopen_card(project: &Path, title: &str) -> Result<bool> {
+    let title = title.to_string();
+    edit(project, move |board| {
+        let Some((c, i)) = board.find(&title) else {
+            return Ok(None);
+        };
+        board.columns[c].cards[i].done = false;
+        let card = board.columns[c].cards.remove(i);
+        board.columns.first_mut().unwrap().cards.push(card);
         Ok(Some(true))
     })?
     .map_or(Ok(false), Ok)
@@ -1309,5 +1345,34 @@ mod tests {
         assert_eq!(completion[0].action, "completed");
         assert_eq!(completion[0].column.as_deref(), Some("Done"));
         assert_eq!(completion[0].from_column.as_deref(), Some("Backlog"));
+    }
+
+    #[test]
+    fn a_card_without_an_id_comment_keeps_a_stable_derived_id() {
+        // Hand-authored cards (the skill invites editing BOARD.md directly)
+        // have no id comment yet. Their id must not change between parses, or
+        // a thread keyed on it would orphan.
+        let text = "# Board\n\n## Backlog\n- [ ] Rate limiting\n";
+        let first = parse(text);
+        let second = parse(text);
+        let id = first.columns[0].cards[0].id.clone();
+        assert_eq!(id, second.columns[0].cards[0].id);
+        assert!(id.starts_with("card-auto-"));
+
+        // The next write persists that id; it is read back unchanged.
+        let rendered = first.render();
+        assert!(rendered.contains("radar:card-id:"));
+        let reread = parse(&rendered);
+        assert_eq!(reread.columns[0].cards[0].id, id);
+    }
+
+    #[test]
+    fn an_indented_dash_line_is_a_note_not_a_card() {
+        let board = board_with("## Backlog\n- [ ] Card\n      - a list item\n      - another\n");
+        assert_eq!(board.columns[0].cards.len(), 1);
+        assert_eq!(
+            board.columns[0].cards[0].body,
+            vec!["- a list item", "- another"]
+        );
     }
 }

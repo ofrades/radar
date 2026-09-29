@@ -56,12 +56,17 @@ use anyhow::{anyhow, bail, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 pub mod activity;
+/// Legacy markdown board monitor. Retained until the markdown path is deleted
+/// (it is no longer started: the board store is authoritative).
+#[allow(dead_code)]
 pub(super) mod board_monitor;
+pub mod board_store;
 pub mod catalog;
 #[cfg(feature = "vte")]
 pub mod client;
 pub mod daemon;
 pub mod registry;
+mod schema;
 
 /// The default grid size, before the client reports its own. Every
 /// terminal starts here if nothing better is known in time.
