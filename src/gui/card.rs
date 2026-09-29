@@ -8,8 +8,9 @@
 //! The thread is the project's durable activity journal filtered to this
 //! card's stable id — a human comment is an event with no session, an agent
 //! comment carries its session, and board transitions appear as quiet system
-//! lines. Nothing here writes to `BOARD.md` except the work itself; the
-//! conversation lives in the journal, so it survives agent runs and restarts.
+//! lines. Nothing here writes a board file; the card lives in radar's store
+//! and the conversation in the journal, so both survive agent runs and
+//! restarts.
 
 use std::cell::RefCell;
 use std::collections::HashSet;

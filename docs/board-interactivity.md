@@ -5,6 +5,10 @@ terminal processes alive across client exits; see
 [`session-daemon.md`](session-daemon.md) for its tested protocol and limitations.
 A durable project activity journal, bounded replay/watch protocol,
 revision-checked attention store, stable card IDs, and CLI are also in place.
+The board itself lives in the daemon's store (lanes and cards, revision-checked)
+and is authoritative for every client — the CLI, Home, the workspace board and
+the web client; the markdown `BOARD.md` path (parser, renderer, id migration and
+file monitor) has been deleted. See [`board-store.md`](board-store.md).
 Lossless terminal-state import and native verification of the Board walkthrough remain follow-up.
 
 The board is the project's full-workspace interaction surface. It presents
@@ -33,10 +37,12 @@ Agents can already submit requests and wait for typed responses with
   activity journal, outstanding attention requests, command results.
 - **Board UI:** presentation, sorting, filters, navigation, keyboard focus, and
   the human's path from a request to the relevant card/session.
-- **BOARD.md:** source of truth for work cards. Do not append terminal output or
-  high-frequency activity to it. Keep runtime events and attention records in
-  server storage, linked to cards using stable identity. Titles and `@agent`
-  alone are not durable identities; design migration before shipping links.
+- **Board store:** the authoritative source of truth for work cards. A card's
+  lane is its status (done is a done-kind lane), its id is stable, and every
+  mutation is revision-checked. Do not append terminal output or high-frequency
+  activity to the card; runtime events and attention records live in server
+  storage, linked to cards using stable identity. There is no board file: the
+  daemon owns lanes and cards, and clients read snapshots and send mutations.
 
 Keep three independent axes:
 
@@ -114,17 +120,18 @@ agent CLI reporting with its radar-provided project/session environment.
 shows actionable unresolved requests with seen/acknowledge/answer/approve/deny/
 dismiss actions, opens linked stable sessions, reflects authoritative
 resolution, and shows unresolved counts for every sidebar project. GUI watching
-reconnects, replays and deduplicates activity. The session daemon independently
-monitors registered boards, persists a silent baseline, and journals stable-card
-transitions even while the Board pane is closed. Native and web project sidebars
-show Done/In progress/Review totals using column names (the Done column, not a
-checkbox or Review, is authoritative), attention counts, and explicit per-agent
-state where available. Notifications are deduplicated by attention ID and
-opening one navigates to the relevant Board without resolving the request.
+reconnects, replays and deduplicates activity. The daemon's board store is the
+single writer: every card mutation is revision-checked and publishes a
+`BoardChanged` activity event, so every watcher refreshes through the stream it
+already listens to — no file monitor, and no silent baseline to reconcile.
+Native and web project sidebars show Done/In progress/Review totals from lane
+kinds, attention counts, and explicit per-agent state where available.
+Notifications are deduplicated by attention ID and opening one navigates to the
+relevant Board without resolving the request.
 
 **Next:** vendor-specific hooks can translate native agent prompts into the
 existing request/wait flow. Verify agent questions and notification delivery
 with real agent CLIs on supported desktop environments.
 
-The journal, attention storage, board monitor, and native notification path are
+The journal, attention storage, board store, and native notification path are
 implemented independently of fullscreen board presentation.

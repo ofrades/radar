@@ -33,21 +33,17 @@ mkdir -p "$BASE/home" "$BASE/demo"
 (
 	cd "$BASE/demo"
 	git init -q
-	cat > BOARD.md <<'EOF'
-# Board — demo
-
-## Backlog
-- [ ] A first to-do
-## In progress
-- [ ] Smoke the board
-## Review
-## Done
-EOF
 )
 
 echo "building (vte)…"
 cargo build --features vte >/dev/null 2>&1
 "$RADAR_BIN" --home "$BASE/home" add "$BASE/demo" >/dev/null
+# The board lives in radar's store now: seed the demo's cards through the CLI,
+# not a BOARD.md.
+"$RADAR_BIN" --home "$BASE/home" card add --path "$BASE/demo" \
+	--title "A first to-do" >/dev/null
+"$RADAR_BIN" --home "$BASE/home" card add --path "$BASE/demo" \
+	--column "In progress" --title "Smoke the board" >/dev/null
 
 export SMOKE_HOME="$BASE/home"
 export SMOKE_BIN="$RADAR_BIN"

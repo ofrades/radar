@@ -21,6 +21,7 @@ use crate::db::{Db, Project};
 use crate::session::activity::{
     ActivitySnapshot, AttentionChange, AttentionResponse, ChangeAttention,
 };
+use crate::session::board_store::BoardState;
 use crate::session::catalog::CatalogFilter;
 use crate::session::daemon::{self, Client, Command, Response};
 use crate::session::registry::{Lifecycle, Output, Spawn, Status};
@@ -423,7 +424,7 @@ async fn activity(
 async fn board_snapshot(
     RoutePath(project_id): RoutePath<i64>,
     State(state): State<WebState>,
-) -> ApiResult<Json<Option<crate::board::Board>>> {
+) -> ApiResult<Json<Option<BoardState>>> {
     let db = open_db(&state.home)?;
     let Some(project) = db.project(project_id).map_err(ApiError::internal)? else {
         return Ok(Json(None));
@@ -437,16 +438,10 @@ async fn board_snapshot(
     }
 
     // The board lives in the daemon's store, not a file.
-    match Client::request(
-        &state.home,
-        Command::BoardState {
-            project_id,
-            path: project.path.clone(),
-        },
-    )
-    .map_err(ApiError::internal)?
+    match Client::request(&state.home, Command::BoardState { project_id })
+        .map_err(ApiError::internal)?
     {
-        Response::BoardState(board) => Ok(Json(Some(board.to_board()))),
+        Response::BoardState(board) => Ok(Json(Some(board))),
         _ => Err(ApiError::internal(
             "daemon returned an unexpected board response",
         )),
@@ -467,7 +462,7 @@ async fn add_card(
     State(state): State<WebState>,
     headers: HeaderMap,
     Json(card): Json<NewCard>,
-) -> ApiResult<Json<Option<crate::board::Board>>> {
+) -> ApiResult<Json<Option<BoardState>>> {
     require_same_origin(&headers)?;
     let db = open_db(&state.home)?;
     let Some(project) = db.project(project_id).map_err(ApiError::internal)? else {
@@ -508,16 +503,10 @@ async fn add_card(
             ))
         }
     }
-    match Client::request(
-        &state.home,
-        Command::BoardState {
-            project_id,
-            path: project.path.clone(),
-        },
-    )
-    .map_err(ApiError::internal)?
+    match Client::request(&state.home, Command::BoardState { project_id })
+        .map_err(ApiError::internal)?
     {
-        Response::BoardState(board) => Ok(Json(Some(board.to_board()))),
+        Response::BoardState(board) => Ok(Json(Some(board))),
         _ => Err(ApiError::internal(
             "daemon returned an unexpected board response",
         )),

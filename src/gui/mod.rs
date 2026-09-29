@@ -277,7 +277,6 @@ struct App {
     /// board/card views with a way back.
     home_nav: RefCell<Vec<HomeView>>,
     board_summaries: RefCell<HashMap<i64, board::BoardSummary>>,
-    board_monitors: RefCell<HashMap<i64, gio::FileMonitor>>,
     notified_attention: RefCell<HashSet<(i64, String)>>,
     /// Attention responses the Home cockpit has sent but not yet heard back
     /// about. Home is rebuilt often, so the pending set outlives its widgets.
@@ -832,7 +831,6 @@ fn build_window(
         board_states: RefCell::new(HashMap::new()),
         home_nav: RefCell::new(Vec::new()),
         board_summaries: RefCell::new(HashMap::new()),
-        board_monitors: RefCell::new(HashMap::new()),
         notified_attention: RefCell::new(HashSet::new()),
         home_pending_attention: Rc::new(RefCell::new(HashSet::new())),
         home_focus_todo: Cell::new(None),
@@ -2715,47 +2713,20 @@ impl App {
         }
     }
 
-    fn reconcile_board_monitors(self: &Rc<Self>, projects: &[Project]) {
+    fn reconcile_board_watchers(self: &Rc<Self>, projects: &[Project]) {
         let wanted: HashSet<i64> = projects.iter().map(|project| project.id).collect();
-        let removed: Vec<i64> = self
-            .board_monitors
-            .borrow()
-            .keys()
-            .filter(|project_id| !wanted.contains(project_id))
-            .copied()
-            .collect();
-        for project_id in removed {
-            self.board_monitors.borrow_mut().remove(&project_id);
-            self.board_summaries.borrow_mut().remove(&project_id);
-        }
+        self.board_summaries
+            .borrow_mut()
+            .retain(|project_id, _| wanted.contains(project_id));
+        self.board_states
+            .borrow_mut()
+            .retain(|project_id, _| wanted.contains(project_id));
 
+        // The store publishes a BoardChanged event on every mutation, so the
+        // summaries refresh through the activity stream; a project's first
+        // summary is warmed here.
         for project in projects {
             self.refresh_board_summary(project.id);
-            if project.is_missing() || self.board_monitors.borrow().contains_key(&project.id) {
-                continue;
-            }
-            let directory = gio::File::for_path(&project.path);
-            let Ok(monitor) =
-                directory.monitor_directory(gio::FileMonitorFlags::NONE, None::<&gio::Cancellable>)
-            else {
-                continue;
-            };
-            let project_id = project.id;
-            let board_path = crate::board::file_path(&project.path);
-            let temporary_path = project.path.join(crate::board::TEMP_NAME);
-            let app = Rc::downgrade(self);
-            monitor.connect_changed(move |_, file, other_file, _| {
-                let relevant = [file.path(), other_file.and_then(|other| other.path())]
-                    .into_iter()
-                    .flatten()
-                    .any(|path| path == board_path || path == temporary_path);
-                if relevant {
-                    if let Some(app) = app.upgrade() {
-                        app.refresh_board_summary(project_id);
-                    }
-                }
-            });
-            self.board_monitors.borrow_mut().insert(project.id, monitor);
         }
     }
 
@@ -2775,7 +2746,7 @@ impl App {
         } else if let Some(state) = self.fetch_board_state(project_id) {
             self.board_summaries
                 .borrow_mut()
-                .insert(project_id, board::summarize(&state.to_board()));
+                .insert(project_id, board::summarize(&state));
             self.board_states.borrow_mut().insert(project_id, state);
         } else {
             self.board_summaries.borrow_mut().remove(&project_id);
@@ -2783,19 +2754,12 @@ impl App {
         self.refresh_home();
     }
 
-    /// Fetch a project's board from the daemon store, with the project root the
-    /// store needs to import a legacy `BOARD.md` once.
+    /// Fetch a project's board from the daemon store.
     fn fetch_board_state(
         &self,
         project_id: i64,
     ) -> Option<crate::session::board_store::BoardState> {
-        let path = self
-            .projects
-            .borrow()
-            .iter()
-            .find(|project| project.id == project_id)
-            .map(|project| project.path.clone())?;
-        match crate::session::daemon::board_state(&self.session_home, project_id, &path) {
+        match crate::session::daemon::board_state(&self.session_home, project_id) {
             Ok(state) => Some(state),
             Err(error) => {
                 eprintln!("radar: board state: {error}");
@@ -3370,7 +3334,7 @@ impl App {
         *app.projects.borrow_mut() = projects.clone();
         app.request_agent_scan();
         app.reconcile_activity_watchers(&projects);
-        app.reconcile_board_monitors(&projects);
+        app.reconcile_board_watchers(&projects);
 
         if projects.is_empty() {
             // With no projects Home is the empty state — unless a drill-down
@@ -3384,12 +3348,6 @@ impl App {
         }
 
         app.refresh_status();
-        // Warm the board cache for every project, so Home's lanes have
-        // summaries the first time it is shown. This also imports a legacy
-        // BOARD.md once per project.
-        for project in &projects {
-            app.refresh_board_summary(project.id);
-        }
 
         // A removed project returns to Home rather than launching another.
         if !app.home_shown.get()
@@ -3727,9 +3685,9 @@ impl App {
         self.stack.set_visible_child_name(&format!("project-{id}"));
         let _ = self.db.touch_project(id);
         let _ = self.db.remember_last_project(Some(id));
-        // Load the board from the store — importing a legacy BOARD.md once —
-        // only when the project's board is enabled.
-        match crate::board::enabled(&self.db, &project.path) {
+        // Load the board from the store, only when the project's board is
+        // enabled.
+        match self.db.board_enabled(&project.path) {
             Ok(true) => self.refresh_board_summary(id),
             Ok(false) => {}
             Err(error) => eprintln!("radar: reading board policy: {error}"),
@@ -4003,19 +3961,15 @@ impl App {
         }
         options.prompt = extras.prompt.clone();
         options.card = extras.card.clone();
-        // An agent meets the board at launch: the board file and the skill
-        // that makes it the convention are both in place before the agent
-        // draws its first frame, and the launch claims work under a name
-        // unique to this instance — two agents of the same kind never hold
-        // each other's cards.
+        // An agent meets the board at launch: the board skill that makes it
+        // the convention is installed before the agent draws its first frame,
+        // and the launch claims work under a name unique to this instance —
+        // two agents of the same kind never hold each other's cards.
         let mut launch_record: Option<(String, u128)> = None;
         if program.kind == Kind::Agent {
-            match crate::board::enabled(&self.db, &workspace.project.path) {
+            match self.db.board_enabled(&workspace.project.path) {
                 Ok(true) => {
-                    if let Err(error) =
-                        crate::board::ensure_enabled_file(&self.db, &workspace.project.path)
-                            .and_then(|_| crate::skill::install(&self.db, &workspace.project.path))
-                    {
+                    if let Err(error) = crate::skill::install(&self.db, &workspace.project.path) {
                         eprintln!("radar: setting up the board: {error}");
                     }
                 }

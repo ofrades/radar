@@ -88,11 +88,8 @@ fn until(mut condition: impl FnMut() -> bool) {
     }
 }
 
-fn state(daemon: &Daemon, project_id: i64, project: &Path) -> BoardState {
-    match daemon.request(Request::BoardState {
-        project_id,
-        path: project.to_path_buf(),
-    }) {
+fn state(daemon: &Daemon, project_id: i64) -> BoardState {
+    match daemon.request(Request::BoardState { project_id }) {
         Response::BoardState(state) => state,
         other => panic!("unexpected board state response: {other:?}"),
     }
@@ -117,55 +114,11 @@ fn add(daemon: &Daemon, project_id: i64, lane: &str, title: &str) -> BoardChange
 }
 
 #[test]
-fn import_leaves_the_file_untouched_and_is_idempotent() {
-    let daemon = Daemon::start();
-    let project = daemon.home.path().join("proj");
-    std::fs::create_dir_all(&project).unwrap();
-    std::fs::write(
-        project.join("BOARD.md"),
-        "# Board\n\n\
-         ## Backlog\n\
-         - [ ] One\n\
-         ## In progress\n\
-         - [ ] Two @agent-1\n\
-               a note\n\
-         ## Done\n\
-         - [x] Shipped\n",
-    )
-    .unwrap();
-    let before = std::fs::read(project.join("BOARD.md")).unwrap();
-
-    let board = state(&daemon, 7, &project);
-    assert_eq!(board.cards.len(), 3);
-    let two = board.cards.iter().find(|c| c.title == "Two").unwrap();
-    assert_eq!(two.claim.as_deref(), Some("agent-1"));
-    assert!(two.body.contains("a note"));
-    assert_eq!(two.lane, "In progress");
-    assert!(
-        board
-            .cards
-            .iter()
-            .find(|c| c.title == "Shipped")
-            .unwrap()
-            .done
-    );
-
-    // The file is a one-time import source: never rewritten.
-    assert_eq!(std::fs::read(project.join("BOARD.md")).unwrap(), before);
-
-    // A second read does not double-import, even after a mutation.
-    add(&daemon, 7, "Backlog", "Added later");
-    let again = state(&daemon, 7, &project);
-    assert_eq!(again.cards.len(), 4);
-    assert_eq!(std::fs::read(project.join("BOARD.md")).unwrap(), before);
-}
-
-#[test]
 fn the_card_lifecycle_and_conversation_round_trip() {
     let daemon = Daemon::start();
     let project = daemon.home.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
-    state(&daemon, 3, &project);
+    state(&daemon, 3);
 
     let added = add(&daemon, 3, "Todo", "Fix login");
     assert_eq!(added.action, "added");
@@ -270,7 +223,7 @@ fn a_stale_revision_is_refused_and_nothing_is_written() {
     let daemon = Daemon::start();
     let project = daemon.home.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
-    state(&daemon, 5, &project);
+    state(&daemon, 5);
     let card = add(&daemon, 5, "Todo", "Task").card;
 
     // A fresh revision succeeds.
@@ -298,7 +251,7 @@ fn a_stale_revision_is_refused_and_nothing_is_written() {
     .unwrap_err();
     assert!(error.to_string().contains("changed"), "{error}");
 
-    let board = state(&daemon, 5, &project);
+    let board = state(&daemon, 5);
     assert_eq!(board.cards[0].title, "Renamed");
 }
 
@@ -307,7 +260,7 @@ fn the_board_survives_a_daemon_restart() {
     let mut daemon = Daemon::start();
     let project = daemon.home.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
-    state(&daemon, 9, &project);
+    state(&daemon, 9);
     add(&daemon, 9, "Todo", "Persisted");
     let moved = add(&daemon, 9, "In progress", "Also here");
     change(daemon.request(Request::CardMove {
@@ -320,7 +273,7 @@ fn the_board_survives_a_daemon_restart() {
 
     daemon.restart();
 
-    let board = state(&daemon, 9, &project);
+    let board = state(&daemon, 9);
     assert_eq!(board.cards.len(), 2);
     let also = board.cards.iter().find(|c| c.title == "Also here").unwrap();
     assert_eq!(also.lane, "Review");

@@ -87,9 +87,8 @@ the program. That keeps radar usable on a machine where you cannot install VTE.
 - `cargo test --features vte` — unit tests, including the board store's schema
   migrations and the desktop-notification policy.
 - `cargo test --features vte --test board_store` — the board store end to end
-  against a real daemon: import (leaving `BOARD.md` untouched), the card
-  lifecycle, the conversation thread, revision conflicts, and restart
-  durability.
+  against a real daemon: the card lifecycle, the conversation thread, revision
+  conflicts, and restart durability.
 - `./scripts/smoke.sh [--notify]` — the GUI offscreen (broadway + chromium):
   build, render Home's board, and, with `--notify`, raise a card question and
   assert the GUI emits a desktop `Notify`. Runs against a scratch `RADAR_HOME`
@@ -204,7 +203,7 @@ radar prefs                 # resolved preference per slot
 radar prefs agent omp        # set one of OpenCode, OMP, or Cursor
 radar web [--port 8787]     # responsive browser client on localhost
 radar pin / move / rename / remove / prune
-radar board                 # the project's kanban (BOARD.md)
+radar board                 # the project's kanban, from radar's store
 radar card add / claim / release / move / done / next
 radar hook guard            # the board's pre-edit check, for harness hooks
 radar doctor                # environment check
@@ -320,9 +319,9 @@ When disabled, Radar does not create or open the board and its claim guards
 allow edits and commits. A lane is a named status (`Todo`, `In progress`,
 `Review`, `Done`, or your own); a card has a title, a markdown body, a claim,
 and a lane, and it is done exactly while it sits in a done lane. Cards carry
-real ids, so moves, claims and edits are exact. For users upgrading from a
-`BOARD.md`, radar imports it once (columns become lanes, cards become records)
-and leaves the file untouched; the file is not read again.
+real ids, so moves, claims and edits are exact. The store is authoritative:
+there is no `BOARD.md` to read or write. Boards from before the store landed
+were imported once, then left untouched on disk.
 
 The board is driveable from the CLI and the app alike: an agent claims work and
 moves it along with `radar card …`, and radar's **Board** renders the same
@@ -340,7 +339,7 @@ radar card move "Fix login" --to Review  # hands the card over: the claim drops
 
 Cards carry a conversation too. A card's thread lives in the daemon's durable
 activity journal, keyed by its stable card ID, so it survives agent runs and
-restarts and never clutters `BOARD.md`:
+restarts and never writes to a file:
 
 ```bash
 radar card show "Fix login"                                  # the card and its thread
@@ -433,7 +432,7 @@ hooks, but nothing needs to be configured for the gate to hold.
 ## Development
 
 ```bash
-cargo test                  # 120 tests: store, board, skill, git parsing, registry, discovery
+cargo test                  # store, board, skill, git parsing, registry, discovery
 cargo clippy --all-targets  # clean
 cargo build --features gui  # no VTE needed
 ```
@@ -442,7 +441,7 @@ Layout:
 
 ```
 src/db/          SQLite: projects, tabs, settings, events  (+ migrations)
-src/board.rs     the kanban: BOARD.md parse/render, atomic card ops
+src/session/     daemon, session registry, activity journal, board store
 src/skill.rs     the convention: skill install, the pre-edit guard
 src/programs/    program registry, omarchy agent knowledge, argv building
 src/discover/    directory discovery: fd or walk, fuzzy filtering
@@ -451,7 +450,7 @@ src/gui/         Home, project finder, workspaces, dialogs, theme, terminal pane
 src/main.rs      CLI
 ```
 
-The core (`db`, `board`, `programs`, `discover`, `git`) has no GTK dependency,
+The core (`db`, `session`, `programs`, `discover`, `git`) has no GTK dependency,
 so it can back other front-ends — a shell widget, a status bar, or the `--json`
 output of the CLI — without duplicating any state.
 

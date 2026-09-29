@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use radar::board;
 use radar::config::Paths;
 use radar::db::{Db, Preferences, Slot, Tab};
 use radar::programs::{self, agents, Kind, LaunchOptions};
@@ -119,7 +118,7 @@ enum Command {
     },
     /// Check the environment radar needs
     Doctor,
-    /// Show a project's board (BOARD.md), creating it if needed
+    /// Show a project's board from radar's store
     Board {
         /// Project directory (default: the current directory)
         path: Option<PathBuf>,
@@ -209,7 +208,7 @@ struct ActivityIdentity {
     /// Stable daemon session ID (defaults to RADAR_SESSION_ID)
     #[arg(long)]
     session_id: Option<String>,
-    /// Stable BOARD.md card ID (defaults to RADAR_CARD_ID)
+    /// Stable card ID (defaults to RADAR_CARD_ID)
     #[arg(long)]
     card_id: Option<String>,
     /// Retry token. Reuse it to make a retry idempotent.
@@ -378,7 +377,7 @@ enum CardAction {
         /// Project directory (default: the current directory)
         #[arg(long)]
         path: Option<PathBuf>,
-        /// Stable card ID (from BOARD.md) or its title
+        /// Stable card ID or its title
         card: String,
     },
     /// Post a message on a card's thread — how an agent reports to the human
@@ -386,7 +385,7 @@ enum CardAction {
         /// Project directory (default: the current directory)
         #[arg(long)]
         path: Option<PathBuf>,
-        /// Stable card ID (from BOARD.md) or its title
+        /// Stable card ID or its title
         card: String,
         /// The message
         text: String,
@@ -399,7 +398,7 @@ enum CardAction {
         /// Project directory (default: the current directory)
         #[arg(long)]
         path: Option<PathBuf>,
-        /// Stable card ID (from BOARD.md) or its title
+        /// Stable card ID or its title
         card: String,
         /// New title
         #[arg(long)]
@@ -413,9 +412,9 @@ enum CardAction {
 #[derive(Subcommand, Debug)]
 enum HookAction {
     /// Judge one edit or commit the way an agent harness's hook would: deny
-    /// (exit 2) unless the project's BOARD.md shows a live claim by
-    /// $RADAR_AGENT. The tool call's JSON is read from stdin when piped, so
-    /// the same command serves a hook and a human checking by hand.
+    /// (exit 2) unless radar shows a live claim by $RADAR_AGENT. The tool
+    /// call's JSON is read from stdin when piped, so the same command serves a
+    /// hook and a human checking by hand.
     Guard {
         /// The file the agent wants to edit (default: from the hook's stdin
         /// JSON, `tool_input.file_path`)
@@ -1068,8 +1067,8 @@ fn show_board(paths: &Paths, db: &Db, path: Option<PathBuf>, json: bool) -> Resu
     use radar::session::daemon as board_api;
 
     let (project_id, root) = board_context(db, path)?;
-    board::require_enabled(db, &root)?;
-    let state = board_api::board_state(&paths.data_dir, project_id, &root)?;
+    db.require_board_enabled(&root)?;
+    let state = board_api::board_state(&paths.data_dir, project_id)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&state)?);
         return Ok(());
@@ -1106,10 +1105,10 @@ fn card_add(
     use radar::session::daemon as board_api;
 
     let (project_id, root) = board_context(db, path)?;
-    board::require_enabled(db, &root)?;
-    // Ensure the store's board exists (and a legacy BOARD.md is imported)
-    // before the first card lands, so an add cannot seed empty defaults first.
-    let _ = board_api::board_state(&paths.data_dir, project_id, &root)?;
+    db.require_board_enabled(&root)?;
+    // Ensure the store's board exists before the first card lands, so an add
+    // cannot seed empty defaults first.
+    let _ = board_api::board_state(&paths.data_dir, project_id)?;
     let change = board_api::board_card_add(
         &paths.data_dir,
         project_id,
@@ -1134,8 +1133,8 @@ fn card_claim(
     use radar::session::daemon as board_api;
 
     let (project_id, root) = board_context(db, path)?;
-    board::require_enabled(db, &root)?;
-    let state = board_api::board_state(&paths.data_dir, project_id, &root)?;
+    db.require_board_enabled(&root)?;
+    let state = board_api::board_state(&paths.data_dir, project_id)?;
     let card_id = find_stored_mut(&state, needle)?.id.clone();
     let change = board_api::board_card_claim(
         &paths.data_dir,
@@ -1166,8 +1165,8 @@ fn card_move(
     use radar::session::daemon as board_api;
 
     let (project_id, root) = board_context(db, path)?;
-    board::require_enabled(db, &root)?;
-    let state = board_api::board_state(&paths.data_dir, project_id, &root)?;
+    db.require_board_enabled(&root)?;
+    let state = board_api::board_state(&paths.data_dir, project_id)?;
     let card_id = find_stored_mut(&state, needle)?.id.clone();
     let change = board_api::board_card_move(
         &paths.data_dir,
@@ -1194,8 +1193,8 @@ fn card_done(
     use radar::session::daemon as board_api;
 
     let (project_id, root) = board_context(db, path)?;
-    board::require_enabled(db, &root)?;
-    let state = board_api::board_state(&paths.data_dir, project_id, &root)?;
+    db.require_board_enabled(&root)?;
+    let state = board_api::board_state(&paths.data_dir, project_id)?;
     let card_id = find_stored_mut(&state, needle)?.id.clone();
     let change = board_api::board_card_complete(
         &paths.data_dir,
@@ -1227,7 +1226,7 @@ fn card_next(
     use radar::session::daemon as board_api;
 
     let (project_id, root) = board_context(db, path)?;
-    board::require_enabled(db, &root)?;
+    db.require_board_enabled(&root)?;
     if let Err(error) = radar::skill::install(db, &root) {
         eprintln!("radar: could not install the board skill: {error}");
     }
@@ -1339,8 +1338,8 @@ fn card_show(
     use radar::session::daemon::{Client, Command as Request, Response};
 
     let (project_id, root) = board_context(db, path)?;
-    board::require_enabled(db, &root)?;
-    let state = board_api::board_state(&paths.data_dir, project_id, &root)?;
+    db.require_board_enabled(&root)?;
+    let state = board_api::board_state(&paths.data_dir, project_id)?;
     let card = find_stored_mut(&state, needle)?.clone();
     let lane = state
         .lanes
@@ -1415,8 +1414,8 @@ fn card_comment(
     use radar::session::daemon::{Client, Command as Request, Response};
 
     let (project_id, root) = board_context(db, path)?;
-    board::require_enabled(db, &root)?;
-    let state = board_api::board_state(&paths.data_dir, project_id, &root)?;
+    db.require_board_enabled(&root)?;
+    let state = board_api::board_state(&paths.data_dir, project_id)?;
     let card_id = find_stored_mut(&state, needle)?.id.clone();
     let command = Request::PublishActivity(PublishActivity {
         project_id,
@@ -1451,8 +1450,8 @@ fn card_edit(
     use radar::session::daemon as board_api;
 
     let (project_id, root) = board_context(db, path)?;
-    board::require_enabled(db, &root)?;
-    let state = board_api::board_state(&paths.data_dir, project_id, &root)?;
+    db.require_board_enabled(&root)?;
+    let state = board_api::board_state(&paths.data_dir, project_id)?;
     let card_id = find_stored_mut(&state, needle)?.id.clone();
     let change = board_api::board_card_update(
         &paths.data_dir,
@@ -1474,10 +1473,9 @@ fn card_edit(
 /// means it could not be judged (daemon down, project not in the sidebar) and
 /// the guard lets the call through.
 fn claim_holds(paths: &Paths, db: &Db, dir: &Path, who: &str) -> Option<bool> {
-    let (project_id, root) = board_context(db, Some(dir.to_path_buf())).ok()?;
+    let (project_id, _root) = board_context(db, Some(dir.to_path_buf())).ok()?;
     // Never spawn a daemon here: an edit-time gate must fail open.
-    let state =
-        radar::session::daemon::board_state_quick(&paths.data_dir, project_id, &root).ok()?;
+    let state = radar::session::daemon::board_state_quick(&paths.data_dir, project_id).ok()?;
     Some(
         state
             .cards
@@ -1672,11 +1670,6 @@ fn open(db: &Db, path: &PathBuf, json: bool) -> Result<()> {
     db.touch_project(project.id)?;
     db.remember_last_project(Some(project.id))?;
     db.log_event("project_opened", Some(project.id), &serde_json::Value::Null)?;
-    // Make the board available before agents start when enabled in Radar's
-    // global per-project settings.
-    if board::enabled(db, &project.path)? {
-        board::ensure_file(&project.path)?;
-    }
 
     let preferences = db
         .project_settings(project.id)?

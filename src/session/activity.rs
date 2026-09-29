@@ -19,8 +19,9 @@ const MAX_TEXT: usize = 16 * 1024;
 const MAX_ID: usize = 200;
 
 /// Bump when the tables below change; add the next step to `SCHEMA_STEPS`.
-const SCHEMA_VERSION: i64 = 1;
-const SCHEMA_STEPS: [&str; 1] = [r#"
+const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_STEPS: [&str; 2] = [
+    r#"
     CREATE TABLE IF NOT EXISTS activity_events (
         project_id INTEGER NOT NULL,
         sequence INTEGER NOT NULL,
@@ -51,7 +52,13 @@ const SCHEMA_STEPS: [&str; 1] = [r#"
         project_id INTEGER PRIMARY KEY,
         board_json TEXT
     );
-"#];
+"#,
+    // The daemon no longer watches a markdown board; card transitions are
+    // published by the store's mutations, so the baseline table is dead.
+    r#"
+    DROP TABLE IF EXISTS board_snapshots;
+"#,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -670,82 +677,6 @@ impl ActivityJournal {
             },
         ))
     }
-    /// Persist the last observed board and append its transitions in the same
-    /// transaction. A missing row is a silent startup baseline; a stored NULL
-    /// is a known-absent file, allowing later creation to be reported.
-    pub fn reconcile_board(
-        &self,
-        project_id: i64,
-        current: Option<&crate::board::Board>,
-    ) -> Result<Vec<ActivityEvent>> {
-        validate_project(project_id)?;
-        let next_json = current.map(serde_json::to_string).transpose()?;
-        let mut inner = self.inner.lock();
-        let tx = inner.connection.transaction()?;
-        let stored: Option<Option<String>> = tx
-            .query_row(
-                "SELECT board_json FROM board_snapshots WHERE project_id = ?1",
-                params![project_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        let Some(previous_json) = stored else {
-            tx.execute(
-                "INSERT INTO board_snapshots(project_id, board_json) VALUES (?1, ?2)",
-                params![project_id, next_json.as_deref()],
-            )?;
-            tx.commit()?;
-            return Ok(Vec::new());
-        };
-
-        if previous_json == next_json {
-            tx.commit()?;
-            return Ok(Vec::new());
-        }
-        let previous: Option<crate::board::Board> = previous_json
-            .map(|json| serde_json::from_str(&json))
-            .transpose()?;
-
-        let changes = crate::board::changes(previous.as_ref(), current);
-        let mut events = Vec::with_capacity(changes.len());
-        for change in changes {
-            let event = append_event(
-                &tx,
-                project_id,
-                None,
-                change.card_id.clone(),
-                ActivityKind::BoardChanged,
-                ActivityPayload::BoardChanged {
-                    action: change.action,
-                    card_id: change.card_id,
-                    title: change.title,
-                    column: change.column,
-                    from_column: change.from_column,
-                },
-            )?;
-            events.push(event);
-        }
-        tx.execute(
-            "UPDATE board_snapshots SET board_json = ?2 WHERE project_id = ?1",
-            params![project_id, next_json],
-        )?;
-        tx.commit()?;
-        for event in &events {
-            notify(&mut inner, event.clone());
-        }
-        Ok(events)
-    }
-    /// Stop tracking a disabled board. Re-enabling starts with a fresh silent
-    /// baseline, rather than replaying edits made while board capture was off.
-    pub fn forget_board(&self, project_id: i64) -> Result<()> {
-        validate_project(project_id)?;
-        self.inner.lock().connection.execute(
-            "DELETE FROM board_snapshots WHERE project_id = ?1",
-            params![project_id],
-        )?;
-        Ok(())
-    }
 }
 
 fn validate_project(project_id: i64) -> Result<()> {
@@ -1311,79 +1242,5 @@ mod tests {
             journal.watch(9, snapshot.watermark).unwrap(),
             WatchResult::Ready(_, _)
         ));
-    }
-    fn board(project: &str) -> crate::board::Board {
-        crate::board::parse(project)
-    }
-
-    #[test]
-    fn board_capture_is_silent_at_baseline_idempotent_and_persistent() {
-        let (dir, journal) = journal();
-        let initial = board(
-            "## Backlog\n\
-             - [ ] Ship fix\n\
-                   <!-- radar:card-id:stable-card -->\n\
-             ## Review\n",
-        );
-        assert!(journal
-            .reconcile_board(9, Some(&initial))
-            .unwrap()
-            .is_empty());
-        assert!(journal
-            .reconcile_board(9, Some(&initial))
-            .unwrap()
-            .is_empty());
-        drop(journal);
-
-        let journal = ActivityJournal::open(&dir.path().join("activity.db")).unwrap();
-        let reordered = board(
-            "## Review\n\
-             ## Backlog\n\
-             - [ ] Ship fix\n\
-                   <!-- radar:card-id:stable-card -->\n",
-        );
-        assert!(journal
-            .reconcile_board(9, Some(&reordered))
-            .unwrap()
-            .is_empty());
-
-        let moved = board(
-            "## Review\n\
-             - [ ] Ship fix\n\
-                   <!-- radar:card-id:stable-card -->\n\
-             ## Backlog\n",
-        );
-        let events = journal.reconcile_board(9, Some(&moved)).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].card_id.as_deref(), Some("stable-card"));
-        assert!(matches!(
-            &events[0].payload,
-            ActivityPayload::BoardChanged {
-                action,
-                column,
-                from_column,
-                ..
-            } if action == "moved"
-                && column.as_deref() == Some("Review")
-                && from_column.as_deref() == Some("Backlog")
-        ));
-        assert!(journal.reconcile_board(9, Some(&moved)).unwrap().is_empty());
-
-        let removed = journal.reconcile_board(9, None).unwrap();
-        assert_eq!(removed.len(), 2);
-        assert!(removed.iter().any(|event| matches!(
-            &event.payload,
-            ActivityPayload::BoardChanged { action, .. } if action == "removed"
-        )));
-        let recreated = journal.reconcile_board(9, Some(&moved)).unwrap();
-        assert!(recreated.iter().any(|event| matches!(
-            &event.payload,
-            ActivityPayload::BoardChanged { action, .. } if action == "board_created"
-        )));
-        assert!(recreated.iter().any(|event| matches!(
-            &event.payload,
-            ActivityPayload::BoardChanged { action, card_id: Some(id), .. }
-                if action == "added" && id == "stable-card"
-        )));
     }
 }

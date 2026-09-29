@@ -30,7 +30,7 @@ use super::registry::{
 };
 use super::Dims;
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 const MAX_REQUEST: usize = 128 * 1024;
 const MAX_RESPONSE: usize = 128 * 1024 * 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
@@ -118,10 +118,8 @@ pub enum Command {
         provider_session_id: String,
     },
     /// The whole board for a project: its lanes and cards, from the store.
-    /// `path` is the project root, used once to import a legacy `BOARD.md`.
     BoardState {
         project_id: i64,
-        path: PathBuf,
     },
     CardAdd {
         project_id: i64,
@@ -479,15 +477,7 @@ fn serve(
             )?;
             Response::Ok
         }
-        Command::BoardState { project_id, path } => {
-            // Import a legacy markdown board once, before the first read.
-            if !board.is_initialized(project_id).unwrap_or(true) {
-                if let Ok(parsed) = crate::board::load(&path) {
-                    let _ = board.import(project_id, &parsed);
-                }
-            }
-            Response::BoardState(board.state(project_id)?)
-        }
+        Command::BoardState { project_id } => Response::BoardState(board.state(project_id)?),
         Command::CardAdd {
             project_id,
             lane,
@@ -961,14 +951,8 @@ fn board_request(home: &Path, command: Command) -> Result<Response> {
     }
 }
 
-pub fn board_state(home: &Path, project_id: i64, path: &Path) -> Result<BoardState> {
-    match board_request(
-        home,
-        Command::BoardState {
-            project_id,
-            path: path.to_path_buf(),
-        },
-    )? {
+pub fn board_state(home: &Path, project_id: i64) -> Result<BoardState> {
+    match board_request(home, Command::BoardState { project_id })? {
         Response::BoardState(state) => Ok(state),
         other => bail!("unexpected board response: {other:?}"),
     }
@@ -977,14 +961,8 @@ pub fn board_state(home: &Path, project_id: i64, path: &Path) -> Result<BoardSta
 /// Like [`board_state`], but never starts the daemon. An edit-time gate runs on
 /// every tool call and must fail open rather than pay to spawn a daemon; a
 /// connection error means "cannot judge", and the caller allows the edit.
-pub fn board_state_quick(home: &Path, project_id: i64, path: &Path) -> Result<BoardState> {
-    match Client::request(
-        home,
-        Command::BoardState {
-            project_id,
-            path: path.to_path_buf(),
-        },
-    )? {
+pub fn board_state_quick(home: &Path, project_id: i64) -> Result<BoardState> {
+    match Client::request(home, Command::BoardState { project_id })? {
         Response::BoardState(state) => Ok(state),
         Response::Error(message) => bail!("{message}"),
         other => bail!("unexpected board response: {other:?}"),

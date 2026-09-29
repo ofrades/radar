@@ -1,11 +1,12 @@
 # The board store: cards in radar's control
 
-Implementation update: the store is live. The daemon owns lanes and cards
-(`board.sqlite`); `radar card …`, the GUI (Home's board, the card view and the
-workspace Board pane) and the web client all read and write it; a legacy
-`BOARD.md` is imported once and then left untouched. Git/sync remains out of
-scope. See [`board-interactivity.md`](board-interactivity.md) and
-[`session-daemon.md`](session-daemon.md) for the surrounding architecture.
+Implementation update: the store is live and the markdown path is retired. The
+daemon owns lanes and cards (`board.sqlite`); `radar card …`, the GUI (Home's
+board, the card view and the workspace Board pane) and the web client all read
+and write it. The markdown parser/renderer, `ensure_card_ids`, the daemon board
+monitor and the GUI's file monitor are gone; no code reads `BOARD.md` any more.
+Git/sync remains out of scope. See [`board-interactivity.md`](board-interactivity.md)
+and [`session-daemon.md`](session-daemon.md) for the surrounding architecture.
 
 ## Problem Statement
 
@@ -121,8 +122,9 @@ is explicitly out of scope here.
   once into lanes and cards, preserving existing card ids. Idempotent, never
   destructive, and never deletes the file.
 - **Removals.** The markdown parser/renderer, `ensure_card_ids`, the daemon
-  board monitor's file watching and reconciliation, and the GUI's
-  summary-from-parse path are deleted once the store is live.
+  board monitor's file watching and reconciliation, the one-time importer, and
+  the GUI's summary-from-parse path have all been deleted now that the store is
+  live. `BOARD.md` files are left on disk but nothing reads them.
 - **Opt-out.** The existing per-project board-enabled setting is unchanged and
   now simply means "no store board for this project".
 

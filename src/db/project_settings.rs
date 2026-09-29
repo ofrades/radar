@@ -1,6 +1,8 @@
 //! Settings that belong to one project but live in Radar's global database.
 
-use anyhow::Result;
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, OptionalExtension};
 
 use super::{Db, Preferences, Slot};
@@ -87,6 +89,28 @@ impl Db {
             params![project_id, enabled as i64],
         )?;
         Ok(())
+    }
+
+    /// Whether Radar's board is enabled for a project. Unregistered paths have
+    /// no override and retain the default-enabled behavior.
+    pub fn board_enabled(&self, project: &Path) -> Result<bool> {
+        Ok(self.project_settings_for_path(project)?.board_enabled)
+    }
+
+    /// Fail when this project's board is disabled in Radar's global settings.
+    pub fn require_board_enabled(&self, project: &Path) -> Result<()> {
+        if !self.board_enabled(project)? {
+            bail!("the board is disabled for {}", project.display());
+        }
+        Ok(())
+    }
+
+    /// Persist a project's board preference in Radar's global database.
+    pub fn set_board_enabled(&self, project: &Path, enabled: bool) -> Result<()> {
+        let project = self
+            .project_by_path(project)?
+            .context("project is not registered in Radar")?;
+        self.set_project_board_enabled(project.id, enabled)
     }
 
     /// Set a project override, or clear it to inherit Radar's global preference.

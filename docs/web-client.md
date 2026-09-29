@@ -35,14 +35,12 @@ attention shortcut remains available in the terminal and jumps to the first
 outstanding request without clearing it. Progress polling retains the last
 snapshot and marks it unavailable when a refresh fails.
 
-The session daemon observes registered, board-enabled `BOARD.md` files whether
-or not a board pane is open. It silently establishes an initial baseline, then
-records stable card additions, removals, edits, claims, and column transitions
-in the project activity journal. Board snapshots are served through
-`/api/projects/{id}/board` without creating missing files. The native desktop
-also delivers deduplicated attention notifications; opening one takes you to
-the relevant Board, and the request stays unresolved until you answer or
-explicitly dismiss it.
+The board is served from the daemon's store, not a file: `/api/projects/{id}/board`
+returns the project's lanes and cards, and card mutations (revision-checked)
+publish a `BoardChanged` activity event so every open client refreshes. The
+native desktop also delivers deduplicated attention notifications; opening one
+takes you to the relevant Board, and the request stays unresolved until you
+answer or explicitly dismiss it.
 
 ## Run locally
 

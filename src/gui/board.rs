@@ -7,8 +7,8 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc::SyncSender;
 
-use crate::board::{Board, Card};
 use crate::session::activity::{Attention, AttentionChange, AttentionResponse, ChangeAttention};
+use crate::session::board_store::{BoardState, StoredCard};
 use crate::session::daemon::{Client, Command, Response};
 use adw::prelude::*;
 
@@ -54,42 +54,40 @@ pub(super) fn lane_label(name: &str) -> &str {
     }
 }
 
-fn work_card(card: &Card) -> WorkCard {
+fn work_card(card: &StoredCard) -> WorkCard {
     WorkCard {
         id: card.id.clone(),
         title: card.title.clone(),
         claim: card
-            .claimed_by
+            .claim
             .as_deref()
             .filter(|claim| !claim.is_empty())
             .map(str::to_string),
     }
 }
 
-pub(super) fn summarize(board: &Board) -> BoardSummary {
+pub(super) fn summarize(state: &BoardState) -> BoardSummary {
     let mut summary = BoardSummary::default();
-    for column in &board.columns {
-        let name = column.name.trim();
-        let done = name.eq_ignore_ascii_case("done");
-        let in_progress = name.eq_ignore_ascii_case("in progress");
-        let review = name.eq_ignore_ascii_case("review");
-        if done {
-            summary.done += column.cards.len();
-        }
-        if in_progress {
-            summary.in_progress += column.cards.len();
-        }
-        if review {
-            summary.review += column.cards.len();
-        }
-        let mut cards = Vec::with_capacity(column.cards.len());
-        for card in &column.cards {
+    for lane in &state.lanes {
+        let name = lane.name.trim();
+        // The lane's kind is its status in the store; a card is done exactly
+        // while it sits in a done-kind lane.
+        let done = lane.kind == "done";
+        let in_progress = lane.kind == "in_progress" || name.eq_ignore_ascii_case("in progress");
+        let review = lane.kind == "review" || name.eq_ignore_ascii_case("review");
+        let mut cards = Vec::new();
+        for card in state.cards.iter().filter(|card| card.lane_id == lane.id) {
             summary.total += 1;
-            if card
-                .claimed_by
-                .as_deref()
-                .is_some_and(|claim| !claim.is_empty())
-            {
+            if done {
+                summary.done += 1;
+            }
+            if in_progress {
+                summary.in_progress += 1;
+            }
+            if review {
+                summary.review += 1;
+            }
+            if card.claim.as_deref().is_some_and(|claim| !claim.is_empty()) {
                 summary.claimed += 1;
             }
             cards.push(work_card(card));
@@ -269,43 +267,59 @@ pub(super) fn answer_dialog(
 #[cfg(test)]
 mod tests {
     use super::summarize;
-    use crate::board::{Board, Card, Column};
+    use crate::session::board_store::{BoardState, Lane, StoredCard};
 
-    fn card(id: &str, claimed_by: Option<&str>, done: bool) -> Card {
-        Card {
+    fn lane(id: i64, name: &str, kind: &str) -> Lane {
+        Lane {
+            id,
+            name: name.to_string(),
+            kind: kind.to_string(),
+            position: id,
+        }
+    }
+
+    fn card(
+        id: &str,
+        lane_id: i64,
+        lane_name: &str,
+        claim: Option<&str>,
+        done: bool,
+    ) -> StoredCard {
+        StoredCard {
             id: id.to_string(),
-            title: id.to_string(),
-            body: Vec::new(),
-            claimed_by: claimed_by.map(str::to_string),
+            project_id: 1,
+            lane_id,
+            lane: lane_name.to_string(),
             done,
+            position: 0,
+            title: id.to_string(),
+            body: String::new(),
+            claim: claim.map(str::to_string),
+            revision: 1,
+            created_at_millis: 0,
+            updated_at_millis: 0,
         }
     }
 
     #[test]
     fn progress_counts_done_column_and_keeps_review_separate_from_checkbox() {
-        let board = Board {
-            header: String::new(),
-            columns: vec![
-                Column {
-                    name: "Backlog".to_string(),
-                    cards: vec![card("todo", Some("codex-abc123"), true)],
-                },
-                Column {
-                    name: "In progress".to_string(),
-                    cards: vec![card("active", None, false)],
-                },
-                Column {
-                    name: "review".to_string(),
-                    cards: vec![card("review", Some("claude-def456"), true)],
-                },
-                Column {
-                    name: " Done ".to_string(),
-                    cards: vec![card("done", None, false)],
-                },
+        let state = BoardState {
+            project_id: 1,
+            lanes: vec![
+                lane(0, "Backlog", "todo"),
+                lane(1, "In progress", "in_progress"),
+                lane(2, "review", "review"),
+                lane(3, " Done ", "done"),
+            ],
+            cards: vec![
+                card("todo", 0, "Backlog", Some("codex-abc123"), false),
+                card("active", 1, "In progress", None, false),
+                card("review", 2, "review", Some("claude-def456"), false),
+                card("done", 3, " Done ", None, true),
             ],
         };
 
-        let summary = summarize(&board);
+        let summary = summarize(&state);
         assert_eq!(
             (
                 summary.done,

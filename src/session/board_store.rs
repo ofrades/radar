@@ -146,79 +146,10 @@ impl BoardStore {
         })
     }
 
-    /// Has this project's board been initialized in the store yet? Used by the
-    /// importer to know whether a legacy `BOARD.md` still needs reading.
+    /// Has this project's board been initialized in the store yet?
     pub fn is_initialized(&self, project_id: i64) -> Result<bool> {
         let inner = self.inner.lock();
         has_cards(&inner, project_id)
-    }
-
-    /// Import a markdown board once: columns become lanes, cards become rows.
-    /// No-op when the project already has cards, so it never double-imports.
-    /// Returns how many cards were imported.
-    pub fn import(&self, project_id: i64, board: &crate::board::Board) -> Result<usize> {
-        let mut inner = self.inner.lock();
-        let tx = inner.transaction()?;
-        if has_cards(&tx, project_id)? {
-            tx.commit()?;
-            return Ok(0);
-        }
-        // state() may have seeded default lanes before the import ran; start
-        // from a clean slate so the file's columns are authoritative.
-        tx.execute(
-            "DELETE FROM board_lanes WHERE project_id = ?1",
-            params![project_id],
-        )?;
-        tx.execute(
-            "DELETE FROM board_cards WHERE project_id = ?1",
-            params![project_id],
-        )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO board_projects (project_id) VALUES (?1)",
-            params![project_id],
-        )?;
-        let now = now_millis();
-        let mut count = 0;
-        for (index, column) in board.columns.iter().enumerate() {
-            let name = column.name.trim();
-            if name.is_empty() {
-                continue;
-            }
-            let kind = lane_kind(name);
-            tx.execute(
-                "INSERT INTO board_lanes (project_id, name, kind, position)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![project_id, name, kind, index as i64],
-            )?;
-            let lane_id = tx.last_insert_rowid();
-            for (position, card) in column.cards.iter().enumerate() {
-                let id = if card.id.is_empty() {
-                    new_card_id()
-                } else {
-                    card.id.clone()
-                };
-                tx.execute(
-                    "INSERT INTO board_cards
-                        (id, project_id, lane_id, position, title, body, claim, done,
-                         created_at, updated_at, revision)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, 1)",
-                    params![
-                        id,
-                        project_id,
-                        lane_id,
-                        position as i64,
-                        card.title,
-                        card.body.join("\n"),
-                        card.claimed_by,
-                        kind == "done",
-                        now,
-                    ],
-                )?;
-                count += 1;
-            }
-        }
-        tx.commit()?;
-        Ok(count)
     }
 
     pub fn state(&self, project_id: i64) -> Result<BoardState> {
@@ -504,39 +435,6 @@ impl Lane {
     }
 }
 
-impl BoardState {
-    /// Adapt the store's board to the markdown board model, so the existing
-    /// rendering (summaries, the board pane) keeps working while the file path
-    /// is retired. Deleted with the markdown model in the final ticket.
-    pub fn to_board(&self) -> crate::board::Board {
-        use crate::board::{Board, Card, Column};
-        let mut columns: Vec<Column> = self
-            .lanes
-            .iter()
-            .map(|lane| Column {
-                name: lane.name.clone(),
-                cards: Vec::new(),
-            })
-            .collect();
-        for card in &self.cards {
-            let Some(index) = self.lanes.iter().position(|lane| lane.id == card.lane_id) else {
-                continue;
-            };
-            columns[index].cards.push(Card {
-                id: card.id.clone(),
-                title: card.title.clone(),
-                body: card.body.lines().map(str::to_string).collect(),
-                claimed_by: card.claim.clone(),
-                done: card.done,
-            });
-        }
-        Board {
-            header: String::new(),
-            columns,
-        }
-    }
-}
-
 fn has_cards(connection: &Connection, project_id: i64) -> Result<bool> {
     let cards: i64 = connection.query_row(
         "SELECT COUNT(*) FROM board_cards WHERE project_id = ?1",
@@ -544,16 +442,6 @@ fn has_cards(connection: &Connection, project_id: i64) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(cards > 0)
-}
-
-fn lane_kind(name: &str) -> &'static str {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "todo" | "backlog" => "todo",
-        "in progress" => "in_progress",
-        "review" => "review",
-        "done" => "done",
-        _ => "custom",
-    }
 }
 
 fn read_state(tx: &Transaction<'_>, project_id: i64) -> Result<BoardState> {
@@ -926,43 +814,6 @@ mod tests {
             .add_card(1, None, "ok", "", Some("bad claim!"))
             .is_err());
         assert!(store.next_card(1, "", None).is_err());
-    }
-
-    #[test]
-    fn import_maps_columns_cards_and_claims_once() {
-        let store = store();
-        let text = "# Board\n\n\
-                    ## Backlog\n\
-                    - [ ] One\n\
-                    - [ ] Two @claude-1\n\
-                          a note\n\
-                    ## Done\n\
-                    - [x] Shipped\n";
-        let board = crate::board::parse(text);
-        assert_eq!(store.import(1, &board).unwrap(), 3);
-
-        let state = store.state(1).unwrap();
-        let lanes: Vec<&str> = state.lanes.iter().map(|lane| lane.name.as_str()).collect();
-        assert_eq!(lanes, vec!["Backlog", "Done"]);
-        assert_eq!(lane_cards(&state, "Backlog"), vec!["One", "Two"]);
-        let two = state.cards.iter().find(|card| card.title == "Two").unwrap();
-        assert_eq!(two.claim.as_deref(), Some("claude-1"));
-        assert!(two.body.contains("a note"));
-        assert!(
-            state
-                .cards
-                .iter()
-                .find(|card| card.title == "Shipped")
-                .unwrap()
-                .done
-        );
-
-        // Importing again is a no-op.
-        assert_eq!(store.import(1, &board).unwrap(), 0);
-        // The adapted board still renders the imported columns and cards.
-        let adapted = state.to_board();
-        assert_eq!(adapted.columns.len(), 2);
-        assert_eq!(adapted.columns[0].cards.len(), 2);
     }
 
     #[test]

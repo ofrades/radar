@@ -116,7 +116,7 @@ pub fn install_default_skill() -> Result<PathBuf> {
 /// to the machine's global config — the skill, the harness edit-gate plugins,
 /// and the git commit-gate dispatcher — never into the repository.
 pub fn install(db: &crate::db::Db, project: &Path) -> Result<Vec<PathBuf>> {
-    if !crate::board::enabled(db, project)? {
+    if !db.board_enabled(project)? {
         return Ok(Vec::new());
     }
     let Some(home) = skills_home() else {
@@ -156,9 +156,9 @@ pub enum GuardDecision {
     Deny(String),
 }
 
-/// Paths the guard never blocks, relative or absolute: the board itself (or
-/// the guard would deny the very edit that creates a claim), agent-harness
-/// state, and git internals.
+/// Paths the guard never blocks, relative or absolute: agent-harness state
+/// and git internals (any top-level dot path), so the guard cannot deadlock
+/// an agent that must write its own harness files.
 fn claimable_path(project: &Path, file: &Path) -> bool {
     let file = if file.is_absolute() {
         file.to_path_buf()
@@ -173,29 +173,13 @@ fn claimable_path(project: &Path, file: &Path) -> bool {
         .next()
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .unwrap_or_default();
-    top == crate::board::FILE_NAME || top.starts_with('.')
-}
-
-/// The guard's whole judgement: `who` is the live claim to look for (the
-/// `RADAR_AGENT` of the launched agent; `None` means the agent was not
-/// launched by radar and is allowed through with a reminder), and `file` the
-/// path the tool call wants to edit. Reading is never blocked — only a file
-/// edit can be.
-pub fn guard_decision(
-    db: &crate::db::Db,
-    project: &Path,
-    who: Option<&str>,
-    file: Option<&Path>,
-) -> GuardDecision {
-    let holds = who.map(|who| crate::board::holds_claim(project, who).unwrap_or(true));
-    guard_decision_for(db, project, who, file, holds)
+    top.starts_with('.')
 }
 
 /// The guard's judgement given whether the agent holds a live claim, read from
-/// whatever store the caller uses (the board store in production). `holds`
-/// is `None` when the claim could not be judged — no daemon, not in the
-/// sidebar — which is allowed through, because a guard must never block what
-/// it cannot see.
+/// the board store. `holds` is `None` when the claim could not be judged — no
+/// daemon, not in the sidebar — which is allowed through, because a guard must
+/// never block what it cannot see.
 pub fn guard_decision_for(
     db: &crate::db::Db,
     project: &Path,
@@ -252,13 +236,8 @@ fn deny_claim(who: &str) -> GuardDecision {
 
 /// The commit gate's judgement: when boards are disabled, commits are not
 /// subject to a board claim.
-pub fn commit_decision(db: &crate::db::Db, project: &Path, who: Option<&str>) -> GuardDecision {
-    let holds = who.map(|who| crate::board::holds_claim(project, who).unwrap_or(true));
-    commit_decision_for(db, project, who, holds)
-}
-
 fn board_policy_decision(db: &crate::db::Db, project: &Path) -> Option<GuardDecision> {
-    match crate::board::enabled(db, project) {
+    match db.board_enabled(project) {
         Ok(true) => None,
         Ok(false) => Some(GuardDecision::Allow),
         Err(error) => Some(GuardDecision::Deny(format!(
@@ -270,7 +249,6 @@ fn board_policy_decision(db: &crate::db::Db, project: &Path) -> Option<GuardDeci
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board;
 
     fn project() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -322,8 +300,7 @@ mod tests {
             .unwrap();
 
         assert!(install(&db, &project).unwrap().is_empty());
-        assert!(board::ensure_enabled_file(&db, &project).is_err());
-        assert!(!board::file_path(&project).exists());
+        assert!(db.require_board_enabled(&project).is_err());
         assert_eq!(std::fs::read(&agents).unwrap(), original);
         assert!(!project.join(".opencode/skills/board/SKILL.md").exists());
         assert!(!project.join(".claude/skills/board/SKILL.md").exists());
@@ -337,28 +314,25 @@ mod tests {
         let project_id = db.project_by_path(&project).unwrap().unwrap().id;
         db.set_project_board_enabled(project_id, false).unwrap();
         assert_eq!(
-            guard_decision(
+            guard_decision_for(
                 &db,
                 &project,
                 Some("claude-1"),
-                Some(Path::new("src/main.rs"))
+                Some(Path::new("src/main.rs")),
+                Some(false),
             ),
             GuardDecision::Allow
         );
         assert_eq!(
-            commit_decision(&db, &project, Some("claude-1")),
+            commit_decision_for(&db, &project, Some("claude-1"), Some(false)),
             GuardDecision::Allow
         );
     }
 
     #[test]
-    fn the_guard_allows_the_board_itself_and_harness_files() {
+    fn the_guard_allows_harness_files_and_dotfiles() {
         let (_dir, project) = project();
-        for file in [
-            "BOARD.md",
-            ".opencode/skills/board/SKILL.md",
-            ".git/COMMIT_EDITMSG",
-        ] {
+        for file in [".opencode/skills/board/SKILL.md", ".git/COMMIT_EDITMSG"] {
             assert!(
                 claimable_path(&project, Path::new(file)),
                 "{file} should be claimable"
@@ -366,47 +340,53 @@ mod tests {
         }
         assert!(!claimable_path(&project, Path::new("src/main.rs")));
         // Absolute paths, the way hooks report them.
-        assert!(claimable_path(&project, &project.join("BOARD.md")));
+        assert!(claimable_path(&project, &project.join(".git/config")));
         assert!(!claimable_path(&project, &project.join("src/main.rs")));
         assert!(claimable_path(&project, Path::new("/etc/passwd")));
     }
 
     #[test]
-    fn the_guard_denies_until_a_claim_exists_then_allows() {
+    fn the_guard_denies_an_unclaimed_edit_and_allows_a_claimed_one() {
         let (_dir, project) = project();
         let db = database(&project);
-        board::ensure_file(&project).unwrap();
-        board::add_card(&project, None, "task", "", None).unwrap();
-
         let src = Path::new("src/main.rs");
         assert!(matches!(
-            guard_decision(&db, &project, Some("claude-1"), Some(src)),
+            guard_decision_for(&db, &project, Some("claude-1"), Some(src), Some(false)),
             GuardDecision::Deny(_)
         ));
-
-        board::next_card(&project, "claude-1", None).unwrap();
         assert_eq!(
-            guard_decision(&db, &project, Some("claude-1"), Some(src)),
+            guard_decision_for(&db, &project, Some("claude-1"), Some(src), Some(true)),
             GuardDecision::Allow
         );
-        board::finish_card(&project, "task").unwrap();
-        assert!(matches!(
-            guard_decision(&db, &project, Some("claude-1"), Some(src)),
-            GuardDecision::Deny(_)
-        ));
     }
 
     #[test]
     fn the_guard_never_blocks_what_it_cannot_judge() {
         let (_dir, project) = project();
         let db = database(&project);
-        board::ensure_file(&project).unwrap();
         assert_eq!(
-            guard_decision(&db, &project, None, Some(Path::new("src/main.rs"))),
+            guard_decision_for(
+                &db,
+                &project,
+                None,
+                Some(Path::new("src/main.rs")),
+                Some(false)
+            ),
             GuardDecision::Allow
         );
         assert_eq!(
-            guard_decision(&db, &project, Some("claude-1"), None),
+            guard_decision_for(&db, &project, Some("claude-1"), None, Some(false)),
+            GuardDecision::Allow
+        );
+        // A claim that could not be read (no daemon) fails open.
+        assert_eq!(
+            guard_decision_for(
+                &db,
+                &project,
+                Some("claude-1"),
+                Some(Path::new("src/main.rs")),
+                None
+            ),
             GuardDecision::Allow
         );
     }
@@ -415,24 +395,17 @@ mod tests {
     fn the_commit_gate_asks_only_for_a_claim() {
         let (_dir, project) = project();
         let db = database(&project);
-        board::ensure_file(&project).unwrap();
-        board::add_card(&project, None, "task", "", None).unwrap();
-
-        assert_eq!(commit_decision(&db, &project, None), GuardDecision::Allow);
-        assert!(matches!(
-            commit_decision(&db, &project, Some("claude-1")),
-            GuardDecision::Deny(_)
-        ));
-
-        board::next_card(&project, "claude-1", None).unwrap();
         assert_eq!(
-            commit_decision(&db, &project, Some("claude-1")),
+            commit_decision_for(&db, &project, None, None),
             GuardDecision::Allow
         );
-        board::move_card(&project, "task", "Review").unwrap();
         assert!(matches!(
-            commit_decision(&db, &project, Some("claude-1")),
+            commit_decision_for(&db, &project, Some("claude-1"), Some(false)),
             GuardDecision::Deny(_)
         ));
+        assert_eq!(
+            commit_decision_for(&db, &project, Some("claude-1"), Some(true)),
+            GuardDecision::Allow
+        );
     }
 }
