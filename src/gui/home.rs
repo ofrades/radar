@@ -1000,9 +1000,10 @@ fn todo_row(
 }
 
 /// A card's session at a glance: the agent bound to the card's claim, with
-/// its state; a card nobody holds offers to start one. Clicking opens the
-/// live session or resumes the claimed agent; a fresh card starts the
-/// project's default agent attached to it (see `win.card-session-create`).
+/// its state; a card whose session is gone — or that nobody holds — offers to
+/// start one. Clicking opens the live session or resumes the claimed agent;
+/// a fresh card starts the project's default agent attached to it (see
+/// `win.card-session-create`).
 fn card_session_chip(app: &App, project_id: i64, card: &board::WorkCard) -> gtk::Widget {
     let button = gtk::Button::new();
     button.add_css_class("flat");
@@ -1010,47 +1011,64 @@ fn card_session_chip(app: &App, project_id: i64, card: &board::WorkCard) -> gtk:
     button.set_valign(gtk::Align::Center);
 
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 5);
-    match &card.claim {
+    let resumable = match &card.claim {
         Some(claim) => {
-            let live = app.live_claim_session(project_id, claim);
-            let sign = app.card_session_sign(project_id, card);
-            let dot = gtk::Label::new(Some("●"));
-            dot.add_css_class("agent-state-dot");
-            dot.add_css_class(sign.css_class());
-            dot.set_valign(gtk::Align::Center);
-            content.append(&dot);
-            let label = gtk::Label::new(Some(match sign {
-                super::activity_sign::Sign::Unknown => "Session",
-                _ => sign.label(),
-            }));
-            label.add_css_class("caption");
-            label.add_css_class("dim-label");
-            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            content.append(&label);
-            button.set_tooltip_text(Some(if live.is_some() {
-                "Open this card's session"
-            } else {
-                "Resume the agent on this card"
-            }));
-            button.set_action_name(Some("win.open-claim"));
-            button.set_action_target_value(Some(&(project_id, claim.as_str()).to_variant()));
+            app.live_claim_session(project_id, claim).is_some()
+                || app.claim_has_exact_session(project_id, claim)
         }
-        None => {
-            let plus = gtk::Image::from_icon_name("list-add-symbolic");
-            plus.set_pixel_size(11);
-            plus.set_valign(gtk::Align::Center);
-            content.append(&plus);
-            let label = gtk::Label::new(Some("Session"));
-            label.add_css_class("caption");
-            label.add_css_class("dim-label");
-            content.append(&label);
-            button.set_tooltip_text(Some("Start an agent session on this card"));
-            button.set_action_name(Some("win.card-session-create"));
-            button.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
-        }
+        None => false,
+    };
+    if !resumable {
+        // Nothing to open: an unclaimed card, or a claim whose conversation
+        // is gone. A dead "Resume" button would lie; offer a new session.
+        start_session_chip(&content, &button, project_id, &card.id);
+    } else if let Some(claim) = &card.claim {
+        let live = app.live_claim_session(project_id, claim);
+        let sign = app.card_session_sign(project_id, card);
+        let dot = gtk::Label::new(Some("●"));
+        dot.add_css_class("agent-state-dot");
+        dot.add_css_class(sign.css_class());
+        dot.set_valign(gtk::Align::Center);
+        content.append(&dot);
+        let label = gtk::Label::new(Some(match sign {
+            super::activity_sign::Sign::Unknown => "Session",
+            _ => sign.label(),
+        }));
+        label.add_css_class("caption");
+        label.add_css_class("dim-label");
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        content.append(&label);
+        button.set_tooltip_text(Some(if live.is_some() {
+            "Open this card's session"
+        } else {
+            "Resume the agent on this card"
+        }));
+        button.set_action_name(Some("win.open-claim"));
+        button.set_action_target_value(Some(&(project_id, claim.as_str()).to_variant()));
     }
     button.set_child(Some(&content));
     button.upcast()
+}
+
+/// The "+ Session" affordance: clicking starts the project's default agent
+/// attached to the card.
+fn start_session_chip(
+    content: &gtk::Box,
+    button: &gtk::Button,
+    project_id: i64,
+    card_id: &str,
+) {
+    let plus = gtk::Image::from_icon_name("list-add-symbolic");
+    plus.set_pixel_size(11);
+    plus.set_valign(gtk::Align::Center);
+    content.append(&plus);
+    let label = gtk::Label::new(Some("Session"));
+    label.add_css_class("caption");
+    label.add_css_class("dim-label");
+    content.append(&label);
+    button.set_tooltip_text(Some("Start an agent session on this card"));
+    button.set_action_name(Some("win.card-session-create"));
+    button.set_action_target_value(Some(&(project_id, card_id).to_variant()));
 }
 
 /// The human's way in: an underlined input just under a project's board chips.

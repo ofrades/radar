@@ -2785,11 +2785,16 @@ impl App {
             return;
         }
         if let Some(claim) = card.claim.as_deref() {
-            self.select_project(project_id);
-            if let Some(workspace) = self.current_workspace() {
-                self.open_agent_session(&workspace, claim);
+            // Open what the claim still holds. A claim whose conversation is
+            // gone offers a fresh start instead of a dead end.
+            let live = self.live_claim_session(project_id, claim);
+            if live.is_some() || self.claim_has_exact_session(project_id, claim) {
+                self.select_project(project_id);
+                if let Some(workspace) = self.current_workspace() {
+                    self.open_agent_session(&workspace, claim);
+                }
+                return;
             }
-            return;
         }
         let prompt = crate::session::board_store::work_prompt(&card.id, &card.title);
         if self.spawn_agent_for_card(project_id, card_id, prompt) {
@@ -3243,6 +3248,14 @@ impl App {
             .iter()
             .find(|session| session.claim_id.as_deref() == Some(claim))
             .cloned()
+    }
+
+    /// Whether a claim still has a conversation to reopen: an exact binding
+    /// captured from its agent (a live session alone is checked separately).
+    fn claim_has_exact_session(&self, project_id: i64, claim: &str) -> bool {
+        self.db
+            .bound_session(project_id, claim)
+            .map_or(false, |bound| bound.is_some())
     }
 
     /// The activity sign a project wears on Home: unresolved attention first,
