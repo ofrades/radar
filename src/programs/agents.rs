@@ -39,7 +39,11 @@ const AGENTS: &[AgentDef] = &[
         name: "OpenCode",
         command: "opencode",
         auto: &["--auto"],
-        args: &[],
+        // The TUI otherwise attaches to opencode's background service, whose
+        // current conversation is whatever the service has open — not the
+        // session id radar asked for. A private server per pane keeps exact
+        // sessions exact.
+        args: &["--standalone"],
         env_unset: &[],
         description: "open source agent",
         omarchy: true,

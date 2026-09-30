@@ -218,6 +218,34 @@ impl SessionCatalog {
         Ok(())
     }
 
+    /// A live pane was seen again (GUI re-attach, provider scan). One row per
+    /// pane: refresh the row that pane already owns instead of inserting a
+    /// placeholder that would compete with the row's bound conversation.
+    pub fn seen_radar(
+        &self,
+        project_id: i64,
+        radar_id: &str,
+        program: &str,
+        cwd: &Path,
+        now_ms: i64,
+        card_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE sessions SET lifecycle = 'running', ended_at = NULL,
+                                  last_activity_at = MAX(last_activity_at, ?2),
+                                  card_id = COALESCE(?3, card_id)
+              WHERE radar_session_id = ?1 AND source = 'radar'",
+            params![radar_id, now_ms, card_id],
+        )?;
+        drop(conn);
+        if updated == 0 {
+            self.record_radar_with_card(project_id, radar_id, program, cwd, now_ms, card_id)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Pull catalog rows toward live daemon truth: titles follow the
     /// terminal's title (a title change is activity), and a running row whose
     /// session is gone — stopped, forgotten, or lost to a daemon restart —
@@ -340,13 +368,30 @@ impl SessionCatalog {
         else {
             return Ok(());
         };
+        // A pane is a runtime slot, not a conversation identity. Its previous
+        // conversations retain their todo links but cannot impersonate this run.
+        conn.execute(
+            "UPDATE sessions SET radar_session_id = NULL, lifecycle = 'ended',
+                                  ended_at = COALESCE(ended_at, ?5)
+              WHERE radar_session_id = ?1 AND id != ?2
+                AND NOT (project_id = ?3 AND provider = ?4 AND provider_session_id = ?6)",
+            params![
+                radar_id,
+                id,
+                project_id,
+                provider,
+                now_ms,
+                provider_session_id
+            ],
+        )?;
         let merged = conn
             .execute(
                 "UPDATE sessions SET radar_session_id = ?3, last_activity_at = MAX(last_activity_at, ?4),
-                                     card_id = COALESCE(?6, card_id)
+                                      card_id = COALESCE(?6, card_id), lifecycle = ?8,
+                                      ended_at = CASE WHEN ?8 = 'running' THEN NULL ELSE ended_at END
                   WHERE project_id = ?1 AND provider = ?2 AND provider_session_id = ?5
                     AND id != ?7",
-                params![project_id, provider, radar_id, now_ms, provider_session_id, card_id, id],
+                params![project_id, provider, radar_id, now_ms, provider_session_id, card_id, id, lifecycle],
             )
             ? > 0;
         if merged {
@@ -354,12 +399,11 @@ impl SessionCatalog {
         } else {
             conn.execute(
                 "UPDATE sessions SET provider = ?2, provider_session_id = ?3,
-                                       title = COALESCE(title, ?4)
-                 WHERE radar_session_id = ?1",
-                params![radar_id, provider, provider_session_id, title],
+                                        title = COALESCE(title, ?4)
+                  WHERE id = ?1",
+                params![id, provider, provider_session_id, title],
             )?;
         }
-        let _ = lifecycle;
         conn.commit()?;
         Ok(())
     }
@@ -633,6 +677,75 @@ mod tests {
     }
 
     #[test]
+    fn seeing_a_bound_pane_does_not_duplicate_its_row() {
+        let catalog = SessionCatalog::open_in_memory().unwrap();
+        let pane = "project-3-agent-0-opencode";
+        catalog
+            .record_radar_with_card(3, pane, "opencode", Path::new("/w"), 1, Some("todo-1"))
+            .unwrap();
+        catalog
+            .bind_provider(pane, "opencode", "ses-exact", 2)
+            .unwrap();
+        catalog
+            .seen_radar(3, pane, "opencode", Path::new("/w"), 3, Some("todo-1"))
+            .unwrap();
+        let rows = catalog.list(&[3], CatalogFilter::All, None, 100).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider_session_id, "ses-exact");
+        assert_eq!(rows[0].radar_session_id.as_deref(), Some(pane));
+        assert_eq!(rows[0].lifecycle, "running");
+    }
+
+    #[test]
+    fn importing_another_conversation_never_rebinds_a_bound_pane() {
+        let catalog = SessionCatalog::open_in_memory().unwrap();
+        let pane = "project-3-agent-0-opencode";
+        let now = 1_800_000_000_000;
+        catalog
+            .record_radar_with_card(3, pane, "opencode", Path::new("/w"), now, Some("todo-1"))
+            .unwrap();
+        catalog
+            .bind_provider(pane, "opencode", "ses-mine", now)
+            .unwrap();
+        catalog
+            .import_provider(
+                3,
+                "opencode",
+                Path::new("/w"),
+                &[
+                    Imported {
+                        id: "ses-mine".into(),
+                        title: None,
+                        created_ms: now,
+                        last_activity_ms: now + 1,
+                    },
+                    Imported {
+                        id: "ses-other".into(),
+                        title: Some("Other".into()),
+                        created_ms: now,
+                        last_activity_ms: now + 1,
+                    },
+                ],
+                now + 2,
+            )
+            .unwrap();
+        let rows = catalog.list(&[3], CatalogFilter::All, None, 100).unwrap();
+        assert_eq!(rows.len(), 2);
+        let mine = rows
+            .iter()
+            .find(|row| row.provider_session_id == "ses-mine")
+            .unwrap();
+        assert_eq!(mine.source, "radar");
+        assert_eq!(mine.radar_session_id.as_deref(), Some(pane));
+        assert_eq!(mine.card_id.as_deref(), Some("todo-1"));
+        assert_eq!(mine.lifecycle, "running");
+        assert!(rows
+            .iter()
+            .find(|row| row.provider_session_id == "ses-other")
+            .is_some());
+    }
+
+    #[test]
     fn v1_catalog_migrates_without_inventing_todo_links() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("catalog.db");
@@ -646,6 +759,70 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].provider_session_id, "ses-old");
         assert_eq!(rows[0].card_id, None);
+    }
+
+    #[test]
+    fn binding_a_reused_pane_preserves_both_conversations_and_todo_links() {
+        for import_new_first in [false, true] {
+            let catalog = SessionCatalog::open_in_memory().unwrap();
+            let pane = "project-3-agent-0-opencode";
+            let now = 1_800_000_000_000;
+            catalog
+                .record_radar_with_card(3, pane, "opencode", Path::new("/w"), now, Some("todo-old"))
+                .unwrap();
+            catalog
+                .bind_provider(pane, "opencode", "ses-old", now)
+                .unwrap();
+            if import_new_first {
+                catalog
+                    .import_provider(
+                        3,
+                        "opencode",
+                        Path::new("/w"),
+                        &[Imported {
+                            id: "ses-new".into(),
+                            title: Some("New work".into()),
+                            created_ms: now + 1,
+                            last_activity_ms: now + 1,
+                        }],
+                        now + 1,
+                    )
+                    .unwrap();
+            }
+            catalog
+                .record_radar_with_card(
+                    3,
+                    pane,
+                    "opencode",
+                    Path::new("/w"),
+                    now + 2,
+                    Some("todo-new"),
+                )
+                .unwrap();
+            catalog
+                .bind_provider(pane, "opencode", "ses-new", now + 2)
+                .unwrap();
+            // An idempotent bind must not reassign any historical conversation.
+            catalog
+                .bind_provider(pane, "opencode", "ses-new", now + 3)
+                .unwrap();
+            let rows = catalog.list(&[3], CatalogFilter::All, None, 100).unwrap();
+            assert_eq!(rows.len(), 2);
+            let old = rows
+                .iter()
+                .find(|row| row.provider_session_id == "ses-old")
+                .unwrap();
+            assert_eq!(old.card_id.as_deref(), Some("todo-old"));
+            assert_eq!(old.radar_session_id, None);
+            assert_eq!(old.lifecycle, "ended");
+            let new = rows
+                .iter()
+                .find(|row| row.provider_session_id == "ses-new")
+                .unwrap();
+            assert_eq!(new.card_id.as_deref(), Some("todo-new"));
+            assert_eq!(new.radar_session_id.as_deref(), Some(pane));
+            assert_eq!(new.lifecycle, "running");
+        }
     }
 
     #[test]

@@ -495,7 +495,7 @@ fn serve(
             cwd,
         } => {
             let session = registry.get(&radar_id).ok();
-            catalog.record_radar_with_card(
+            catalog.seen_radar(
                 project_id,
                 &radar_id,
                 &program,

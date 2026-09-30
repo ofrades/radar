@@ -510,7 +510,7 @@ mod tests {
     #[test]
     fn supported_agents_resume_last_or_exact_provider_session() {
         let by_id = |id: &str| crate::programs::by_id(id).unwrap();
-        for id in ["opencode", "omp", "cursor-agent"] {
+        for id in ["omp", "cursor-agent"] {
             let program = by_id(id);
             let resumed = command_spec(
                 &program,
@@ -525,6 +525,20 @@ mod tests {
                 "{id}"
             );
         }
+        // opencode always runs a private server: its background service would
+        // attach the TUI to whatever conversation the service has open.
+        let opencode = by_id("opencode");
+        assert_eq!(
+            command_spec(
+                &opencode,
+                &LaunchOptions {
+                    resume: true,
+                    ..Default::default()
+                },
+            )
+            .argv,
+            vec!["opencode", "--standalone", "--continue"]
+        );
 
         let exact = LaunchOptions {
             session: Some("session-42".into()),
@@ -532,7 +546,7 @@ mod tests {
         };
         assert_eq!(
             command_spec(&by_id("opencode"), &exact).argv,
-            vec!["opencode", "--session", "session-42"]
+            vec!["opencode", "--standalone", "--session", "session-42"]
         );
         assert_eq!(
             command_spec(&by_id("omp"), &exact).argv,

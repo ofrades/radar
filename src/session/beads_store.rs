@@ -34,6 +34,12 @@ pub struct BeadsBoardStore {
     /// One lock per project, so creating a workspace and migrating its old
     /// board serialize while unrelated projects stay parallel.
     init: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
+    /// Beads stamps updates at second granularity (millis in the board
+    /// contract), so two mutations inside one second read the same revision
+    /// and a stale write cannot be told from a fresh one. The daemon is the
+    /// single writer: remember the highest revision it issued per card and
+    /// never let a card's revision go backwards or repeat.
+    issued: Mutex<HashMap<(i64, String), u64>>,
 }
 
 impl BeadsBoardStore {
@@ -48,6 +54,7 @@ impl BeadsBoardStore {
             root,
             legacy,
             init: Mutex::new(HashMap::new()),
+            issued: Mutex::new(HashMap::new()),
         })
     }
 
@@ -192,7 +199,29 @@ impl BeadsBoardStore {
             .find(|lane| lane.id == card.lane_id)
             .map(|lane| lane.kind.clone())
             .unwrap_or_default();
+        let mut card = card;
+        card.revision = self.effective_revision(project_id, &card);
         Ok((card, kind))
+    }
+
+    /// The revision a card carries now: the store's stamp, but never below a
+    /// revision this daemon already handed out (beads cannot bump within one
+    /// of its own stamps).
+    fn effective_revision(&self, project_id: i64, card: &StoredCard) -> u64 {
+        let issued = *self
+            .issued
+            .lock()
+            .get(&(project_id, card.id.clone()))
+            .unwrap_or(&0);
+        card.revision.max(issued)
+    }
+
+    /// Record the revision a mutation hands out, keeping it strictly above
+    /// every revision this card had before.
+    fn note_revision(&self, project_id: i64, card_id: &str, revision: u64) {
+        let mut issued = self.issued.lock();
+        let slot = issued.entry((project_id, card_id.to_string())).or_default();
+        *slot = (*slot).max(revision);
     }
 
     fn change(
@@ -203,12 +232,23 @@ impl BeadsBoardStore {
         action: &str,
         from_lane: Option<String>,
     ) -> Result<BoardChange> {
-        let card = self
+        // The floor this card already reached, before reading the fresh stamp.
+        let floor = self
+            .issued
+            .lock()
+            .get(&(project_id, card_id.to_string()))
+            .copied()
+            .unwrap_or(0);
+        let mut card = self
             .board_state(project_id, dir)?
             .cards
             .into_iter()
             .find(|card| card.id == card_id)
             .with_context(|| format!("card {card_id} vanished"))?;
+        // A store stamp equal to the floor is an unchanged stamp, not an
+        // unchanged card: this mutation must still be conflict-visible.
+        card.revision = card.revision.max(floor + 1);
+        self.note_revision(project_id, card_id, card.revision);
         Ok(BoardChange {
             card,
             action: action.to_string(),
