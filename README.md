@@ -19,7 +19,7 @@ terminal. It gathers every project into Basecamp-style lanes:
   to-do opens its card; **Open board** opens the project's full kanban. A big
   **Add a project** card leads the grid and opens one picker for both: folders
   it finds under the scan root get **Add**, and a typed name that is not on
-  disk gets **Create** (a new folder with `git init`) — all inside Home.
+  disk gets **Create** (a new folder without initializing Git) — all inside Home.
 
 Cards open conversations inside Home; opening a session or **Open workspace**
 is an explicit step into developer tools. Going Home never stops a program.
@@ -136,7 +136,7 @@ each with its to-dos (every one showing the state of the session bound to it)
 and board counts, and the actions to drive them without opening a terminal. A
 big **Add a project** card above the lanes opens one picker: search the scan
 root for a folder to add, or type a
-name to create a new folder with `git init` in it — the new project's view
+name to create a new folder without initializing Git — the new project's view
 opens without starting an agent. With no projects yet Home offers the same.
 Tool programs and workspace layout live in **Preferences** (`Alt+,`), not on
 Home. Going home never stops a program; the panes keep running behind it.
@@ -474,4 +474,4 @@ Two environment variables exist because layout bugs are hard to see otherwise:
   panes are split, which is far easier to read than a screenshot when a widget
   does not appear.
 - `RADAR_NEW_PROJECT=/some/path` runs the new-project flow on startup — folder,
-  `git init`, add, open — without the file chooser.
+  add, open — without the file chooser or initializing Git.

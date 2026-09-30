@@ -52,7 +52,7 @@ impl Status {
     }
 }
 
-/// Read the status of the repository containing `dir`.
+/// Read Git status within the selected project folder, never above it.
 ///
 /// Returns a "not a repo" status rather than an error: a project without git is
 /// a normal thing to have in the sidebar.
@@ -73,7 +73,7 @@ pub fn status(dir: impl AsRef<Path>) -> Status {
     status
 }
 
-/// Top level of the repository containing `dir`.
+/// Repository root within `dir`; an ancestor repository is not this project.
 pub fn rev_parse_root(dir: impl AsRef<Path>) -> Option<PathBuf> {
     let dir = dir.as_ref();
     let output = git(dir, &["rev-parse", "--show-toplevel"])?;
@@ -87,10 +87,18 @@ pub fn rev_parse_root(dir: impl AsRef<Path>) -> Option<PathBuf> {
 
 /// Run git, read-only and lock-free.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    let dir = std::fs::canonicalize(dir).ok()?;
     let output = Command::new("git")
         .arg("--no-optional-locks")
         .args(args)
-        .current_dir(dir)
+        .current_dir(&dir)
+        // A folder project may contain several independent service repos.
+        // Never let discovery climb into a repository containing that folder.
+        .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap_or(&dir))
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat")
@@ -219,6 +227,29 @@ mod tests {
     fn missing_directory_is_not_a_repo() {
         let status = status("/definitely/not/here");
         assert!(!status.is_repo);
+    }
+
+    #[test]
+    fn folder_project_does_not_inherit_an_ancestor_repository() {
+        let parent = tempfile::tempdir().unwrap();
+        init_repo(parent.path());
+        let folder = parent.path().join("neuraspace");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(!status(&folder).is_repo);
+        assert_eq!(rev_parse_root(&folder), None);
+    }
+
+    #[test]
+    fn service_repository_remains_visible_inside_a_folder_project() {
+        let parent = tempfile::tempdir().unwrap();
+        init_repo(parent.path());
+        let folder = parent.path().join("neuraspace");
+        let service = folder.join("web.platform");
+        std::fs::create_dir_all(&service).unwrap();
+        init_repo(&service);
+        assert!(!status(&folder).is_repo);
+        assert!(status(&service).is_repo);
+        assert_eq!(rev_parse_root(&service), Some(service.canonicalize().unwrap()));
     }
 
     #[test]

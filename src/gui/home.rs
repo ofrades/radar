@@ -1290,9 +1290,8 @@ pub(super) fn valid_project_folder_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }
 
-/// The chosen folder becomes a project: directory if missing, git if bare.
-/// The paths that end here have already been through a file chooser, so the
-/// quick synchronous git init is not worth a thread.
+/// Create and register a folder project without changing its Git ownership.
+/// A project can contain several repositories or have no repository at all.
 pub(super) fn create_project(app: &SharedApp, path: std::path::PathBuf) {
     if let Err(error) = std::fs::create_dir_all(&path) {
         app.toast(&format!(
@@ -1301,8 +1300,6 @@ pub(super) fn create_project(app: &SharedApp, path: std::path::PathBuf) {
         ));
         return;
     }
-    let existing_repo = path.join(".git").exists();
-    let initialised = existing_repo || git_init(&path);
     let project = match app.db.add_project(&path) {
         Ok(project) => project,
         Err(error) => {
@@ -1316,23 +1313,7 @@ pub(super) fn create_project(app: &SharedApp, path: std::path::PathBuf) {
         .borrow_mut()
         .push(super::HomeView::Project(project.id));
     app.refresh_home();
-    let detail = if existing_repo {
-        "already a git repository"
-    } else if initialised {
-        "new git repository"
-    } else {
-        "git init failed"
-    };
-    app.toast(&format!("{} · {detail}", project.name));
-}
-
-fn git_init(path: &Path) -> bool {
-    std::process::Command::new("git")
-        .arg("init")
-        .current_dir(path)
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    app.toast(&format!("{} · project folder added", project.name));
 }
 
 #[cfg(test)]

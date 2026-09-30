@@ -889,7 +889,7 @@ fn build_window(
     App::refresh_projects(&state);
     state.request_agent_scan();
     start_agent_session_polling(&state);
-    // Development aid: exercise the new-project flow — folder, git init, add,
+    // Development aid: exercise the new-project flow — folder creation, add,
     // open — without the file chooser. RADAR_NEW_PROJECT=/some/path.
     if let Ok(path) = std::env::var("RADAR_NEW_PROJECT") {
         home::create_project(&state, PathBuf::from(path));
@@ -5919,7 +5919,11 @@ mod home_navigation_tests {
             .project_by_path(scratch.path().join("created"))
             .unwrap()
             .unwrap();
-        assert!(created.path.join(".git").is_dir());
+        assert!(created.path.is_dir());
+        assert!(
+            !created.path.join(".git").exists(),
+            "creating a folder project must not initialize git"
+        );
         assert!(
             db.tabs(created.id).unwrap().is_empty(),
             "creation stays in the human project view"
