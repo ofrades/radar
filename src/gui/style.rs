@@ -442,6 +442,26 @@ paned > separator:hover {
 .home-cockpit .agent-state-dot {
   font-size: 0.8em;
 }
+/* The running-agents view: one row per live session, grouped by project. */
+.home-cockpit button.agent-row {
+  padding: 5px 8px;
+  border-radius: {control_radius};
+}
+.home-cockpit button.agent-row:hover {
+  background-color: @radar_surface_hover;
+}
+/* The cockpit header's way into the agents view: a quiet count that reads
+   as part of the pulse, not a toolbar button. */
+.home-cockpit button.agents-pulse {
+  padding: 2px 9px;
+  border-radius: 99px;
+  font-size: 0.9em;
+  color: @radar_accent;
+  background-color: @radar_accent_soft;
+}
+.home-cockpit button.agents-pulse:hover {
+  background-color: alpha(@radar_accent, 0.18);
+}
 .home-cockpit button.todo-tick {
   min-width: 22px;
   min-height: 22px;

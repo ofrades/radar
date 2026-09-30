@@ -305,6 +305,8 @@ struct App {
 enum HomeView {
     Project(i64),
     Card(i64, String),
+    /// Every agent running, across every project, in one list.
+    Agents,
     /// Home's combined "Add a project" picker (its own stack page).
     AddProject,
 }
@@ -669,6 +671,12 @@ fn build_window(
     home_button.set_action_name(Some("win.show-home"));
     home_button.set_tooltip_text(Some("All projects · Alt+Home / Alt+B"));
     workspace_bar.append(&home_button);
+    let board_button = gtk::Button::with_label("Board");
+    board_button.add_css_class("flat");
+    // The project's board lives in Home; this is the way back to it.
+    board_button.set_action_name(Some("win.workspace-project"));
+    board_button.set_tooltip_text(Some("This project's board (to-dos and lanes) · Alt+K"));
+    workspace_bar.append(&board_button);
     let workspace_title = gtk::Button::new();
     workspace_title.add_css_class("flat");
     workspace_title.add_css_class("heading");
@@ -695,6 +703,13 @@ fn build_window(
         toggle_buttons.insert(slot, button);
     }
     workspace_bar.append(&toggles);
+    // A new session from the workspace: pick a to-do, start an agent on it —
+    // without leaving for Home. Works while another agent panel is on screen.
+    let new_session = gtk::Button::from_icon_name("list-add-symbolic");
+    new_session.add_css_class("flat");
+    new_session.set_tooltip_text(Some("New agent session on a to-do"));
+    new_session.set_action_name(Some("win.new-session"));
+    workspace_bar.append(&new_session);
     let tools = gtk::Button::with_label("Tools & shortcuts");
     tools.add_css_class("flat");
     tools.set_action_name(Some("win.hud"));
@@ -945,6 +960,17 @@ fn build_window(
             });
         }
     }
+    // Development aid: open a project's workspace, so the workspace bar —
+    // its Board button and dock — can be checked without clicking.
+    // RADAR_OPEN_WORKSPACE=<project_id>.
+    if let Ok(value) = std::env::var("RADAR_OPEN_WORKSPACE") {
+        if let Ok(project_id) = value.parse::<i64>() {
+            let state_for_workspace = state.clone();
+            glib::timeout_add_local_once(Duration::from_millis(1700), move || {
+                state_for_workspace.select_project(project_id);
+            });
+        }
+    }
     // Development aid: open Home's Add-a-project picker on startup.
     // RADAR_OPEN_ADD_PROJECT=1 (RADAR_OPEN_NEW_PROJECT still accepted).
     if std::env::var("RADAR_OPEN_ADD_PROJECT").is_ok()
@@ -953,6 +979,15 @@ fn build_window(
         let state_for_new = state.clone();
         glib::timeout_add_local_once(Duration::from_millis(1700), move || {
             state_for_new.open_home_add();
+        });
+    }
+    // Development aid: open Home's running-agents view on startup, so every
+    // project's live sessions can be checked without clicking.
+    // RADAR_OPEN_AGENTS=1.
+    if std::env::var("RADAR_OPEN_AGENTS").is_ok() {
+        let state_for_agents = state.clone();
+        glib::timeout_add_local_once(Duration::from_millis(1700), move || {
+            state_for_agents.enter_home_view(HomeView::Agents);
         });
     }
     // Development aid: throw the completion confetti on startup, so the burst
@@ -1967,6 +2002,14 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         app.window.add_action(&action);
     }
     {
+        // Home's running-agents view: every live session, every project.
+        let app_for_action = app.clone();
+        add(
+            "home-agents",
+            Box::new(move || app_for_action.enter_home_view(HomeView::Agents)),
+        );
+    }
+    {
         // The card detail's Edit control: the board's card dialog.
         let action = gio::SimpleAction::new(
             "card-edit",
@@ -2211,18 +2254,37 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         let app = app.clone();
         add("show-home", Box::new(move || app.show_home()));
     }
+    {
+        // A new session from the workspace: pick a to-do, start the
+        // project's default agent on it. Agents are 1:1 with board to-dos,
+        // so the picker is the create form.
+        let app = app.clone();
+        add(
+            "new-session",
+            Box::new(move || {
+                let Some(project_id) = *app.current.borrow() else {
+                    app.toast("Select a project first");
+                    return;
+                };
+                // Re-read the board so the picker shows what holds right now.
+                app.refresh_board_summary(project_id);
+                app.hud.present_cards(&app, project_id);
+            }),
+        );
+    }
 
     // ---- keyboard ----
     // Alt is radar's only modifier, so every Ctrl chord reaches the programs
     // in the panels the way their authors wrote them. The one exception is
     // cycling: the window manager owns Alt+Tab, so the cycle stays on Ctrl.
-    let accels: [(&str, &[&str]); 15] = [
+    let accels: [(&str, &[&str]); 16] = [
         ("win.preferences", &["<Alt>comma"]),
         ("win.refresh", &["<Alt>r"]),
         ("win.quit", &["<Alt>q"]),
         ("win.zoom", &["<Alt>f"]),
         ("win.hud", &["<Alt>h"]),
         ("win.show-home", &["<Alt>Home", "<Alt>b"]),
+        ("win.workspace-project", &["<Alt>k"]),
         ("win.primitive-toggle::editor", &["<Alt>e"]),
         ("win.primitive-toggle::agent", &["<Alt>a"]),
         ("win.primitive-toggle::diff", &["<Alt>g"]),
@@ -4385,15 +4447,11 @@ impl App {
             // A no-op when the pane went away: an empty panel has no header.
         } else {
             // Agents are 1:1 with board to-dos: a bare agent is never created
-            // from the dock, the chords or the HUD. With no agent on screen,
-            // the answer is the to-dos that start one.
+            // from the dock, the chords or the HUD. Asking for an agent with
+            // none on screen opens the project's open to-dos to start one on.
             if key.slot == Slot::Agent && workspace.tabs_of_kind(Slot::Agent).is_empty() {
-                let _ = gtk::prelude::WidgetExt::activate_action(
-                    &self.window,
-                    "win.workspace-project",
-                    None,
-                );
-                self.toast("Start an agent from a to-do");
+                let _ =
+                    gtk::prelude::WidgetExt::activate_action(&self.window, "win.new-session", None);
                 return;
             }
             let Some(primitive) = self.ensure_primitive(workspace, key, None, Resume::No) else {
@@ -5802,6 +5860,33 @@ mod home_navigation_tests {
             Some(format!("project-{}", project.id).as_str())
         );
         assert!(bar.is_visible());
+
+        // The workspace carries a Board button: it navigates to this
+        // project's board (the project view) inside Home, with Alt+K.
+        let board_button = widgets(&bar)
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| button.label().as_deref() == Some("Board"))
+            .unwrap_or_else(|| panic!("the workspace bar has a Board button"));
+        assert_eq!(
+            board_button.action_name().as_deref(),
+            Some("win.workspace-project")
+        );
+        assert!(app
+            .accels_for_action("win.workspace-project")
+            .iter()
+            .any(|keys| keys.as_str() == "<Alt>k"));
+        board_button.emit_clicked();
+        drain();
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        assert!(widgets(&stack.child_by_name("_home").unwrap())
+            .iter()
+            .any(|widget| widget.has_css_class("project-view")));
+        activate(&window, "win.open-project", Some(&project.id.to_variant()));
+        assert_eq!(
+            stack.visible_child_name().as_deref(),
+            Some(format!("project-{}", project.id).as_str())
+        );
 
         // Todo -> exact session -> todo -> Back returns to the same pane.
         // Use an inert daemon child, never launch a real agent in this test.

@@ -14,6 +14,10 @@ terminal. It gathers every project into Basecamp-style lanes:
 
 - **Needs you** — every unresolved approval, question or failure, newest first,
   each with the actions to answer, approve, deny or dismiss it in place.
+- **Agents** — the header's running count opens a view of every agent running,
+  across every project: grouped by project, each row carrying its activity
+  sign, its program, the to-do it was launched for and when it was last heard
+  from; a click opens the session.
 - **Projects** — a lane per project: its to-dos (the board's cards, ticked once
   Done), its board's lane counts, and its running and external sessions. A
   to-do opens its card; **Open board** opens the project's full kanban. A big
@@ -102,10 +106,11 @@ the GTK app; without it the CLI and the session daemon still work.
 | --- | --- |
 | Keys & primitives overlay (open a primitive, read the keymap) | `Alt+H` |
 | Home — projects, tasks and conversations | `Alt+Home` / `Alt+B` |
+| The current project's board, from the workspace | `Alt+K` |
 | Move between the panes on screen | `Alt+Arrows` |
 | Cycle panes and dividers | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | The focused pane's menu (group, move, zoom, close) | `Menu` / `Shift+F10` |
-| Show or hide a primitive | `Alt+E` / `A` / `G` / `K` / `T` |
+| Show or hide a primitive | `Alt+E` / `A` / `G` / `T` |
 | Change the focused pane's program | `Alt+P` |
 | Focus Editor / Agent / Changes / Commands | `Alt+1` – `4` |
 | Preferences | `Alt+,` |
@@ -133,7 +138,10 @@ choices in this same overlay.
 **Home** (`Alt+Home` / `Alt+B`, or the workspace's Home button) is the
 cockpit when you have projects: a needs-you inbox over a row of project lanes,
 each with its to-dos (every one showing the state of the session bound to it)
-and board counts, and the actions to drive them without opening a terminal. A
+and board counts, and the actions to drive them without opening a terminal.
+The header's **running count** opens the **Agents** view — every agent running
+across every project, grouped by project, each row with its activity sign,
+program, to-do and last-heard-from time; clicking a row opens that session. A
 big **Add a project** card above the lanes opens one picker: search the scan
 root for a folder to add, or type a
 name to create a new folder without initializing Git — the new project's view
@@ -145,7 +153,12 @@ Project **⋮** menus provide name editing, project defaults, pinning, ordering,
 and archive. Archive hides the project while preserving its tasks, settings
 and sessions; adding its folder again restores it. No project files are deleted.
 Inside a workspace, the compact top toolbar exposes tools and shortcuts;
-clicking the project name returns to its tasks and conversations.
+**Board** (or `Alt+K`, or clicking the project name) opens the project's board
+in Home — its lanes and to-dos. **New session** (the toolbar's ＋) starts an
+agent right from the workspace: pick one of the project's open to-dos and the
+default agent starts attached to it, claiming it. Asking for an agent when
+none is on screen — the dock's Agent button, `Alt+A` — opens the same picker;
+the overlay's Actions row does too, while an agent is already up.
 
 **Every pane header carries its own controls, right on the chip**: the
 program's live info beside its name, a ▾ dropdown to change that program —
@@ -291,9 +304,10 @@ guide](docs/web-client.md) for details.
 ## The board
 
 Project boards live in **Home**: open a project to see its lanes, then a card
-to read its conversation. There is no separate workspace Board tool. Sessions
-keep running when you return Home. Older saved Board panels restore their
-tool arrangement instead.
+to read its conversation. From a project workspace the toolbar's **Board**
+button (`Alt+K`) takes you straight there. There is no separate workspace Board
+tool. Sessions keep running when you return Home. Older saved Board panels
+restore their tool arrangement instead.
 
 The client/server direction is **board-first interaction**: the server owns
 session state, explicit agent activity and durable attention; the board presents

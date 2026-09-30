@@ -7,7 +7,7 @@
 //! primitive stays exactly what it was and the panel never grows a second
 //! way to do a thing.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -44,8 +44,13 @@ const KEYMAP: &[(&str, &str)] = &[
 enum Kind {
     /// Open (or focus) the primitive.
     Primitive(Slot),
-    /// Select the program used by one primitive.
-    Program(Slot, Program),
+    /// Select the program used by one primitive. Boxed: the variant sits in
+    /// a small enum beside primitive and card rows, and the payload is the
+    /// only large one.
+    Program(Slot, Box<Program>),
+    /// Start the project's default agent on this board card — how the
+    /// workspace creates a session (agents are 1:1 with board to-dos).
+    Card(i64, String),
     /// Fire a `win.` action, no parameter.
     Action(&'static str),
     /// A section heading. Shows only while one of its rows does.
@@ -64,6 +69,9 @@ pub struct Hud {
     list: gtk::ListBox,
     /// Rows in list order, with the text the filter matches.
     rows: RefCell<Vec<(gtk::ListBoxRow, String, Kind)>>,
+    /// The panel is showing the to-do picker (`present_cards`): rows that
+    /// re-open the picker keep it up instead of closing the panel.
+    picker: Cell<bool>,
 }
 
 impl Hud {
@@ -119,6 +127,7 @@ impl Hud {
             scroll,
             list,
             rows: RefCell::new(Vec::new()),
+            picker: Cell::new(false),
         })
     }
 
@@ -133,6 +142,7 @@ impl Hud {
     /// Bring the panel up over the workspace: fresh rows (visibility
     /// changes), empty filter, the keys on the filter box.
     pub fn present(&self, app: &SharedApp) {
+        self.picker.set(false);
         self.heading.set_text("Keys and primitives");
         self.search
             .set_placeholder_text(Some("Filter primitives and keys…"));
@@ -149,6 +159,7 @@ impl Hud {
         if matches!(slot, Slot::Board | Slot::Custom) {
             return;
         }
+        self.picker.set(false);
         self.heading
             .set_text(&format!("Choose a {} program", label_for(slot)));
         self.search.set_placeholder_text(Some("Filter programs…"));
@@ -159,10 +170,25 @@ impl Hud {
         self.search.grab_focus();
     }
 
+    /// Show the project's open to-dos to start a session on. The workspace's
+    /// create-a-session form: agents are 1:1 with board to-dos, so a new
+    /// session picks the to-do it will work on.
+    pub fn present_cards(&self, app: &SharedApp, project_id: i64) {
+        self.picker.set(true);
+        self.heading.set_text("Start a session on a to-do");
+        self.search.set_placeholder_text(Some("Filter to-dos…"));
+        self.rebuild_cards(app, project_id);
+        self.search.set_text("");
+        self.apply_filter("");
+        self.root.set_visible(true);
+        self.search.grab_focus();
+    }
+
     pub fn close(&self, app: &SharedApp) {
         if !self.root.is_visible() {
             return;
         }
+        self.picker.set(false);
         self.root.set_visible(false);
         self.search.set_text("");
         // The keys go back to the program you were looking at — unless the
@@ -334,6 +360,18 @@ impl Hud {
                 "all projects overview",
             ),
             (
+                "New agent session…",
+                "",
+                "win.new-session",
+                "start an agent on a to-do",
+            ),
+            (
+                "This project's board",
+                "Alt+K",
+                "win.workspace-project",
+                "to-dos lanes kanban",
+            ),
+            (
                 "Add a project…",
                 "",
                 "win.home-add-project",
@@ -387,8 +425,35 @@ impl Hud {
                     "{} {} {} {}",
                     program.name, program.id, program.description, program.command
                 );
-                self.push(row, haystack, Kind::Program(slot, program));
+                self.push(row, haystack, Kind::Program(slot, Box::new(program)));
             }
+        }
+    }
+
+    /// The project's open to-dos, Home's order, each row starting the
+    /// project's default agent attached to that card.
+    fn rebuild_cards(&self, app: &SharedApp, project_id: i64) {
+        self.clear_rows();
+        let rows = app
+            .board_states
+            .borrow()
+            .get(&project_id)
+            .map(card_rows)
+            .unwrap_or_default();
+        if rows.is_empty() {
+            let row = self.row_widget(None, "No open to-dos — add one in Home", None, None);
+            row.set_selectable(false);
+            row.set_activatable(false);
+            self.push(row, "no open to-dos".to_string(), Kind::Info);
+            return;
+        }
+        for (id, title, note) in rows {
+            let row = self.row_widget(None, &title, None, Some(&note));
+            self.push(
+                row,
+                format!("{title} {note} {id}"),
+                Kind::Card(project_id, id),
+            );
         }
     }
 
@@ -408,15 +473,30 @@ impl Hud {
             Kind::Primitive(slot) => {
                 let _ = row
                     .activate_action("win.primitive-activate", Some(&slot.as_str().to_variant()));
+                // Asking for an agent with none to show opens this panel's
+                // to-do picker; the picker is the answer, so it stays up.
+                if matches!(slot, Slot::Agent) && self.picker.get() {
+                    return;
+                }
             }
             Kind::Program(slot, program) => {
                 if let Some(workspace) = app.current_workspace() {
-                    app.set_primitive_program(&workspace, slot, program, true);
+                    app.set_primitive_program(&workspace, slot, *program, true);
                     focus_program = Some((workspace, slot));
                 }
             }
+            Kind::Card(project_id, card_id) => {
+                let _ = row.activate_action(
+                    "win.card-session-create",
+                    Some(&(project_id, card_id.as_str()).to_variant()),
+                );
+            }
             Kind::Action(action) => {
                 let _ = row.activate_action(action, None);
+                // The new-session row re-opens this panel as the picker.
+                if action == "win.new-session" && self.picker.get() {
+                    return;
+                }
             }
             Kind::Section | Kind::Info => {}
         }
@@ -510,5 +590,97 @@ impl Hud {
         } else if bottom > view_bottom {
             adjustment.set_value(bottom - adjustment.page_size());
         }
+    }
+}
+
+/// The to-do picker's rows from a board state: `(card id, title, note)`, the
+/// project's open to-dos in Home's order, the lane — and the claim, when one
+/// is held — as the note.
+fn card_rows(state: &crate::session::board_store::BoardState) -> Vec<(String, String, String)> {
+    super::home::open_and_done(&super::board::summarize(state))
+        .0
+        .into_iter()
+        .map(|(lane_name, card)| {
+            let note = match &card.claim {
+                Some(claim) => format!("{lane_name} · {claim}"),
+                None => lane_name,
+            };
+            (card.id, card.title, note)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::card_rows;
+    use crate::session::board_store::{BoardState, Lane, StoredCard};
+
+    fn card(id: &str, lane_id: i64, title: &str, claim: Option<&str>) -> StoredCard {
+        StoredCard {
+            id: id.to_string(),
+            project_id: 1,
+            lane_id,
+            lane: String::new(),
+            done: false,
+            position: 0,
+            title: title.to_string(),
+            body: String::new(),
+            claim: claim.map(str::to_string),
+            revision: 1,
+            created_at_millis: 0,
+            updated_at_millis: 0,
+        }
+    }
+
+    fn lane(id: i64, name: &str, kind: &str) -> Lane {
+        Lane {
+            id,
+            name: name.to_string(),
+            kind: kind.to_string(),
+            position: 0,
+        }
+    }
+
+    #[test]
+    fn the_picker_lists_open_to_dos_in_home_order_with_claims_as_notes() {
+        let state = BoardState {
+            project_id: 1,
+            lanes: vec![
+                lane(1, "In progress", "in_progress"),
+                lane(2, "Backlog", "open"),
+                lane(3, "Done", "done"),
+            ],
+            cards: vec![
+                card("c-done", 3, "Shipped work", Some("opencode-x")),
+                card("c-todo", 2, "Untouched work", None),
+                card("c-doing", 1, "Started work", Some("omp-y")),
+            ],
+        };
+        let rows = card_rows(&state);
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "c-doing".to_string(),
+                    "Started work".to_string(),
+                    "In progress · omp-y".to_string()
+                ),
+                (
+                    "c-todo".to_string(),
+                    "Untouched work".to_string(),
+                    "Todo".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_board_without_open_to_dos_leaves_the_picker_rows_empty() {
+        let state = BoardState {
+            project_id: 1,
+            lanes: vec![lane(3, "Done", "done")],
+            cards: vec![card("c-done", 3, "Shipped work", None)],
+        };
+        assert!(card_rows(&state).is_empty());
     }
 }

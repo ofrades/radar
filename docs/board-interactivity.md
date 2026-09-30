@@ -96,12 +96,14 @@ Desktop notifications link back to that same request and are a secondary channel
 
 ## Delivery and acceptance
 
-**Implemented now:** board opens full workspace width and height, its columns
-expand into available space, tool selection restores the tool arrangement, and
-board grouping/split drops cannot shrink it into a tile. Board/Alt+K, its close
-button, or Alt+F returns to tools; the saved tool split tree survives restarting
-with Board open. Existing grouped layouts are normalized when rendered. Existing
-card editing, adding, and dragging remain available.
+**Implemented now:** boards render in Home's project view — lanes side by
+side, cards opening their conversation in place. The workspace has no Board
+pane: the retired tool's grouping/split behavior is gone, and saved board
+panels restore their tool arrangement instead. From a project workspace, the
+toolbar's **Board** button, `Alt+K`, or the project name navigates to the
+project's board in Home; sessions keep running behind the navigation.
+Existing card editing, adding, and dragging remain available in Home's
+project view.
 Claimed cards link to their agent: a card's `@claim` opens the matching agent
 session — matched exactly by the process's own `RADAR_AGENT`, or by the
 claim's leading program — and an exited agent re-opens resumed. When the

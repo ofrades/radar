@@ -5,6 +5,9 @@
 //!
 //!   * **Needs you** — every unresolved request for human attention, with the
 //!     actions to answer, approve, deny, or dismiss it in place.
+//!   * **Agents** — every agent running across every project in one list,
+//!     grouped by project, each row carrying its activity sign and a way to
+//!     open the session. The cockpit header's running count is the way in.
 //!   * **Projects** — a small, clickable card per project: its git state, its
 //!     board counts and its to-dos, each carrying the state of the session bound
 //!     to it. The card opens the project's own view, where its to-dos are
@@ -70,7 +73,8 @@ pub fn cockpit(app: &App) -> gtk::Widget {
         .filter(|session| live_agents::sidebar_session_is_live(session))
         .count();
 
-    // A one-line pulse for the whole workspace.
+    // A one-line pulse for the whole workspace. The running count is the way
+    // into the agents view — every live session, every project.
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     let title = gtk::Label::new(Some("Home"));
     title.add_css_class("heading");
@@ -81,7 +85,7 @@ pub fn cockpit(app: &App) -> gtk::Widget {
         count => format!("{count} projects"),
     };
     let counts = gtk::Label::new(Some(&format!(
-        "{projects_label} · {running} running · {} need you",
+        "{projects_label} · {} need you",
         needs.len()
     )));
     counts.add_css_class("caption");
@@ -89,6 +93,14 @@ pub fn cockpit(app: &App) -> gtk::Widget {
     counts.set_hexpand(true);
     counts.set_xalign(1.0);
     header.append(&counts);
+    let agents = gtk::Button::builder()
+        .label(agents_button_text(running))
+        .tooltip_text("Every agent running, across all projects")
+        .action_name("win.home-agents")
+        .build();
+    agents.add_css_class("flat");
+    agents.add_css_class("agents-pulse");
+    header.append(&agents);
     let shortcuts = gtk::Button::builder()
         .icon_name("view-more-symbolic")
         .tooltip_text("Tools and shortcuts · Alt+H")
@@ -106,12 +118,14 @@ pub fn cockpit(app: &App) -> gtk::Widget {
     scroll.upcast()
 }
 
-/// The current Home view: the cockpit, a project's own view, or a card
-/// conversation — the Basecamp drill-down, with a way back.
+/// The current Home view: the cockpit, a project's own view, a card
+/// conversation, or every running agent — the Basecamp drill-down, with a way
+/// back.
 pub fn view(app: &App) -> gtk::Widget {
     match app.home_nav.borrow().last().cloned() {
         Some(super::HomeView::Project(project_id)) => project_view(app, project_id),
         Some(super::HomeView::Card(project_id, card_id)) => card_view(app, project_id, &card_id),
+        Some(super::HomeView::Agents) => agents_view(app),
         Some(super::HomeView::AddProject) => cockpit(app),
         None => cockpit(app),
     }
@@ -160,6 +174,162 @@ fn view_header(title: &str, meta: Option<&str>) -> gtk::Widget {
         bar.append(&meta);
     }
     bar.upcast()
+}
+
+// ---- Agents: every live session, every project ----
+
+/// Every agent running, across every project: the cross-project answer to
+/// "what is working right now?". Sessions group under their project (the
+/// sidebar's project order); a click opens the session — a radar pane, an
+/// external terminal, or a resumable conversation.
+fn agents_view(app: &App) -> gtk::Widget {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.add_css_class("home-view");
+
+    let groups = live_sessions_by_project(app);
+    let running: usize = groups.iter().map(|(_, rows)| rows.len()).sum();
+    root.append(&view_header("Agents", Some(&agents_button_text(running))));
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    content.add_css_class("home-cockpit");
+    content.add_css_class("agents-view");
+    content.set_margin_top(16);
+    content.set_margin_bottom(20);
+    content.set_margin_start(22);
+    content.set_margin_end(22);
+    content.set_halign(gtk::Align::Fill);
+    content.set_hexpand(true);
+    content.set_valign(gtk::Align::Start);
+
+    if groups.is_empty() {
+        content.append(&quiet("No agents running"));
+    }
+    for (project, rows) in &groups {
+        let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        head.append(&sign_dot(app.project_activity_sign(project.id)));
+        let name = gtk::Button::with_label(&project.name);
+        name.add_css_class("flat");
+        name.add_css_class("lane-name");
+        name.set_tooltip_text(Some("Open this project's tasks and conversations"));
+        name.set_action_name(Some("win.home-project"));
+        name.set_action_target_value(Some(&project.id.to_variant()));
+        head.append(&name);
+        let count = gtk::Label::new(Some(&agents_button_text(rows.len())));
+        count.add_css_class("caption");
+        count.add_css_class("dim-label");
+        count.set_xalign(1.0);
+        count.set_hexpand(true);
+        head.append(&count);
+        content.append(&head);
+
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        for session in rows {
+            list.append(&agents_row(app, project.id, session));
+        }
+        content.append(&list);
+    }
+
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&content)
+        .build();
+    scroll.add_css_class("home-scroll");
+    root.append(&scroll);
+    root.upcast()
+}
+
+/// The live sessions that belong to a project someone still has, in the
+/// sidebar's project order, most recently active session first.
+fn live_sessions_by_project(app: &App) -> Vec<(Project, Vec<live_agents::AgentSession>)> {
+    let index = app.agent_sessions.borrow();
+    app.projects
+        .borrow()
+        .iter()
+        .filter_map(|project| {
+            let mut rows: Vec<live_agents::AgentSession> = index
+                .by_project
+                .get(&project.id)?
+                .iter()
+                .filter(|session| live_agents::sidebar_session_is_live(session))
+                .cloned()
+                .collect();
+            if rows.is_empty() {
+                return None;
+            }
+            rows.sort_by_key(|session| std::cmp::Reverse(session.last_activity_at));
+            Some((project.clone(), rows))
+        })
+        .collect()
+}
+
+/// One running agent: its activity sign, its title, and beneath it what it
+/// runs, the to-do it carries and when it was last heard from.
+fn agents_row(app: &App, project_id: i64, session: &live_agents::AgentSession) -> gtk::Widget {
+    let row = gtk::Button::new();
+    row.add_css_class("flat");
+    row.add_css_class("agent-row");
+    row.set_action_name(Some("win.todo-session"));
+    row.set_action_target_value(Some(&(project_id, session.id.as_str()).to_variant()));
+    row.set_tooltip_text(Some(if session.external.is_some() {
+        "Focus this agent's terminal"
+    } else {
+        "Open this session"
+    }));
+
+    let body = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    body.append(&sign_dot(app.session_activity_sign(project_id, session)));
+
+    let texts = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    texts.set_valign(gtk::Align::Center);
+    texts.set_hexpand(true);
+    let title = gtk::Label::new(Some(&session.title));
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    texts.append(&title);
+
+    let meta = gtk::Box::new(gtk::Orientation::Horizontal, 7);
+    if let Some(program) = crate::programs::by_id(&session.program_id) {
+        let label = gtk::Label::new(Some(&program.name));
+        label.add_css_class("caption");
+        label.add_css_class("dim-label");
+        meta.append(&label);
+    }
+    if let Some(card_id) = app.session_card_id(project_id, session) {
+        if let Some(todo) = app.card_title(project_id, &card_id) {
+            let label = gtk::Label::new(Some(&todo));
+            label.add_css_class("caption");
+            label.add_css_class("dim-label");
+            label.add_css_class("todo-claim");
+            label.set_xalign(0.0);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label.set_hexpand(true);
+            meta.append(&label);
+        }
+    }
+    if meta.first_child().is_some() {
+        texts.append(&meta);
+    }
+    body.append(&texts);
+
+    let age = gtk::Label::new(Some(&board::relative_age(session.last_activity_at)));
+    age.add_css_class("caption");
+    age.add_css_class("dim-label");
+    age.set_valign(gtk::Align::Center);
+    body.append(&age);
+
+    row.set_child(Some(&body));
+    row.upcast()
+}
+
+/// The agents view's one-line count, reused on the cockpit's header button.
+fn agents_button_text(running: usize) -> String {
+    match running {
+        0 => "No agents".to_string(),
+        1 => "1 running".to_string(),
+        count => format!("{count} running"),
+    }
 }
 
 // ---- Needs you ----
@@ -676,7 +846,7 @@ pub(super) fn project_menu(project: &Project) -> gtk::MenuButton {
 
 /// Split a board's lanes into open to-dos (in-progress, review, then the
 /// rest) and the Done lane's cards.
-fn open_and_done(
+pub(super) fn open_and_done(
     summary: &board::BoardSummary,
 ) -> (Vec<(String, board::WorkCard)>, Vec<board::WorkCard>) {
     let mut lanes: Vec<&board::LaneSummary> = summary.lanes.iter().collect();
@@ -1331,7 +1501,7 @@ pub(super) fn create_project(app: &SharedApp, path: std::path::PathBuf) {
 
 #[cfg(test)]
 mod tests {
-    use super::{lane_footer_text, valid_project_folder_name};
+    use super::{agents_button_text, lane_footer_text, valid_project_folder_name};
 
     #[test]
     fn new_project_names_cannot_escape_the_parent_folder() {
@@ -1349,5 +1519,12 @@ mod tests {
         assert_eq!(lane_footer_text(1, 0), "1 running");
         assert_eq!(lane_footer_text(3, 1), "3 running · 1 stopped");
         assert_eq!(lane_footer_text(0, 2), "no agents · 2 stopped");
+    }
+
+    #[test]
+    fn the_agents_count_reads_like_the_lanes_footer() {
+        assert_eq!(agents_button_text(0), "No agents");
+        assert_eq!(agents_button_text(1), "1 running");
+        assert_eq!(agents_button_text(4), "4 running");
     }
 }
