@@ -2786,9 +2786,16 @@ impl App {
         }
         if let Some(claim) = card.claim.as_deref() {
             // Open what the claim still holds. A claim whose conversation is
-            // gone offers a fresh start instead of a dead end.
+            // gone offers a fresh start instead of a dead end: a launch binds
+            // its exact id before the CLI has created anything, so a crashed
+            // first turn leaves the card pointing at a conversation that was
+            // never written — reopening it would open an empty one that never
+            // saw this card, and the work would be untriggerable.
             let live = self.live_claim_session(project_id, claim);
-            if live.is_some() || self.claim_has_exact_session(project_id, claim) {
+            if live.is_some()
+                || (self.claim_has_exact_session(project_id, claim)
+                    && !self.bound_conversation_is_lost(project_id, claim))
+            {
                 self.select_project(project_id);
                 if let Some(workspace) = self.current_workspace() {
                     self.open_agent_session(&workspace, claim);
@@ -3256,6 +3263,33 @@ impl App {
         self.db
             .bound_session(project_id, claim)
             .map_or(false, |bound| bound.is_some())
+    }
+
+    /// Whether the claim's bound conversation is gone from the provider's
+    /// own store. A launch binds its exact conversation id up front, before
+    /// the CLI has written anything, so a crashed first turn leaves a
+    /// binding that points at nothing. `false` when radar cannot tell (the
+    /// CLI has no readable store, or the read failed): the reopen is still
+    /// worth trying then.
+    fn bound_conversation_is_lost(&self, project_id: i64, claim: &str) -> bool {
+        let path = self
+            .workspaces
+            .borrow()
+            .get(&project_id)
+            .map(|workspace| workspace.project.path.clone());
+        let Some(path) = path else {
+            return false;
+        };
+        let Some((program_id, provider_session_id)) =
+            self.db.bound_session(project_id, claim).ok().flatten()
+        else {
+            return false;
+        };
+        crate::programs::sessions::has_provider_session(
+            program_id.as_str(),
+            &path,
+            provider_session_id.as_str(),
+        ) == Some(false)
     }
 
     /// The activity sign a project wears on Home: unresolved attention first,

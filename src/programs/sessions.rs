@@ -39,9 +39,9 @@ struct ListedSession {
     directory: Option<String>,
 }
 
-/// The title OpenCode assigned to one exact conversation, when its store
-/// exposes it. Other CLIs do not yet share this listing contract.
-pub(crate) fn title_for(program_id: &str, cwd: &Path, id: &str) -> Option<String> {
+/// Run the CLI's session list and parse it. `None` when the CLI has no
+/// readable store, the run failed, or the output did not parse.
+fn run_session_list(program_id: &str, cwd: &Path) -> Option<Vec<ListedSession>> {
     if !can_capture(program_id) {
         return None;
     }
@@ -56,7 +56,13 @@ pub(crate) fn title_for(program_id: &str, cwd: &Path, id: &str) -> Option<String
     if !output.status.success() {
         return None;
     }
-    let sessions = parse_sessions(std::str::from_utf8(&output.stdout).ok()?);
+    Some(parse_sessions(std::str::from_utf8(&output.stdout).ok()?))
+}
+
+/// The title OpenCode assigned to one exact conversation, when its store
+/// exposes it. Other CLIs do not yet share this listing contract.
+pub(crate) fn title_for(program_id: &str, cwd: &Path, id: &str) -> Option<String> {
+    let sessions = run_session_list(program_id, cwd)?;
     listed_title(&sessions, cwd, id)
 }
 
@@ -72,23 +78,9 @@ pub(crate) struct ProviderSession {
 /// Every conversation the provider's store lists for `cwd`. `None` when the
 /// CLI has no readable store, the run failed, or the output did not parse.
 pub(crate) fn list_provider_sessions(program_id: &str, cwd: &Path) -> Option<Vec<ProviderSession>> {
-    if !can_capture(program_id) {
-        return None;
-    }
-    let output = std::process::Command::new(program_id)
-        .args(SESSION_LIST_ARGS)
-        .current_dir(cwd)
-        // The daemon may lack the login shell's PATH; resolve the provider
-        // CLI through the same entries a spawn uses.
-        .env("PATH", crate::config::path_value())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
     let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     Some(
-        parse_sessions(std::str::from_utf8(&output.stdout).ok()?)
+        run_session_list(program_id, cwd.as_path())?
             .into_iter()
             .filter(|session| {
                 session.directory.as_ref().is_none_or(|directory| {
@@ -107,22 +99,44 @@ pub(crate) fn list_provider_sessions(program_id: &str, cwd: &Path) -> Option<Vec
     )
 }
 
-fn listed_title(sessions: &[ListedSession], cwd: &Path, id: &str) -> Option<String> {
+/// Whether the provider's own store still lists this conversation — scoped
+/// to `cwd`, the same project scoping every reader here applies. `None`
+/// when radar cannot tell: the CLI has no readable store, the run failed,
+/// or the output did not parse.
+pub(crate) fn has_provider_session(program_id: &str, cwd: &Path, id: &str) -> Option<bool> {
+    let sessions = run_session_list(program_id, cwd)?;
+    Some(listed_session_exists(&sessions, cwd, id))
+}
+
+/// The store's entry for `id` scoped to `cwd`, canonicalized the way the
+/// CLI records directories.
+fn scoped_find<'a>(
+    sessions: &'a [ListedSession],
+    cwd: &Path,
+    id: &str,
+) -> Option<&'a ListedSession> {
     let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    sessions
-        .iter()
-        .find(|session| {
-            session.id == id
-                && session.directory.as_ref().is_none_or(|directory| {
-                    let directory =
-                        std::fs::canonicalize(directory).unwrap_or_else(|_| directory.into());
-                    directory == cwd
-                })
-        })
+    sessions.iter().find(|session| {
+        session.id == id
+            && session.directory.as_ref().is_none_or(|directory| {
+                let directory =
+                    std::fs::canonicalize(directory).unwrap_or_else(|_| directory.into());
+                directory == cwd
+            })
+    })
+}
+
+fn listed_title(sessions: &[ListedSession], cwd: &Path, id: &str) -> Option<String> {
+    scoped_find(sessions, cwd, id)
         .and_then(|session| session.title.as_deref())
         .map(str::trim)
         .filter(|title| !title.is_empty())
         .map(str::to_string)
+}
+
+/// Whether the store's list has `id` at all, scoped to `cwd`.
+fn listed_session_exists(sessions: &[ListedSession], cwd: &Path, id: &str) -> bool {
+    scoped_find(sessions, cwd, id).is_some()
 }
 /// Parse a session list the way the CLI prints it (JSON, newest first).
 fn parse_sessions(json: &str) -> Vec<ListedSession> {
@@ -135,21 +149,7 @@ fn parse_sessions(json: &str) -> Vec<ListedSession> {
 /// `None` when the CLI has no readable store, the run failed, or the
 /// agent never started a conversation.
 pub fn newest_since(program_id: &str, cwd: &Path, since_ms: u128) -> Option<String> {
-    if !can_capture(program_id) {
-        return None;
-    }
-    let output = std::process::Command::new(program_id)
-        .args(SESSION_LIST_ARGS)
-        .current_dir(cwd)
-        // The daemon may lack the login shell's PATH; resolve the provider
-        // CLI through the same entries a spawn uses.
-        .env("PATH", crate::config::path_value())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_sessions(std::str::from_utf8(&output.stdout).ok()?)
+    run_session_list(program_id, cwd)?
         .into_iter()
         .filter(|session| session.created as u128 >= since_ms)
         .max_by_key(|session| session.created)
@@ -196,6 +196,40 @@ mod tests {
             listed_title(&sessions, Path::new("/projects/other"), "ses_b"),
             None
         );
+    }
+
+    #[test]
+    fn a_bound_conversation_exists_only_when_its_own_project_lists_it() {
+        // `has_provider_session` reads the store the way `listed_title`
+        // does: a binding to a conversation the store never wrote (a
+        // crashed first turn) must read as lost, and one recorded under
+        // another project stays invisible here.
+        let sessions = parse_sessions(
+            r#"[
+                {"id":"ses_a","created":1,"directory":"/projects/radar"},
+                {"id":"ses_c","created":3,"directory":"/projects/other"}
+            ]"#,
+        );
+        assert!(listed_session_exists(
+            &sessions,
+            Path::new("/projects/radar"),
+            "ses_a"
+        ));
+        assert!(!listed_session_exists(
+            &sessions,
+            Path::new("/projects/radar"),
+            "ses_b"
+        ));
+        assert!(!listed_session_exists(
+            &sessions,
+            Path::new("/projects/radar"),
+            "ses_c"
+        ));
+        assert!(listed_session_exists(
+            &sessions,
+            Path::new("/projects/other"),
+            "ses_c"
+        ));
     }
 
     #[test]
