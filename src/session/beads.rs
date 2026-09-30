@@ -101,10 +101,18 @@ impl Beads {
         &self.executable
     }
 
-    /// Every valid status in `dir`, built-in and configured custom.
+    /// Every valid status in `dir`, built-in and configured custom. The
+    /// envelope (always on for `run`) wraps the map in `data`.
     pub fn statuses(&self, dir: &Path) -> Result<Vec<StatusSpec>> {
         let json = self.run(dir, &["statuses", "--json"])?;
-        let raw: RawStatuses = serde_json::from_str(&json)
+        let raw: serde_json::Value = serde_json::from_str(&json)
+            .with_context(|| format!("parsing `bd statuses --json` in {}", dir.display()))?;
+        let map = if raw["data"].is_object() {
+            &raw["data"]
+        } else {
+            &raw
+        };
+        let raw: RawStatuses = serde_json::from_value(map.clone())
             .with_context(|| format!("parsing `bd statuses --json` in {}", dir.display()))?;
         let mut statuses = Vec::new();
         for status in raw.built_in_statuses.into_iter().chain(raw.custom_statuses) {
@@ -127,12 +135,22 @@ impl Beads {
     /// One issue, by id.
     pub fn show(&self, dir: &Path, id: &str) -> Result<Issue> {
         let json = self.run(dir, &["show", id, "--json"])?;
-        let issues: Vec<RawIssue> = serde_json::from_str(&json)
+        let value: serde_json::Value = serde_json::from_str(&json)
             .with_context(|| format!("parsing `bd show {id} --json` in {}", dir.display()))?;
+        // The envelope wraps the list in `data`; a bare array is unwrapped too.
+        let issues = value
+            .as_array()
+            .map(|issues| issues.as_slice())
+            .or_else(|| value["data"].as_array().map(|issues| issues.as_slice()))
+            .unwrap_or_default();
         issues
-            .into_iter()
-            .next()
-            .map(Issue::from_raw)
+            .first()
+            .map(|raw| {
+                serde_json::from_value::<RawIssue>(raw.clone())
+                    .map(Issue::from_raw)
+                    .context("bd show returned an issue shape this radar cannot read")
+            })
+            .transpose()?
             .with_context(|| format!("bd show {id} returned no issue"))
     }
 
@@ -178,6 +196,31 @@ impl Issue {
                 .unwrap_or(0),
         }
     }
+}
+
+/// The radar lane name for a status. The canonical four keep radar's names;
+/// any other status reads as its display name.
+pub(crate) fn lane_name(status: &str) -> String {
+    match status {
+        "open" => "Todo".to_string(),
+        "in_progress" => "In progress".to_string(),
+        "review" => "Review".to_string(),
+        "closed" => "Done".to_string(),
+        other => display_name(other),
+    }
+}
+
+/// One issue object as `bd create --json` emits it: either the bare issue
+/// or nested under the envelope's `data`.
+pub(crate) fn issue_from_json(json: &str) -> Result<Issue> {
+    let raw: serde_json::Value = serde_json::from_str(json).context("parsing a bd issue")?;
+    let object = if raw["data"].is_object() {
+        &raw["data"]
+    } else {
+        &raw
+    };
+    let parsed: RawIssue = serde_json::from_value(object.clone()).context("bd issue object")?;
+    Ok(Issue::from_raw(parsed))
 }
 
 /// Build a [`BoardState`] from Beads issues and the status list.
@@ -266,7 +309,7 @@ pub fn board_state(project_id: i64, statuses: &[StatusSpec], issues: &[Issue]) -
 
 /// A status category as a lane kind. `review` is radar's own review lane and
 /// keeps its kind even though Beads files it as `wip`.
-fn lane_kind(category: &str) -> &'static str {
+pub(crate) fn lane_kind(category: &str) -> &'static str {
     match category {
         "active" => "todo",
         "wip" => "in_progress",
@@ -305,7 +348,7 @@ fn status_rank(status: &str) -> i32 {
 }
 
 /// `in_progress` → `In progress`.
-fn display_name(status: &str) -> String {
+pub(crate) fn display_name(status: &str) -> String {
     status
         .split('_')
         .map(|word| {

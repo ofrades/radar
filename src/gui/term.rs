@@ -29,16 +29,35 @@ struct Metrics {
     font_size: f64,
     cell_w: f64,
     cell_h: f64,
+    /// Baseline from the cell's top: the font's rounded ascent, so glyphs in
+    /// every cell land on the same pixel phase.
+    baseline: f64,
 }
 
 impl Metrics {
+    /// Measure the font on a scratch surface. Cell metrics come from the font
+    /// itself and snap to whole pixels: fractional advances (the old 0.6·size
+    /// guess) put every glyph on a different subpixel phase, which smeared the
+    /// panel — the pixelization report — and broke box-drawing joins.
     fn new(family: &str, font_size: f64, scale: f64) -> Self {
-        let size = font_size * scale;
+        // The theme's size is in points (kitty font_size), like the Pango path
+        // this renderer replaced: pixels at GTK's 96 dpi are 4/3 of a point.
+        let size = font_size * scale * 4.0 / 3.0;
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 8, 8).unwrap();
+        let cr = cairo::Context::new(&surface).unwrap();
+        cr.select_font_face(family, cairo::FontSlant::Normal, cairo::FontWeight::Normal);
+        cr.set_font_size(size);
+        let extents = cr.font_extents().unwrap();
+        let sample = cr.text_extents("MMMMMMMMMM").unwrap();
+        let cell_w = (sample.width() / 10.0).round().max(1.0);
+        let ascent = extents.ascent().round().max(1.0);
+        let descent = extents.descent().round().max(1.0);
         Self {
             family: family.to_string(),
             font_size: size,
-            cell_w: (size * 0.6).max(1.0),
-            cell_h: (size * 1.25).max(1.0),
+            cell_w,
+            cell_h: ascent + descent,
+            baseline: ascent,
         }
     }
 
@@ -589,10 +608,7 @@ fn paint_cell(
             };
         }
         set_rgb(cr, color);
-        cr.move_to(
-            x,
-            y + metrics.cell_h - (metrics.cell_h - metrics.font_size) / 2.0,
-        );
+        cr.move_to(x, y + metrics.baseline);
         cr.show_text(&cell.text).ok();
     }
 
@@ -768,5 +784,68 @@ mod tests {
             encode_key(gtk::gdk::Key::Up, none),
             Some(b"\x1b[A".to_vec())
         );
+    }
+
+    /// Visual probe: paint a representative frame to a PNG when
+    /// `RADAR_TERM_PNG` names a path, so a reviewer can inspect glyph quality
+    /// (the pixelization report) without a display. Skipped otherwise.
+    #[test]
+    fn paint_dumps_a_frame_for_visual_inspection() {
+        let Ok(path) = std::env::var("RADAR_TERM_PNG") else {
+            eprintln!("skipping: RADAR_TERM_PNG is not set");
+            return;
+        };
+
+        let family = std::env::var("RADAR_TERM_FONT")
+            .unwrap_or_else(|_| "JetBrainsMono Nerd Font".to_string());
+        let size = std::env::var("RADAR_TERM_SIZE")
+            .ok()
+            .and_then(|size| size.parse::<f64>().ok())
+            .unwrap_or(11.0);
+        let mut inner = Inner {
+            term: Terminal::new(80, 24),
+            render: RenderState::new(),
+            metrics: Metrics::new(&family, size, 1.0),
+            base_family: family,
+            base_size: size,
+            scale: 1.0,
+            last_grid: (0, 0),
+        };
+
+        // What an agent panel actually shows: TUI chrome, styled text, a
+        // spinner line, dim markdown and a diff.
+        inner.term.write(
+            concat!(
+            "\x1b[38;5;244m╭─ agent \x1b[38;5;39mopencode\x1b[38;5;244m ─────────────╮\x1b[0m\r\n",
+            "\x1b[1m❯\x1b[0m fix the pixelized panel\r\n",
+            "\x1b[2m  Reading src/gui/term.rs…\x1b[0m\r\n",
+            "\x1b[1;32m●\x1b[0m Edited \x1b[36msrc/gui/term.rs\x1b[0m +18 -4\r\n",
+            "\x1b[33m⠸\x1b[0m thinking…\r\n",
+            "\x1b[31m- old cell width guess\x1b[0m\r\n",
+            "\x1b[32m+ measured from the font\x1b[0m\r\n",
+            "ascii band: |il1 oO08 .,;'\r\n",
+        )
+            .as_bytes(),
+        );
+
+        let width = 80 * inner.metrics.cell_w as i32;
+        let height = 24 * inner.metrics.cell_h as i32;
+        let mut surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, width, height).unwrap();
+        let cr = cairo::Context::new(&surface).unwrap();
+        paint(&mut inner, &cr, width, height);
+        drop(cr);
+
+        // cairo ARGB32 is premultiplied B,G,R,A on little-endian.
+        let bytes = gtk::glib::Bytes::from(&surface.data().unwrap().to_vec());
+        let texture = gtk::gdk::MemoryTexture::new(
+            width,
+            height,
+            gtk::gdk::MemoryFormat::B8g8r8a8Premultiplied,
+            &bytes,
+            width as usize * 4,
+        );
+        texture.save_to_png(std::path::Path::new(&path)).unwrap();
+        eprintln!("wrote {path}");
     }
 }

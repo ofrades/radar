@@ -1052,12 +1052,7 @@ fn card_session_chip(app: &App, project_id: i64, card: &board::WorkCard) -> gtk:
 
 /// The "+ Session" affordance: clicking starts the project's default agent
 /// attached to the card.
-fn start_session_chip(
-    content: &gtk::Box,
-    button: &gtk::Button,
-    project_id: i64,
-    card_id: &str,
-) {
+fn start_session_chip(content: &gtk::Box, button: &gtk::Button, project_id: i64, card_id: &str) {
     let plus = gtk::Image::from_icon_name("list-add-symbolic");
     plus.set_pixel_size(11);
     plus.set_valign(gtk::Align::Center);

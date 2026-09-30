@@ -249,7 +249,10 @@ mod tests {
         init_repo(&service);
         assert!(!status(&folder).is_repo);
         assert!(status(&service).is_repo);
-        assert_eq!(rev_parse_root(&service), Some(service.canonicalize().unwrap()));
+        assert_eq!(
+            rev_parse_root(&service),
+            Some(service.canonicalize().unwrap())
+        );
     }
 
     #[test]

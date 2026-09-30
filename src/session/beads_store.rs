@@ -15,11 +15,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use parking_lot::Mutex;
 
-use super::beads::{self, Beads};
-use super::board_store::{check_revision, Board, BoardChange, BoardState, BoardStore, StoredCard};
+use super::beads::{self, lane_kind, lane_name, Beads, StatusSpec};
+use super::board_store::{
+    check_revision, Board, BoardChange, BoardState, BoardStore, Lane, StoredCard,
+};
 
 /// The custom statuses a radar board needs: `review` is a lane of its own, and
 /// `backlog` and `test` are the workflow radar's board has always had.
@@ -40,6 +42,15 @@ pub struct BeadsBoardStore {
     /// single writer: remember the highest revision it issued per card and
     /// never let a card's revision go backwards or repeat.
     issued: Mutex<HashMap<(i64, String), u64>>,
+    /// Valid statuses per workspace, cached: they change only through
+    /// `bd config set`, which radar runs once at workspace creation. Each
+    /// `bd` call pays the embedded-Dolt startup (~0.2s), so this halves every
+    /// board read.
+    statuses: Mutex<HashMap<PathBuf, Arc<Vec<StatusSpec>>>>,
+    /// The last board state per project. The daemon is the store's only
+    /// writer, so mutations can patch this in place and reads are free; a
+    /// card is re-read with `bd show` after each mutation to stay honest.
+    states: Mutex<HashMap<i64, BoardState>>,
 }
 
 impl BeadsBoardStore {
@@ -55,6 +66,8 @@ impl BeadsBoardStore {
             legacy,
             init: Mutex::new(HashMap::new()),
             issued: Mutex::new(HashMap::new()),
+            statuses: Mutex::new(HashMap::new()),
+            states: Mutex::new(HashMap::new()),
         })
     }
 
@@ -123,13 +136,15 @@ impl BeadsBoardStore {
         let state = legacy.state(project_id)?;
         for card in state.cards {
             let status = beads::status_for_lane(&card.lane);
-            let id = self.create_issue(
-                dir,
-                &card.title,
-                &card.body,
-                Some(&status),
-                card.claim.as_deref(),
-            )?;
+            let id = self
+                .create_issue(
+                    dir,
+                    &card.title,
+                    &card.body,
+                    Some(&status),
+                    card.claim.as_deref(),
+                )?
+                .id;
             if card.done {
                 self.beads.run(dir, &["close", &id, "--force"])?;
             }
@@ -137,6 +152,8 @@ impl BeadsBoardStore {
         Ok(())
     }
 
+    /// Create an issue and return its full JSON (the same shape `bd show`
+    /// reports), so the caller can patch the state without another spawn.
     fn create_issue(
         &self,
         dir: &Path,
@@ -144,7 +161,7 @@ impl BeadsBoardStore {
         body: &str,
         status: Option<&str>,
         claim: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<beads::Issue> {
         let mut args: Vec<String> = vec![
             "create".to_string(),
             title.to_string(),
@@ -163,13 +180,12 @@ impl BeadsBoardStore {
             args.push(claim.to_string());
         }
         let output = self.run_args(dir, &args)?;
-        let value: serde_json::Value = serde_json::from_str(&output)
+        let issue = beads::issue_from_json(&output)
             .with_context(|| format!("parsing `bd create` in {}", dir.display()))?;
-        value["data"]["id"]
-            .as_str()
-            .or_else(|| value["id"].as_str())
-            .map(str::to_string)
-            .context("bd create returned no issue id")
+        if issue.id.is_empty() {
+            bail!("bd create returned no issue id");
+        }
+        Ok(issue)
     }
 
     fn run_args(&self, dir: &Path, args: &[String]) -> Result<String> {
@@ -177,16 +193,105 @@ impl BeadsBoardStore {
         self.beads.run(dir, &refs)
     }
 
+    /// Valid statuses in the workspace, from the cache after the first read.
+    fn statuses(&self, dir: &Path) -> Result<Arc<Vec<StatusSpec>>> {
+        let mut cache = self.statuses.lock();
+        if let Some(statuses) = cache.get(dir) {
+            return Ok(Arc::clone(statuses));
+        }
+        let statuses = Arc::new(self.beads.statuses(dir)?);
+        cache.insert(dir.to_path_buf(), Arc::clone(&statuses));
+        Ok(statuses)
+    }
+
     fn board_state(&self, project_id: i64, dir: &Path) -> Result<BoardState> {
-        let statuses = self.beads.statuses(dir)?;
+        let statuses = self.statuses(dir)?;
         let issues = self.beads.list(dir)?;
         Ok(beads::board_state(project_id, &statuses, &issues))
     }
 
-    /// The card and its lane kind, so a claim can start a Todo card and leave a
-    /// card in Review where it is.
-    fn locate(&self, project_id: i64, dir: &Path, card_id: &str) -> Result<(StoredCard, String)> {
+    /// The project's board: the cached state when there is one, one full read
+    /// when there is not.
+    fn cached_state(&self, project_id: i64, dir: &Path) -> Result<BoardState> {
+        if let Some(state) = self.states.lock().get(&project_id) {
+            return Ok(state.clone());
+        }
         let state = self.board_state(project_id, dir)?;
+        self.states.lock().insert(project_id, state.clone());
+        Ok(state)
+    }
+
+    /// Fold a freshly read card into the cached state, adding its lane when a
+    /// status is used for the first time.
+    fn patch_state(&self, project_id: i64, dir: &Path, issue: beads::Issue) -> Result<()> {
+        let statuses = self.statuses(dir)?;
+        let mut states = self.states.lock();
+        let state = states
+            .entry(project_id)
+            .or_insert_with(|| beads::board_state(project_id, &statuses, &[]));
+        let status = issue.status.clone();
+        let kind = |status: &str| {
+            statuses
+                .iter()
+                .find(|spec| spec.name == *status)
+                .map(|spec| lane_kind(&spec.category))
+                .unwrap_or("custom")
+        };
+        let lane_id = match state
+            .lanes
+            .iter()
+            .find(|lane| lane.name == lane_name(&status))
+        {
+            Some(lane) => lane.id,
+            None => {
+                // A status with cards becomes a lane, ordered by workflow.
+                let id = state.lanes.iter().map(|lane| lane.id).max().unwrap_or(0) + 1;
+                let position = state.lanes.len() as i64;
+                let name = lane_name(&status);
+                state.lanes.push(Lane {
+                    id,
+                    name: name.clone(),
+                    kind: kind(&status).to_string(),
+                    position,
+                });
+                state.lanes.sort_by_key(|lane| lane.position);
+                // Reindex positions after the sort so a later insert stays stable.
+                for (index, lane) in state.lanes.iter_mut().enumerate() {
+                    lane.position = index as i64;
+                }
+                id
+            }
+        };
+        state.cards.retain(|card| card.id != issue.id);
+        state.cards.push(StoredCard {
+            id: issue.id.clone(),
+            project_id,
+            lane_id,
+            lane: lane_name(&status),
+            done: kind(&status) == "done",
+            position: state.cards.len() as i64,
+            title: issue.title.clone(),
+            body: issue.description.clone(),
+            claim: issue.assignee.clone(),
+            revision: issue.updated_at_millis.max(1) as u64,
+            created_at_millis: issue.created_at_millis,
+            updated_at_millis: issue.updated_at_millis,
+        });
+        Ok(())
+    }
+
+    /// Drop a deleted card from the cached state.
+    fn forget_card(&self, project_id: i64, card_id: &str) {
+        if let Some(state) = self.states.lock().get_mut(&project_id) {
+            state.cards.retain(|card| card.id != card_id);
+        }
+    }
+
+    /// The card and its lane kind, so a claim can start a Todo card and leave a
+    /// card in Review where it is. Reads the cached state (no spawn); the
+    /// state is patched after every mutation, so it is current.
+    fn locate(&self, project_id: i64, dir: &Path, card_id: &str) -> Result<(StoredCard, String)> {
+        let state = self.cached_state(project_id, dir)?;
         let card = state
             .cards
             .iter()
@@ -224,6 +329,8 @@ impl BeadsBoardStore {
         *slot = (*slot).max(revision);
     }
 
+    /// The fresh card after a mutation: one `bd show` (a full re-list costs
+    /// another Dolt startup for nothing), folded into the cached state.
     fn change(
         &self,
         project_id: i64,
@@ -239,12 +346,14 @@ impl BeadsBoardStore {
             .get(&(project_id, card_id.to_string()))
             .copied()
             .unwrap_or(0);
+        let issue = self.beads.show(dir, card_id)?;
+        self.patch_state(project_id, dir, issue)?;
         let mut card = self
-            .board_state(project_id, dir)?
-            .cards
-            .into_iter()
-            .find(|card| card.id == card_id)
-            .with_context(|| format!("card {card_id} vanished"))?;
+            .states
+            .lock()
+            .get(&project_id)
+            .and_then(|state| state.cards.iter().find(|card| card.id == card_id).cloned())
+            .with_context(|| format!("card {card_id} vanished after {action}"))?;
         // A store stamp equal to the floor is an unchanged stamp, not an
         // unchanged card: this mutation must still be conflict-visible.
         card.revision = card.revision.max(floor + 1);
@@ -258,7 +367,7 @@ impl BeadsBoardStore {
 
     pub fn state(&self, project_id: i64) -> Result<BoardState> {
         let dir = self.ensure(project_id)?;
-        self.board_state(project_id, &dir)
+        self.cached_state(project_id, &dir)
     }
 
     pub fn add_card(
@@ -271,8 +380,28 @@ impl BeadsBoardStore {
     ) -> Result<BoardChange> {
         let dir = self.ensure(project_id)?;
         let status = lane.map(beads::status_for_lane);
-        let id = self.create_issue(&dir, title, body, status.as_deref(), claim)?;
-        self.change(project_id, &dir, &id, "added", None)
+        let issue = self.create_issue(&dir, title, body, status.as_deref(), claim)?;
+        // `bd create` already reported the full issue; no re-read needed.
+        let floor = self
+            .issued
+            .lock()
+            .get(&(project_id, issue.id.clone()))
+            .copied()
+            .unwrap_or(0);
+        self.patch_state(project_id, &dir, issue.clone())?;
+        let mut card = self
+            .states
+            .lock()
+            .get(&project_id)
+            .and_then(|state| state.cards.iter().find(|card| card.id == issue.id).cloned())
+            .with_context(|| format!("card {} vanished after added", issue.id))?;
+        card.revision = card.revision.max(floor + 1);
+        self.note_revision(project_id, &issue.id, card.revision);
+        Ok(BoardChange {
+            card,
+            action: "added".to_string(),
+            from_lane: None,
+        })
     }
 
     pub fn update_card(
@@ -315,16 +444,19 @@ impl BeadsBoardStore {
         if target != beads::status_for_lane(&card.lane) {
             self.set_status(&dir, card_id, &target)?;
             // Moving a card drops its claim: a card handed to another column is
-            // by definition no longer the worker's.
-            self.run_args(
-                &dir,
-                &[
-                    "assign".to_string(),
-                    card_id.to_string(),
-                    String::new(),
-                    "--force".to_string(),
-                ],
-            )?;
+            // by definition no longer the worker's. Clearing an absent claim
+            // would buy another Dolt startup for nothing.
+            if card.claim.is_some() {
+                self.run_args(
+                    &dir,
+                    &[
+                        "assign".to_string(),
+                        card_id.to_string(),
+                        String::new(),
+                        "--force".to_string(),
+                    ],
+                )?;
+            }
         }
         self.change(project_id, &dir, card_id, "moved", Some(card.lane))
     }
@@ -370,15 +502,17 @@ impl BeadsBoardStore {
                 self.change(project_id, &dir, card_id, "claimed", from_lane)
             }
             None => {
-                self.run_args(
-                    &dir,
-                    &[
-                        "assign".to_string(),
-                        card_id.to_string(),
-                        String::new(),
-                        "--force".to_string(),
-                    ],
-                )?;
+                if card.claim.is_some() {
+                    self.run_args(
+                        &dir,
+                        &[
+                            "assign".to_string(),
+                            card_id.to_string(),
+                            String::new(),
+                            "--force".to_string(),
+                        ],
+                    )?;
+                }
                 if kind == "in_progress" {
                     self.run_args(
                         &dir,
@@ -440,6 +574,7 @@ impl BeadsBoardStore {
                 "--force".to_string(),
             ],
         )?;
+        self.forget_card(project_id, card_id);
         Ok(BoardChange {
             card,
             action: "removed".to_string(),
@@ -454,7 +589,7 @@ impl BeadsBoardStore {
         lane: Option<&str>,
     ) -> Result<Option<BoardChange>> {
         let dir = self.ensure(project_id)?;
-        let state = self.board_state(project_id, &dir)?;
+        let state = self.cached_state(project_id, &dir)?;
         let filter = lane.map(beads::status_for_lane);
         let found = state
             .cards
