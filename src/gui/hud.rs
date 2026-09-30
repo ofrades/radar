@@ -340,12 +340,6 @@ impl Hud {
                 "create or add",
             ),
             ("Preferences…", "Alt+,", "win.preferences", "settings prefs"),
-            (
-                "Pane menu",
-                "Right-click / Menu / Shift+F10",
-                "win.pane-menu",
-                "context",
-            ),
             ("Zoom the focused pane", "Alt+F", "win.zoom", "maximize"),
             ("Refresh", "Alt+R", "win.refresh", "reload status"),
         ] {

@@ -48,6 +48,9 @@ pub(crate) fn title_for(program_id: &str, cwd: &Path, id: &str) -> Option<String
     let output = std::process::Command::new(program_id)
         .args(SESSION_LIST_ARGS)
         .current_dir(cwd)
+        // The daemon may lack the login shell's PATH; resolve the provider
+        // CLI through the same entries a spawn uses.
+        .env("PATH", crate::config::path_value())
         .output()
         .ok()?;
     if !output.status.success() {
@@ -75,6 +78,9 @@ pub(crate) fn list_provider_sessions(program_id: &str, cwd: &Path) -> Option<Vec
     let output = std::process::Command::new(program_id)
         .args(SESSION_LIST_ARGS)
         .current_dir(cwd)
+        // The daemon may lack the login shell's PATH; resolve the provider
+        // CLI through the same entries a spawn uses.
+        .env("PATH", crate::config::path_value())
         .output()
         .ok()?;
     if !output.status.success() {
@@ -135,6 +141,9 @@ pub fn newest_since(program_id: &str, cwd: &Path, since_ms: u128) -> Option<Stri
     let output = std::process::Command::new(program_id)
         .args(SESSION_LIST_ARGS)
         .current_dir(cwd)
+        // The daemon may lack the login shell's PATH; resolve the provider
+        // CLI through the same entries a spawn uses.
+        .env("PATH", crate::config::path_value())
         .output()
         .ok()?;
     if !output.status.success() {

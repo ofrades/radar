@@ -1,9 +1,10 @@
-//! VTE attachment to a daemon-owned session.
+//! A client attachment to a daemon-owned session.
 //!
-//! VTE still needs a PTY endpoint to encode keyboard/mouse/paste/IME input.
-//! This module provides only a local renderer bridge; the remote daemon owns
-//! the child and authoritative PTY. Dropping this attachment closes its local
-//! bridge and sockets but does not send Stop.
+//! The daemon owns the child and the authoritative terminal. This module
+//! delivers the lossless snapshot and the raw output stream to the client as
+//! [`ClientEvent`]s, and forwards input and resizes. A small local PTY is kept
+//! only as the input channel. Dropping this attachment closes its sockets but
+//! does not send Stop.
 
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -23,9 +24,19 @@ const POLL_MS: i32 = 50;
 const INPUT_CHUNK: usize = 4096;
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ClientEvent {
     Exit(ExitInfo),
     Failed(String),
+    /// The daemon's lossless snapshot for this attachment. The client decodes
+    /// it into its own engine instead of replaying ANSI.
+    Snapshot(Vec<u8>),
+    /// Raw program output after the snapshot watermark.
+    Bytes(Vec<u8>),
+    /// The program set (or reset) the window title.
+    Title(Option<String>),
+    /// The program rang the terminal bell.
+    Bell,
 }
 
 struct Fd(libc::c_int);
@@ -60,7 +71,7 @@ impl Interrupts {
     }
 }
 
-/// A VTE renderer attached to a persistent daemon session.
+/// A client attached to a persistent daemon session.
 pub struct RemoteSession {
     id: String,
     home: PathBuf,
@@ -120,7 +131,6 @@ impl RemoteSession {
             let interrupts = interrupts.clone();
             let process_id = process_id.clone();
             let emit = emit.clone();
-            let slave = slave;
             std::thread::Builder::new()
                 .name(format!("radar-client-output-{id}"))
                 .spawn(move || {
@@ -129,13 +139,11 @@ impl RemoteSession {
                         &id,
                         spawn,
                         replace_existing,
-                        slave,
                         stop,
                         interrupts,
                         process_id,
                         emit,
                     );
-                    // output_loop owns the slave fd on completion.
                 })?
         };
         let input_worker = {
@@ -298,13 +306,11 @@ fn output_loop(
     id: &str,
     spawn: Spawn,
     replace_existing: bool,
-    slave: Fd,
     stop: Arc<AtomicBool>,
     interrupts: Arc<Interrupts>,
     process_id: Arc<AtomicU32>,
     emit: Arc<dyn Fn(ClientEvent) + Send + Sync>,
 ) {
-    let slave = slave.0;
     let mut create_needed = true;
     let mut replace_needed = replace_existing;
     while !stop.load(Ordering::Acquire) {
@@ -417,9 +423,8 @@ fn output_loop(
                 if let Some(pid) = snapshot.status.pid {
                     process_id.store(pid, Ordering::Release);
                 }
-                if write_bridge(slave, &snapshot.replay, &stop).is_err() {
-                    return;
-                }
+                // The client decodes the lossless snapshot into its own engine.
+                emit(ClientEvent::Snapshot(snapshot.terminal_snapshot.clone()));
                 match snapshot.status.lifecycle {
                     Lifecycle::Exited(info) => emit(ClientEvent::Exit(info)),
                     Lifecycle::Failed(message) => emit(ClientEvent::Failed(message)),
@@ -450,7 +455,6 @@ fn output_loop(
                 if stop.load(Ordering::Acquire) {
                     return;
                 }
-                let _ = write_bridge(slave, b"\x1bc\x1b[?25h", &stop);
                 eprintln!("radar: session {id} attachment reset: {error}");
                 std::thread::sleep(Duration::from_millis(40));
                 continue;
@@ -463,12 +467,7 @@ fn output_loop(
             }
             match client.receive() {
                 Ok(Response::Output(item)) => match item.event {
-                    Output::Bytes(bytes) => {
-                        if write_bridge(slave, &bytes, &stop).is_err() {
-                            Interrupts::clear(&interrupts.output);
-                            return;
-                        }
-                    }
+                    Output::Bytes(bytes) => emit(ClientEvent::Bytes(bytes)),
                     Output::Resize(_) => {}
                     Output::Closed => {
                         Interrupts::clear(&interrupts.output);
@@ -498,9 +497,8 @@ fn output_loop(
             }
         }
         Interrupts::clear(&interrupts.output);
-        // Resnapshot after an explicit lag or truncated socket. The reset and
-        // complete display replay establish a new rendering checkpoint.
-        let _ = write_bridge(slave, b"\x1bc\x1b[?25h", &stop);
+        // Resnapshot after an explicit lag or truncated socket: the next
+        // attach delivers a fresh snapshot that replaces the client state.
     }
 }
 
@@ -567,6 +565,8 @@ fn feedback_loop(
                                 emit(ClientEvent::Failed(message));
                             }
                             Feedback::StreamClosed => stream_closed = true,
+                            Feedback::Title(title) => emit(ClientEvent::Title(title)),
+                            Feedback::Bell => emit(ClientEvent::Bell),
                             _ => {}
                         },
                         Ok(Response::ResyncRequired) | Err(_) => break,
@@ -593,7 +593,6 @@ fn input_loop(home: &Path, id: &str, slave: Fd, master: Fd, stop: Arc<AtomicBool
     let master = master.0;
     let mut last_size = None;
     let mut buffer = [0; INPUT_CHUNK];
-    let mut reply_filter = ReplyFilter::default();
     while !stop.load(Ordering::Acquire) {
         let mut descriptor = libc::pollfd {
             fd: slave,
@@ -609,7 +608,7 @@ fn input_loop(home: &Path, id: &str, slave: Fd, master: Fd, stop: Arc<AtomicBool
         if descriptor.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
             let count = unsafe { libc::read(slave, buffer.as_mut_ptr().cast(), buffer.len()) };
             if count > 0 {
-                let bytes = reply_filter.filter(&buffer[..count as usize]);
+                let bytes = buffer[..count as usize].to_vec();
                 if !bytes.is_empty() {
                     let _ = Client::request(
                         home,
@@ -647,124 +646,9 @@ fn winsize_of(fd: libc::c_int) -> Option<Dims> {
     })
 }
 
-fn write_bridge(fd: libc::c_int, mut bytes: &[u8], stop: &AtomicBool) -> Result<()> {
-    while !bytes.is_empty() {
-        if stop.load(Ordering::Acquire) {
-            bail!("attachment closed");
-        }
-        let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        if n > 0 {
-            bytes = &bytes[n as usize..];
-            continue;
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        if error.kind() == io::ErrorKind::WouldBlock {
-            let mut poll = libc::pollfd {
-                fd,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            unsafe {
-                libc::poll(&mut poll, 1, POLL_MS);
-            }
-            continue;
-        }
-        return Err(error.into());
-    }
-    Ok(())
-}
-
-/// VTE may automatically answer server-owned DSR/DA/OSC/DCS queries. Strip
-/// emulator-generated control replies from the local PTY input before sending
-/// it to the daemon; ordinary keys, mouse reports and paste remain byte exact.
-#[derive(Default)]
-struct ReplyFilter {
-    sequence: Vec<u8>,
-}
-
-impl ReplyFilter {
-    fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
-        let mut output = Vec::new();
-        for byte in bytes.iter().copied() {
-            if self.sequence.is_empty() {
-                if byte == 0x1b {
-                    self.sequence.push(byte);
-                } else {
-                    output.push(byte);
-                }
-                continue;
-            }
-            self.sequence.push(byte);
-            match self.sequence.as_slice() {
-                [0x1b] => continue,
-                [0x1b, b'[', ..] => {
-                    if self.sequence.len() > 2 && (0x40..=0x7e).contains(&byte) {
-                        let is_reply = matches!(byte, b'R' | b'c' | b'n');
-                        if !is_reply {
-                            output.extend_from_slice(&self.sequence);
-                        }
-                        self.sequence.clear();
-                    }
-                }
-                [0x1b, b']', ..] => {
-                    if byte == 0x07 || self.sequence.ends_with(b"\x1b\\") {
-                        self.sequence.clear();
-                    }
-                }
-                [0x1b, b'P', ..] => {
-                    if self.sequence.ends_with(b"\x1b\\") {
-                        self.sequence.clear();
-                    }
-                }
-                [0x1b, ..] => {
-                    output.extend_from_slice(&self.sequence);
-                    self.sequence.clear();
-                }
-                _ => {
-                    output.extend_from_slice(&self.sequence);
-                    self.sequence.clear();
-                }
-            }
-            if self.sequence.len() > 4096 {
-                output.extend_from_slice(&self.sequence);
-                self.sequence.clear();
-            }
-        }
-        output
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn reply_filter_keeps_input_and_removes_terminal_query_responses() {
-        let mut filter = ReplyFilter::default();
-        let mut forwarded = Vec::new();
-        for chunk in [
-            b"hello\x1b[".as_slice(),
-            b"1;2Rworld\x1b[?1;2c",
-            b"\x1b]4;1;rgb:ff/00/00\x07x",
-        ] {
-            forwarded.extend(filter.filter(chunk));
-        }
-        assert_eq!(forwarded, b"helloworldx");
-    }
-
-    #[test]
-    fn reply_filter_preserves_nonreply_csi_and_plain_escape_keys() {
-        let mut filter = ReplyFilter::default();
-        assert_eq!(
-            filter.filter(b"\x1b[A\x1b[200~paste\x1b[201~"),
-            b"\x1b[A\x1b[200~paste\x1b[201~"
-        );
-        assert_eq!(filter.filter(b"\x1b"), b"");
-        assert_eq!(filter.filter(b"x"), b"\x1bx");
-    }
 
     #[test]
     fn refused_attach_restarts_daemon_and_retries_protocol_attach() {

@@ -8,8 +8,6 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line};
 use radar::session::daemon::{socket_path, Client, Command as Request, Response, VERSION};
 use radar::session::registry::{Feedback, Lifecycle, Output, Snapshot, Spawn};
 use radar::session::Dims;
@@ -114,12 +112,17 @@ fn until(mut condition: impl FnMut() -> bool) {
 }
 
 fn text(snapshot: &Snapshot) -> String {
-    (0..snapshot.grid.screen_lines())
-        .flat_map(|row| {
-            (0..snapshot.grid.columns())
-                .map(move |col| snapshot.grid[Line(row as i32)][Column(col)].c)
-        })
-        .collect()
+    let terminal = radar::ghostty::Terminal::from_snapshot(&snapshot.terminal_snapshot);
+    let mut render = radar::ghostty::render::RenderState::new();
+    let frame = render.frame(&terminal);
+    let mut text = String::new();
+    for row in &frame.lines {
+        for cell in &row.cells {
+            text.push_str(&cell.text);
+        }
+        text.push('\n');
+    }
+    text
 }
 
 #[test]
@@ -188,10 +191,9 @@ fn maximum_screen_with_full_history_can_attach_within_client_timeout() {
         Response::Sessions(sessions) => sessions[0].title.as_deref() == Some("ready"),
         other => panic!("unexpected response {other:?}"),
     });
-    // Use the real client's normal timeout: a valid display must remain attachable
-    // even when the bounded scrollback is full, without extending timeouts.
+    // Use the real client's normal timeout: a valid snapshot must remain
+    // attachable even with a full scrollback, without extending timeouts.
     let (snapshot, _stream) = daemon.attach();
-    assert_eq!(snapshot.history_lines, 10_000);
     assert_eq!(
         snapshot.dims,
         Dims {
@@ -199,7 +201,9 @@ fn maximum_screen_with_full_history_can_attach_within_client_timeout() {
             rows: 300
         }
     );
-    assert!(!snapshot.replay.is_empty());
+    assert!(!snapshot.terminal_snapshot.is_empty());
+    // The full-history snapshot decodes into a terminal on its own.
+    let _terminal = radar::ghostty::Terminal::from_snapshot(&snapshot.terminal_snapshot);
 }
 
 #[test]
@@ -320,118 +324,6 @@ fn stream_and_watch_finish_when_attaching_to_an_ended_session() {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-}
-
-#[cfg(feature = "vte")]
-#[test]
-fn vte_bridge_restores_snapshot_forwards_input_and_detaches_without_stopping_process() {
-    use radar::session::client::RemoteSession;
-
-    fn wait_output(fd: libc::c_int, output: &mut Vec<u8>, text: &str) {
-        let deadline = Instant::now() + Duration::from_secs(4);
-        let mut poll = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        while !String::from_utf8_lossy(output).contains(text) {
-            assert!(
-                Instant::now() < deadline,
-                "renderer did not receive {text:?}: {}",
-                String::from_utf8_lossy(output)
-            );
-            unsafe {
-                libc::poll(&mut poll, 1, 100);
-            }
-            let mut buffer = [0_u8; 8192];
-            let n = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
-            if n > 0 {
-                output.extend_from_slice(&buffer[..n as usize]);
-            }
-        }
-    }
-
-    let daemon = Daemon::start();
-    let spawn = Spawn {
-        id: "test".into(),
-        argv: vec!["/bin/sh".into(), "-c".into(), "printf 'daemon-banner'; read first; printf '\\r\\nreceived:%s' \"$first\"; read second; printf '\\r\\nagain:%s' \"$second\"; sleep 1".into()],
-        cwd: daemon.home.path().to_owned(),
-        env: vec![("RADAR_SESSION_TEST".into(), "yes".into())],
-        env_remove: vec!["COLORTERM".into()],
-        dims: Dims { cols: 80, rows: 24 },
-    };
-    let mut output = Vec::new();
-    let first = RemoteSession::attach(
-        daemon.home.path(),
-        "test".into(),
-        spawn.clone(),
-        false,
-        |_| {},
-    )
-    .unwrap();
-    wait_output(first.client_fd(), &mut output, "daemon-banner");
-    let pid = first
-        .process_id()
-        .expect("freshly created daemon session has a PID");
-    assert_eq!(first.process_id(), Some(pid));
-    assert_eq!(
-        unsafe { libc::write(first.client_fd(), b"hello\n".as_ptr().cast(), 6) },
-        6
-    );
-    wait_output(first.client_fd(), &mut output, "received:hello");
-    drop(first);
-
-    let session = daemon.request(Request::List);
-    assert!(
-        matches!(session, Response::Sessions(ref entries) if entries[0].pid == Some(pid) && entries[0].lifecycle == Lifecycle::Running)
-    );
-    let second =
-        RemoteSession::attach(daemon.home.path(), "test".into(), spawn, false, |_| {}).unwrap();
-    let mut restored = Vec::new();
-    wait_output(second.client_fd(), &mut restored, "received:hello");
-    assert_eq!(second.process_id(), Some(pid));
-    assert_eq!(
-        unsafe { libc::write(second.client_fd(), b"world\n".as_ptr().cast(), 6) },
-        6
-    );
-    wait_output(second.client_fd(), &mut restored, "again:world");
-}
-
-#[cfg(feature = "vte")]
-#[test]
-fn vte_attachment_reports_an_ended_session_once() {
-    use radar::session::client::{ClientEvent, RemoteSession};
-
-    let daemon = Daemon::start();
-    daemon.spawn("exit 7");
-    until(|| {
-        matches!(daemon.request(Request::List), Response::Sessions(ref entries)
-            if entries[0].stream_closed && matches!(entries[0].lifecycle, Lifecycle::Exited(_)))
-    });
-    let spawn = Spawn {
-        id: "test".into(),
-        argv: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
-        cwd: daemon.home.path().to_owned(),
-        env: Vec::new(),
-        env_remove: Vec::new(),
-        dims: Dims { cols: 80, rows: 24 },
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _session = RemoteSession::attach(
-        daemon.home.path(),
-        "test".into(),
-        spawn,
-        false,
-        move |event| {
-            let _ = tx.send(event);
-        },
-    )
-    .unwrap();
-    assert!(matches!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-        ClientEvent::Exit(info) if info.code == 7
-    ));
-    assert!(rx.recv_timeout(Duration::from_millis(250)).is_err());
 }
 
 #[test]
@@ -882,7 +774,7 @@ fn created_sessions_are_cataloged_and_end_with_their_process() {
             "printf ready; sleep 60".into(),
         ],
         cwd: daemon.home.path().join("project-99"),
-        env: Vec::new(),
+        env: vec![("RADAR_CARD_ID".into(), "todo-99".into())],
         env_remove: Vec::new(),
         dims: Dims { cols: 80, rows: 24 },
     })) {
@@ -895,6 +787,7 @@ fn created_sessions_are_cataloged_and_end_with_their_process() {
     assert_eq!(entries[0].radar_session_id.as_deref(), Some(id));
     assert_eq!(entries[0].provider, "opencode");
     assert_eq!(entries[0].lifecycle, "running");
+    assert_eq!(entries[0].card_id.as_deref(), Some("todo-99"));
     let catalog_id = entries[0].id;
 
     daemon.request(Request::Stop { id: id.into() });
@@ -913,6 +806,7 @@ fn created_sessions_are_cataloged_and_end_with_their_process() {
     let archived = catalog_entries(&daemon, catalog_list(&daemon, CatalogFilter::Archived));
     assert_eq!(archived.len(), 1);
     assert_eq!(archived[0].id, catalog_id);
+    assert_eq!(archived[0].card_id.as_deref(), Some("todo-99"));
 }
 
 /// Sessions that predate the catalog are backfilled by CatalogSeen; the
@@ -978,4 +872,47 @@ fn provider_binding_upgrades_a_session_row() {
     assert_eq!(entries[0].provider_session_id, "ses_manual");
     assert_eq!(entries[0].radar_session_id.as_deref(), Some(id));
     let _ = daemon.request(Request::Stop { id: id.into() });
+}
+
+/// The daemon's attach snapshot is a real libghostty-vt snapshot: detach and
+/// reattach mid-escape, decode, and the restored terminal continues exactly
+/// where a terminal that saw the whole stream would.
+#[test]
+fn daemon_attach_snapshot_resumes_a_mid_escape_cut_after_reattach() {
+    use radar::ghostty::Terminal;
+
+    let daemon = Daemon::start();
+    daemon.spawn("printf '\\033]0;ready\\007abc\\033[38;5'; sleep 60");
+
+    // Wait until the daemon has parsed the prefix (the partial SGR follows it
+    // in the same write, so "abc" in the grid means the cut is in the parser).
+    until(|| {
+        let (snapshot, client) = daemon.attach();
+        let seen = text(&snapshot).contains("abc");
+        drop(client);
+        seen
+    });
+
+    // Close the attachment, then reopen it while the program keeps running.
+    let (first, client) = daemon.attach();
+    assert!(
+        !first.terminal_snapshot.is_empty(),
+        "attach did not carry a snapshot"
+    );
+    drop(client);
+    let (reopened, _client) = daemon.attach();
+    assert!(matches!(reopened.status.lifecycle, Lifecycle::Running));
+
+    let bytes = reopened.terminal_snapshot.clone();
+    let mut restored = Terminal::from_snapshot(&bytes);
+    restored.write(b";196m!");
+    let mut reference = Terminal::new(80, 24);
+    reference.write(b"\x1b]0;ready\x07abc\x1b[38;5;196m!");
+
+    assert_eq!(
+        restored.cursor(),
+        reference.cursor(),
+        "reattached snapshot diverged from the full stream"
+    );
+    assert_eq!(restored.title(), "ready");
 }

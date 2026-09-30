@@ -59,8 +59,8 @@ entries across all projects.
 
 Agents, editors and diff tools are terminal programs, and terminal programs
 want a real terminal: mouse, clipboard, OSC 52, hyperlinks, key protocols. radar
-gives each one an embedded terminal (VTE) inside a native window, instead of
-imposing an editor's key handling on top of it.
+gives each one an embedded terminal (libghostty-vt) inside a native window,
+instead of imposing an editor's key handling on top of it.
 
 Agents are run exactly as their authors shipped them — the CLI/TUI, in a
 terminal, with the project as its working directory. No API adapters, no
@@ -70,25 +70,27 @@ all of its own behaviour.
 ## Install / build
 
 ```bash
-# the terminal widget the app embeds (Arch, via omarchy)
-omarchy pkg add vte4
+mise install                             # Zig 0.16.0 for the pinned libghostty-vt
 
 cd ~/Work/radar
-cargo build --release --features vte     # full app, embedded terminals
+cargo build --release --features gui # full app, embedded terminals
 ./target/release/radar
 ```
 
-`vte4` is optional: without it, build with `--features gui` and the app still
-works — each tab then offers **Open in a terminal window** instead of embedding
-the program. That keeps radar usable on a machine where you cannot install VTE.
+The terminal engine is libghostty-vt, built from a pinned Ghostty revision with
+Zig; see [`docs/libghostty-vt.md`](docs/libghostty-vt.md). `--features gui` adds
+the GTK app; without it the CLI and the session daemon still work.
 
 ## Testing
 
-- `cargo test --features vte` — unit tests, including the board store's schema
+- `cargo test` — unit tests, including the board store's schema
   migrations and the desktop-notification policy.
-- `cargo test --features vte --test board_store` — the board store end to end
+- `cargo test --test board_store` — the board store end to end
   against a real daemon: the card lifecycle, the conversation thread, revision
   conflicts, and restart durability.
+- `cargo test --test ghostty_snapshot` — builds the pinned
+  libghostty-vt (Zig 0.16.0 via `mise install`) and round-trips a terminal
+  snapshot taken mid-escape and mid-UTF-8. See `docs/libghostty-vt.md`.
 - `./scripts/smoke.sh [--notify]` — the GUI offscreen (broadway + chromium):
   build, render Home's board, and, with `--notify`, raise a card question and
   assert the GUI emits a desktop `Notify`. Runs against a scratch `RADAR_HOME`
@@ -130,9 +132,10 @@ choices in this same overlay.
 
 **Home** (`Alt+Home` / `Alt+B`, or the workspace's Home button) is the
 cockpit when you have projects: a needs-you inbox over a row of project lanes,
-each with its to-dos, board counts and running sessions, and the actions to
-drive them without opening a terminal. A big **Add a project** card above the
-lanes opens one picker: search the scan root for a folder to add, or type a
+each with its to-dos (every one showing the state of the session bound to it)
+and board counts, and the actions to drive them without opening a terminal. A
+big **Add a project** card above the lanes opens one picker: search the scan
+root for a folder to add, or type a
 name to create a new folder with `git init` in it — the new project's view
 opens without starting an agent. With no projects yet Home offers the same.
 Tool programs and workspace layout live in **Preferences** (`Alt+,`), not on
@@ -246,10 +249,9 @@ persistent request record before resuming, so a response is not lost to replay
 limits.
 
 See [the daemon guide](docs/session-daemon.md) for commands and protocol details.
-The GUI autostarts the daemon; with VTE enabled, its local PTY is only the VTE
-input adapter for daemon-owned sessions. Snapshot replay restores the active
-screen, common modes and recent scrollback, but full parser-state restoration
-remains the next terminal compatibility step.
+The GUI autostarts the daemon; it decodes the daemon's lossless libghostty-vt
+snapshot into its own engine, so close/reopen mid-escape restores the exact
+screen, modes, scrollback and unfinished parser input.
 
 Agent conversation history is provider-specific. Radar imports and reopens exact
 OpenCode conversations from OpenCode's JSON session list. OpenCode, OMP, and
@@ -266,8 +268,8 @@ session list.
 project, see its Radar-launched sessions and activity, answer outstanding agent
 requests, open running sessions interactively or ended sessions read-only, and
 start a project shell. Detaching the web terminal leaves a running session alive.
-The browser terminal is rendered with xterm.js; it is independent of the native
-VTE/Ghostty renderer.
+The browser decodes the same libghostty-vt snapshots via WASM and renders
+`RenderState` to a canvas.
 
 To keep the client running with your user session, install and enable the
 packaged systemd user unit; see [the web client guide](docs/web-client.md).
@@ -319,7 +321,10 @@ When disabled, Radar does not create or open the board and its claim guards
 allow edits and commits. A lane is a named status (`Todo`, `In progress`,
 `Review`, `Done`, or your own); a card has a title, a markdown body, a claim,
 and a lane, and it is done exactly while it sits in a done lane. Cards carry
-real ids, so moves, claims and edits are exact. The store is authoritative:
+real ids, so moves, claims and edits are exact. Claiming is what starts a card:
+a card claimed out of Todo moves to In progress in the same step, and releasing
+it moves it back, so the board shows what is being worked on without an agent
+moving it by hand. The store is authoritative:
 there is no `BOARD.md` to read or write. Boards from before the store landed
 were imported once, then left untouched on disk.
 
@@ -421,6 +426,11 @@ hooks, but nothing needs to be configured for the gate to hold.
   decides which one leads the list; for that agent radar runs
   `omarchy agent --inline` so omarchy keeps owning the flags. `omarchy agent`
   and radar agree, always.
+- **Agents installed with mise**: radar asks `mise bin-paths` for the user's
+  tool directories and prepends them to the `PATH` of every program it
+  launches. Agents under `~/.local/share/mise` are therefore found even when
+  radar was started by a desktop session or the `radar-web.service` unit
+  without the login shell's `PATH`.
 - **Theme**: colours come from
   `~/.local/state/omarchy/current/theme/colors.toml` and the font from your
   terminal config, so panes look like your terminal. A file monitor re-applies
@@ -434,7 +444,7 @@ hooks, but nothing needs to be configured for the gate to hold.
 ```bash
 cargo test                  # store, board, skill, git parsing, registry, discovery
 cargo clippy --all-targets  # clean
-cargo build --features gui  # no VTE needed
+cargo build --features gui  # the full app (GTK + libghostty-vt)
 ```
 
 Layout:

@@ -47,7 +47,8 @@ out of each other's way. There is no file to edit.
 
 1. Claim work before editing anything:
    `radar card next --by "$RADAR_AGENT"` — claims the first unclaimed card in
-   your name and prints it.
+   your name and prints it. Claiming starts the card: a card claimed from Todo
+   moves to In progress for you, and releasing it moves it back.
 2. Work one card at a time, and only what the card describes.
 3. Blocked, or the card is wrong? Leave a note on it
    (`radar card comment "<card id or title>" "…"`), release it with

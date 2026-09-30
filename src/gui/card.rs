@@ -27,6 +27,197 @@ use crate::session::activity::{
 };
 use crate::session::daemon::{Client, Command};
 
+/// Store-backed editor. A failed save leaves the draft intact; optimistic
+/// revisions prevent overwriting another editor or agent's changes. Socket I/O
+/// runs off the GTK thread so the dialog stays responsive while saving.
+pub(super) fn edit_dialog(
+    parent: &impl IsA<gtk::Window>,
+    home: &Path,
+    project_id: i64,
+    card: crate::session::board_store::StoredCard,
+    on_saved: impl Fn() + 'static,
+) -> gtk::Window {
+    let window = gtk::Window::builder()
+        .title("Edit card")
+        .transient_for(parent)
+        .modal(true)
+        .default_width(460)
+        .default_height(340)
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    content.set_margin_top(14);
+    content.set_margin_bottom(14);
+    content.set_margin_start(14);
+    content.set_margin_end(14);
+    let title = gtk::Entry::new();
+    title.set_text(&card.title);
+    title.set_placeholder_text(Some("Title"));
+    content.append(&title);
+    let body = gtk::TextView::new();
+    body.buffer().set_text(&card.body);
+    body.set_wrap_mode(gtk::WrapMode::WordChar);
+    let scroll = gtk::ScrolledWindow::builder()
+        .min_content_height(160)
+        .vexpand(true)
+        .child(&body)
+        .build();
+    content.append(&scroll);
+    let feedback = board::activity_label("", false);
+    feedback.add_css_class("error");
+    feedback.set_visible(false);
+    content.append(&feedback);
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+    buttons.append(&cancel);
+    let save = gtk::Button::with_label("Save");
+    save.add_css_class("suggested-action");
+    buttons.append(&save);
+    content.append(&buttons);
+    window.set_child(Some(&content));
+
+    let home = home.to_path_buf();
+    let window_for_save = window.clone();
+    let on_saved = Rc::new(on_saved);
+    save.connect_clicked(move |save| {
+        let new_title = title.text().trim().to_string();
+        if new_title.is_empty() {
+            feedback.set_text("A card needs a title.");
+            feedback.set_visible(true);
+            title.grab_focus();
+            return;
+        }
+        let buffer = body.buffer();
+        let text = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string();
+        if new_title == card.title && text == card.body {
+            window_for_save.close();
+            return;
+        }
+        feedback.set_visible(false);
+        save.set_sensitive(false);
+        cancel.set_sensitive(false);
+        title.set_sensitive(false);
+        body.set_sensitive(false);
+        save.set_label("Saving…");
+        let home = home.clone();
+        let card_id = card.id.clone();
+        let revision = card.revision;
+        let command = super::gui_command_id("edit");
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = crate::session::daemon::board_card_update(
+                &home,
+                project_id,
+                &card_id,
+                Some(&new_title),
+                Some(&text),
+                Some(revision),
+                &command,
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+            let _ = tx.send_blocking(result);
+        });
+        let (window, save, cancel, title, body, feedback, on_saved) = (
+            window_for_save.clone(),
+            save.clone(),
+            cancel.clone(),
+            title.clone(),
+            body.clone(),
+            feedback.clone(),
+            on_saved.clone(),
+        );
+        gtk::glib::MainContext::default().spawn_local(async move {
+            match rx.recv().await {
+                Ok(Ok(())) => {
+                    window.close();
+                    on_saved();
+                }
+                result => {
+                    let error = match result {
+                        Ok(Err(error)) => error,
+                        Err(error) => error.to_string(),
+                        Ok(Ok(())) => unreachable!(),
+                    };
+                    feedback.set_text(&format!("Could not save: {error}"));
+                    feedback.set_visible(true);
+                    save.set_label("Save");
+                    save.set_sensitive(true);
+                    cancel.set_sensitive(true);
+                    title.set_sensitive(true);
+                    body.set_sensitive(true);
+                }
+            }
+        });
+    });
+    window.present();
+    window
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a private D-Bus session and GTK display"]
+    fn editor_validates_titles_and_closes_unchanged_without_writing() {
+        gtk::init().unwrap();
+        let parent = gtk::Window::new();
+        let home = tempfile::tempdir().unwrap();
+        let card = crate::session::board_store::StoredCard {
+            id: "card".into(),
+            project_id: 1,
+            lane_id: 1,
+            lane: "Todo".into(),
+            done: false,
+            position: 0,
+            title: "Original".into(),
+            body: "Draft".into(),
+            claim: None,
+            revision: 1,
+            created_at_millis: 0,
+            updated_at_millis: 0,
+        };
+        let window = edit_dialog(&parent, home.path(), 1, card, || {
+            panic!("unchanged card was saved")
+        });
+        let content = window.child().unwrap();
+        let title = content
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Entry>()
+            .unwrap();
+        let feedback = title
+            .next_sibling()
+            .unwrap()
+            .next_sibling()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        let save = content
+            .last_child()
+            .unwrap()
+            .last_child()
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        title.set_text("   ");
+        save.emit_clicked();
+        assert!(window.is_visible());
+        assert!(feedback.is_visible());
+        assert_eq!(feedback.text(), "A card needs a title.");
+        title.set_text("Original");
+        save.emit_clicked();
+        assert!(!window.is_visible());
+        assert!(home.path().read_dir().unwrap().next().is_none());
+        parent.close();
+    }
+}
+
 /// Build the in-app card detail. Rebuilt by `App::refresh_home` whenever the
 /// journal or board changes, so it always shows the current conversation.
 pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
@@ -85,6 +276,31 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
     meta.add_css_class("caption");
     meta.add_css_class("dim-label");
     inner.append(&meta);
+
+    // The card's stable id, visible and copyable: how a human hands this
+    // exact card to another agent (`radar card show "<id>"`).
+    let id_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let id_label = gtk::Label::new(Some(&card.id));
+    id_label.set_xalign(0.0);
+    id_label.set_selectable(true);
+    id_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    id_label.add_css_class("card-panel-id");
+    id_row.append(&id_label);
+    let copy = gtk::Button::with_label("Copy id");
+    copy.add_css_class("flat");
+    copy.add_css_class("card-panel-copy");
+    copy.set_tooltip_text(Some("Copy this card's id, to reference it to an agent"));
+    {
+        let id = card.id.clone();
+        let toasts = app.toasts.clone();
+        let window = app.window.clone();
+        copy.connect_clicked(move |_| {
+            window.clipboard().set_text(&id);
+            toasts.add_toast(adw::Toast::new("Card id copied"));
+        });
+    }
+    id_row.append(&copy);
+    inner.append(&id_row);
 
     if !card.body.trim().is_empty() {
         let body = markdown::render(&card.body);
@@ -146,6 +362,72 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
     open_board.set_action_target_value(Some(&project_id.to_variant()));
     controls.append(&open_board);
     inner.append(&controls);
+
+    let session_heading = board::activity_label("Linked sessions", false);
+    session_heading.add_css_class("lane-section");
+    inner.append(&session_heading);
+    if app.todo_origin.get().is_some() && app.home_nav.borrow().len() == 1 {
+        let back = gtk::Button::with_label("Back to session");
+        back.set_halign(gtk::Align::Start);
+        back.set_action_name(Some("win.home-back"));
+        inner.append(&back);
+    }
+    let sessions = app
+        .agent_sessions
+        .borrow()
+        .by_project
+        .get(&project_id)
+        .cloned()
+        .unwrap_or_default();
+    let linked: Vec<_> = sessions
+        .iter()
+        .filter(|session| {
+            app.session_card_id(project_id, session).as_deref() == Some(card.id.as_str())
+        })
+        .collect();
+    if linked.is_empty() {
+        inner.append(&board::activity_label("No linked session yet.", true));
+        let open = gtk::Button::with_label(if card.claim.is_some() {
+            "Open claimed session"
+        } else {
+            "Start session"
+        });
+        open.set_halign(gtk::Align::Start);
+        if let Some(claim) = &card.claim {
+            open.set_action_name(Some("win.open-claim"));
+            open.set_action_target_value(Some(&(project_id, claim.as_str()).to_variant()));
+        } else {
+            open.set_action_name(Some("win.card-session-create"));
+            open.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
+            open.set_sensitive(!card.done);
+        }
+        inner.append(&open);
+    }
+    for session in linked {
+        let running = super::live_agents::sidebar_session_is_live(session);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let label = board::activity_label(&session.title, false);
+        label.set_hexpand(true);
+        row.append(&label);
+        row.append(&board::activity_label(
+            if running { "Running" } else { "Stopped" },
+            true,
+        ));
+        let open = gtk::Button::with_label(if running {
+            "Open session"
+        } else {
+            "Resume session"
+        });
+        open.set_action_name(Some("win.todo-session"));
+        open.set_action_target_value(Some(&(project_id, session.id.as_str()).to_variant()));
+        let can_open = running || super::live_agents::exact_provider_session_id(session).is_some();
+        open.set_sensitive(can_open);
+        if !can_open {
+            open.set_tooltip_text(Some("The agent did not report an exact conversation id; a different session will not be opened instead."));
+        }
+        row.append(&open);
+        inner.append(&row);
+    }
 
     inner.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 

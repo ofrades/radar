@@ -22,18 +22,24 @@ use super::activity::{
     ActivitySnapshot, ActivitySubscription, Attention, AttentionMutationResult, ChangeAttention,
     CreateAttention, CreateAttentionResult, PublishActivity, WatchResult,
 };
-use super::board_store::{BoardChange, BoardState, BoardStore};
+use super::agent::{AgentHost, AgentStart, AgentStatus};
+use super::beads_store::BeadsBoardStore;
+use super::board_store::{Board, BoardChange, BoardState, BoardStore};
 use super::catalog::{self, CatalogFilter, SessionCatalog};
 use super::registry::{
-    Feedback, History, Lifecycle, Output, ReceiveError, Registry, Sequenced, Snapshot, Spawn,
-    Status, Subscription,
+    Feedback, Lifecycle, Output, ReceiveError, Registry, Sequenced, Snapshot, Spawn, Status,
+    Subscription,
 };
 use super::Dims;
 
 pub const VERSION: u32 = 2;
 const MAX_REQUEST: usize = 128 * 1024;
 const MAX_RESPONSE: usize = 128 * 1024 * 1024;
-const SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a client or server waits on a socket read. Generous enough for the
+/// one slow operation a request can carry — creating a project's Beads
+/// workspace (`bd init`, a few seconds) on first board access — while still
+/// bounding a hung peer.
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often the daemon re-reads a provider's own session store per project.
 const PROVIDER_IMPORT_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -53,12 +59,6 @@ pub enum Command {
     },
     Watch {
         id: String,
-    },
-    History {
-        id: String,
-        sequence: u64,
-        offset: usize,
-        limit: usize,
     },
     Input {
         id: String,
@@ -175,6 +175,23 @@ pub enum Command {
         lane: Option<String>,
         command_id: String,
     },
+    /// Start an ACP agent session owned by the daemon.
+    AgentStart(AgentStart),
+    /// Send a prompt to a running ACP agent.
+    AgentPrompt {
+        id: String,
+        text: String,
+    },
+    /// Ask an ACP agent to cancel its current turn.
+    AgentCancel {
+        id: String,
+    },
+    /// Stop an ACP agent and close its connection.
+    AgentStop {
+        id: String,
+    },
+    /// Every ACP agent the daemon is running.
+    AgentList,
 }
 
 /// A project as the catalog knows it: the client supplies the roster, since
@@ -195,7 +212,6 @@ pub enum Response {
     Status(Status),
     Sessions(Vec<Status>),
     Snapshot(Box<Snapshot>),
-    History(History),
     Watching {
         status: Status,
         sequence: u64,
@@ -217,6 +233,8 @@ pub enum Response {
     BoardState(BoardState),
     CardChanged(Box<BoardChange>),
     CardNext(Option<Box<BoardChange>>),
+    AgentStatus(AgentStatus),
+    Agents(Vec<AgentStatus>),
 }
 
 /// Socket directory is private even when the surrounding RADAR_HOME is shared.
@@ -231,7 +249,8 @@ pub struct Server {
     registry: Arc<Registry>,
     activity: Arc<ActivityJournal>,
     catalog: Arc<SessionCatalog>,
-    board: Arc<BoardStore>,
+    board: Arc<dyn Board>,
+    agents: Arc<AgentHost>,
     /// Last provider-history refresh per project root.
     imports: Arc<Mutex<HashMap<PathBuf, Instant>>>,
     stopping: Arc<AtomicBool>,
@@ -257,7 +276,18 @@ impl Server {
         }
         let activity = Arc::new(ActivityJournal::open(&directory.join("activity.sqlite"))?);
         let catalog = Arc::new(SessionCatalog::open(&directory.join("catalog.sqlite"))?);
-        let board = Arc::new(BoardStore::open(&directory.join("board.sqlite"))?);
+        // Beads is the board's default store. The old SQLite board is opened
+        // only to migrate its cards into the project's Beads workspace, and is
+        // the fallback when bd is not installed.
+        let legacy = BoardStore::open(&directory.join("board.sqlite"))?;
+        let board: Arc<dyn Board> =
+            match BeadsBoardStore::open(directory.join("beads"), Some(legacy)) {
+                Ok(store) => Arc::new(store),
+                Err(error) => {
+                    eprintln!("radar: Beads is unavailable ({error}); using the SQLite board");
+                    Arc::new(BoardStore::open(&directory.join("board.sqlite"))?)
+                }
+            };
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -274,6 +304,7 @@ impl Server {
             activity,
             catalog,
             board,
+            agents: Arc::new(AgentHost::default()),
             imports: Arc::new(Mutex::new(HashMap::new())),
             stopping: Arc::new(AtomicBool::new(false)),
         })
@@ -296,6 +327,7 @@ impl Server {
                     let activity = self.activity.clone();
                     let catalog = self.catalog.clone();
                     let board = self.board.clone();
+                    let agents = self.agents.clone();
                     let imports = self.imports.clone();
                     let stopping = self.stopping.clone();
                     workers.push(std::thread::spawn(move || {
@@ -306,6 +338,7 @@ impl Server {
                             activity,
                             catalog,
                             board,
+                            agents,
                             imports,
                             stopping,
                         ) {
@@ -324,6 +357,7 @@ impl Server {
             }
         }
         self.registry.stop_all();
+        self.agents.stop_all();
         for worker in workers {
             let _ = worker.join();
         }
@@ -335,6 +369,7 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
         self.registry.stop_all();
+        self.agents.stop_all();
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -344,7 +379,8 @@ fn serve(
     registry: Arc<Registry>,
     activity: Arc<ActivityJournal>,
     catalog: Arc<SessionCatalog>,
-    board: Arc<BoardStore>,
+    board: Arc<dyn Board>,
+    agents: Arc<AgentHost>,
     imports: Arc<Mutex<HashMap<PathBuf, Instant>>>,
     stopping: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -361,16 +397,18 @@ fn serve(
     let response = match request.command {
         Command::Ping => Response::Hello { version: VERSION },
         Command::Create(spec) => {
-            let status = registry.create(spec.clone())?.status();
+            let session = registry.create(spec.clone())?;
+            let status = session.status();
             if let Some(project_id) = catalog::project_of_session_id(&status.id) {
                 let provider = catalog::provider_of_session_id(&status.id)
                     .unwrap_or_else(|| "shell".to_string());
-                if let Err(error) = catalog.record_radar(
+                if let Err(error) = catalog.record_radar_with_card(
                     project_id,
                     &status.id,
                     &provider,
                     &spec.cwd,
                     catalog::now_millis(),
+                    session.card_id(),
                 ) {
                     eprintln!("radar session catalog: {error:#}");
                 }
@@ -378,12 +416,6 @@ fn serve(
             Response::Status(status)
         }
         Command::List => Response::Sessions(registry.list()),
-        Command::History {
-            id,
-            sequence,
-            offset,
-            limit,
-        } => Response::History(registry.get(&id)?.history(sequence, offset, limit)?),
         Command::Input { id, bytes } => {
             registry.get(&id)?.input(bytes)?;
             Response::Ok
@@ -402,6 +434,7 @@ fn serve(
         }
         Command::Shutdown => {
             registry.stop_all();
+            agents.stop_all();
             stopping.store(true, Ordering::Release);
             Response::Ok
         }
@@ -461,7 +494,15 @@ fn serve(
             program,
             cwd,
         } => {
-            catalog.record_radar(project_id, &radar_id, &program, &cwd, catalog::now_millis())?;
+            let session = registry.get(&radar_id).ok();
+            catalog.record_radar_with_card(
+                project_id,
+                &radar_id,
+                &program,
+                &cwd,
+                catalog::now_millis(),
+                session.as_ref().and_then(|session| session.card_id()),
+            )?;
             Response::Ok
         }
         Command::CatalogBind {
@@ -573,12 +614,31 @@ fn serve(
             }
             Response::CardNext(result.map(Box::new))
         }
+        Command::AgentStart(spec) => Response::AgentStatus(agents.start(spec, activity.clone())?),
+        Command::AgentPrompt { id, text } => {
+            agents.prompt(&id, text)?;
+            Response::Ok
+        }
+        Command::AgentCancel { id } => {
+            agents.cancel(&id)?;
+            Response::Ok
+        }
+        Command::AgentStop { id } => {
+            agents.stop(&id)?;
+            Response::Ok
+        }
+        Command::AgentList => Response::Agents(agents.list()),
         Command::PublishActivity(input) => Response::ActivityPublished(activity.publish(input)?),
         Command::CreateAttention(input) => {
             Response::AttentionCreated(activity.create_attention(input)?)
         }
         Command::ChangeAttention(input) => {
-            Response::AttentionChanged(activity.change_attention(input)?)
+            let request_id = input.request_id.clone();
+            let result = activity.change_attention(input)?;
+            if let Some(response) = result.attention.resolution.clone() {
+                agents.resolve(&request_id, response);
+            }
+            Response::AttentionChanged(result)
         }
         Command::AttentionStatus {
             project_id,
@@ -1218,6 +1278,7 @@ mod tests {
             Arc::new(ActivityJournal::open_in_memory().unwrap()),
             Arc::new(SessionCatalog::open_in_memory().unwrap()),
             Arc::new(BoardStore::open_in_memory().unwrap()),
+            Arc::new(AgentHost::default()),
             Arc::new(Mutex::new(HashMap::new())),
             stopping.clone(),
         )
@@ -1245,6 +1306,7 @@ mod tests {
             Arc::new(ActivityJournal::open_in_memory().unwrap()),
             Arc::new(SessionCatalog::open_in_memory().unwrap()),
             Arc::new(BoardStore::open_in_memory().unwrap()),
+            Arc::new(AgentHost::default()),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(AtomicBool::new(false)),
         )
@@ -1292,6 +1354,7 @@ mod tests {
             activity.clone(),
             Arc::new(SessionCatalog::open_in_memory().unwrap()),
             board.clone(),
+            Arc::new(AgentHost::default()),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(AtomicBool::new(false)),
         )

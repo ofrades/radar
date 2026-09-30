@@ -106,6 +106,110 @@ pub struct BoardState {
     pub cards: Vec<StoredCard>,
 }
 
+/// Board-to-workspace presentation policy. Hiding never stops a process;
+/// keeping a card in Todo/custom leaves the user's panel choice unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardWorkspaceVisibility {
+    Show,
+    Hide,
+    Preserve,
+}
+
+impl BoardState {
+    pub fn workspace_visibility(&self, card_id: &str) -> CardWorkspaceVisibility {
+        use CardWorkspaceVisibility::*;
+        let Some(card) = self.cards.iter().find(|card| card.id == card_id) else {
+            return Hide;
+        };
+        if card.done {
+            return Hide;
+        }
+        if let Some(lane) = self.lanes.iter().find(|lane| lane.id == card.lane_id) {
+            return match lane.kind.as_str() {
+                "done" => Hide,
+                "in_progress" | "review" => Show,
+                _ => Preserve,
+            };
+        }
+        // Older snapshots may only carry the joined lane name. Never let a
+        // display name override an available lane's canonical kind.
+        if card.lane.eq_ignore_ascii_case("in progress") || card.lane.eq_ignore_ascii_case("review")
+        {
+            Show
+        } else {
+            Preserve
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_visibility_tests {
+    use super::*;
+    use CardWorkspaceVisibility::*;
+
+    fn board(kind: Option<&str>, name: &str, done: bool) -> BoardState {
+        BoardState {
+            project_id: 1,
+            lanes: kind
+                .into_iter()
+                .map(|kind| Lane {
+                    id: 1,
+                    name: name.into(),
+                    kind: kind.into(),
+                    position: 0,
+                })
+                .collect(),
+            cards: vec![StoredCard {
+                id: "card".into(),
+                project_id: 1,
+                lane_id: 1,
+                lane: name.into(),
+                done,
+                position: 0,
+                title: "Card".into(),
+                body: String::new(),
+                claim: None,
+                revision: 1,
+                created_at_millis: 0,
+                updated_at_millis: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn canonical_lane_kinds_control_visibility_not_display_names() {
+        for (kind, name, expected) in [
+            ("todo", "Review", Preserve),
+            ("custom", "In progress", Preserve),
+            ("in_progress", "Building", Show),
+            ("review", "Checking", Show),
+            ("done", "Finished", Hide),
+        ] {
+            assert_eq!(
+                board(Some(kind), name, false).workspace_visibility("card"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_snapshots_fall_back_to_joined_lane_names() {
+        for (name, expected) in [("In progress", Show), ("review", Show), ("Todo", Preserve)] {
+            assert_eq!(
+                board(None, name, false).workspace_visibility("card"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn done_or_missing_cards_hide_even_when_the_lane_would_show() {
+        let board = board(Some("review"), "Review", true);
+        assert_eq!(board.workspace_visibility("card"), Hide);
+        assert_eq!(board.workspace_visibility("missing"), Hide);
+    }
+}
+
 /// What a mutation changed, so the daemon can publish a `BoardChanged` event
 /// without re-reading the board.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,8 +221,82 @@ pub struct BoardChange {
     pub from_lane: Option<String>,
 }
 
+/// The prompt a card's worker is handed when the card is dispatched to it: the
+/// card itself, then the hygiene that keeps the board current. The same
+/// contract the board skill teaches, so the card never depends on the agent
+/// remembering it.
+pub fn work_prompt(card_id: &str, title: &str) -> String {
+    format!(
+        "Work on board card \"{title}\" ({card_id}).\n\
+         Read it and its thread with `radar card show \"{card_id}\"`.\n\n\
+         After each turn where you made progress, comment on the card:\n\
+         - `radar card comment \"{card_id}\" \"<what changed>\"`\n\
+         When it is ready for review: `radar card move --to Review \"{card_id}\"`.\n\
+         When it is done: `radar card done \"{card_id}\"`."
+    )
+}
+
 pub struct BoardStore {
     inner: Mutex<Connection>,
+}
+
+/// The board's operations, independent of how they are stored.
+///
+/// The daemon holds one of these. [`BoardStore`] is the original SQLite
+/// implementation; [`super::beads_store::BeadsBoardStore`] is the Beads-backed
+/// one the daemon uses by default. Both speak the same types, so no client
+/// changes.
+pub trait Board: Send + Sync {
+    fn state(&self, project_id: i64) -> Result<BoardState>;
+    fn add_card(
+        &self,
+        project_id: i64,
+        lane: Option<&str>,
+        title: &str,
+        body: &str,
+        claim: Option<&str>,
+    ) -> Result<BoardChange>;
+    fn update_card(
+        &self,
+        project_id: i64,
+        card_id: &str,
+        title: Option<&str>,
+        body: Option<&str>,
+        expected_revision: Option<u64>,
+    ) -> Result<BoardChange>;
+    fn move_card(
+        &self,
+        project_id: i64,
+        card_id: &str,
+        lane: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<BoardChange>;
+    fn claim_card(
+        &self,
+        project_id: i64,
+        card_id: &str,
+        claim: Option<&str>,
+        expected_revision: Option<u64>,
+    ) -> Result<BoardChange>;
+    fn complete_card(
+        &self,
+        project_id: i64,
+        card_id: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<BoardChange>;
+    fn reopen_card(
+        &self,
+        project_id: i64,
+        card_id: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<BoardChange>;
+    fn remove_card(&self, project_id: i64, card_id: &str) -> Result<BoardChange>;
+    fn next_card(
+        &self,
+        project_id: i64,
+        who: &str,
+        lane: Option<&str>,
+    ) -> Result<Option<BoardChange>>;
 }
 
 impl BoardStore {
@@ -285,9 +463,23 @@ impl BoardStore {
         }
         let mut inner = self.inner.lock();
         let tx = inner.transaction()?;
+        ensure_project(&tx, project_id)?;
         let card = require_card(&tx, project_id, card_id)?;
         check_revision(&card, expected_revision)?;
-        bump(&tx, card_id, None, None, None, Some(claim))?;
+        // A claim starts the work and a release parks it: the lane moves in the
+        // same transaction as the claim, so no client ever sees a claimed card
+        // still sitting in Todo.
+        let target = claim_lane_transition(&tx, project_id, &card, claim.is_some())?;
+        let from_lane = target.as_ref().map(|_| card.lane.clone());
+        let lane = match &target {
+            Some(lane) => Some((
+                lane.id,
+                next_position(&tx, project_id, lane.id)?,
+                lane.done(),
+            )),
+            None => None,
+        };
+        bump(&tx, card_id, None, None, lane, Some(claim))?;
         let card = read_card(&tx, card_id)?.context("card vanished after claim")?;
         tx.commit()?;
         Ok(BoardChange {
@@ -297,7 +489,7 @@ impl BoardStore {
             } else {
                 "released".to_string()
             },
-            from_lane: None,
+            from_lane,
         })
     }
 
@@ -418,14 +610,107 @@ impl BoardStore {
             tx.commit()?;
             return Ok(None);
         };
-        bump(&tx, &card_id, None, None, None, Some(Some(who)))?;
+        // Claiming from `next` starts the card too: a Todo card moves to the
+        // first In progress lane in the same transaction, while a card already
+        // in progress, review or a custom lane keeps its lane.
+        let card = require_card(&tx, project_id, &card_id)?;
+        let target = claim_lane_transition(&tx, project_id, &card, true)?;
+        let from_lane = target.as_ref().map(|_| card.lane.clone());
+        let lane = match &target {
+            Some(lane) => Some((
+                lane.id,
+                next_position(&tx, project_id, lane.id)?,
+                lane.done(),
+            )),
+            None => None,
+        };
+        bump(&tx, &card_id, None, None, lane, Some(Some(who)))?;
         let card = read_card(&tx, &card_id)?.context("card vanished after next")?;
         tx.commit()?;
         Ok(Some(BoardChange {
             card,
             action: "claimed".to_string(),
-            from_lane: None,
+            from_lane,
         }))
+    }
+}
+
+impl Board for BoardStore {
+    fn state(&self, project_id: i64) -> Result<BoardState> {
+        BoardStore::state(self, project_id)
+    }
+
+    fn add_card(
+        &self,
+        project_id: i64,
+        lane: Option<&str>,
+        title: &str,
+        body: &str,
+        claim: Option<&str>,
+    ) -> Result<BoardChange> {
+        BoardStore::add_card(self, project_id, lane, title, body, claim)
+    }
+
+    fn update_card(
+        &self,
+        project_id: i64,
+        card_id: &str,
+        title: Option<&str>,
+        body: Option<&str>,
+        expected_revision: Option<u64>,
+    ) -> Result<BoardChange> {
+        BoardStore::update_card(self, project_id, card_id, title, body, expected_revision)
+    }
+
+    fn move_card(
+        &self,
+        project_id: i64,
+        card_id: &str,
+        lane: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<BoardChange> {
+        BoardStore::move_card(self, project_id, card_id, lane, expected_revision)
+    }
+
+    fn claim_card(
+        &self,
+        project_id: i64,
+        card_id: &str,
+        claim: Option<&str>,
+        expected_revision: Option<u64>,
+    ) -> Result<BoardChange> {
+        BoardStore::claim_card(self, project_id, card_id, claim, expected_revision)
+    }
+
+    fn complete_card(
+        &self,
+        project_id: i64,
+        card_id: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<BoardChange> {
+        BoardStore::complete_card(self, project_id, card_id, expected_revision)
+    }
+
+    fn reopen_card(
+        &self,
+        project_id: i64,
+        card_id: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<BoardChange> {
+        BoardStore::reopen_card(self, project_id, card_id, expected_revision)
+    }
+
+    fn remove_card(&self, project_id: i64, card_id: &str) -> Result<BoardChange> {
+        BoardStore::remove_card(self, project_id, card_id)
+    }
+
+    fn next_card(
+        &self,
+        project_id: i64,
+        who: &str,
+        lane: Option<&str>,
+    ) -> Result<Option<BoardChange>> {
+        BoardStore::next_card(self, project_id, who, lane)
     }
 }
 
@@ -518,7 +803,7 @@ fn require_card(tx: &Transaction<'_>, project_id: i64, card_id: &str) -> Result<
         .with_context(|| format!("no card {card_id} in project {project_id}"))
 }
 
-fn check_revision(card: &StoredCard, expected: Option<u64>) -> Result<()> {
+pub(crate) fn check_revision(card: &StoredCard, expected: Option<u64>) -> Result<()> {
     if let Some(expected) = expected {
         if card.revision != expected {
             bail!(
@@ -617,17 +902,67 @@ fn first_open_lane(tx: &Transaction<'_>, project_id: i64) -> Result<Lane> {
          WHERE project_id = ?1 AND kind <> 'done'
          ORDER BY position, id LIMIT 1",
         params![project_id],
-        |row| {
-            Ok(Lane {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                kind: row.get(2)?,
-                position: row.get(3)?,
-            })
-        },
+        lane_from_row,
     )
     .optional()?
     .context("the board has no open lane")
+}
+
+fn lane_from_row(row: &Row<'_>) -> rusqlite::Result<Lane> {
+    Ok(Lane {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        position: row.get(3)?,
+    })
+}
+
+fn lane_by_id(tx: &Transaction<'_>, lane_id: i64) -> Result<Lane> {
+    tx.query_row(
+        "SELECT id, name, kind, position FROM board_lanes WHERE id = ?1",
+        params![lane_id],
+        lane_from_row,
+    )
+    .optional()?
+    .with_context(|| format!("no lane {lane_id}"))
+}
+
+fn first_lane_of_kind(tx: &Transaction<'_>, project_id: i64, kind: &str) -> Result<Option<Lane>> {
+    tx.query_row(
+        "SELECT id, name, kind, position FROM board_lanes
+         WHERE project_id = ?1 AND kind = ?2
+         ORDER BY position, id LIMIT 1",
+        params![project_id, kind],
+        lane_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// The lane a claim or release moves the card to, when it should move at all.
+///
+/// Claiming starts work: a card in a `todo`-kind lane moves to the first
+/// `in_progress` lane. Releasing parks work: a card in an `in_progress` lane
+/// moves back to the first `todo`-kind lane. Every other case — claiming a card
+/// already in progress, claiming or releasing a card in Review or a custom lane
+/// — leaves the lane where it is, so review handoff and a human's own lane
+/// choices are never rewritten. A board with no matching lane simply keeps the
+/// card where it is.
+fn claim_lane_transition(
+    tx: &Transaction<'_>,
+    project_id: i64,
+    card: &StoredCard,
+    claiming: bool,
+) -> Result<Option<Lane>> {
+    let (from_kind, to_kind) = if claiming {
+        ("todo", "in_progress")
+    } else {
+        ("in_progress", "todo")
+    };
+    if lane_by_id(tx, card.lane_id)?.kind != from_kind {
+        return Ok(None);
+    }
+    first_lane_of_kind(tx, project_id, to_kind)
 }
 
 fn next_position(tx: &Transaction<'_>, project_id: i64, lane_id: i64) -> Result<i64> {
@@ -755,6 +1090,64 @@ mod tests {
     }
 
     #[test]
+    fn claiming_a_todo_card_starts_it_in_progress() {
+        let store = store();
+        let card = store.add_card(1, None, "Task", "", None).unwrap().card;
+        assert_eq!(card.lane, "Todo");
+
+        let claimed = store
+            .claim_card(1, &card.id, Some("claude-1"), None)
+            .unwrap();
+        assert_eq!(claimed.action, "claimed");
+        assert_eq!(claimed.card.claim.as_deref(), Some("claude-1"));
+        assert_eq!(claimed.card.lane, "In progress");
+        assert_eq!(claimed.from_lane.as_deref(), Some("Todo"));
+
+        // Releasing parks it back in Todo and clears the claim.
+        let released = store.claim_card(1, &card.id, None, None).unwrap();
+        assert_eq!(released.action, "released");
+        assert_eq!(released.card.claim, None);
+        assert_eq!(released.card.lane, "Todo");
+        assert_eq!(released.from_lane.as_deref(), Some("In progress"));
+    }
+
+    #[test]
+    fn claiming_a_review_card_leaves_it_in_review() {
+        let store = store();
+        let card = store
+            .add_card(1, Some("Review"), "Check", "", None)
+            .unwrap()
+            .card;
+        let claimed = store
+            .claim_card(1, &card.id, Some("claude-1"), None)
+            .unwrap();
+        assert_eq!(claimed.card.claim.as_deref(), Some("claude-1"));
+        assert_eq!(claimed.card.lane, "Review");
+        assert_eq!(claimed.from_lane, None);
+
+        // Releasing a review card keeps it waiting for review.
+        let released = store.claim_card(1, &card.id, None, None).unwrap();
+        assert_eq!(released.card.claim, None);
+        assert_eq!(released.card.lane, "Review");
+        assert_eq!(released.from_lane, None);
+    }
+
+    #[test]
+    fn claiming_a_card_already_in_progress_leaves_its_lane() {
+        let store = store();
+        // A card placed in In progress directly is claimed without moving, and
+        // keeps its lane on release.
+        let card = store.add_card(1, None, "Task", "", None).unwrap().card;
+        let moved = store.move_card(1, &card.id, "In progress", None).unwrap();
+        assert_eq!(moved.card.lane, "In progress");
+        let claimed = store
+            .claim_card(1, &card.id, Some("claude-1"), None)
+            .unwrap();
+        assert_eq!(claimed.card.lane, "In progress");
+        assert_eq!(claimed.from_lane, None);
+    }
+
+    #[test]
     fn next_claims_the_first_open_card_and_respects_a_lane_filter() {
         let store = store();
         store.add_card(1, Some("Todo"), "first", "", None).unwrap();
@@ -766,12 +1159,18 @@ mod tests {
         assert_eq!(claimed.card.title, "first");
         assert_eq!(claimed.card.claim.as_deref(), Some("codex-1"));
         assert_eq!(claimed.action, "claimed");
+        // A card claimed from Todo starts: it is now In progress.
+        assert_eq!(claimed.card.lane, "In progress");
+        assert_eq!(claimed.from_lane.as_deref(), Some("Todo"));
 
         let in_progress = store
             .next_card(1, "codex-1", Some("In progress"))
             .unwrap()
             .unwrap();
         assert_eq!(in_progress.card.title, "second");
+        // A card already In progress is claimed without moving.
+        assert_eq!(in_progress.card.lane, "In progress");
+        assert_eq!(in_progress.from_lane, None);
         // Both are claimed now: nothing left in Todo.
         assert!(store
             .next_card(1, "codex-2", Some("Todo"))

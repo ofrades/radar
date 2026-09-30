@@ -17,6 +17,10 @@ pub(super) struct Raise {
     pub request_id: String,
     pub kind: AttentionKind,
     pub reason: String,
+    /// The card and session the request points at, so a notification (desktop
+    /// or in-app) can open exactly what asked.
+    pub card_id: Option<String>,
+    pub session_id: Option<String>,
 }
 
 /// For a project snapshot: which previously-raised requests to withdraw, and
@@ -48,6 +52,8 @@ pub(super) fn plan_snapshot(
             request_id: attention.id.clone(),
             kind: attention.kind,
             reason: attention.reason.clone(),
+            card_id: attention.card_id.clone(),
+            session_id: attention.session_id.clone(),
         })
         .collect();
     (withdraw, raise)
@@ -62,6 +68,8 @@ pub(super) fn plan_request(
     request_id: &str,
     kind: AttentionKind,
     reason: &str,
+    card_id: Option<&str>,
+    session_id: Option<&str>,
 ) -> Option<Raise> {
     if already_outstanding || notified.contains(&(project_id, request_id.to_string())) {
         return None;
@@ -70,6 +78,8 @@ pub(super) fn plan_request(
         request_id: request_id.to_string(),
         kind,
         reason: reason.to_string(),
+        card_id: card_id.map(str::to_string),
+        session_id: session_id.map(str::to_string),
     })
 }
 
@@ -142,8 +152,11 @@ mod tests {
             "attention-9",
             AttentionKind::Question,
             "why",
+            Some("card-1"),
+            Some("session-1"),
         );
         assert!(first.is_some());
+        assert_eq!(first.unwrap().card_id.as_deref(), Some("card-1"));
         notified.insert((1, "attention-9".to_string()));
         assert!(plan_request(
             1,
@@ -151,7 +164,9 @@ mod tests {
             false,
             "attention-9",
             AttentionKind::Question,
-            "why"
+            "why",
+            None,
+            None,
         )
         .is_none());
         assert!(plan_request(
@@ -160,7 +175,9 @@ mod tests {
             true,
             "attention-9",
             AttentionKind::Question,
-            "why"
+            "why",
+            None,
+            None,
         )
         .is_none());
     }

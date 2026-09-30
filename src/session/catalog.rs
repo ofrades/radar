@@ -38,6 +38,9 @@ pub struct Entry {
     pub provider_session_id: String,
     /// The radar daemon session currently or last attached to this row.
     pub radar_session_id: Option<String>,
+    /// Stable todo association, independent of mutable board claims.
+    #[serde(default)]
+    pub card_id: Option<String>,
     /// `radar` when radar spawned it, `provider` when imported from history.
     pub source: String,
     pub title: Option<String>,
@@ -115,8 +118,9 @@ pub(crate) fn is_generic_session_title(
 }
 
 /// Bump when the table below changes; add the next step to `SCHEMA_STEPS`.
-const SCHEMA_VERSION: i64 = 1;
-const SCHEMA_STEPS: [&str; 1] = [r#"
+const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_STEPS: [&str; 2] = [
+    r#"
     CREATE TABLE IF NOT EXISTS sessions (
         id                 INTEGER PRIMARY KEY,
         project_id         INTEGER NOT NULL,
@@ -135,7 +139,9 @@ const SCHEMA_STEPS: [&str; 1] = [r#"
     );
     CREATE INDEX IF NOT EXISTS sessions_activity
         ON sessions(project_id, last_activity_at DESC);
-"#];
+"#,
+    "ALTER TABLE sessions ADD COLUMN card_id TEXT;",
+];
 
 impl SessionCatalog {
     pub fn open(path: &Path) -> Result<Self> {
@@ -176,18 +182,38 @@ impl SessionCatalog {
         cwd: &Path,
         now_ms: i64,
     ) -> Result<()> {
+        self.record_radar_with_card(project_id, radar_id, program, cwd, now_ms, None)
+    }
+
+    pub fn record_radar_with_card(
+        &self,
+        project_id: i64,
+        radar_id: &str,
+        program: &str,
+        cwd: &Path,
+        now_ms: i64,
+        card_id: Option<&str>,
+    ) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO sessions (project_id, provider, provider_session_id, radar_session_id,
                                    source, title, cwd, created_at, last_activity_at,
-                                   ended_at, lifecycle, archived_at)
-             VALUES (?1, ?2, ?3, ?3, 'radar', NULL, ?4, ?5, ?5, NULL, 'running', NULL)
+                                    ended_at, lifecycle, archived_at, card_id)
+             VALUES (?1, ?2, ?3, ?3, 'radar', NULL, ?4, ?5, ?5, NULL, 'running', NULL, ?6)
              ON CONFLICT(project_id, provider, provider_session_id) DO UPDATE SET
                  radar_session_id = excluded.radar_session_id,
                  lifecycle = 'running',
                  ended_at = NULL,
-                 last_activity_at = excluded.last_activity_at",
-            params![project_id, program, radar_id, cwd.to_string_lossy(), now_ms],
+                  last_activity_at = excluded.last_activity_at,
+                  card_id = excluded.card_id",
+            params![
+                project_id,
+                program,
+                radar_id,
+                cwd.to_string_lossy(),
+                now_ms,
+                card_id
+            ],
         )?;
         Ok(())
     }
@@ -292,11 +318,13 @@ impl SessionCatalog {
         provider_session_id: &str,
         now_ms: i64,
     ) -> Result<()> {
-        let conn = self.conn.lock();
-        let Some((_id, project_id, title, lifecycle)) = conn
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction()?;
+        let Some((id, project_id, title, lifecycle, card_id)) = conn
             .query_row(
-                "SELECT id, project_id, title, lifecycle FROM sessions
-                 WHERE radar_session_id = ?1 AND source = 'radar'",
+                "SELECT id, project_id, title, lifecycle, card_id FROM sessions
+                  WHERE radar_session_id = ?1 AND source = 'radar'
+                  ORDER BY (provider_session_id = radar_session_id) DESC, created_at DESC LIMIT 1",
                 params![radar_id],
                 |row| {
                     Ok((
@@ -304,6 +332,7 @@ impl SessionCatalog {
                         row.get::<_, i64>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
@@ -313,17 +342,15 @@ impl SessionCatalog {
         };
         let merged = conn
             .execute(
-                "UPDATE sessions SET radar_session_id = ?3, last_activity_at = MAX(last_activity_at, ?4)
-                 WHERE project_id = ?1 AND provider = ?2 AND provider_session_id = ?5
-                   AND radar_session_id IS NULL",
-                params![project_id, provider, radar_id, now_ms, provider_session_id],
+                "UPDATE sessions SET radar_session_id = ?3, last_activity_at = MAX(last_activity_at, ?4),
+                                     card_id = COALESCE(?6, card_id)
+                  WHERE project_id = ?1 AND provider = ?2 AND provider_session_id = ?5
+                    AND id != ?7",
+                params![project_id, provider, radar_id, now_ms, provider_session_id, card_id, id],
             )
             ? > 0;
         if merged {
-            conn.execute(
-                "DELETE FROM sessions WHERE radar_session_id = ?1 AND source = 'radar'",
-                params![radar_id],
-            )?;
+            conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         } else {
             conn.execute(
                 "UPDATE sessions SET provider = ?2, provider_session_id = ?3,
@@ -333,6 +360,7 @@ impl SessionCatalog {
             )?;
         }
         let _ = lifecycle;
+        conn.commit()?;
         Ok(())
     }
 
@@ -364,6 +392,7 @@ impl SessionCatalog {
                                          cwd = CASE WHEN cwd = '' THEN ?6 ELSE cwd END
                      WHERE project_id = ?1 AND provider = ?2 AND source = 'radar'
                        AND lifecycle = 'running'
+                       AND (provider_session_id = radar_session_id OR provider_session_id = ?4)
                        AND ABS(created_at - ?3) < 15000
                      RETURNING id, title",
                     params![project_id, provider, created, session.id, activity, cwd_text],
@@ -443,7 +472,7 @@ impl SessionCatalog {
     ) -> Result<Vec<Entry>> {
         let mut sql = format!(
             "SELECT id, project_id, provider, provider_session_id, radar_session_id, source,
-                    title, cwd, created_at, last_activity_at, ended_at, lifecycle, archived_at
+                     title, cwd, created_at, last_activity_at, ended_at, lifecycle, archived_at, card_id
              FROM sessions WHERE project_id IN ({})",
             vec!["?"; project_ids.len().max(1)].join(",")
         );
@@ -499,6 +528,7 @@ impl SessionCatalog {
                         ended_at: row.get(10)?,
                         lifecycle: row.get(11)?,
                         archived_at: row.get(12)?,
+                        card_id: row.get(13)?,
                     })
                 },
             )?
@@ -537,6 +567,102 @@ pub fn provider_of_session_id(session_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn todo_binding_survives_exit_restart_import_merge_and_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        let radar_id = "project-3-agent-0-opencode";
+        let now = 1_800_000_000_000;
+        {
+            let catalog = SessionCatalog::open(&path).unwrap();
+            catalog
+                .import_provider(
+                    3,
+                    "opencode",
+                    Path::new("/w"),
+                    &[Imported {
+                        id: "ses-exact".into(),
+                        title: Some("Work".into()),
+                        created_ms: now,
+                        last_activity_ms: now,
+                    }],
+                    now,
+                )
+                .unwrap();
+            catalog
+                .record_radar_with_card(
+                    3,
+                    radar_id,
+                    "opencode",
+                    Path::new("/w"),
+                    now,
+                    Some("todo-1"),
+                )
+                .unwrap();
+            catalog
+                .bind_provider(radar_id, "opencode", "ses-exact", now)
+                .unwrap();
+            catalog.reconcile(&[], now + 1).unwrap();
+        }
+        let catalog = SessionCatalog::open(&path).unwrap();
+        let rows = catalog.list(&[3], CatalogFilter::All, None, 100).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].card_id.as_deref(), Some("todo-1"));
+        assert_eq!(rows[0].provider_session_id, "ses-exact");
+        assert_eq!(rows[0].lifecycle, "ended");
+        // Reopen that exact conversation on a new pane, preserving one row.
+        let resumed = "project-3-agent-2-opencode";
+        catalog
+            .record_radar_with_card(
+                3,
+                resumed,
+                "opencode",
+                Path::new("/w"),
+                now + 2,
+                Some("todo-1"),
+            )
+            .unwrap();
+        catalog
+            .bind_provider(resumed, "opencode", "ses-exact", now + 2)
+            .unwrap();
+        let rows = catalog.list(&[3], CatalogFilter::All, None, 100).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].card_id.as_deref(), Some("todo-1"));
+        assert_eq!(rows[0].radar_session_id.as_deref(), Some(resumed));
+    }
+
+    #[test]
+    fn v1_catalog_migrates_without_inventing_todo_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        super::super::schema::migrate(&conn, 1, &SCHEMA_STEPS[..1]).unwrap();
+        conn.execute("INSERT INTO sessions (project_id, provider, provider_session_id, source, cwd,
+            created_at, last_activity_at, lifecycle) VALUES (3, 'opencode', 'ses-old', 'provider', '/w', 1, 1, 'ended')", []).unwrap();
+        drop(conn);
+        let catalog = SessionCatalog::open(&path).unwrap();
+        let rows = catalog.list(&[3], CatalogFilter::All, None, 100).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider_session_id, "ses-old");
+        assert_eq!(rows[0].card_id, None);
+    }
+
+    #[test]
+    fn a_reused_pane_without_a_todo_does_not_inherit_the_old_binding() {
+        let catalog = SessionCatalog::open_in_memory().unwrap();
+        let id = "project-3-agent-0-opencode";
+        catalog
+            .record_radar_with_card(3, id, "opencode", Path::new("/w"), 1, Some("todo-old"))
+            .unwrap();
+        catalog.reconcile(&[], 2).unwrap();
+        catalog
+            .record_radar_with_card(3, id, "opencode", Path::new("/w"), 3, None)
+            .unwrap();
+        let rows = catalog.list(&[3], CatalogFilter::All, None, 100).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].card_id, None);
+    }
     use crate::session::registry::Lifecycle;
 
     #[test]
@@ -801,6 +927,44 @@ mod tests {
         assert_eq!(old.lifecycle, "ended");
         assert_eq!(old.created_at, 1_690_000_000_000);
         assert!(old.archived_at.is_some(), "stale history is archived");
+    }
+
+    #[test]
+    fn importing_never_overwrites_an_exact_bind() {
+        let catalog = catalog();
+        let radar_id = "project-3-agent-0-opencode";
+        catalog
+            .record_radar(3, radar_id, "opencode", Path::new("/w"), 1_700_000_050_000)
+            .unwrap();
+        // Radar named the conversation at launch: the row already has a real
+        // provider id, not the placeholder.
+        catalog
+            .bind_provider(radar_id, "opencode", "ses_exact", 1_700_000_050_100)
+            .unwrap();
+        // A different session created in the same window must not steal it.
+        catalog
+            .import_provider(
+                3,
+                "opencode",
+                Path::new("/w"),
+                &[Imported {
+                    id: "ses_other".into(),
+                    title: None,
+                    created_ms: 1_700_000_052_000,
+                    last_activity_ms: 1_700_000_052_000,
+                }],
+                1_700_000_052_000,
+            )
+            .unwrap();
+        let rows = catalog.list(&[3], CatalogFilter::All, None, 10).unwrap();
+        let live = rows
+            .iter()
+            .find(|row| row.radar_session_id.as_deref() == Some(radar_id))
+            .unwrap();
+        assert_eq!(live.provider_session_id, "ses_exact");
+        assert!(rows
+            .iter()
+            .any(|row| row.provider_session_id == "ses_other" && row.source == "provider"));
     }
 
     #[test]

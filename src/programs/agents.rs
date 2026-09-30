@@ -218,6 +218,7 @@ impl AgentDef {
             auto_args: self.auto.iter().map(|s| s.to_string()).collect(),
             resume_args: Vec::new(),
             resume_session: String::new(),
+            create_session: false,
             env_unset: self.env_unset.iter().map(|s| s.to_string()).collect(),
             external: false,
             omarchy: self.omarchy,
@@ -242,6 +243,11 @@ impl AgentDef {
             "omp" => "--resume={id}".to_string(),
             _ => String::new(),
         };
+        // OpenCode's `--session` creates the conversation if the id is new, so
+        // radar can name a fresh launch's conversation up front (an exact 1:1
+        // link to the board card) instead of reading its store after the fact.
+        // The other CLIs' flags only resume; a fresh launch there stays a guess.
+        program.create_session = self.id == "opencode";
         // omarchy's default agent is the one users expect first everywhere.
         if omarchy_default().as_deref() == Some(self.id) {
             program.priority = -1;
@@ -364,6 +370,17 @@ mod tests {
         assert_eq!(by_id("omp").resume_session, "--resume={id}");
         assert_eq!(by_id("cursor-agent").resume_session, "--resume {id}");
         assert_eq!(by_id("opencode").resume_session, "--session {id}");
+    }
+
+    #[test]
+    fn only_opencode_can_create_a_conversation_under_a_chosen_id() {
+        let by_id = |id: &str| programs().into_iter().find(|p| p.id == id).unwrap();
+        assert!(by_id("opencode").create_session);
+        // The others' flags only resume an existing conversation, so a fresh
+        // launch there must not be handed a made-up id.
+        for id in ["omp", "cursor-agent", "claude", "codex", "crush"] {
+            assert!(!by_id(id).create_session, "{id}");
+        }
     }
 
     #[test]

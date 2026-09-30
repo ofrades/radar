@@ -1,0 +1,9 @@
+# Toolchain pins for building radar from source.
+#
+# libghostty-vt (Ghostty's VT core, behind radar's `ghostty` feature) is built
+# from a pinned Ghostty revision by `build.rs`, which needs Zig. Ghostty's
+# build.zig.zon compares major.minor for equality, so this is exact: Zig 0.16.0,
+# not a floor. Run `mise install` once to fetch it; `zig` then resolves from
+# this directory.
+[tools]
+zig = "0.16.0"

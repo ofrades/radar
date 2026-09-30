@@ -21,6 +21,13 @@ pub struct LaunchOptions {
     /// Reopen one exact conversation by the CLI's own session id, when
     /// radar has a binding for it (see `db::agent_sessions`).
     pub session: Option<String>,
+    /// Create a fresh conversation under this exact CLI session id, when the
+    /// CLI can (see [`Program::create_session`]). OpenCode creates one if the
+    /// id is new, so a fresh launch knows its conversation up front and the
+    /// board claim links to it exactly — no post-exit guess against whatever
+    /// other session in the project happened to be newest.
+    #[serde(default)]
+    pub create_session: Option<String>,
     /// A unique instance name for an agent launch, folded into `RADAR_AGENT`
     /// (see [`command_spec`]). Irrelevant for non-agents.
     pub agent_instance: Option<String>,
@@ -84,6 +91,38 @@ pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
         }
         argv.extend(options.extra_args.iter().cloned());
     };
+    // A fresh launch that names its own conversation: the CLI creates one
+    // under this id (OpenCode's `--session` does). Radar knows the exact
+    // conversation from the first frame, so the board claim links to it
+    // without any post-exit guess. This is a *fresh* start, so it keeps the
+    // permission flags and the program's own arguments; only the wrapper is
+    // skipped (it cannot carry a session id).
+    if let Some(id) = options
+        .create_session
+        .as_deref()
+        .filter(|id| !id.is_empty())
+    {
+        if program.create_session && !program.resume_session.is_empty() {
+            let mut argv = vec![program.command.clone()];
+            argv.extend(program.args.iter().cloned());
+            if !options.safe {
+                argv.extend(program.auto_args.iter().cloned());
+            }
+            argv.extend(
+                program
+                    .resume_session
+                    .replace("{id}", id)
+                    .split_whitespace()
+                    .map(str::to_string),
+            );
+            append_tail(&mut argv);
+            return CommandSpec {
+                argv,
+                env_unset: program.env_unset.clone(),
+                env_set,
+            };
+        }
+    }
     let resumed_argv = || {
         let mut argv = vec![program.command.clone()];
         argv.extend(program.args.iter().cloned());
@@ -180,18 +219,37 @@ pub fn now_stamp() -> String {
     instance_stamp(now_millis())
 }
 
+/// The exact CLI conversation id a fresh launch is given when the CLI can
+/// create one (see [`Program::create_session`]). Derived from the launch's
+/// instance stamp, so it is unique per launch and still names the same
+/// conversation in the board claim that carries that stamp.
+pub fn provider_session_id(project_id: i64, stamp: &str) -> String {
+    format!("ses_radar{project_id}{stamp}")
+}
+
 /// The `RADAR_AGENT` a process carries, read from `/proc/<pid>/environ`:
 /// how a board claim is matched to the exact agent tab that owns it —
 /// two instances of the same program are told apart by their stamps.
 /// Linux only, and only while the process lives; `None` otherwise.
 pub fn radar_agent_of(pid: u32) -> Option<String> {
+    radar_env_of(pid, "RADAR_AGENT")
+}
+
+/// The `RADAR_CARD_ID` a process carries: the board to-do it was launched for.
+/// Stable for the life of the process, unlike the card's claim (which moves to
+/// whoever holds the card now).
+pub fn radar_card_of(pid: u32) -> Option<String> {
+    radar_env_of(pid, "RADAR_CARD_ID")
+}
+
+fn radar_env_of(pid: u32, key: &str) -> Option<String> {
     std::fs::read_to_string(format!("/proc/{pid}/environ"))
         .ok()
         .and_then(|environ| {
-            environ
-                .split('\0')
-                .find_map(|entry| entry.strip_prefix("RADAR_AGENT="))
-                .map(str::to_string)
+            environ.split('\0').find_map(|entry| {
+                let (name, value) = entry.split_once('=')?;
+                (name == key).then(|| value.to_string())
+            })
         })
 }
 
@@ -211,6 +269,7 @@ mod tests {
             auto_args: Vec::new(),
             resume_args: Vec::new(),
             resume_session: String::new(),
+            create_session: false,
             env_unset: Vec::new(),
             external: false,
             omarchy: false,
@@ -326,6 +385,16 @@ mod tests {
     }
 
     #[test]
+    fn a_named_provider_session_is_unique_per_launch_and_project() {
+        let a = provider_session_id(2, "abc");
+        let b = provider_session_id(2, "abd");
+        let c = provider_session_id(3, "abc");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert!(a.starts_with("ses_"), "{a}");
+    }
+
+    #[test]
     fn display_shows_the_whole_command_line() {
         let spec = command_spec(
             &program("hunk", "hunk"),
@@ -391,6 +460,51 @@ mod tests {
         let mut crush = program("crush", "crush");
         crush.resume_session = String::new();
         assert_eq!(command_spec(&crush, &options).argv, vec!["crush"]);
+    }
+
+    #[test]
+    fn a_named_fresh_session_is_created_with_the_auto_flags() {
+        let mut opencode = program("opencode", "opencode");
+        opencode.auto_args = vec!["--auto".into()];
+        opencode.resume_session = "--session {id}".into();
+        opencode.create_session = true;
+        let options = LaunchOptions {
+            create_session: Some("ses_radar7abc".into()),
+            prompt: Some("work the card".into()),
+            card: Some("card-1".into()),
+            agent_instance: Some("abc".into()),
+            ..Default::default()
+        };
+        let spec = command_spec(&opencode, &options);
+        // A fresh create keeps the permission flags and the prompt; it only
+        // skips the omarchy wrapper, which cannot carry a session id.
+        assert_eq!(
+            spec.argv,
+            vec![
+                "opencode",
+                "--auto",
+                "--session",
+                "ses_radar7abc",
+                "work the card"
+            ]
+        );
+        assert!(spec
+            .env_set
+            .iter()
+            .any(|(key, value)| key == "RADAR_AGENT" && value == "opencode-abc"));
+
+        // A CLI that cannot create a session ignores the request rather than
+        // resuming some other conversation under a made-up id.
+        let mut crush = program("crush", "crush");
+        crush.resume_session = "--resume {id}".into();
+        let ignored = command_spec(
+            &crush,
+            &LaunchOptions {
+                create_session: Some("ses_radar7abc".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ignored.argv, vec!["crush"]);
     }
 
     #[test]

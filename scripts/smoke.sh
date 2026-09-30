@@ -36,14 +36,14 @@ mkdir -p "$BASE/home" "$BASE/demo"
 )
 
 echo "building (vte)…"
-cargo build --features vte >/dev/null 2>&1
+cargo build --features gui >/dev/null 2>&1
 "$RADAR_BIN" --home "$BASE/home" add "$BASE/demo" >/dev/null
 # The board lives in radar's store now: seed the demo's cards through the CLI,
 # not a BOARD.md.
 "$RADAR_BIN" --home "$BASE/home" card add --path "$BASE/demo" \
-	--title "A first to-do" >/dev/null
+	"A first to-do" >/dev/null
 "$RADAR_BIN" --home "$BASE/home" card add --path "$BASE/demo" \
-	--column "In progress" --title "Smoke the board" >/dev/null
+	--column "In progress" "Smoke the board" >/dev/null
 
 export SMOKE_HOME="$BASE/home"
 export SMOKE_BIN="$RADAR_BIN"

@@ -113,17 +113,6 @@ pub(super) fn activity_label(text: &str, muted: bool) -> gtk::Label {
     label
 }
 
-pub(super) fn agent_state_label(state: crate::session::activity::AgentState) -> &'static str {
-    use crate::session::activity::AgentState;
-    match state {
-        AgentState::Unknown => "Unknown",
-        AgentState::Working => "Working",
-        AgentState::WaitingForInput => "Waiting for input",
-        AgentState::WaitingForApproval => "Waiting for approval",
-        AgentState::Idle => "Idle",
-    }
-}
-
 pub(super) fn attention_kind_label(kind: crate::session::activity::AttentionKind) -> &'static str {
     use crate::session::activity::AttentionKind;
     match kind {

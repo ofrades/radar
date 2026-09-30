@@ -35,12 +35,12 @@ for arg in "$@"; do
 	esac
 done
 
-echo "building radar ($PROFILE, with embedded terminals)…"
+echo "building radar ($PROFILE, libghostty-vt terminal)…"
 if [[ $PROFILE == release ]]; then
-	cargo build --release --features vte
+	cargo build --release --features gui
 	SRC=target/release/radar
 else
-	cargo build --features vte
+	cargo build --features gui
 	SRC=target/debug/radar
 fi
 

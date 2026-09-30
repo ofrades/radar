@@ -53,7 +53,7 @@ paned.divider-focus > separator {
 paned > separator:hover {
   background-color: alpha(@radar_accent, 0.55);
 }
-.group-pane separator {
+.panel-pane separator {
   background-color: @radar_hairline;
 }
 
@@ -61,16 +61,16 @@ paned > separator:hover {
    Panes take the terminal's own background so header and content read as one
    surface. Roundness follows Hyprland's decoration:rounding, inner surfaces
    tighten. */
-.group-pane {
+.panel-pane {
   border: 1px solid @radar_hairline;
   border-radius: {panel_radius};
   background-color: {pane_bg};
 }
-.group-pane.kbd-focus {
+.panel-pane.kbd-focus {
   border-color: alpha(@radar_accent, 0.82);
   box-shadow: 0 0 0 1px alpha(@radar_accent, 0.28);
 }
-.group-header {
+.panel-header {
   min-height: 0;
   /* 4px here + 4px chip padding puts header titles at the same 8px inset
      as the sidebar header's title. */
@@ -78,7 +78,7 @@ paned > separator:hover {
   border-radius: {panel_radius} {panel_radius} 0 0;
   background-color: {pane_bg};
 }
-.group-header.dragging {
+.panel-header.dragging {
   opacity: 0.55;
 }
 /* Chips are mini panel-headers, not buttons: icon, name, the program's live
@@ -86,60 +86,69 @@ paned > separator:hover {
    the active member is accented, and a bell (an agent asking for attention)
    turns its whole chip accent until it is looked at. They stay buttons
    underneath — drag, hover, and keyboard focus still work. */
-.group-header .group-chip {
+.panel-header .panel-chip {
   border-radius: {control_radius};
 }
-.group-header .group-chip button.chip-main {
+.panel-header .panel-chip button.chip-main {
   min-height: 26px;
   background: none;
   border: none;
   color: alpha(@radar_fg, 0.6);
 }
-.group-header .group-chip button.chip-main:hover {
+.panel-header .panel-chip button.chip-main:hover {
   color: @radar_fg;
   background: none;
 }
-.group-header .group-chip.active button.chip-main {
+.panel-header .panel-chip.active button.chip-main {
   color: @radar_accent;
   background: none;
 }
-.group-header .group-chip.attention button.chip-main,
-.group-header .group-chip.attention label.pane-info {
+.panel-header .panel-chip.attention button.chip-main,
+.panel-header .panel-chip.attention label.pane-info {
   color: @radar_accent;
 }
 /* Live info from the member's program, dim beside its label. */
-.group-header label.pane-info {
+.panel-header label.pane-info {
   margin: 0 2px;
 }
 /* A chip's own controls sit quiet until hovered. */
-.group-header .group-chip button.chip-menu,
-.group-header .group-chip button.chip-close {
+.panel-header .panel-chip button.chip-menu,
+.panel-header .panel-chip button.chip-close {
   min-width: 22px;
   min-height: 22px;
   padding: 0;
   border-radius: {control_radius};
   color: alpha(@radar_fg, 0.45);
 }
-.group-header .group-chip button.chip-menu:hover,
-.group-header .group-chip button.chip-close:hover {
+.panel-header .panel-chip button.chip-menu:hover,
+.panel-header .panel-chip button.chip-close:hover {
   color: @radar_fg;
   background-color: @radar_surface_hover;
 }
-.group-header .group-chip button.chip-menu:checked {
+.panel-header .panel-chip button.chip-menu:checked {
   color: @radar_fg;
   background-color: @radar_surface_hover;
 }
-.group-header button.flat {
+/* The to-do opens its card view: a button that reads as the dim text it
+   wraps, with a quiet hover as the only affordance. */
+.panel-header .panel-chip button.panel-todo {
+  min-height: 0;
+  min-width: 0;
+  padding: 0;
+  background: none;
+  border: none;
+}
+.panel-header .panel-chip button.panel-todo:hover label.pane-info,
+.panel-header .panel-chip button.panel-todo:active label.pane-info {
+  color: @radar_fg;
+}
+.panel-header button.flat {
   min-height: 26px;
   min-width: 26px;
   padding: 0 4px;
   border-radius: {control_radius};
 }
-.group-header.drop-header {
-  background-color: @radar_accent_soft;
-  color: @radar_accent;
-}
-.group-pane:drop(active) {
+.panel-pane:drop(active) {
   box-shadow: none;
 }
 .drop-edge {
@@ -256,9 +265,100 @@ paned > separator:hover {
   padding-top: 8px;
   border-top: 1px solid @radar_hairline;
 }
-.home-cockpit .lane-dot {
+/* Activity signs: one status-dot vocabulary, shared by Home's project lanes,
+   session rows, card chips and the workspace pane headers. The dot's colour is
+   the state; work in flight and waiting breathe. */
+.activity-dot {
+  font-size: 0.8em;
+}
+.activity-dot.sign-needs-you,
+.activity-dot.sign-waiting {
+  color: @radar_warning;
+}
+.activity-dot.sign-working {
+  color: @radar_accent;
+}
+.activity-dot.sign-running {
+  color: alpha(@radar_accent, 0.6);
+}
+.activity-dot.sign-idle {
+  color: alpha(@radar_fg, 0.45);
+}
+.activity-dot.sign-stopped {
+  color: alpha(@radar_fg, 0.35);
+}
+.activity-dot.sign-unknown {
+  color: alpha(@radar_fg, 0.28);
+}
+@keyframes radar-pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.3; }
+  100% { opacity: 1; }
+}
+.activity-pulse {
+  animation-name: radar-pulse;
+  animation-duration: 1.8s;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+}
+/* Activity alerts: shadcn-Alert cards floating top-right, above everything.
+   A bordered panel with an icon, title, body and its own actions. */
+.alert-stack {
+  background: none;
+}
+.activity-alert {
+  padding: 12px 10px 12px 14px;
+  border: 1px solid @radar_hairline;
+  border-radius: 12px;
+  background-color: @radar_bg;
+  box-shadow: 0 8px 28px alpha(#000000, 0.4);
+}
+.activity-alert.info {
+  border-color: alpha(@radar_fg, 0.2);
+}
+.activity-alert.success {
+  border-color: alpha(@radar_accent, 0.55);
+}
+.activity-alert.warning {
+  border-color: alpha(@radar_warning, 0.6);
+}
+.activity-alert.danger {
+  border-color: alpha(@radar_warning, 0.9);
+}
+.activity-alert .alert-title {
+  font-weight: 700;
+}
+.activity-alert .alert-body {
+  color: alpha(@radar_fg, 0.72);
+}
+.activity-alert image.alert-icon.info {
+  color: alpha(@radar_fg, 0.7);
+}
+.activity-alert image.alert-icon.success {
+  color: @radar_accent;
+}
+.activity-alert image.alert-icon.warning,
+.activity-alert image.alert-icon.danger {
+  color: @radar_warning;
+}
+.activity-alert button.alert-action {
+  min-height: 24px;
+  padding: 1px 8px;
   border-radius: 99px;
-  background-color: @radar_accent;
+  background-color: alpha(@radar_fg, 0.07);
+}
+.activity-alert button.alert-action:hover {
+  background-color: @radar_surface_hover;
+}
+.activity-alert button.alert-close {
+  min-width: 22px;
+  min-height: 22px;
+  padding: 0;
+  color: alpha(@radar_fg, 0.5);
+}
+.activity-alert button.alert-close:hover {
+  color: @radar_fg;
+  background-color: @radar_surface_hover;
 }
 .home-cockpit button.lane-name {
   padding: 2px 6px;
@@ -324,9 +424,6 @@ paned > separator:hover {
   padding-top: 7px;
   border-top: 1px solid @radar_hairline;
 }
-.home-cockpit .cockpit-row {
-  padding: 2px 0;
-}
 .home-cockpit button.cockpit-action {
   min-width: 26px;
   min-height: 26px;
@@ -344,21 +441,6 @@ paned > separator:hover {
 }
 .home-cockpit .agent-state-dot {
   font-size: 0.8em;
-}
-.home-cockpit .agent-state-working {
-  color: @radar_accent;
-}
-.home-cockpit .agent-state-waiting {
-  color: @radar_warning;
-}
-.home-cockpit .agent-state-idle {
-  color: @radar_muted;
-}
-.home-cockpit .agent-state-unknown {
-  color: alpha(@radar_fg, 0.28);
-}
-.home-cockpit label.cockpit-active {
-  color: @radar_accent;
 }
 .home-cockpit button.todo-tick {
   min-width: 22px;
@@ -400,6 +482,16 @@ paned > separator:hover {
 }
 .card-panel .card-thread {
   border-top: 1px solid @radar_hairline;
+}
+.card-panel .card-panel-id {
+  color: @radar_muted;
+  font-family: monospace;
+  font-size: 0.9em;
+}
+.card-panel .card-panel-copy {
+  min-height: 22px;
+  padding: 0 6px;
+  font-size: 0.85em;
 }
 .card-panel .thread-row {
   padding: 6px 8px;
@@ -445,12 +537,18 @@ paned > separator:hover {
   min-height: 28px;
   padding: 0 4px;
 }
-.home-cockpit button.session-item {
-  padding: 3px 5px;
-  border-radius: {control_radius};
+/* A card's session chip: the agent on it, its state, or a way to start one. */
+.home-cockpit button.card-session {
+  min-height: 20px;
+  padding: 1px 7px;
+  border-radius: 99px;
+  background-color: alpha(@radar_fg, 0.05);
 }
-.home-cockpit button.session-item:hover {
+.home-cockpit button.card-session:hover {
   background-color: @radar_surface_hover;
+}
+.home-cockpit button.card-session label {
+  font-size: 0.85em;
 }
 /* Markdown rendered inside a card. */
 .markdown .md-heading {
@@ -509,25 +607,60 @@ toast {
 
 /* Keyboard: the pane (or sidebar) holding the keys wears a quiet ring, and
    the overlay panel floats above the workspace while the keyboard drives. */
-.group-pane.kbd-focus {
+.panel-pane.kbd-focus {
   box-shadow: inset 0 0 0 1px alpha(@radar_accent, 0.7);
 }
 /* Menus follow the omarchy menu card: the theme's canvas and panel
    roundness, a quiet border, and rows that highlight like the sidebar's.
    Chip dropdowns and context menus (gtk MenuButton / PopoverMenu) all
-   render through `popover`. */
-popover {
+   render through `popover`. libadwaita paints the visible card on
+   `popover > contents` (and its pointer on `popover > arrow`) over a
+   transparent outer node, and resets the popover's font — so both nodes
+   are dressed here, and the omarchy face is restored, or every menu would
+   float in Adwaita's grey and its own typeface. */
+popover.background {
+  background-color: transparent;
+  font-family: "{font_family}";
+}
+popover > arrow,
+popover > contents {
   background-color: @radar_bg;
-  border-radius: {panel_radius};
+  color: @radar_fg;
+  background-clip: padding-box;
   border: 1px solid alpha(@radar_fg, 0.12);
-  box-shadow: 0 10px 32px alpha(black, 0.35);
+  box-shadow: 0 12px 34px alpha(black, 0.5);
+}
+popover > contents {
+  border-radius: {panel_radius};
   padding: 4px;
 }
-popover modelbutton {
-  border-radius: {control_radius};
+/* A menu's own padding lives on its inner stack; the card keeps the
+   hairline and roundness, and the rows sit tight inside it. */
+popover.menu > contents {
+  padding: 0;
 }
-popover modelbutton:hover {
+popover.menu > contents > stack > box {
+  padding: 4px;
+}
+popover.menu modelbutton {
+  min-height: 28px;
+  min-width: 0;
+  padding: 0 10px;
+  border-radius: {control_radius};
+  background-color: transparent;
+  color: @radar_fg;
+}
+popover.menu modelbutton:hover,
+popover.menu modelbutton:selected {
   background-color: @radar_surface_hover;
+}
+popover.menu modelbutton:active {
+  background-color: @radar_accent_soft;
+}
+popover.menu separator {
+  margin: 4px 6px;
+  min-height: 1px;
+  background-color: @radar_hairline;
 }
 
 .hud-root {
@@ -732,7 +865,15 @@ mod tests {
             ..Theme::default()
         };
         let css = stylesheet(&theme);
-        assert!(css.contains("popover {\n  background-color: @radar_bg;\n  border-radius: 8px;"));
+        // libadwaita paints the card on `popover > contents`; the panel's
+        // roundness must land there, not on the transparent outer node.
+        assert!(css.contains("popover > contents {\n  border-radius: 8px;\n  padding: 4px;\n}"));
+        // The menu rows highlight like the sidebar's, not Adwaita's grey.
+        assert!(css.contains(
+            "popover.menu modelbutton:hover,\npopover.menu modelbutton:selected {\n  background-color: @radar_surface_hover;\n}"
+        ));
+        // Adwaita resets the popover font; the omarchy face is restored.
+        assert!(css.contains("font-family: \"monospace\";\n}"));
         // The HUD card rounds with the panel instead of a hardcoded 12px.
         assert!(css.contains(".hud-card {\n  background-color: @radar_bg;\n  border-radius: 8px;"));
     }
@@ -745,7 +886,7 @@ mod tests {
         };
         let css = stylesheet(&theme);
         assert!(css.contains(
-            ".group-pane {\n  border: 1px solid @radar_hairline;\n  border-radius: 8px;"
+            ".panel-pane {\n  border: 1px solid @radar_hairline;\n  border-radius: 8px;"
         ));
         assert!(css.contains("border-radius: 8px 8px 0 0;\n  background-color: #111111;"));
         assert!(css.contains("border-radius: 6px;\n}"));

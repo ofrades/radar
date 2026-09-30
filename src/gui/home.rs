@@ -6,9 +6,10 @@
 //!   * **Needs you** — every unresolved request for human attention, with the
 //!     actions to answer, approve, deny, or dismiss it in place.
 //!   * **Projects** — a small, clickable card per project: its git state, its
-//!     board counts and its running sessions at a glance. The card opens the
-//!     project's own view, where its to-dos are grouped Todo / In progress /
-//!     Review and a new one can be typed; a to-do there opens its conversation.
+//!     board counts and its to-dos, each carrying the state of the session bound
+//!     to it. The card opens the project's own view, where its to-dos are
+//!     grouped Todo / In progress / Review and a new one can be typed; a to-do
+//!     there opens its conversation.
 //!
 //! Home is the project navigator. Workspace tools live in a local toolbar,
 //! not a permanent sidebar. When there are no projects yet, Home falls back to the
@@ -21,12 +22,11 @@ use adw::prelude::*;
 use std::path::Path;
 
 use super::board;
-use super::live_agents::{self, AgentSession};
+use super::live_agents;
 use super::{App, SharedApp};
 use crate::db::Project;
-use crate::programs;
 use crate::session::activity::{
-    AgentState, Attention, AttentionActionKind, AttentionChange, AttentionResponse,
+    Attention, AttentionActionKind, AttentionChange, AttentionResponse,
 };
 
 /// The Home panel. The cockpit when there is work to show; the setup/empty
@@ -390,7 +390,7 @@ fn change_button(
     button
 }
 
-// ---- Projects: one lane per project, with its to-dos and sessions ----
+// ---- Projects: one lane per project, with its to-dos ----
 
 fn projects_section(app: &App, content: &gtk::Box, projects: &[Project]) {
     let to_dos = open_todo_count(app);
@@ -474,8 +474,9 @@ fn open_todo_count(app: &App) -> usize {
 }
 
 /// One project's lane: its header, its board chips, a way to add a to-do, its
-/// to-dos, and its running sessions. The name opens the workspace; **Open
-/// project** drills into the project's own view; a to-do opens its card.
+/// to-dos (each with the state of the session bound to it), and a footer pulse.
+/// The name opens the workspace; **Open project** drills into the project's own
+/// view; a to-do opens its card.
 fn project_lane(app: &App, project: &Project) -> gtk::Widget {
     let lane = gtk::Box::new(gtk::Orientation::Vertical, 8);
     lane.add_css_class("lane");
@@ -549,18 +550,10 @@ fn project_lane(app: &App, project: &Project) -> gtk::Widget {
         lane.append(&quiet("No board"));
     }
 
-    let sessions = live_sessions(app, project.id);
-    if !sessions.is_empty() {
-        lane.append(&section_label("Sessions"));
-        for (session, _) in sessions.iter().take(4) {
-            lane.append(&session_row(app, project.id, session));
-        }
-        if sessions.len() > 4 {
-            lane.append(&quiet(&format!("+{} more", sessions.len() - 4)));
-        }
-    }
-
-    lane.append(&lane_footer(sessions.len()));
+    lane.append(&lane_footer(
+        live_session_count(app, project.id),
+        app.project_recent_exits(project.id),
+    ));
     lane.upcast()
 }
 
@@ -602,11 +595,7 @@ fn lane_pill(lane: &board::LaneSummary) -> gtk::Label {
 fn lane_header(app: &App, project: &Project) -> gtk::Widget {
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
 
-    let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    dot.add_css_class("lane-dot");
-    dot.set_valign(gtk::Align::Center);
-    dot.set_size_request(9, 9);
-    header.append(&dot);
+    header.append(&sign_dot(app.project_activity_sign(project.id)));
 
     let name = gtk::Button::with_label(&project.name);
     name.add_css_class("flat");
@@ -640,45 +629,44 @@ fn lane_header(app: &App, project: &Project) -> gtk::Widget {
     git.set_ellipsize(gtk::pango::EllipsizeMode::Start);
     header.append(&git);
 
-    let create = gtk::Button::builder()
-        .icon_name("list-add-symbolic")
-        .tooltip_text("Create an agent in this project")
-        .build();
-    if let Some(image) = create.child().and_downcast::<gtk::Image>() {
-        image.set_pixel_size(13);
-    }
-    create.add_css_class("flat");
-    create.add_css_class("cockpit-action");
-    create.set_valign(gtk::Align::Center);
-    create.set_action_name(Some("win.project-agent-create"));
-    create.set_action_target_value(Some(&project.id.to_variant()));
-    create.set_sensitive(!project.is_missing());
-    header.append(&create);
     header.append(&project_menu(project));
     header.upcast()
 }
 
 pub(super) fn project_menu(project: &Project) -> gtk::MenuButton {
+    // One menu item bound to this project's `win.` action. Sections draw the
+    // separators, so the destructive archive sits apart from the arrangement
+    // controls and the name/settings pair. GTK4 popovers ignore an item's
+    // `icon` unless the item is icon-only, so the labels carry the meaning.
+    let item = |label: &str, action: &str| {
+        let entry = gtk::gio::MenuItem::new(Some(label), None);
+        entry.set_action_and_target_value(Some(action), Some(&project.id.to_variant()));
+        entry
+    };
+
     let menu = gtk::gio::Menu::new();
-    for (label, action) in [
-        ("Edit project name…", "win.home-project-edit"),
-        ("Project defaults…", "win.home-project-defaults"),
-        (
-            if project.pinned {
-                "Unpin project"
-            } else {
-                "Pin project"
-            },
-            "win.home-project-pin",
-        ),
-        ("Move earlier", "win.home-project-up"),
-        ("Move later", "win.home-project-down"),
-        ("Archive project…", "win.home-project-archive"),
-    ] {
-        let item = gtk::gio::MenuItem::new(Some(label), None);
-        item.set_action_and_target_value(Some(action), Some(&project.id.to_variant()));
-        menu.append_item(&item);
-    }
+    let settings = gtk::gio::Menu::new();
+    settings.append_item(&item("Edit project name…", "win.home-project-edit"));
+    settings.append_item(&item("Project defaults…", "win.home-project-defaults"));
+    menu.append_section(None, &settings);
+
+    let arrange = gtk::gio::Menu::new();
+    arrange.append_item(&item(
+        if project.pinned {
+            "Unpin project"
+        } else {
+            "Pin project"
+        },
+        "win.home-project-pin",
+    ));
+    arrange.append_item(&item("Move earlier", "win.home-project-up"));
+    arrange.append_item(&item("Move later", "win.home-project-down"));
+    menu.append_section(None, &arrange);
+
+    let danger = gtk::gio::Menu::new();
+    danger.append_item(&item("Archive project…", "win.home-project-archive"));
+    menu.append_section(None, &danger);
+
     gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
         .tooltip_text("Manage project")
@@ -728,7 +716,7 @@ fn todo_scroll(app: &App, project_id: i64, open: &[(String, board::WorkCard)]) -
     let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
     for (lane_name, card) in open {
         let note = latest_card_note(app, project_id, &card.id);
-        list.append(&todo_row(project_id, lane_name, card, note.as_deref()));
+        list.append(&todo_row(app, project_id, lane_name, card, note.as_deref()));
     }
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -741,20 +729,32 @@ fn todo_scroll(app: &App, project_id: i64, open: &[(String, board::WorkCard)]) -
     scroll.upcast()
 }
 
-fn lane_footer(running: usize) -> gtk::Widget {
+fn lane_footer(running: usize, stopped: usize) -> gtk::Widget {
     let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     footer.add_css_class("lane-foot");
-    let status = gtk::Label::new(Some(&match running {
-        0 => "no agents".to_string(),
-        1 => "1 running".to_string(),
-        count => format!("{count} running"),
-    }));
+    let status = gtk::Label::new(Some(&lane_footer_text(running, stopped)));
     status.add_css_class("caption");
     status.add_css_class("dim-label");
     status.set_xalign(1.0);
     status.set_hexpand(true);
     footer.append(&status);
     footer.upcast()
+}
+
+/// The lane's one-line pulse: how many agents are running, and how many
+/// sessions ended recently (the "stopped" activity that would otherwise be
+/// invisible).
+fn lane_footer_text(running: usize, stopped: usize) -> String {
+    let running = match running {
+        0 => "no agents".to_string(),
+        1 => "1 running".to_string(),
+        count => format!("{count} running"),
+    };
+    match stopped {
+        0 => running,
+        1 => format!("{running} · 1 stopped"),
+        count => format!("{running} · {count} stopped"),
+    }
 }
 
 fn section_label(text: &str) -> gtk::Label {
@@ -808,12 +808,6 @@ fn project_view(app: &App, project_id: i64) -> gtk::Widget {
     open_workspace.set_action_target_value(Some(&project_id.to_variant()));
     actions.append(&open_workspace);
     open_workspace.set_sensitive(!project.is_missing());
-    let new_agent = gtk::Button::with_label("New agent");
-    new_agent.add_css_class("flat");
-    new_agent.set_action_name(Some("win.project-agent-create"));
-    new_agent.set_action_target_value(Some(&project_id.to_variant()));
-    actions.append(&new_agent);
-    new_agent.set_sensitive(!project.is_missing());
     actions.append(&project_menu(&project));
     content.append(&actions);
     let path = gtk::Label::new(Some(&project.subtitle()));
@@ -826,7 +820,8 @@ fn project_view(app: &App, project_id: i64) -> gtk::Widget {
     content.append(&todo_add_entry(app, project_id));
 
     // The board as columns, side by side: Todo, In progress, Review, Done —
-    // each scrolls on its own, and Sessions sits beside them.
+    // each scrolls on its own. Sessions are not a column: each card carries
+    // its own session chip instead.
     let columns = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     columns.add_css_class("project-columns");
     columns.set_vexpand(true);
@@ -843,10 +838,6 @@ fn project_view(app: &App, project_id: i64) -> gtk::Widget {
             }
             None => content.append(&quiet("No board")),
         }
-    }
-    let sessions = live_sessions(app, project_id);
-    if !sessions.is_empty() {
-        columns.append(&sessions_column(app, project_id, &sessions));
     }
     let hscroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -885,7 +876,7 @@ fn lane_column(app: &App, project_id: i64, lane: &board::LaneSummary) -> gtk::Wi
     for card in &lane.cards {
         let note = latest_card_note(app, project_id, &card.id);
         let label = if lane.done { "Done" } else { "" };
-        list.append(&todo_row(project_id, label, card, note.as_deref()));
+        list.append(&todo_row(app, project_id, label, card, note.as_deref()));
     }
     if lane.cards.is_empty() {
         list.append(&quiet("Nothing here"));
@@ -900,63 +891,26 @@ fn lane_column(app: &App, project_id: i64, lane: &board::LaneSummary) -> gtk::Wi
     column.upcast()
 }
 
-/// A project's running sessions, newest first, with their titles.
-fn live_sessions(app: &App, project_id: i64) -> Vec<(AgentSession, String)> {
-    let mut sessions: Vec<(AgentSession, String)> = app
-        .agent_sessions
+/// How many of a project's sessions are live, for the lane's footer pulse.
+fn live_session_count(app: &App, project_id: i64) -> usize {
+    app.agent_sessions
         .borrow()
         .by_project
         .get(&project_id)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(live_agents::sidebar_session_is_live)
-        .map(|session| {
-            let title = session.title.clone();
-            (session, title)
+        .map(|sessions| {
+            sessions
+                .iter()
+                .filter(|session| live_agents::sidebar_session_is_live(session))
+                .count()
         })
-        .collect();
-    live_agents::sort_sidebar_sessions(&mut sessions);
-    sessions
-}
-
-/// The Sessions column: the same rows the cockpit renders, beside the lanes.
-fn sessions_column(app: &App, project_id: i64, sessions: &[(AgentSession, String)]) -> gtk::Widget {
-    let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    column.add_css_class("project-column");
-    column.set_width_request(230);
-    column.set_valign(gtk::Align::Fill);
-    column.set_vexpand(true);
-
-    let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let name = gtk::Label::new(Some("Sessions"));
-    name.set_xalign(0.0);
-    name.set_hexpand(true);
-    name.add_css_class("caption-heading");
-    head.append(&name);
-    let count = gtk::Label::new(Some(&sessions.len().to_string()));
-    count.add_css_class("caption");
-    count.add_css_class("dim-label");
-    head.append(&count);
-    column.append(&head);
-
-    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    for (session, _) in sessions {
-        list.append(&session_row(app, project_id, session));
-    }
-    let scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .vexpand(true)
-        .child(&list)
-        .build();
-    column.append(&scroll);
-    column.upcast()
+        .unwrap_or(0)
 }
 
 /// One to-do: a checkbox that closes it, its title (which opens the card
-/// panel), and the lane, claim and latest agent note beneath it.
+/// panel), the lane, claim and latest agent note beneath it, and the session
+/// bound to it on the right.
 fn todo_row(
+    app: &App,
     project_id: i64,
     lane_name: &str,
     card: &board::WorkCard,
@@ -992,7 +946,10 @@ fn todo_row(
     button.add_css_class("todo");
     button.set_halign(gtk::Align::Fill);
     button.set_hexpand(true);
-    button.set_tooltip_text(Some("Open this card — read it, reply, edit it"));
+    button.set_tooltip_text(Some(&format!(
+        "Open this card — read it, reply, edit it\n{}",
+        card.id
+    )));
     button.set_action_name(Some("win.open-card"));
     button.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
 
@@ -1036,7 +993,64 @@ fn todo_row(
     }
     button.set_child(Some(&texts));
     row.append(&button);
+    if !done {
+        row.append(&card_session_chip(app, project_id, card));
+    }
     row.upcast()
+}
+
+/// A card's session at a glance: the agent bound to the card's claim, with
+/// its state; a card nobody holds offers to start one. Clicking opens the
+/// live session or resumes the claimed agent; a fresh card starts the
+/// project's default agent attached to it (see `win.card-session-create`).
+fn card_session_chip(app: &App, project_id: i64, card: &board::WorkCard) -> gtk::Widget {
+    let button = gtk::Button::new();
+    button.add_css_class("flat");
+    button.add_css_class("card-session");
+    button.set_valign(gtk::Align::Center);
+
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+    match &card.claim {
+        Some(claim) => {
+            let live = app.live_claim_session(project_id, claim);
+            let sign = app.card_session_sign(project_id, card);
+            let dot = gtk::Label::new(Some("●"));
+            dot.add_css_class("agent-state-dot");
+            dot.add_css_class(sign.css_class());
+            dot.set_valign(gtk::Align::Center);
+            content.append(&dot);
+            let label = gtk::Label::new(Some(match sign {
+                super::activity_sign::Sign::Unknown => "Session",
+                _ => sign.label(),
+            }));
+            label.add_css_class("caption");
+            label.add_css_class("dim-label");
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            content.append(&label);
+            button.set_tooltip_text(Some(if live.is_some() {
+                "Open this card's session"
+            } else {
+                "Resume the agent on this card"
+            }));
+            button.set_action_name(Some("win.open-claim"));
+            button.set_action_target_value(Some(&(project_id, claim.as_str()).to_variant()));
+        }
+        None => {
+            let plus = gtk::Image::from_icon_name("list-add-symbolic");
+            plus.set_pixel_size(11);
+            plus.set_valign(gtk::Align::Center);
+            content.append(&plus);
+            let label = gtk::Label::new(Some("Session"));
+            label.add_css_class("caption");
+            label.add_css_class("dim-label");
+            content.append(&label);
+            button.set_tooltip_text(Some("Start an agent session on this card"));
+            button.set_action_name(Some("win.card-session-create"));
+            button.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
+        }
+    }
+    button.set_child(Some(&content));
+    button.upcast()
 }
 
 /// The human's way in: an underlined input just under a project's board chips.
@@ -1118,98 +1132,18 @@ fn quiet(text: &str) -> gtk::Label {
     label
 }
 
-fn session_row(app: &App, project_id: i64, session: &AgentSession) -> gtk::Widget {
-    let active = app.active_panel_session_id(project_id).as_deref() == Some(session.id.as_str());
-    let state = app.latest_agent_activity(project_id, session);
-
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    row.add_css_class("cockpit-row");
-    row.set_margin_start(12);
-
+/// A small colored status dot for an activity sign, with a pulse while work is
+/// in flight or something is waiting.
+fn sign_dot(sign: super::activity_sign::Sign) -> gtk::Widget {
     let dot = gtk::Label::new(Some("●"));
-    dot.add_css_class("agent-state-dot");
-    dot.add_css_class(match state {
-        Some((state, _, _)) => state_class(state),
-        None => "agent-state-unknown",
-    });
     dot.set_valign(gtk::Align::Center);
-    row.append(&dot);
-
-    let texts = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    texts.set_hexpand(true);
-    let title = gtk::Label::new(Some(&session.title));
-    title.set_xalign(0.0);
-    title.set_hexpand(true);
-    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    if active {
-        title.add_css_class("cockpit-active");
-    }
-    texts.append(&title);
-
-    let program_name = programs::by_id(&session.program_id)
-        .map(|program| program.name)
-        .unwrap_or_else(|| session.program_id.clone());
-    let lifecycle = if session.external.is_some() {
-        "external terminal"
+    dot.set_tooltip_text(Some(sign.label()));
+    if sign.animates() {
+        dot.set_css_classes(&["activity-dot", "activity-pulse", sign.css_class()]);
     } else {
-        "running"
-    };
-    let detail = match &state {
-        Some((state, at_millis, message)) => {
-            let text = message
-                .as_ref()
-                .map(|message| format!("{} · {message}", board::agent_state_label(*state)))
-                .unwrap_or_else(|| board::agent_state_label(*state).to_string());
-            format!(
-                "{program_name} · {lifecycle} · {} · {text}",
-                board::relative_age(*at_millis)
-            )
-        }
-        None => format!("{program_name} · {lifecycle}"),
-    };
-    let detail = gtk::Label::new(Some(&detail));
-    detail.add_css_class("caption");
-    detail.add_css_class("dim-label");
-    detail.set_xalign(0.0);
-    detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    texts.append(&detail);
-    row.append(&texts);
-
-    let can_open = live_agents::can_open_sidebar_session(
-        session,
-        programs::by_id(&session.program_id)
-            .is_some_and(|program| !program.resume_session.is_empty()),
-    );
-    let button = gtk::Button::new();
-    button.add_css_class("flat");
-    button.add_css_class("session-item");
-    button.set_halign(gtk::Align::Fill);
-    button.set_hexpand(true);
-    button.set_sensitive(can_open);
-    button.set_tooltip_text(Some(if can_open {
-        if session.external.is_some() {
-            "Focus this terminal"
-        } else {
-            "Open this session"
-        }
-    } else {
-        "History only; no supported reopen link"
-    }));
-    if can_open {
-        button.set_action_name(Some("win.project-session-open"));
-        button.set_action_target_value(Some(&(project_id, session.id.as_str()).to_variant()));
+        dot.set_css_classes(&["activity-dot", sign.css_class()]);
     }
-    button.set_child(Some(&row));
-    button.upcast()
-}
-
-fn state_class(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Working => "agent-state-working",
-        AgentState::WaitingForInput | AgentState::WaitingForApproval => "agent-state-waiting",
-        AgentState::Idle => "agent-state-idle",
-        AgentState::Unknown => "agent-state-unknown",
-    }
+    dot.upcast()
 }
 
 // ---- Shared bits ----
@@ -1403,7 +1337,7 @@ fn git_init(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_project_folder_name;
+    use super::{lane_footer_text, valid_project_folder_name};
 
     #[test]
     fn new_project_names_cannot_escape_the_parent_folder() {
@@ -1413,5 +1347,13 @@ mod tests {
         for name in ["my-project", "Project with spaces", "café"] {
             assert!(valid_project_folder_name(name), "{name:?}");
         }
+    }
+
+    #[test]
+    fn the_lane_footer_reports_running_and_stopped_agents() {
+        assert_eq!(lane_footer_text(0, 0), "no agents");
+        assert_eq!(lane_footer_text(1, 0), "1 running");
+        assert_eq!(lane_footer_text(3, 1), "3 running · 1 stopped");
+        assert_eq!(lane_footer_text(0, 2), "no agents · 2 stopped");
     }
 }

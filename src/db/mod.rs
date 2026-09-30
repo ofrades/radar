@@ -21,7 +21,10 @@ pub use project_settings::ProjectSettings;
 pub use projects::Project;
 pub use settings::{NewWorkspaceLayout, Preferences, UiPrefs};
 pub use tabs::{Slot, Tab, TabKey};
-pub use workspace::{WorkspaceAxis, WorkspaceGroup, WorkspaceLayout, WorkspaceState};
+pub use workspace::{
+    workspace_restore_plan, WorkspaceAxis, WorkspaceLayout, WorkspacePanel, WorkspaceRestorePlan,
+    WorkspaceState,
+};
 
 use crate::config::Paths;
 

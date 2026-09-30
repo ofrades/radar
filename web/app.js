@@ -1,6 +1,27 @@
 import { Terminal } from "./xterm.mjs";
 import { FitAddon } from "./fit-addon.mjs";
 
+// Prefer the libghostty-vt renderer when the build ships its WASM module;
+// otherwise fall back to xterm.js. The check is async and the choice is read
+// when a terminal is attached.
+let GhosttyTerminal = null;
+let ghosttyEngine = false;
+(async () => {
+  try {
+    const module = await import("./ghostty-terminal.mjs");
+    await module.loadGhostty();
+    GhosttyTerminal = module.GhosttyTerminal;
+    ghosttyEngine = true;
+  } catch (error) {
+    console.warn("libghostty-vt unavailable; using xterm.js:", error);
+  }
+})();
+
+function fit() {
+  if (ghosttyEngine) terminal?.fit?.();
+  else fitAddon?.fit();
+}
+
 const $ = (selector) => document.querySelector(selector);
 const projectList = $("#project-list");
 const dashboard = $("#dashboard");
@@ -621,7 +642,13 @@ function attach(session) {
   reconnectAttempts = 0;
   window.clearTimeout(reconnectTimer);
   reconnectTimer = null;
-  terminal = new Terminal({
+  terminal = ghosttyEngine
+    ? new GhosttyTerminal({
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+        fontSize: 14,
+        theme: { background: "#0d100d", foreground: "#e3e8df" },
+      })
+    : new Terminal({
     cursorBlink: true,
     disableStdin: readOnly,
     convertEol: false,
@@ -654,7 +681,7 @@ function attach(session) {
   fitAddon = new FitAddon();
   terminal.loadAddon(fitAddon);
   terminal.open($("#terminal"));
-  fitAddon.fit();
+  fit();
   terminal.focus();
 
   terminal.onData(sendTerminalInput);
@@ -680,7 +707,7 @@ function attach(session) {
     };
   }
   resizeObserver?.disconnect();
-  resizeObserver = new ResizeObserver(() => requestAnimationFrame(() => fitAddon?.fit()));
+  resizeObserver = new ResizeObserver(() => requestAnimationFrame(() => fit()));
   resizeObserver.observe($(".terminal-frame"));
   window.addEventListener("resize", fitTerminal);
   window.visualViewport?.addEventListener("resize", fitTerminal);
@@ -694,6 +721,7 @@ function connectTerminal(session, reset) {
     document.baseURI,
   );
   socketUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  if (ghosttyEngine) socketUrl.searchParams.set("engine", "ghostty");
   const generation = ++socketGeneration;
   const socket = new WebSocket(socketUrl.toString());
   currentSocket = socket;
@@ -706,13 +734,20 @@ function connectTerminal(session, reset) {
         : "Read-only · use Workspace to choose another session",
       session.state === "running",
     );
-    fitAddon?.fit();
+    fit();
     if (session.state === "running") sendTerminalResize(terminal?.cols, terminal?.rows);
   });
   socket.addEventListener("message", (message) => {
     if (generation !== socketGeneration) return;
     if (message.data instanceof ArrayBuffer) {
-      terminal?.write(new Uint8Array(message.data));
+      const bytes = new Uint8Array(message.data);
+      if (ghosttyEngine) {
+        // Tagged frames: 1 = lossless snapshot, 0 = raw output.
+        if (bytes[0] === 1) terminal?.loadSnapshot?.(bytes.subarray(1));
+        else terminal?.write(bytes.subarray(1));
+      } else {
+        terminal?.write(bytes);
+      }
       return;
     }
     try {
@@ -808,7 +843,7 @@ function setTerminalReadOnly(state) {
 
 function fitTerminal() {
   window.setTimeout(() => {
-    fitAddon?.fit();
+    fit();
     terminal?.focus();
   }, 60);
 }

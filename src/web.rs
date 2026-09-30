@@ -30,9 +30,9 @@ use crate::session::Dims;
 const INDEX: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const APP_CSS: &str = include_str!("../web/app.css");
-const XTERM_JS: &[u8] = include_bytes!("../web/vendor/xterm.mjs");
-const XTERM_CSS: &[u8] = include_bytes!("../web/vendor/xterm.css");
-const FIT_JS: &[u8] = include_bytes!("../web/vendor/fit-addon.mjs");
+const GHOSTTY_TERMINAL_JS: &str = include_str!("../web/ghostty-terminal.mjs");
+/// The browser's libghostty-vt module, built by `build.rs`.
+const GHOSTTY_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ghostty-vt.wasm"));
 
 #[derive(Clone)]
 struct WebState {
@@ -63,9 +63,8 @@ async fn async_run(home: PathBuf, port: u16) -> Result<()> {
         .route("/", get(index))
         .route("/assets/app.js", get(app_js))
         .route("/assets/app.css", get(app_css))
-        .route("/assets/xterm.mjs", get(xterm_js))
-        .route("/assets/xterm.css", get(xterm_css))
-        .route("/assets/fit-addon.mjs", get(fit_js))
+        .route("/assets/ghostty-terminal.mjs", get(ghostty_terminal_js))
+        .route("/assets/ghostty-vt.wasm", get(ghostty_wasm))
         .route("/api/projects", get(projects))
         .route(
             "/api/projects/{project_id}/sessions",
@@ -107,16 +106,15 @@ async fn app_css() -> impl IntoResponse {
     static_asset("text/css; charset=utf-8", APP_CSS.as_bytes())
 }
 
-async fn xterm_js() -> impl IntoResponse {
-    static_asset("text/javascript; charset=utf-8", XTERM_JS)
+async fn ghostty_terminal_js() -> impl IntoResponse {
+    static_asset(
+        "text/javascript; charset=utf-8",
+        GHOSTTY_TERMINAL_JS.as_bytes(),
+    )
 }
 
-async fn xterm_css() -> impl IntoResponse {
-    static_asset("text/css; charset=utf-8", XTERM_CSS)
-}
-
-async fn fit_js() -> impl IntoResponse {
-    static_asset("text/javascript; charset=utf-8", FIT_JS)
+async fn ghostty_wasm() -> impl IntoResponse {
+    static_asset("application/wasm", GHOSTTY_WASM)
 }
 
 fn static_asset(content_type: &'static str, body: &'static [u8]) -> impl IntoResponse {
@@ -607,7 +605,10 @@ async fn attach_terminal(
 }
 
 enum Outbound {
+    /// Raw program output (tagged 0 on the wire).
     Bytes(Vec<u8>),
+    /// A lossless libghostty-vt snapshot (tagged 1 on the wire).
+    Snapshot(Vec<u8>),
     Text(String),
     Close,
 }
@@ -654,7 +655,7 @@ async fn bridge_terminal(
             match client.receive() {
                 Ok(Response::Snapshot(snapshot)) => {
                     if out_tx
-                        .blocking_send(Outbound::Bytes(snapshot.replay.clone()))
+                        .blocking_send(Outbound::Snapshot(snapshot.terminal_snapshot.clone()))
                         .is_err()
                     {
                         return;
@@ -735,7 +736,18 @@ async fn bridge_terminal(
             frame = out_rx.recv() => {
                 match frame {
                     Some(Outbound::Bytes(bytes)) => {
-                        if sender.send(Message::Binary(bytes.into())).await.is_err() {
+                        let mut tagged = Vec::with_capacity(bytes.len() + 1);
+                        tagged.push(0u8);
+                        tagged.extend_from_slice(&bytes);
+                        if sender.send(Message::Binary(tagged.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Outbound::Snapshot(bytes)) => {
+                        let mut tagged = Vec::with_capacity(bytes.len() + 1);
+                        tagged.push(1u8);
+                        tagged.extend_from_slice(&bytes);
+                        if sender.send(Message::Binary(tagged.into())).await.is_err() {
                             break;
                         }
                     }
@@ -931,6 +943,7 @@ mod tests {
             provider: provider.to_string(),
             provider_session_id: format!("ses_{id}"),
             radar_session_id: radar_id.map(str::to_string),
+            card_id: None,
             source: "provider".to_string(),
             title: Some(format!("Conversation {id}")),
             cwd: PathBuf::from("/work/project"),

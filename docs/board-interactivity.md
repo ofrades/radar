@@ -129,9 +129,23 @@ kinds, attention counts, and explicit per-agent state where available.
 Notifications are deduplicated by attention ID and opening one navigates to the
 relevant Board without resolving the request.
 
+**Implemented:** Home no longer spends a column or a section on Sessions — the
+project view's last column and the project lane's list are both gone. Each card
+carries the session bound to its claim — its explicit state, a click to open or
+resume it, and a start control when nobody holds the card — and the card detail
+shows its stable id with a copy button, so a human can hand that exact card to
+another agent (`radar card show "<id>"`).
+
 **Next:** vendor-specific hooks can translate native agent prompts into the
 existing request/wait flow. Verify agent questions and notification delivery
 with real agent CLIs on supported desktop environments.
+
+**Implemented:** an ACP (Agent Client Protocol) adapter (`radar acp`, see
+[`acp.md`](acp.md)) turns an agent's own protocol events into that same flow:
+`session/update` becomes explicit agent state and feed messages,
+`session/request_permission` becomes a durable approval request whose typed
+response travels back to the agent, and the ACP session id is exposed for exact
+resume. No output inference, no vendor prompt parsing.
 
 The journal, attention storage, board store, and native notification path are
 implemented independently of fullscreen board presentation.

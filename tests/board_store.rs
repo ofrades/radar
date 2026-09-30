@@ -139,7 +139,8 @@ fn the_card_lifecycle_and_conversation_round_trip() {
     assert_eq!(edited.card.title, "Fix login (v2)");
     assert!(edited.card.body.contains("a body"));
 
-    // Claim, then move: the move drops the claim.
+    // Claim, then move: claiming a Todo card starts it, and the move drops the
+    // claim.
     let claimed = change(daemon.request(Request::CardClaim {
         project_id: 3,
         card_id: card_id.clone(),
@@ -148,6 +149,8 @@ fn the_card_lifecycle_and_conversation_round_trip() {
         command_id: "claim-1".into(),
     }));
     assert_eq!(claimed.card.claim.as_deref(), Some("claude-1"));
+    assert_eq!(claimed.card.lane, "In progress");
+    assert_eq!(claimed.from_lane.as_deref(), Some("Todo"));
     let moved = change(daemon.request(Request::CardMove {
         project_id: 3,
         card_id: card_id.clone(),

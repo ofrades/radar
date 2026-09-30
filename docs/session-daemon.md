@@ -8,11 +8,10 @@ the process registry, real PTYs, the Alacritty terminal parser, current screen,
 socket under `<RADAR_HOME>/run/sessions.sock`.
 
 This follows the Superlogical direction of long-lived server ownership and
-snapshot-then-stream attachment. With the `vte` feature, the GUI starts or
-connects to the daemon, uses a small local PTY only as VTE's input adapter, and
-attaches each project/tab/program to the same persistent server session. Closing
-the pane or GUI detaches; the process remains in the daemon. The daemon and CLI
-API can also be used independently.
+snapshot-then-stream attachment. The GUI starts or connects to the daemon,
+decodes the daemon's lossless libghostty-vt snapshot into its own engine, and
+attaches each project/tab/program to the same persistent server session. Closing the pane or GUI detaches; the process remains in the
+daemon. The daemon and CLI API can also be used independently.
 
 ## Agent conversations versus terminal sessions
 
@@ -91,6 +90,15 @@ not daemon crashes or machine reboots.
   `Failed`; a worker that could not confirm process exit never leaves its
   retained lifecycle marked `Running`.
 
+### Environment
+
+A spawned program is given a `PATH` that prepends the directories mise
+reports (`mise bin-paths`) to the daemon's own `PATH`. The daemon is often
+started by a desktop session or a systemd user unit whose `PATH` is not the
+login shell's; the mise entries let an agent installed under the user's home
+resolve, and let an omarchy wrapper started for it see the same tools. When
+mise is absent the ambient `PATH` stands alone.
+
 ### Attach and ordering
 
 The parser, display snapshot, and subscription registration share one lock.
@@ -98,30 +106,15 @@ The snapshot carries output watermark `N`; the first subsequent event is
 `N+1`. Bytes are parsed before being published. Resize and stream closure use
 the same sequence as bytes. Terminal bytes are unmodified.
 
-The display snapshot includes the visible grid with cell attributes, explicit
-cursor coordinates (Alacritty's grid serde skips its cursor), terminal mode
-bits, dimensions, title/lifecycle, and available history length. It also includes
-a bounded ANSI `replay` of the active screen, common input modes, title, and the
-newest scrollback that fits the 8 MiB replay budget. The GUI feeds this replay
-into VTE before raw bytes after the snapshot watermark. VTE automatic DSR/DA/
-OSC/DCS replies are filtered from its local PTY input; the server remains the
-single query-reply owner. Scrollback can also be paged separately with
-`History(id, sequence, offset, limit)`, newest row first, at most 200 rows per
-page. A stale sequence is rejected rather than mixing terminal revisions.
-
-**VTE compatibility boundary:** the ANSI replay reconstructs the active display,
-cell attributes, common DEC/kitty modes, cursor and recent scrollback, then raw
-bytes resume at `sequence + 1`. It cannot import Alacritty's private parser
-internals. It does not preserve a partial UTF-8/escape sequence at the cut,
-inactive screen contents while alternate screen is active, saved cursor/charset,
-scroll margins, custom tab stops, title stack, terminal palette overrides, or
-every mode stack. A TUI may repaint these on attach; behavior that depends on
-hidden emulator state may differ. This is an explicit remaining integration
-requirement, not a claim of byte-perfect state transfer. The regression test
-replays a colored screen, scrollback, cursor and common modes through the parser.
-Before claiming full Superlogical-style replication, add an importable compatible
-terminal-state snapshot and test split UTF-8/escape sequences, alternate-screen
-return, saved cursor, margins, tabs, palette and mode stacks.
+The display snapshot carries the status (id, cwd, pid, lifecycle, title),
+dimensions, the output watermark, and a lossless binary `terminal_snapshot` from
+libghostty-vt. That snapshot is an ordered, CRC-protected record stream covering
+the whole terminal — both screens, scrollback, tab stops, palette (including
+overrides), scroll region, mode sets, cursor, title, and the unfinished VT/UTF-8
+parser continuation at the cut. A client decodes it into its own libghostty-vt
+terminal and feeds raw bytes after the snapshot watermark; it resumes exactly,
+with no replay. See [libghostty-vt](libghostty-vt.md) for the pinned engine and
+the snapshot contract.
 
 ### Backpressure and terminal queries
 
@@ -250,8 +243,9 @@ frames.
 `cargo test --test session_daemon` launches a real daemon process and checks
 client-process exit/reconnect, ordered delivery, blocked socket isolation,
 private endpoint permissions, singleton startup, invalid frame handling, and
-(with `--features vte`) local-PTY input, replay, detach, and reattach to the same
-process.
+(with `--features gui`) libghostty-vt snapshot attach, detach, and reattach
+to the same process.
 
-Next delivery: lossless terminal-state snapshot/import and vendor-specific
-prompt adapters in [`board-interactivity.md`](board-interactivity.md).
+The libghostty-vt pin is pre-1.0: the C ABI and the snapshot format still
+change. The pin and its bump policy live in
+[`libghostty-vt.md`](libghostty-vt.md).

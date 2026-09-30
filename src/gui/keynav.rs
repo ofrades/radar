@@ -11,8 +11,6 @@
 //! - `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle panes and dividers in layout order —
 //!   the one chord left on Ctrl, because the window manager owns Alt+Tab and
 //!   it never even reaches the window.
-//! - `Menu` (or `Shift+F10`) opens the focused pane's menu — every pane
-//!   action radar has, no mouse needed.
 //!
 //! The "which pane is over there" geometry is pure data, like `split.rs`, so
 //! it is testable without a display.
@@ -22,7 +20,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib;
 
-use super::group::Group;
+use super::panel::Panel;
 use super::SharedApp;
 
 /// Which way the keys should move.
@@ -93,7 +91,7 @@ pub fn pick(current: &Rect, candidates: &[(usize, Rect)], direction: Direction) 
 
 /// One thing the keys can land on.
 enum Target {
-    Pane(Rc<Group>),
+    Pane(Rc<Panel>),
     Divider(gtk::Paned),
 }
 
@@ -134,11 +132,6 @@ pub fn install(app: &SharedApp) {
             cycle_focus(app, shift);
             return glib::Propagation::Stop;
         }
-        let menu = key == gtk::gdk::Key::Menu || (shift && key == gtk::gdk::Key::F10);
-        if menu && !hud_open {
-            open_pane_menu(app);
-            return glib::Propagation::Stop;
-        }
         glib::Propagation::Proceed
     });
     app.window.add_controller(controller);
@@ -165,9 +158,9 @@ fn keys_are_free(window: &adw::ApplicationWindow) -> bool {
 /// so Alt+Arrows always moves between panes.
 fn panel_targets(app: &SharedApp, workspace: &super::Workspace) -> Vec<(Target, Rect)> {
     let mut targets = Vec::new();
-    for group in workspace.groups() {
-        if let Some(rect) = rect_of(group.widget.upcast_ref(), &app.window) {
-            targets.push((Target::Pane(group), rect));
+    for panel in workspace.panels() {
+        if let Some(rect) = rect_of(panel.widget.upcast_ref(), &app.window) {
+            targets.push((Target::Pane(panel), rect));
         }
     }
     targets
@@ -223,7 +216,7 @@ fn current_index(
 ) -> Option<usize> {
     let focus = focus?;
     targets.iter().position(|(target, _)| match target {
-        Target::Pane(group) => focus.is_ancestor(&group.widget),
+        Target::Pane(panel) => focus.is_ancestor(&panel.widget),
         Target::Divider(divider) => *focus == divider.clone().upcast::<gtk::Widget>(),
     })
 }
@@ -288,15 +281,12 @@ fn cycle_focus(app: &SharedApp, backwards: bool) {
     focus_target(app, &workspace, &targets[next].0);
 }
 
-/// Give the keys to a pane or a keyboard-resizable divider.
+/// Give the keys to a panel or a keyboard-resizable divider.
 fn focus_target(_app: &SharedApp, workspace: &Rc<super::Workspace>, target: &Target) {
     match target {
-        Target::Pane(group) => {
-            if let Some(key) = group.active_key() {
-                group.activate(key);
-                if let Some(primitive) = workspace.tab(key) {
-                    primitive.focus();
-                }
+        Target::Pane(panel) => {
+            if let Some(primitive) = panel.key().and_then(|key| workspace.tab(key)) {
+                primitive.focus();
             }
         }
         Target::Divider(divider) => {
@@ -305,48 +295,25 @@ fn focus_target(_app: &SharedApp, workspace: &Rc<super::Workspace>, target: &Tar
     }
 }
 
-/// The focused pane's menu: which program it runs, grouping, splitting,
-/// toggles — the whole pane vocabulary, keyboard-driven.
-fn open_pane_menu(app: &SharedApp) {
-    let Some(workspace) = app.current_workspace() else {
-        return;
-    };
-    if let Some(group) = app.focused_group(&workspace) {
-        group.menu_button.popup();
-    }
-}
-
-/// The ring follows focus, however it got there. Focusing a chip also activates
-/// the primitive it names, so the visible content follows keyboard focus.
+/// The ring follows focus, however it got there.
 fn install_ring(app: &SharedApp) {
     let app = Rc::clone(app);
     let window = app.window.clone();
     window.connect_focus_widget_notify(move |window| {
         let focus = window.focus_widget();
         let workspace = app.current_workspace();
-        if let (Some(workspace), Some(focus)) = (&workspace, focus.as_ref()) {
-            for group in workspace.groups() {
-                if let Some(key) = group.key_for_focus(focus) {
-                    if group.active_key() != Some(key) {
-                        group.activate(key);
-                        app.refresh_group_menu(&group);
-                        app.persist_primitives(workspace);
-                    }
-                }
-            }
-        }
         let focused = workspace
             .as_ref()
-            .and_then(|workspace| app.focused_group(workspace));
-        for group in workspace
+            .and_then(|workspace| app.focused_panel(workspace));
+        for panel in workspace
             .as_ref()
-            .map(|workspace| workspace.groups())
+            .map(|workspace| workspace.panels())
             .unwrap_or_default()
         {
-            let on = focused.as_ref().is_some_and(|f| Rc::ptr_eq(f, &group));
-            group.widget.remove_css_class("kbd-focus");
+            let on = focused.as_ref().is_some_and(|f| Rc::ptr_eq(f, &panel));
+            panel.widget.remove_css_class("kbd-focus");
             if on {
-                group.widget.add_css_class("kbd-focus");
+                panel.widget.add_css_class("kbd-focus");
             }
         }
         for divider in workspace

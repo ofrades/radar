@@ -55,6 +55,11 @@ enum Command {
         #[command(subcommand)]
         action: ActivityAction,
     },
+    /// Drive an ACP agent (Agent Client Protocol) through the session daemon
+    Acp {
+        #[command(subcommand)]
+        action: AcpAction,
+    },
     /// List projects with their git status
     List,
     /// Add one or more project directories
@@ -187,15 +192,6 @@ enum SessionAction {
     Forget {
         id: String,
     },
-    /// Fetch up to 200 scrollback rows at a snapshot's sequence, newest first
-    History {
-        id: String,
-        sequence: u64,
-        #[arg(long, default_value_t = 0)]
-        offset: usize,
-        #[arg(long, default_value_t = 100)]
-        limit: usize,
-    },
     /// Stop all sessions and shut down the daemon
     Shutdown,
 }
@@ -304,6 +300,42 @@ enum ActivityResponseAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum AcpAction {
+    /// Start an ACP agent session owned by the daemon
+    Start {
+        /// Stable id for this agent session
+        id: String,
+        /// The project directory the agent works in
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        /// The ACP agent program
+        #[arg(long, default_value = "opencode")]
+        program: String,
+        /// An argument for the agent; repeat for several. Defaults to
+        /// `acp` (the opencode shape).
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        /// Radar project ID (defaults to RADAR_PROJECT_ID)
+        #[arg(long)]
+        project_id: Option<i64>,
+        /// Radar session ID (defaults to RADAR_SESSION_ID)
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Stable card ID (defaults to RADAR_CARD_ID)
+        #[arg(long)]
+        card_id: Option<String>,
+    },
+    /// Send a prompt to a running agent
+    Prompt { id: String, text: String },
+    /// Ask a running agent to cancel its current turn
+    Cancel { id: String },
+    /// Stop a running agent and close its connection
+    Stop { id: String },
+    /// List the agents the daemon is running
+    List,
+}
+
+#[derive(Subcommand, Debug)]
 enum CardAction {
     /// Add a card (default column: Todo)
     Add {
@@ -407,6 +439,24 @@ enum CardAction {
         #[arg(long)]
         body: Option<String>,
     },
+    /// Link the session you are running in to a card, claiming it for you.
+    /// Reads RADAR_AGENT from the pane, so it needs no name.
+    Associate {
+        /// Project directory (default: the current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Stable card ID or its title
+        card: String,
+    },
+    /// Dispatch a worker agent for a card. Idempotent: a card already claimed
+    /// is left alone.
+    Start {
+        /// Project directory (default: the current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Stable card ID or its title
+        card: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -466,17 +516,6 @@ fn session_command(paths: &Paths, action: SessionAction) -> Result<()> {
         },
         SessionAction::Stop { id } => Request::Stop { id },
         SessionAction::Forget { id } => Request::Forget { id },
-        SessionAction::History {
-            id,
-            sequence,
-            offset,
-            limit,
-        } => Request::History {
-            id,
-            sequence,
-            offset,
-            limit,
-        },
         SessionAction::Shutdown => Request::Shutdown,
     };
     let mut client = Client::connect(&paths.data_dir, request)?;
@@ -690,6 +729,62 @@ fn activity_command(paths: &Paths, action: ActivityAction) -> Result<()> {
     Ok(())
 }
 
+/// Drive an ACP agent through the daemon: start, prompt, cancel, stop, list.
+fn acp_command(paths: &Paths, action: AcpAction) -> Result<()> {
+    use radar::session::agent::AgentStart;
+    use radar::session::daemon::{self, Client, Command as Request};
+
+    daemon::ensure_running(&paths.data_dir)?;
+    let default_project_id = || -> Result<i64> {
+        std::env::var("RADAR_PROJECT_ID")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .context("project ID is required (use --project-id or launch from a radar project)")
+    };
+    let request = match action {
+        AcpAction::Start {
+            id,
+            cwd,
+            program,
+            args,
+            project_id,
+            session_id,
+            card_id,
+        } => {
+            let cwd = cwd.canonicalize()?;
+            let project_id = match project_id {
+                Some(id) => id,
+                None => default_project_id()?,
+            };
+            // `opencode acp` takes no positional: the project directory travels
+            // in `NewSessionRequest`, not on the command line. Explicit
+            // `--arg`s replace the default for other agents.
+            let args = if args.is_empty() {
+                vec!["acp".to_string()]
+            } else {
+                args
+            };
+            Request::AgentStart(AgentStart {
+                id,
+                provider: program.clone(),
+                program,
+                args,
+                cwd,
+                project_id,
+                session_id: session_id.or_else(|| std::env::var("RADAR_SESSION_ID").ok()),
+                card_id: card_id.or_else(|| std::env::var("RADAR_CARD_ID").ok()),
+            })
+        }
+        AcpAction::Prompt { id, text } => Request::AgentPrompt { id, text },
+        AcpAction::Cancel { id } => Request::AgentCancel { id },
+        AcpAction::Stop { id } => Request::AgentStop { id },
+        AcpAction::List => Request::AgentList,
+    };
+    let response = Client::request(&paths.data_dir, request)?;
+    println!("{}", serde_json::to_string(&response)?);
+    Ok(())
+}
+
 /// Keep an agent-side CLI invocation alive until its request receives a typed
 /// human response. The durable record is checked after resync, while watching
 /// from the snapshot watermark closes the race with a response arriving then.
@@ -815,6 +910,7 @@ fn main() -> Result<()> {
         Some(Command::Web { port }) => return radar::web::run(&paths.data_dir, port),
         Some(Command::Session { action }) => return session_command(&paths, action),
         Some(Command::Activity { action }) => return activity_command(&paths, action),
+        Some(Command::Acp { action }) => return acp_command(&paths, action),
         _ => {}
     }
     let db = Db::open(&paths)?;
@@ -826,7 +922,8 @@ fn main() -> Result<()> {
             Command::Serve
             | Command::Web { .. }
             | Command::Session { .. }
-            | Command::Activity { .. },
+            | Command::Activity { .. }
+            | Command::Acp { .. },
         ) => {
             unreachable!("handled before opening the database")
         }
@@ -946,6 +1043,10 @@ fn main() -> Result<()> {
                 body.as_deref(),
                 cli.json,
             ),
+            CardAction::Associate { path, card } => {
+                card_associate(&paths, &db, path, &card, cli.json)
+            }
+            CardAction::Start { path, card } => card_start(&paths, &db, path, &card, cli.json),
         },
         Some(Command::Hook { action }) => match action {
             HookAction::Guard { file, commit, path } => {
@@ -1120,6 +1221,165 @@ fn card_add(
     )?;
     println!("added \"{}\"", change.card.title);
     Ok(())
+}
+
+/// `radar card start <card>`: dispatch a worker agent for a card. The daemon
+/// spawns it with the card's canonical work prompt as its first message,
+/// attached to the card (`RADAR_CARD_ID`) and claiming it for the new instance.
+/// Idempotent: a card already claimed is left alone, so an orchestrator can
+/// call it repeatedly.
+fn card_start(
+    paths: &Paths,
+    db: &Db,
+    path: Option<PathBuf>,
+    needle: &str,
+    json: bool,
+) -> Result<()> {
+    use radar::session::daemon as board_api;
+    use radar::session::daemon::{Client, Command as Request};
+    use radar::session::registry::Spawn;
+    use radar::session::Dims;
+
+    let (project_id, root) = board_context(db, path)?;
+    db.require_board_enabled(&root)?;
+    let state = board_api::board_state(&paths.data_dir, project_id)?;
+    let card = find_stored(&state, needle)
+        .with_context(|| format!("no card {needle}"))?
+        .clone();
+
+    // A card someone already holds is not dispatched again.
+    if let Some(claim) = &card.claim {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "created": false, "cardId": card.id, "claim": claim })
+            );
+        } else {
+            println!("{} is already claimed by {claim}", card.title);
+        }
+        return Ok(());
+    }
+
+    let global = db.preferences().unwrap_or_default();
+    let preferences = db
+        .project_settings(project_id)
+        .unwrap_or_default()
+        .apply_to(&global);
+    let program = programs::for_slot(Slot::Agent, &preferences)
+        .context("No agent is installed — set one in Preferences")?;
+    let stamp = programs::launch::now_stamp();
+    let claim = format!("{}-{stamp}", program.id);
+    let session_id = format!("card-{}-{stamp}", card.id);
+    // A CLI that can create a conversation under an id radar picks gets one
+    // named for this card, so the claim links to it exactly instead of a
+    // post-exit guess against the CLI's store. Others fall back to the guess.
+    let provider_session_id = program
+        .create_session
+        .then(|| programs::launch::provider_session_id(project_id, &stamp));
+    let spec = programs::launch::command_spec(
+        &program,
+        &LaunchOptions {
+            prompt: Some(radar::session::board_store::work_prompt(
+                &card.id,
+                &card.title,
+            )),
+            card: Some(card.id.clone()),
+            agent_instance: Some(stamp),
+            create_session: provider_session_id.clone(),
+            ..Default::default()
+        },
+    );
+
+    let mut env = spec.env_set.clone();
+    env.extend([
+        ("RADAR_PROJECT_ID".to_string(), project_id.to_string()),
+        (
+            "RADAR_PROJECT_ROOT".to_string(),
+            root.to_string_lossy().into_owned(),
+        ),
+        (
+            "RADAR_HOME".to_string(),
+            paths.data_dir.to_string_lossy().into_owned(),
+        ),
+        ("RADAR_SESSION_ID".to_string(), session_id.clone()),
+    ]);
+
+    Client::request(
+        &paths.data_dir,
+        Request::Create(Spawn {
+            id: session_id.clone(),
+            argv: spec.argv,
+            cwd: root,
+            dims: Dims {
+                cols: 120,
+                rows: 32,
+            },
+            env,
+            env_remove: spec.env_unset,
+        }),
+    )?;
+
+    // The daemon has no exit handler for a session it owns, so bind the exact
+    // conversation now, while the catalog row from `Create` is fresh.
+    if let Some(provider_session_id) = &provider_session_id {
+        let _ = db.bind_session(project_id, &claim, &program.id, provider_session_id);
+        let _ = Client::request(
+            &paths.data_dir,
+            Request::CatalogBind {
+                radar_id: session_id.clone(),
+                provider: program.id.clone(),
+                provider_session_id: provider_session_id.clone(),
+            },
+        );
+    }
+
+    let change = board_api::board_card_claim(
+        &paths.data_dir,
+        project_id,
+        &card.id,
+        Some(&claim),
+        None,
+        &board_command_id("start"),
+    )?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "created": true,
+                "cardId": change.card.id,
+                "claim": claim,
+                "sessionId": session_id,
+            })
+        );
+    } else {
+        println!(
+            "Started {claim} on \"{}\" ({})",
+            change.card.title, change.card.id
+        );
+    }
+    Ok(())
+}
+
+/// `radar card associate <card>`: put the session you are running in on a
+/// card, by claiming it for the pane's own `RADAR_AGENT`. No name argument, and
+/// safe to run again after a fork or restore — the board's "this session is
+/// working that card" command.
+fn card_associate(
+    paths: &Paths,
+    db: &Db,
+    path: Option<PathBuf>,
+    needle: &str,
+    json: bool,
+) -> Result<()> {
+    let agent = std::env::var("RADAR_AGENT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .context(
+            "radar card associate must run inside a radar-launched pane (RADAR_AGENT is not set); \
+             name the holder explicitly with `radar card claim --by <name>`",
+        )?;
+    card_claim(paths, db, path, needle, Some(&agent), json)
 }
 
 fn card_claim(
@@ -1754,6 +2014,7 @@ fn launch_options(preferences: &Preferences, safe: bool) -> LaunchOptions {
         prompt: None,
         resume: false,
         session: None,
+        create_session: None,
         agent_instance: None,
         card: None,
     }

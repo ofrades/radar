@@ -1,6 +1,8 @@
 //! Paths and user configuration.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Where radar keeps its state.
 ///
@@ -144,23 +146,108 @@ pub fn preferred_editor_from_env() -> Option<String> {
     which(editor).map(|_| editor.to_string())
 }
 
-/// Resolve a program on `PATH`.
+/// Resolve a program on `PATH`, including the entries mise contributes.
 pub fn which(program: &str) -> Option<PathBuf> {
     if program.contains('/') {
         let path = PathBuf::from(program);
         return path.is_file().then_some(path);
     }
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
+    find_in(&search_entries(), program)
+}
+
+/// Resolve a program on the ambient `PATH` alone. Used to find `mise` itself,
+/// so it must not consult the entries mise adds.
+fn which_ambient(program: &str) -> Option<PathBuf> {
+    find_in(&ambient_entries(), program)
+}
+
+/// First executable `program` in `entries`.
+fn find_in(entries: &[PathBuf], program: &str) -> Option<PathBuf> {
+    entries.iter().find_map(|dir| {
         let candidate = dir.join(program);
-        if candidate.is_file() && is_executable(&candidate) {
-            return Some(candidate);
+        (candidate.is_file() && is_executable(&candidate)).then_some(candidate)
+    })
+}
+
+/// The directories of the ambient `PATH`, in order.
+fn ambient_entries() -> Vec<PathBuf> {
+    std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The directories to search for a program, and to hand a spawned program as
+/// its `PATH`: what mise installs, then the ambient `PATH`.
+///
+/// Radar is often started by a desktop session or a systemd user unit whose
+/// `PATH` is not the login shell's, while agents (opencode, omp, claude, …)
+/// are installed through mise under the user's home. Prepending mise's bin
+/// paths lets radar find and launch those tools however it was started,
+/// without shelling out to a login shell. An omarchy wrapper spawned with
+/// this `PATH` sees the same tools, so it no longer reports them missing.
+pub fn search_entries() -> Vec<PathBuf> {
+    let mut entries = mise_bin_paths().to_vec();
+    entries.extend(ambient_entries());
+    entries
+}
+
+/// The `PATH` value to give a spawned program.
+pub fn path_value() -> OsString {
+    std::env::join_paths(search_entries())
+        .unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
+}
+
+/// The bin directories mise reports for the user's installed tools.
+///
+/// Asked once per process and cached: the answer is the user's global mise
+/// configuration, read from the home directory so it does not depend on
+/// wherever radar happened to start. Empty when mise is absent or says
+/// nothing, in which case the ambient `PATH` stands alone.
+fn mise_bin_paths() -> &'static [PathBuf] {
+    static PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    PATHS.get_or_init(|| {
+        let Some(mise) = mise_binary() else {
+            return Vec::new();
+        };
+        let mut command = std::process::Command::new(mise);
+        command.arg("bin-paths");
+        if let Some(home) = dirs::home_dir() {
+            command.current_dir(home);
         }
+        let Ok(output) = command.output() else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .collect()
+    })
+}
+
+/// Where the `mise` binary is: on the ambient `PATH`, or one of the usual
+/// install locations when radar was started without the login shell's.
+fn mise_binary() -> Option<PathBuf> {
+    if let Some(path) = which_ambient("mise") {
+        return Some(path);
     }
-    None
+    let mut candidates = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local/bin/mise"));
+        candidates.push(home.join(".local/share/mise/bin/mise"));
+    }
+    candidates.push(PathBuf::from("/usr/bin/mise"));
+    candidates.push(PathBuf::from("/usr/local/bin/mise"));
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 #[cfg(unix)]
@@ -195,6 +282,35 @@ mod tests {
     fn which_resolves_an_absolute_path() {
         assert!(which("/bin/sh").is_some());
         assert!(which("/nope/nope").is_none());
+    }
+
+    #[test]
+    fn find_in_skips_non_executables() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(find_in(&[dir.path().to_path_buf()], "tool"), None);
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(find_in(&[dir.path().to_path_buf()], "tool"), Some(tool));
+    }
+
+    #[test]
+    fn search_entries_prepend_mise_and_keep_the_ambient_path() {
+        let ambient = ambient_entries();
+        let mise = mise_bin_paths();
+        let entries = search_entries();
+        assert_eq!(entries.len(), mise.len() + ambient.len());
+        assert_eq!(&entries[..mise.len()], mise);
+        assert_eq!(&entries[mise.len()..], &ambient[..]);
+    }
+
+    #[test]
+    fn path_value_is_the_search_entries_joined() {
+        let value = path_value();
+        let parsed: Vec<PathBuf> = std::env::split_paths(&value).collect();
+        assert_eq!(parsed, search_entries());
     }
 
     #[test]

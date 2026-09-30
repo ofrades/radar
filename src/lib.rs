@@ -12,6 +12,7 @@
 pub mod config;
 pub mod db;
 pub mod discover;
+pub mod ghostty;
 pub mod git;
 #[cfg(feature = "gui")]
 pub mod gui;

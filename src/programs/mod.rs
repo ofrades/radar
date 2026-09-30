@@ -91,6 +91,12 @@ pub struct Program {
     /// where the session id goes (e.g. `"--session {id}"`). Empty when
     /// the CLI has no such flag radar knows.
     pub resume_session: String,
+    /// Can the CLI *create* a conversation under an id radar picks, using
+    /// the same flag as `resume_session` (OpenCode's `--session` creates
+    /// one if it does not exist)? Then a fresh launch can be given an exact
+    /// conversation id up front, instead of radar guessing one from the
+    /// CLI's store after the fact. False for CLIs whose flag only resumes.
+    pub create_session: bool,
     /// Environment variables to remove for this program.
     pub env_unset: Vec<String>,
     /// GUI program: launch it externally instead of embedding it.
@@ -120,6 +126,7 @@ impl Program {
             auto_args: Vec::new(),
             resume_args: Vec::new(),
             resume_session: String::new(),
+            create_session: false,
             env_unset: Vec::new(),
             external: false,
             omarchy: false,

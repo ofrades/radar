@@ -7,7 +7,7 @@
 #   make check      clippy, both feature sets
 #   make uninstall  remove what install put down
 
-FEATURES ?= vte
+FEATURES ?= gui
 
 .PHONY: build install dev test check uninstall clean
 
@@ -24,9 +24,9 @@ test:
 	cargo test --features $(FEATURES)
 
 check:
+	cargo clippy --all-targets -- -D warnings
 	cargo clippy --all-targets --features gui -- -D warnings
-	cargo clippy --all-targets --features vte -- -D warnings
-	@echo "clippy clean for gui and vte"
+	@echo "clippy clean"
 
 uninstall:
 	./install.sh --uninstall

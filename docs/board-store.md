@@ -98,9 +98,13 @@ is explicitly out of scope here.
 - **Status.** A card's lane is its status; `done` is true exactly while the
   card sits in a done-kind lane, and clears when it leaves. One definition,
   replacing the column-heading-vs-checkbox ambiguity.
-- **Claim.** Moving a card drops its claim, as today; a claim still names the
-  agent by `RADAR_AGENT`, and the existing claim-to-conversation binding is
-  unchanged.
+- **Claim.** A claim is the transition that starts a card: claiming (or
+  `card next`) moves a card in a `todo`-kind lane to the first `in_progress`
+  lane, and releasing it parks it back in the first `todo`-kind lane, in the
+  same transaction. A card already in progress, in Review, or in a custom lane
+  keeps its lane, so review handoff is never rewritten. Moving a card still
+  drops its claim, as today; a claim still names the agent by `RADAR_AGENT`,
+  and the existing claim-to-conversation binding is unchanged.
 - **Concurrency.** Mutations are revision-checked server-side (the pattern the
   attention store already uses); a stale write returns a conflict the client
   can retry. No whole-file rewrites, no mtime races.

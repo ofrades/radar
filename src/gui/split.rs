@@ -36,7 +36,7 @@ pub enum Node<L> {
 impl<L> Clone for Node<L> {
     fn clone(&self) -> Self {
         match self {
-            Node::Leaf(group) => Node::Leaf(Rc::clone(group)),
+            Node::Leaf(panel) => Node::Leaf(Rc::clone(panel)),
             Node::Split {
                 axis,
                 ratio,
@@ -55,8 +55,8 @@ impl<L> Clone for Node<L> {
 }
 
 impl<L> Node<L> {
-    pub fn leaf(group: &Rc<L>) -> Node<L> {
-        Node::Leaf(Rc::clone(group))
+    pub fn leaf(panel: &Rc<L>) -> Node<L> {
+        Node::Leaf(Rc::clone(panel))
     }
 
     pub fn split(
@@ -75,11 +75,11 @@ impl<L> Node<L> {
         }
     }
 
-    /// Does this subtree hold `group`?
-    pub fn contains(&self, group: &Rc<L>) -> bool {
+    /// Does this subtree hold `panel`?
+    pub fn contains(&self, panel: &Rc<L>) -> bool {
         match self {
-            Node::Leaf(g) => Rc::ptr_eq(g, group),
-            Node::Split { first, second, .. } => first.contains(group) || second.contains(group),
+            Node::Leaf(g) => Rc::ptr_eq(g, panel),
+            Node::Split { first, second, .. } => first.contains(panel) || second.contains(panel),
         }
     }
 
@@ -127,11 +127,11 @@ impl<L> Node<L> {
 
         fn walk<L>(node: &mut Node<L>, first: &Rc<L>, second: &Rc<L>) {
             match node {
-                Node::Leaf(group) if Rc::ptr_eq(group, first) => {
-                    *group = Rc::clone(second);
+                Node::Leaf(panel) if Rc::ptr_eq(panel, first) => {
+                    *panel = Rc::clone(second);
                 }
-                Node::Leaf(group) if Rc::ptr_eq(group, second) => {
-                    *group = Rc::clone(first);
+                Node::Leaf(panel) if Rc::ptr_eq(panel, second) => {
+                    *panel = Rc::clone(first);
                 }
                 Node::Leaf(_) => {}
                 Node::Split {
@@ -149,7 +149,7 @@ impl<L> Node<L> {
         true
     }
 
-    /// Drop leaves whose group is gone, hoisting the survivor when one side of
+    /// Drop leaves whose panel is gone, hoisting the survivor when one side of
     /// a split dies. None when the whole subtree is gone.
     pub fn prune(self, alive: &[Rc<L>]) -> Option<Node<L>> {
         match self {
@@ -172,19 +172,19 @@ impl<L> Node<L> {
         }
     }
 
-    /// Take the leaf holding `group` out of the tree, hoisting the surviving
+    /// Take the leaf holding `panel` out of the tree, hoisting the surviving
     /// side into its place. None when the leaf was the whole tree — or when
-    /// the group was not here at all.
-    pub fn take_leaf(self, group: &Rc<L>) -> Option<Node<L>> {
+    /// the panel was not here at all.
+    pub fn take_leaf(self, panel: &Rc<L>) -> Option<Node<L>> {
         match self {
-            Node::Leaf(g) => (!Rc::ptr_eq(&g, group)).then(|| Node::Leaf(g)),
+            Node::Leaf(g) => (!Rc::ptr_eq(&g, panel)).then(|| Node::Leaf(g)),
             Node::Split {
                 axis,
                 ratio,
                 key,
                 first,
                 second,
-            } => match (first.take_leaf(group), second.take_leaf(group)) {
+            } => match (first.take_leaf(panel), second.take_leaf(panel)) {
                 (Some(f), Some(s)) => Some(Node::split(axis, ratio, key, f, s)),
                 (Some(f), None) => Some(f),
                 (None, Some(s)) => Some(s),
@@ -195,7 +195,7 @@ impl<L> Node<L> {
 
     /// Add a pane beside the deepest last leaf: where brand-new panes land in
     /// an arranged tree.
-    pub fn append(&mut self, group: &Rc<L>) {
+    pub fn append(&mut self, panel: &Rc<L>) {
         match self {
             Node::Leaf(existing) => {
                 let existing = Rc::clone(existing);
@@ -204,10 +204,10 @@ impl<L> Node<L> {
                     0.7,
                     "tree-append",
                     Node::leaf(&existing),
-                    Node::leaf(group),
+                    Node::leaf(panel),
                 );
             }
-            Node::Split { second, .. } => second.append(group),
+            Node::Split { second, .. } => second.append(panel),
         }
     }
 }

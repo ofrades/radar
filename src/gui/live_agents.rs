@@ -38,6 +38,9 @@ pub(super) struct AgentSession {
     pub provider_session_id: Option<String>,
     /// Exact `RADAR_AGENT` claim carried by a live process, when readable.
     pub claim_id: Option<String>,
+    /// The board to-do the process was launched for (`RADAR_CARD_ID`), when
+    /// readable. Stable for the process's life, unlike the card's claim.
+    pub card_id: Option<String>,
     pub last_activity_at: i64,
     pub running: bool,
     pub archived: bool,
@@ -46,29 +49,6 @@ pub(super) struct AgentSession {
 /// Whether an entry belongs in the running section of the sidebar.
 pub(super) fn sidebar_session_is_live(session: &AgentSession) -> bool {
     session.running || session.external.is_some()
-}
-
-/// Sidebar ordering keeps running agents before recent history and archived
-/// history, then orders each section by activity and title.
-pub(super) fn sort_sidebar_sessions(sessions: &mut [(AgentSession, String)]) {
-    sessions.sort_by_cached_key(|(session, title)| {
-        (
-            !sidebar_session_is_live(session),
-            session.archived,
-            std::cmp::Reverse(session.last_activity_at),
-            title.to_lowercase(),
-            session.program_id.to_lowercase(),
-            session.id.clone(),
-        )
-    });
-}
-
-/// History can only reopen when the provider supplied an exact conversation
-/// id and the selected program has a resume command.
-pub(super) fn can_open_sidebar_session(session: &AgentSession, program_can_resume: bool) -> bool {
-    session.external.is_some()
-        || (session.running && session.radar_session_id.is_some())
-        || (program_can_resume && exact_provider_session_id(session).is_some())
 }
 
 fn fallback_title(program_id: &str) -> String {
@@ -107,29 +87,6 @@ pub(super) fn exact_provider_session_id(session: &AgentSession) -> Option<&str> 
         Some(id) if Some(id.as_str()) != session.radar_session_id.as_deref() => Some(id),
         _ => None,
     }
-}
-
-/// The sidebar row the agent panel's visible tab shows, if any. A tab
-/// launched on an exact conversation (`--session <id>`) shows that
-/// conversation's row — the history row reopened, not whatever else runs
-/// at the tab. Without one, the live radar session whose stable place is
-/// that tab is what the panel shows. External rows live in other
-/// terminals; a radar panel never shows one.
-pub(super) fn active_panel_session<'a>(
-    sessions: &'a [AgentSession],
-    active_tab: &str,
-    launched: Option<&str>,
-) -> Option<&'a AgentSession> {
-    if let Some(conversation) = launched {
-        if let Some(session) = sessions.iter().find(|session| {
-            session.external.is_none() && exact_provider_session_id(session) == Some(conversation)
-        }) {
-            return Some(session);
-        }
-    }
-    sessions.iter().find(|session| {
-        session.external.is_none() && session.tab_key.as_deref() == Some(active_tab)
-    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -304,6 +261,10 @@ pub(super) fn discover(
             external: None,
             catalog_id: entry.as_ref().map(|entry| entry.id),
             claim_id: status.pid.and_then(programs::launch::radar_agent_of),
+            card_id: status
+                .pid
+                .and_then(programs::launch::radar_card_of)
+                .or_else(|| entry.as_ref().and_then(|entry| entry.card_id.clone())),
             radar_session_id: Some(status.id.clone()),
             provider_session_id: entry
                 .as_ref()
@@ -343,6 +304,7 @@ pub(super) fn discover(
             radar_session_id: entry.radar_session_id.clone(),
             provider_session_id: Some(entry.provider_session_id.clone()),
             claim_id: None,
+            card_id: entry.card_id.clone(),
             last_activity_at: entry.last_activity_at,
             running: entry.lifecycle == "running",
             archived: entry.archived_at.is_some(),
@@ -515,6 +477,7 @@ fn external_sessions(
             radar_session_id: None,
             provider_session_id: explicit_session_id(&process.program, &process.argv),
             claim_id: programs::launch::radar_agent_of(process.pid),
+            card_id: programs::launch::radar_card_of(process.pid),
             last_activity_at: now,
             running: true,
             archived: false,
@@ -939,120 +902,6 @@ mod tests {
         assert_eq!(explicit_session_id(&cursor, &argv), None);
     }
     #[test]
-    fn sidebar_sessions_sort_by_newest_activity_then_title() {
-        let session = |id: &str, program_id: &str, last_activity_at: i64| super::AgentSession {
-            project_id: 1,
-            id: id.to_string(),
-            title: String::new(),
-            program_id: program_id.to_string(),
-            tab_key: None,
-            external: None,
-            catalog_id: None,
-            radar_session_id: None,
-            provider_session_id: None,
-            claim_id: None,
-            last_activity_at,
-            running: false,
-            archived: false,
-        };
-        let mut sessions = vec![
-            (session("old", "codex", 100), "zeta".to_string()),
-            (session("new", "claude", 900), "alpha".to_string()),
-            (session("tie-a", "codex", 500), "ALPHA".to_string()),
-            (session("tie-b", "codex", 500), "alpha".to_string()),
-        ];
-
-        super::sort_sidebar_sessions(&mut sessions);
-
-        assert_eq!(
-            sessions
-                .iter()
-                .map(|(session, _)| session.id.as_str())
-                .collect::<Vec<_>>(),
-            ["new", "tie-a", "tie-b", "old"],
-            "newest activity first; title breaks timestamp ties case-insensitively"
-        );
-    }
-
-    #[test]
-    fn sidebar_sessions_sort_running_agents_before_recent_history() {
-        let session = |id: &str, last_activity_at: i64| super::AgentSession {
-            project_id: 1,
-            id: id.to_string(),
-            title: String::new(),
-            program_id: "codex".to_string(),
-            tab_key: None,
-            external: None,
-            catalog_id: None,
-            radar_session_id: None,
-            provider_session_id: None,
-            claim_id: None,
-            last_activity_at,
-            running: false,
-            archived: false,
-        };
-        let mut running = session("running", 100);
-        running.running = true;
-        running.radar_session_id = Some("project-1-agent-0-codex".to_string());
-        let mut archived = session("archived", 950);
-        archived.archived = true;
-        let mut sessions = vec![
-            (session("recent", 900), "Recent".to_string()),
-            (archived, "Archived".to_string()),
-            (running, "Running".to_string()),
-        ];
-
-        super::sort_sidebar_sessions(&mut sessions);
-
-        assert_eq!(
-            sessions
-                .iter()
-                .map(|(session, _)| session.id.as_str())
-                .collect::<Vec<_>>(),
-            ["running", "recent", "archived"]
-        );
-    }
-
-    #[test]
-    fn history_opens_only_with_an_exact_provider_resume_target() {
-        let session = || super::AgentSession {
-            project_id: 1,
-            id: "catalog-1".to_string(),
-            title: "Old conversation".to_string(),
-            program_id: "opencode".to_string(),
-            tab_key: None,
-            external: None,
-            catalog_id: Some(1),
-            radar_session_id: None,
-            provider_session_id: None,
-            claim_id: None,
-            last_activity_at: 0,
-            running: false,
-            archived: false,
-        };
-        let history = session();
-        assert!(!super::can_open_sidebar_session(&history, true));
-
-        let mut exact = session();
-        exact.provider_session_id = Some("ses-42".to_string());
-        assert!(super::can_open_sidebar_session(&exact, true));
-        assert!(!super::can_open_sidebar_session(&exact, false));
-
-        let mut live = session();
-        live.running = true;
-        live.radar_session_id = Some("project-1-agent-0-opencode".to_string());
-        assert!(super::can_open_sidebar_session(&live, false));
-
-        let mut external = session();
-        external.external = Some(super::ExternalTarget {
-            pid: 42,
-            start_ticks: 1,
-            window_pid: 42,
-        });
-        assert!(super::can_open_sidebar_session(&external, false));
-    }
-
-    #[test]
     fn initial_session_scan_failure_does_not_claim_to_show_previous_results() {
         let mut index = super::SessionIndex::default();
 
@@ -1082,6 +931,7 @@ mod tests {
             radar_session_id: None,
             provider_session_id: Some("thread-7".to_string()),
             claim_id: None,
+            card_id: None,
             last_activity_at: 0,
             running: false,
             archived: false,
@@ -1158,81 +1008,6 @@ mod tests {
     }
 
     #[test]
-    fn active_panel_session_prefers_the_launched_conversation_then_the_tab() {
-        let session = |id: &str,
-                       tab: Option<&str>,
-                       radar: Option<&str>,
-                       provider: Option<&str>,
-                       external: bool| super::AgentSession {
-            project_id: 1,
-            id: id.to_string(),
-            title: String::new(),
-            program_id: "omp".to_string(),
-            tab_key: tab.map(str::to_string),
-            external: external.then_some(super::ExternalTarget {
-                pid: 42,
-                start_ticks: 1,
-                window_pid: 42,
-            }),
-            catalog_id: None,
-            radar_session_id: radar.map(str::to_string),
-            provider_session_id: provider.map(str::to_string),
-            claim_id: None,
-            last_activity_at: 0,
-            running: !external,
-            archived: false,
-        };
-        let live = session("project-1-agent-0-omp", Some("agent-0"), None, None, false);
-        let history = session("catalog-7", None, None, Some("ses_42"), false);
-        let backfilled = session(
-            "catalog-8",
-            None,
-            Some("project-1-agent-1-omp"),
-            Some("project-1-agent-1-omp"),
-            false,
-        );
-        let sessions = [live, history, backfilled];
-
-        // No exact conversation on the tab: the live session running there.
-        assert_eq!(
-            super::active_panel_session(&sessions, "agent-0", None)
-                .map(|session| session.id.as_str()),
-            Some("project-1-agent-0-omp")
-        );
-        // Relaunched on the history row's conversation: that row, not the
-        // session that happens to hold the tab.
-        assert_eq!(
-            super::active_panel_session(&sessions, "agent-0", Some("ses_42"))
-                .map(|session| session.id.as_str()),
-            Some("catalog-7")
-        );
-        // A conversation no row reports — and a radar-backfilled id, which
-        // is not a conversation the provider ever reported — both fall back
-        // to the tab's own session.
-        for conversation in ["ses_missing", "project-1-agent-1-omp"] {
-            assert_eq!(
-                super::active_panel_session(&sessions, "agent-0", Some(conversation))
-                    .map(|session| session.id.as_str()),
-                Some("project-1-agent-0-omp"),
-                "{conversation} is not an honest resume target"
-            );
-        }
-        // Nothing live at the tab and no conversation match: nothing to mark.
-        assert_eq!(
-            super::active_panel_session(&sessions, "agent-9", None).map(|s| s.id.as_str()),
-            None
-        );
-        // An external row is never what a radar panel shows, not even by
-        // its own provider-reported conversation.
-        let external = session("external-42-1", None, None, Some("ses_42"), true);
-        assert_eq!(
-            super::active_panel_session(&[external], "agent-0", Some("ses_42"))
-                .map(|session| session.id.as_str()),
-            None
-        );
-    }
-
-    #[test]
     fn exact_resume_needs_a_provider_reported_conversation_id() {
         let session = |radar: Option<&str>, provider: Option<&str>| super::AgentSession {
             project_id: 3,
@@ -1244,6 +1019,7 @@ mod tests {
             catalog_id: None,
             radar_session_id: radar.map(str::to_string),
             claim_id: None,
+            card_id: None,
             provider_session_id: provider.map(str::to_string),
             last_activity_at: 0,
             running: false,
