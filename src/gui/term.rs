@@ -18,6 +18,7 @@ use gtk::cairo;
 use gtk::glib;
 use gtk::prelude::*;
 
+use crate::ghostty::mouse::MouseEncoder;
 use crate::ghostty::render::{Frame, RenderState, Rgb};
 use crate::ghostty::Terminal;
 
@@ -87,6 +88,8 @@ struct Inner {
     scale: f64,
     /// The grid size last reported to the pane, so a resize is sent once.
     last_grid: (u16, u16),
+    /// The mouse encoder, for wheel events a program wants to see itself.
+    mouse: MouseEncoder,
 }
 
 /// The terminal widget: a drawing area plus the engine behind it.
@@ -103,6 +106,10 @@ pub struct TerminalView {
     dragging: Rc<std::cell::Cell<bool>>,
     /// The primary-button gesture, for probes that emit a synthetic press.
     click: gtk::GestureClick,
+    /// The last pointer position in surface pixels, for mouse-report coords.
+    pointer: std::cell::Cell<(f32, f32)>,
+    /// Smooth-scroll pixels not yet worth a row.
+    pending: std::cell::Cell<f64>,
 }
 
 impl TerminalView {
@@ -121,6 +128,7 @@ impl TerminalView {
             base_size: font_size,
             scale: 1.0,
             last_grid: (0, 0),
+            mouse: MouseEncoder::new(),
         }));
 
         let resize: ResizeSink = Rc::new(Mutex::new(None));
@@ -144,6 +152,8 @@ impl TerminalView {
             anchor: std::cell::Cell::new(None),
             dragging: Rc::new(std::cell::Cell::new(false)),
             click: click.clone(),
+            pointer: std::cell::Cell::new((0.0, 0.0)),
+            pending: std::cell::Cell::new(0.0),
         };
 
         // Keys: radar's own chords on Alt, everything else encoded for the
@@ -223,14 +233,31 @@ impl TerminalView {
         });
         view.area.add_controller(keys);
 
-        // Mouse wheel scrolls the scrollback.
-        let wheel = gtk::EventControllerScroll::new(
-            gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
-        );
+        // Mouse wheel: scrollback on the primary screen; program input when a
+        // TUI owns the view. Both axes lets the unit() check tell discrete
+        // wheel notches from smooth trackpad pixels.
+        let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
         let view_for_wheel = view.clone();
-        wheel.connect_scroll(move |_controller, _dx, dy| {
-            let delta = if dy < 0.0 { -3 } else { 3 };
-            view_for_wheel.scroll(delta);
+        wheel.connect_scroll(move |controller, _dx, dy| {
+            let rows = match controller.unit() {
+                // A wheel notch is three rows, the classic terminal step.
+                gtk::gdk::ScrollUnit::Wheel => dy * 3.0,
+                // Trackpads scroll in pixels; a row moves once the gesture
+                // crosses a cell height.
+                gtk::gdk::ScrollUnit::Surface => {
+                    let cell = view_for_wheel
+                        .inner
+                        .try_borrow()
+                        .map(|inner| inner.metrics.cell_h)
+                        .unwrap_or(0.0);
+                    if cell <= 0.0 {
+                        return glib::Propagation::Stop;
+                    }
+                    dy / cell
+                }
+                _ => return glib::Propagation::Stop,
+            };
+            view_for_wheel.wheel_rows(rows);
             glib::Propagation::Stop
         });
         view.area.add_controller(wheel);
@@ -260,6 +287,8 @@ impl TerminalView {
         let motion = gtk::EventControllerMotion::new();
         let view_for_motion = view.clone();
         motion.connect_motion(move |_controller, px, py| {
+            // Always remember the pointer: mouse-report coords for the wheel.
+            view_for_motion.pointer.set((px as f32, py as f32));
             if !view_for_motion.dragging.get() {
                 return;
             }
@@ -357,6 +386,56 @@ impl TerminalView {
         };
         inner.term.scroll_viewport_bottom();
         drop(inner);
+        self.area.queue_draw();
+    }
+
+    /// One wheel gesture worth `rows` rows (negative scrolls up into
+    /// history), at the current pointer. Fractional input (trackpad pixels,
+    /// fractional wheel notches) accumulates in `pending` until it makes a
+    /// whole row.
+    fn wheel_rows(&self, rows: f64) {
+        let pending = self.pending.get() + rows;
+        let whole = pending.trunc();
+        self.pending.set(pending - whole);
+        if whole == 0.0 {
+            return;
+        }
+
+        let spot = {
+            let Ok(inner) = self.inner.try_borrow() else {
+                return;
+            };
+            WheelSpot {
+                pos: self.pointer.get(),
+                screen_px: (
+                    self.area.width().max(1) as u32,
+                    self.area.height().max(1) as u32,
+                ),
+                cell_px: (
+                    inner.metrics.cell_w.max(1.0) as u32,
+                    inner.metrics.cell_h.max(1.0) as u32,
+                ),
+            }
+        };
+        let mut sent: Vec<Vec<u8>> = Vec::new();
+        {
+            let Ok(mut inner) = self.inner.try_borrow_mut() else {
+                return;
+            };
+            // Split the borrow: the policy mutates both the terminal and the
+            // encoder.
+            let Inner { term, mouse, .. } = &mut *inner;
+            let mut send = |bytes: &[u8]| sent.push(bytes.to_vec());
+            wheel_scroll(term, mouse, whole as i32, spot, &mut send);
+        }
+        if !sent.is_empty() {
+            let send = self.input.lock();
+            if let Some(send) = send.as_ref() {
+                for bytes in &sent {
+                    send(bytes);
+                }
+            }
+        }
         self.area.queue_draw();
     }
 
@@ -626,6 +705,71 @@ fn paint_cell(
     }
 }
 
+/// DECSET 1007: on the alternate screen, wheel events become cursor keys.
+const ALT_SCROLL_MODE: u16 = 1007;
+/// DECSET 1 (DECCKM): cursor keys send application-mode sequences.
+const CURSOR_KEYS_MODE: u16 = 1;
+
+/// Where the wheel happened, in the units both encoders need: the event's
+/// pixel position plus the view's screen and cell geometry.
+struct WheelSpot {
+    pos: (f32, f32),
+    screen_px: (u32, u32),
+    cell_px: (u32, u32),
+}
+
+/// The wheel policy — upstream Ghostty's `Surface.scrollCallback`:
+///
+/// * On the alternate screen, a full-screen program has no scrollback to
+///   move. Without mouse reporting but with alt-scroll (DECSET 1007, on
+///   unless the program opted out), the wheel becomes cursor keys, in the
+///   mode the program set with DECCKM — what every terminal sends.
+/// * With mouse reporting on, the program owns scrolling: the wheel becomes
+///   an encoded button-four/five press and the viewport never moves.
+/// * Otherwise the primary screen shows its own scrollback: scroll it.
+fn wheel_scroll(
+    term: &mut Terminal,
+    mouse: &mut MouseEncoder,
+    rows: i32,
+    spot: WheelSpot,
+    send: &mut dyn FnMut(&[u8]),
+) {
+    if rows == 0 {
+        return;
+    }
+    let up = rows < 0;
+    let count = rows.unsigned_abs().max(1);
+
+    if term.alt_screen() && !term.mouse_tracking() && term.dec_mode(ALT_SCROLL_MODE) {
+        let sequence: &[u8] = if term.dec_mode(CURSOR_KEYS_MODE) {
+            if up {
+                b"\x1bOA"
+            } else {
+                b"\x1bOB"
+            }
+        } else if up {
+            b"\x1b[A"
+        } else {
+            b"\x1b[B"
+        };
+        for _ in 0..count {
+            send(sequence);
+        }
+        return;
+    }
+
+    if term.mouse_tracking() {
+        mouse.sync(term, spot.screen_px, spot.cell_px);
+        let bytes = mouse.wheel(up, spot.pos);
+        if !bytes.is_empty() {
+            send(&bytes);
+        }
+        return;
+    }
+
+    term.scroll_viewport(rows);
+}
+
 /// Encode a GTK key press as the bytes a program expects.
 ///
 /// Covers the common cases (printable text, Ctrl+letter, Alt prefix, cursor and
@@ -723,6 +867,26 @@ fn prefix_alt(bytes: &[u8], alt: bool) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// The Send bundle a re-entrant resize callback needs: it re-draws the
+    /// view, so it must reach the same `Inner`. The sink type demands Send,
+    /// but the callback is invoked synchronously on the installing thread, so
+    /// the bundle never actually crosses one.
+    struct ReentrantHandles {
+        inner: Rc<RefCell<Inner>>,
+        resize: ResizeSink,
+        reentered: Rc<std::cell::Cell<bool>>,
+    }
+    unsafe impl Send for ReentrantHandles {}
+
+    impl ReentrantHandles {
+        fn step(&self, cols: u16, rows: u16) {
+            self.reentered.set(true);
+            let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 200, 60).unwrap();
+            let cr = cairo::Context::new(&surface).unwrap();
+            draw(&self.inner, &self.resize, &cr, cols as i32, rows as i32);
+        }
+    }
+
     fn test_inner() -> Inner {
         Inner {
             term: Terminal::new(10, 2),
@@ -732,6 +896,7 @@ mod tests {
             base_size: 12.0,
             scale: 1.0,
             last_grid: (0, 0),
+            mouse: MouseEncoder::new(),
         }
     }
 
@@ -761,6 +926,158 @@ mod tests {
             pixel[2] > pixel[1] + 50 && pixel[2] > pixel[0] + 50,
             "expected a red cell background, got BGRA {pixel:?}"
         );
+    }
+
+    /// The SIGABRT storm of 2026-09-30 (four crashes while handling a pane
+    /// click): draw() held the Inner borrow across the resize sink's send, and
+    /// the click/selection handlers borrowed Inner again — a RefCell panic
+    /// unwinding out of the extern "C" GTK callback aborts the app. Every
+    /// borrow is a try_borrow that skips now, so a re-entrant callback must
+    /// skip silently instead of panicking.
+    #[test]
+    fn a_resize_callback_reentering_the_view_cannot_panic_the_draw() {
+        let inner = Rc::new(RefCell::new(test_inner()));
+        let resize: ResizeSink = Rc::new(Mutex::new(None));
+
+        // The re-entry: the pane's resize handling re-drew the view while the
+        // outer draw still held the borrow — the exact crash shape. The sink
+        // type demands Send (the convention production uses), but the callback
+        // is invoked synchronously on the installing thread, so the handles it
+        // captures ride in a Send bundle rather than across threads.
+
+        let reentrant_resize = resize.clone();
+        let reentered = Rc::new(std::cell::Cell::new(false));
+        let counted = reentered.clone();
+        let mut slot = resize.lock();
+        let handles = ReentrantHandles {
+            inner: inner.clone(),
+            resize: reentrant_resize,
+            reentered: counted,
+        };
+        *slot = Some(Box::new(move |cols, rows| handles.step(cols, rows)));
+        drop(slot);
+
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 200, 60).unwrap();
+        let cr = cairo::Context::new(&surface).unwrap();
+        draw(&inner, &resize, &cr, 200, 60);
+
+        assert!(reentered.get(), "the resize callback must run");
+    }
+
+    /// A wheel spot matching an 80×24 view of 8×16 cells.
+    fn spot(pos: (f32, f32)) -> WheelSpot {
+        WheelSpot {
+            pos,
+            screen_px: (80, 24),
+            cell_px: (8, 16),
+        }
+    }
+
+    /// The wheel on the primary screen scrolls the local scrollback and
+    /// forwards nothing — a plain shell has no mouse modes.
+    #[test]
+    fn wheel_on_the_primary_screen_scrolls_scrollback() {
+        let mut term = Terminal::new(10, 3);
+        for i in 0..12 {
+            term.write(format!("L{i:02}\r\n").as_bytes());
+        }
+        let mut render = RenderState::new();
+        let bottom_top: String = render.frame(&term).lines[0]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect();
+
+        let mut mouse = MouseEncoder::new();
+        let mut sent: Vec<Vec<u8>> = Vec::new();
+        wheel_scroll(&mut term, &mut mouse, -3, spot((0.0, 0.0)), &mut |bytes| {
+            sent.push(bytes.to_vec());
+        });
+
+        assert!(sent.is_empty(), "nothing to forward: {sent:?}");
+        let scrolled_top: String = render.frame(&term).lines[0]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect();
+        assert_ne!(bottom_top, scrolled_top, "the wheel must move the viewport");
+        assert!(
+            scrolled_top.starts_with("L0"),
+            "wheeled up into history, top row is {scrolled_top:?}"
+        );
+    }
+
+    /// A TUI on the alternate screen has no scrollback: with alt-scroll (the
+    /// default) the wheel becomes cursor keys, one per row, in the mode
+    /// DECCKM selected.
+    #[test]
+    fn wheel_on_the_alternate_screen_sends_cursor_keys() {
+        let mut term = Terminal::new(10, 3);
+        term.write(b"\x1b[?1049h"); // alternate screen, alt-scroll default on
+
+        let mut mouse = MouseEncoder::new();
+        let mut sent: Vec<Vec<u8>> = Vec::new();
+        wheel_scroll(&mut term, &mut mouse, -3, spot((0.0, 0.0)), &mut |bytes| {
+            sent.push(bytes.to_vec());
+        });
+        assert_eq!(sent, vec![b"\x1b[A".to_vec(); 3], "DECCKM off: CSI arrows");
+
+        // DECCKM on (application cursor keys) switches the sequence.
+        term.write(b"\x1b[?1h");
+        sent.clear();
+        wheel_scroll(&mut term, &mut mouse, 2, spot((0.0, 0.0)), &mut |bytes| {
+            sent.push(bytes.to_vec());
+        });
+        assert_eq!(sent, vec![b"\x1bOB".to_vec(); 2], "DECCKM on: SS3 arrows");
+    }
+
+    /// A program that reports mouse events gets the wheel as a button
+    /// four/five press, and the viewport never moves — the program scrolls.
+    #[test]
+    fn wheel_with_mouse_reporting_encodes_wheel_buttons() {
+        let mut term = Terminal::new(10, 3);
+        term.write(b"\x1b[?1000h\x1b[?1006h"); // normal tracking + SGR format
+        let mut render = RenderState::new();
+        let before_top: String = render.frame(&term).lines[0]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect();
+
+        let mut mouse = MouseEncoder::new();
+        let mut sent: Vec<Vec<u8>> = Vec::new();
+        wheel_scroll(
+            &mut term,
+            &mut mouse,
+            -1,
+            spot((16.0, 16.0)),
+            &mut |bytes| {
+                sent.push(bytes.to_vec());
+            },
+        );
+
+        assert_eq!(sent.len(), 1, "one tick, one press: {sent:?}");
+        let after_top: String = render.frame(&term).lines[0]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect();
+        assert_eq!(before_top, after_top, "the program owns scrolling");
+    }
+
+    /// With alt-scroll disabled (DECSET 1007 off) an alt-screen program with
+    /// no mouse modes gets nothing — matching upstream Ghostty.
+    #[test]
+    fn wheel_on_the_alternate_screen_without_alt_scroll_is_a_noop() {
+        let mut term = Terminal::new(10, 3);
+        term.write(b"\x1b[?1049h\x1b[?1007l");
+
+        let mut mouse = MouseEncoder::new();
+        let mut sent: Vec<Vec<u8>> = Vec::new();
+        wheel_scroll(&mut term, &mut mouse, -3, spot((0.0, 0.0)), &mut |bytes| {
+            sent.push(bytes.to_vec());
+        });
+        assert!(sent.is_empty(), "alt-scroll off: no cursor keys: {sent:?}");
     }
 
     #[test]
@@ -810,6 +1127,7 @@ mod tests {
             base_size: size,
             scale: 1.0,
             last_grid: (0, 0),
+            mouse: MouseEncoder::new(),
         };
 
         // What an agent panel actually shows: TUI chrome, styled text, a

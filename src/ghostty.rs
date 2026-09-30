@@ -24,6 +24,7 @@
 
 use std::ffi::c_void;
 
+pub mod mouse;
 pub mod render;
 
 /// Opaque `GhosttyTerminal`.
@@ -42,6 +43,15 @@ const DATA_CURSOR_Y: i32 = 4;
 const DATA_TITLE: i32 = 12;
 /// `GHOSTTY_TERMINAL_DATA_PWD` (`GhosttyString`).
 const DATA_PWD: i32 = 13;
+/// `GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN` (`GhosttyTerminalScreen *`).
+const DATA_ACTIVE_SCREEN: i32 = 6;
+/// `GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING` (bool *).
+const DATA_MOUSE_TRACKING: i32 = 11;
+/// `GHOSTTY_TERMINAL_DATA_MODE` (`GhosttyTerminalModeConfig *`).
+const DATA_MODE: i32 = 37;
+
+/// `GHOSTTY_TERMINAL_SCREEN_ALTERNATE`.
+const SCREEN_ALTERNATE: i32 = 1;
 
 /// `GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES` (size_t *). Enables the
 /// continuation tracking that lets a snapshot carry a mid-escape/mid-UTF-8 cut.
@@ -226,6 +236,16 @@ struct Selection {
     start: GridRef,
     end: GridRef,
     rectangle: bool,
+}
+
+/// `GhosttyTerminalModeConfig`: one mode plus its value, for set and query.
+/// `GhosttyMode` packs the mode number in bits 0–14 and the ANSI flag in bit
+/// 15 (`ghostty_mode_new`); radar only queries DEC private modes, whose flag
+/// bit is 0, so the packed mode is the plain number.
+#[repr(C)]
+struct ModeConfig {
+    mode: u16,
+    value: bool,
 }
 
 /// `GhosttyTerminalSelectionFormatOptions`.
@@ -421,6 +441,52 @@ impl Terminal {
         unsafe { ghostty_terminal_scroll_viewport(self.raw, behavior) };
     }
 
+    /// Whether the alternate screen is active — a full-screen program (a TUI)
+    /// owns the view and there is no scrollback to move through.
+    pub fn alt_screen(&self) -> bool {
+        let mut screen: i32 = 0;
+        unsafe {
+            ghostty_terminal_get(
+                self.raw,
+                DATA_ACTIVE_SCREEN,
+                &mut screen as *mut i32 as *mut c_void,
+            );
+        }
+        screen == SCREEN_ALTERNATE
+    }
+
+    /// Whether the program asked for any mouse reporting (X10, normal,
+    /// button-event or any-event tracking).
+    pub fn mouse_tracking(&self) -> bool {
+        let mut on = false;
+        unsafe {
+            ghostty_terminal_get(
+                self.raw,
+                DATA_MOUSE_TRACKING,
+                &mut on as *mut bool as *mut c_void,
+            );
+        }
+        on
+    }
+
+    /// A DEC private mode's current value. The engine's mode packing has the
+    /// ANSI flag in bit 15 and DEC modes are 0, so the packed mode is the
+    /// plain number.
+    pub fn dec_mode(&self, number: u16) -> bool {
+        let mut config = ModeConfig {
+            mode: number,
+            value: false,
+        };
+        let result = unsafe {
+            ghostty_terminal_get(
+                self.raw,
+                DATA_MODE,
+                &mut config as *mut ModeConfig as *mut c_void,
+            )
+        };
+        result == SUCCESS && config.value
+    }
+
     /// Select the inclusive viewport range between two cells.
     pub fn select_viewport(&mut self, start: (u16, u32), end: (u16, u32)) -> bool {
         let mut from = GridRef::new();
@@ -568,6 +634,41 @@ unsafe impl Send for Terminal {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state queries the wheel policy reads: active screen, mouse
+    /// tracking, and DEC private modes with their defaults.
+    #[test]
+    fn terminal_reports_screen_mouse_tracking_and_modes() {
+        let mut terminal = Terminal::new(10, 3);
+        assert!(
+            !terminal.alt_screen(),
+            "a fresh terminal is on the primary screen"
+        );
+        assert!(
+            !terminal.mouse_tracking(),
+            "nothing asks for mouse events yet"
+        );
+        assert!(
+            terminal.dec_mode(1007),
+            "alt-scroll (DECSET 1007) defaults on"
+        );
+        assert!(!terminal.dec_mode(1), "cursor keys (DECCKM) default off");
+
+        terminal.write(b"\x1b[?1049h\x1b[?1000h\x1b[?1h");
+        assert!(
+            terminal.alt_screen(),
+            "1049h switches to the alternate screen"
+        );
+        assert!(terminal.mouse_tracking(), "1000h enables mouse reporting");
+        assert!(terminal.dec_mode(1), "1h enables application cursor keys");
+
+        terminal.write(b"\x1b[?1049l\x1b[?1000l");
+        assert!(
+            !terminal.alt_screen(),
+            "1049l returns to the primary screen"
+        );
+        assert!(!terminal.mouse_tracking(), "1000l stops mouse reporting");
+    }
 
     #[test]
     fn effects_capture_bell_title_pwd_and_query_replies() {
