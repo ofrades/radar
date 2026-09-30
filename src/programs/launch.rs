@@ -58,6 +58,21 @@ impl CommandSpec {
     }
 }
 
+/// Append an initial prompt the way this CLI takes it: a bare positional
+/// argument for most, under its flag when the positional means something
+/// else — opencode's positional is its project *directory*, and a card
+/// prompt passed there made it chdir into the prompt text (ENAMETOOLONG)
+/// instead of prompting.
+fn push_prompt(program: &Program, argv: &mut Vec<String>, prompt: &str) {
+    match program.prompt_flag.as_deref() {
+        Some(flag) => {
+            argv.push(flag.to_string());
+            argv.push(prompt.to_string());
+        }
+        None => argv.push(prompt.to_string()),
+    }
+}
+
 /// Build the command line for `program`.
 pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
     // Agents launched by radar carry their claim name: `$RADAR_AGENT` is what
@@ -80,14 +95,16 @@ pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
     // fresh agent) and the permission flags: the conversation being
     // reopened had its own. An exact session id wins over "the last one".
     // A prompt (and extra args) still append after the resume flags, so a
-    // resumed agent is handed the card message that woke it.
+    // resumed agent is handed the card message that woke it. The prompt
+    // travels the way this CLI expects: bare positional for most, under
+    // its flag when the positional means something else.
     let append_tail = |argv: &mut Vec<String>| {
         if let Some(prompt) = options
             .prompt
             .as_deref()
             .filter(|prompt| !prompt.is_empty())
         {
-            argv.push(prompt.to_string());
+            push_prompt(program, argv, prompt);
         }
         argv.extend(options.extra_args.iter().cloned());
     };
@@ -180,7 +197,11 @@ pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
         argv.extend(program.auto_args.iter().cloned());
     }
     if options.prompt.as_deref().is_some_and(|p| !p.is_empty()) {
-        argv.push(options.prompt.clone().unwrap_or_default());
+        push_prompt(
+            program,
+            &mut argv,
+            options.prompt.as_deref().unwrap_or_default(),
+        );
     }
     argv.extend(options.extra_args.iter().cloned());
 
@@ -270,6 +291,7 @@ mod tests {
             resume_args: Vec::new(),
             resume_session: String::new(),
             create_session: false,
+            prompt_flag: None,
             env_unset: Vec::new(),
             external: false,
             omarchy: false,
@@ -343,6 +365,21 @@ mod tests {
             },
         );
         assert_eq!(spec.argv, vec!["codex"]);
+    }
+
+    #[test]
+    fn a_cli_whose_positional_is_not_a_prompt_flags_it() {
+        // opencode's positional argument is its project directory: a card
+        // prompt passed there made it chdir into the prompt text (and die
+        // with ENAMETOOLONG) instead of starting the conversation with it.
+        let spec = command_spec(
+            &program("opencode", "opencode").with_prompt_flag("--prompt"),
+            &LaunchOptions {
+                prompt: Some("review this".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(spec.argv, vec!["opencode", "--prompt", "review this"]);
     }
 
     #[test]
@@ -468,6 +505,7 @@ mod tests {
         opencode.auto_args = vec!["--auto".into()];
         opencode.resume_session = "--session {id}".into();
         opencode.create_session = true;
+        opencode.prompt_flag = Some("--prompt".into());
         let options = LaunchOptions {
             create_session: Some("ses_radar7abc".into()),
             prompt: Some("work the card".into()),
@@ -477,7 +515,9 @@ mod tests {
         };
         let spec = command_spec(&opencode, &options);
         // A fresh create keeps the permission flags and the prompt; it only
-        // skips the omarchy wrapper, which cannot carry a session id.
+        // skips the omarchy wrapper, which cannot carry a session id. The
+        // prompt goes through opencode's --prompt: its bare positional is
+        // the project directory, not a prompt.
         assert_eq!(
             spec.argv,
             vec![
@@ -485,6 +525,7 @@ mod tests {
                 "--auto",
                 "--session",
                 "ses_radar7abc",
+                "--prompt",
                 "work the card"
             ]
         );
@@ -562,6 +603,7 @@ mod tests {
     fn a_resumed_launch_carries_the_card_prompt_and_card_env() {
         let mut agent = program("opencode", "opencode");
         agent.resume_session = "--session {id}".to_string();
+        agent.prompt_flag = Some("--prompt".to_string());
         let options = LaunchOptions {
             session: Some("ses_1".into()),
             prompt: Some("a message from the human".into()),
@@ -572,7 +614,13 @@ mod tests {
         let spec = command_spec(&agent, &options);
         assert_eq!(
             spec.argv,
-            vec!["opencode", "--session", "ses_1", "a message from the human"]
+            vec![
+                "opencode",
+                "--session",
+                "ses_1",
+                "--prompt",
+                "a message from the human"
+            ]
         );
         assert!(spec
             .env_set

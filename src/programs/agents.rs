@@ -223,6 +223,7 @@ impl AgentDef {
             resume_args: Vec::new(),
             resume_session: String::new(),
             create_session: false,
+            prompt_flag: None,
             env_unset: self.env_unset.iter().map(|s| s.to_string()).collect(),
             external: false,
             omarchy: self.omarchy,
@@ -252,6 +253,15 @@ impl AgentDef {
         // link to the board card) instead of reading its store after the fact.
         // The other CLIs' flags only resume; a fresh launch there stays a guess.
         program.create_session = self.id == "opencode";
+        // How a launch hands the agent its initial prompt: a bare positional
+        // argument for most CLIs, a flag for the one whose positional means
+        // something else — opencode's positional is its project *directory*,
+        // and a card prompt passed there made it chdir into the prompt text
+        // (ENAMETOOLONG) instead of prompting.
+        program.prompt_flag = match self.id {
+            "opencode" => Some("--prompt".to_string()),
+            _ => None,
+        };
         // omarchy's default agent is the one users expect first everywhere.
         if omarchy_default().as_deref() == Some(self.id) {
             program.priority = -1;
@@ -374,6 +384,17 @@ mod tests {
         assert_eq!(by_id("omp").resume_session, "--resume={id}");
         assert_eq!(by_id("cursor-agent").resume_session, "--resume {id}");
         assert_eq!(by_id("opencode").resume_session, "--session {id}");
+    }
+
+    #[test]
+    fn only_opencode_takes_its_prompt_through_a_flag() {
+        let by_id = |id: &str| programs().into_iter().find(|p| p.id == id).unwrap();
+        // opencode's positional argument is its project directory, so a
+        // positional card prompt would make it chdir into the prompt text.
+        assert_eq!(by_id("opencode").prompt_flag.as_deref(), Some("--prompt"));
+        for id in ["claude", "codex", "omp", "cursor-agent", "crush"] {
+            assert_eq!(by_id(id).prompt_flag, None, "{id}");
+        }
     }
 
     #[test]

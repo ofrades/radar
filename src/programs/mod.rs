@@ -97,6 +97,12 @@ pub struct Program {
     /// conversation id up front, instead of radar guessing one from the
     /// CLI's store after the fact. False for CLIs whose flag only resumes.
     pub create_session: bool,
+    /// The flag that carries an initial prompt, for the CLIs whose bare
+    /// positional argument is not a prompt: opencode's positional is its
+    /// project *directory*, so its prompt goes through `--prompt`. The
+    /// rest (claude, codex, omp, cursor-agent) take a positional prompt,
+    /// which is `None`.
+    pub prompt_flag: Option<String>,
     /// Environment variables to remove for this program.
     pub env_unset: Vec<String>,
     /// GUI program: launch it externally instead of embedding it.
@@ -127,6 +133,7 @@ impl Program {
             resume_args: Vec::new(),
             resume_session: String::new(),
             create_session: false,
+            prompt_flag: None,
             env_unset: Vec::new(),
             external: false,
             omarchy: false,
@@ -146,6 +153,11 @@ impl Program {
 
     pub fn with_env_unset(mut self, keys: &[&str]) -> Program {
         self.env_unset = keys.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub fn with_prompt_flag(mut self, flag: &str) -> Program {
+        self.prompt_flag = Some(flag.to_string());
         self
     }
 
