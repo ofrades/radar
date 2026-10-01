@@ -36,6 +36,20 @@ struct CardEditor {
     actions: gtk::Widget,
 }
 
+/// Turn off text selection throughout a read view. A selectable label claims
+/// the click for selection, so the description's Markdown would otherwise never
+/// reach its open-on-click gesture. The field the click opens still selects.
+fn make_unselectable(widget: &gtk::Widget) {
+    if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+        label.set_selectable(false);
+    }
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        make_unselectable(&current);
+        child = current.next_sibling();
+    }
+}
+
 /// Click `target` to open `stack`'s edit child, focus `focus`, and reveal the
 /// Save/Cancel row.
 fn open_on_click(
@@ -131,6 +145,7 @@ fn card_editor(
     actions.append(&feedback);
     actions.set_visible(false);
 
+    make_unselectable(&body_view);
     open_on_click(&title_view, &title_stack, &title, &actions);
     open_on_click(&body_view, &body_stack, &text, &actions);
 
@@ -350,6 +365,25 @@ mod editor_tests {
         window.close();
         assert!(title_height > 0, "title height was {title_height}");
         assert!(body_height > 0, "description height was {body_height}");
+    }
+
+    #[test]
+    #[ignore = "requires a private D-Bus session and GTK display"]
+    fn read_description_labels_do_not_steal_the_click() {
+        gtk::init().unwrap();
+        let view = markdown::render("Some **bold** text and a [link](https://example.com).");
+        make_unselectable(&view);
+        fn assert_unselectable(widget: &gtk::Widget) {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                assert!(!label.is_selectable(), "a read label is still selectable");
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                assert_unselectable(&current);
+                child = current.next_sibling();
+            }
+        }
+        assert_unselectable(&view);
     }
 }
 
