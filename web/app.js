@@ -162,16 +162,13 @@ let editingCard = null;
 // Terminal state
 let terminalOpen = false;
 let lastNonSessionHash = "#/";
-let currentSocket = null;
-let terminal = null;
-let terminalSession = null;
-let terminalProjectId = null;
-let fitAddon = null;
-let resizeObserver = null;
-let reconnectTimer = null;
-let reconnectAttempts = 0;
-let socketGeneration = 0;
-let applyingRemoteResize = false;
+/// The one full-screen terminal, when a session route is open.
+let singleTerminal = null;
+
+// The Agents wall: a persistent set of live terminal tiles, reconciled in
+// place so polling never reconnects a pane.
+let agentsWall = null;
+const dismissedAgents = new Set();
 
 // ---------------------------------------------------------------------------
 // Requests
@@ -403,13 +400,16 @@ function render() {
     return;
   }
   if (terminalOpen) exitTerminal();
+  if (route.name !== "agents") teardownAgentsWall();
+  main.classList.toggle("wall-open", route.name === "agents");
+  if (route.name === "agents") {
+    showAgentsWall();
+    return;
+  }
   main.replaceChildren();
   const error = $("#page-error");
   let view;
   switch (route.name) {
-    case "agents":
-      view = renderAgents();
-      break;
     case "project":
       view = renderProject(route.projectId);
       break;
@@ -972,35 +972,202 @@ function cardIsLiveWork(projectId, card) {
   return name !== "todo" && name !== "backlog" && name !== "done";
 }
 
-function renderAgents() {
-  const wrap = el("div", { class: "home-view agents-view" });
-  if (!loadedProjects) {
-    wrap.append(hero("Agents", "Loading…", () => navigate("#/")));
-    return wrap;
+/// A session's activity sign, the same dot vocabulary the native panel header
+/// wears: a request waiting is "needs you", a reported agent state is its own,
+/// otherwise the process is simply running.
+function sessionSign(projectId, session) {
+  const snapshot = snapshotOf(projectId);
+  const waiting = (snapshot?.attention || []).some(
+    (item) => item.session_id === session.id && item.resolved_at_millis == null,
+  );
+  if (waiting) return { label: "needs you", cls: "sign-needs-you" };
+  const event = (snapshot?.events || []).findLast(
+    (item) => item.session_id === session.id && item.kind === "agent_state_changed",
+  );
+  const state = event?.payload?.data?.state;
+  if (state === "waiting_for_input" || state === "waiting_for_approval") {
+    return { label: "waiting", cls: "sign-waiting" };
   }
-  const wall = projects.flatMap((project) => agentWall(project.id));
-  const count = wall.length === 0 ? "No agents" : wall.length === 1 ? "1 running" : `${wall.length} running`;
-  wrap.append(hero("Agents", `${count} · All projects, one workspace`, () => navigate("#/")));
-
-  let any = false;
-  for (const project of projects) {
-    const sessions = agentWall(project.id);
-    if (!sessions.length) continue;
-    any = true;
-    wrap.append(el("h2", { class: "lane-section" }, project.name));
-    const list = el("div", { class: "session-list" });
-    for (const session of sessions) list.append(sessionCard(project.id, session));
-    wrap.append(list);
-  }
-  if (!any) {
-    wrap.append(el("div", { class: "empty-card" },
-      el("strong", {}, "No agent panels yet."),
-      el("span", {}, "Open a project and start a session from a to-do. Active work appears here; a to-do still in Todo or already done keeps its session off this wall, and its program keeps running."),
-    ));
-  }
-  return wrap;
+  if (state === "working") return { label: "working", cls: "sign-working" };
+  return { label: "running", cls: "sign-running" };
 }
 
+/// The wall's membership across every project, in project order, newest
+/// activity first — the native `live_sessions_by_project` order.
+function agentsWallWanted() {
+  const wanted = [];
+  for (const project of projects) {
+    const sessions = agentWall(project.id)
+      .filter((session) => !dismissedAgents.has(session.id))
+      .slice()
+      .sort((a, b) => (b.last_activity_ms || 0) - (a.last_activity_ms || 0));
+    for (const session of sessions) wanted.push({ project, session });
+  }
+  return wanted;
+}
+
+/// The Agents page is the workspace: real, interactive terminal panels tiled
+/// across the viewport. It is reconciled in place — polling never rebuilds a
+/// pane, so typing is never interrupted.
+function showAgentsWall() {
+  if (!agentsWall) {
+    const meta = el("p", { class: "project-summary wall-meta" });
+    const grid = el("div", { class: "agents-grid" });
+    const root = el("div", { class: "home-view agents-view agents-wall" },
+      el("div", { class: "page-heading wall-heading" },
+        el("button", { class: "back-button", type: "button", onclick: () => navigate("#/") },
+          el("span", {}, "‹"), " Back"),
+        el("h1", { text: "Agents" }),
+        meta,
+      ),
+      grid,
+    );
+    const observer = new ResizeObserver(() => layoutAgentWall());
+    observer.observe(grid);
+    agentsWall = { root, grid, meta, observer, tiles: new Map(), empty: null };
+  }
+  if (agentsWall.root.parentElement !== main) main.replaceChildren(agentsWall.root, pageErrorHost);
+  syncAgentsWall();
+}
+
+function teardownAgentsWall() {
+  if (!agentsWall) return;
+  for (const tile of agentsWall.tiles.values()) tile.view.dispose();
+  agentsWall.observer?.disconnect();
+  agentsWall.root.remove();
+  agentsWall = null;
+}
+
+function syncAgentsWall() {
+  if (!agentsWall) return;
+  const wanted = agentsWallWanted();
+  const wantedIds = new Set(wanted.map(({ session }) => session.id));
+
+  for (const [id, tile] of [...agentsWall.tiles]) {
+    if (!wantedIds.has(id)) {
+      tile.view.dispose();
+      tile.el.remove();
+      agentsWall.tiles.delete(id);
+    }
+  }
+  for (const { project, session } of wanted) {
+    if (!agentsWall.tiles.has(session.id)) {
+      agentsWall.tiles.set(session.id, createAgentTile(project, session));
+    }
+  }
+  for (const { project, session } of wanted) {
+    const tile = agentsWall.tiles.get(session.id);
+    updateAgentTile(tile, project, session);
+  }
+  // Reorder only when the order actually changed: re-inserting a node that is
+  // already in place would blur the terminal the human is typing in.
+  const order = wanted.map(({ session }) => agentsWall.tiles.get(session.id).el);
+  const inOrder =
+    agentsWall.grid.children.length === order.length &&
+    order.every((node, index) => agentsWall.grid.children[index] === node);
+  if (!inOrder) {
+    for (const node of order) agentsWall.grid.append(node);
+  }
+
+  if (wanted.length === 0 && !agentsWall.empty) {
+    agentsWall.empty = el("div", { class: "empty-card wall-empty" },
+      el("strong", {}, "No agent panels yet."),
+      el("span", {}, "Open a project and start a session from a to-do. Active work appears here; a to-do still in Todo or already done keeps its session off this wall, and its program keeps running."),
+    );
+    agentsWall.grid.append(agentsWall.empty);
+  } else if (wanted.length > 0 && agentsWall.empty) {
+    agentsWall.empty.remove();
+    agentsWall.empty = null;
+  }
+
+  const count = wanted.length;
+  agentsWall.meta.textContent = `${count === 1 ? "1 running" : `${count} running`} · All projects, one workspace`;
+  layoutAgentWall();
+}
+
+/// One tile: the workspace panel's own header (activity sign, session name,
+/// its to-do, a done check, a close that keeps the program running) over a
+/// live terminal attached to the daemon session.
+function createAgentTile(project, session) {
+  const dot = el("span", { class: "activity-dot", "aria-hidden": "true" }, "●");
+  const title = el("button", { class: "tile-title", type: "button" });
+  const todo = el("button", { class: "tile-todo", type: "button" });
+  const done = el("button", { class: "tile-action", type: "button", title: "Mark this to-do done" }, "✓");
+  const close = el("button", { class: "tile-action", type: "button", title: "Close this panel — its program keeps running" }, "✕");
+  const header = el("div", { class: "tile-header" }, dot, title, todo, done, close);
+  const body = el("div", { class: "tile-body" });
+  const tileEl = el("section", { class: "agents-tile" }, header, body);
+
+  const view = new TerminalView(project.id, session, {
+    interactive: true,
+    onGone: () => {
+      dismissedAgents.add(session.id);
+      syncAgentsWall();
+    },
+  });
+  const tile = { el: tileEl, body, view, dot, title, todo, done };
+  title.addEventListener("click", () => openSession(project.id, session));
+  close.addEventListener("click", () => {
+    dismissedAgents.add(session.id);
+    view.dispose();
+    tileEl.remove();
+    agentsWall?.tiles.delete(session.id);
+    syncAgentsWall();
+  });
+  view.mount(body);
+  return tile;
+}
+
+function updateAgentTile(tile, project, session) {
+  const sign = sessionSign(project.id, session);
+  tile.dot.className = `activity-dot ${sign.cls}`;
+  tile.dot.title = sign.label;
+  const name = session.title || session.label;
+  tile.title.textContent = name;
+  tile.title.title = `${name} — open full screen`;
+
+  const cardId = sessionCardId(project.id, session);
+  const card = cardId ? cardById(project.id, cardId) : null;
+  if (card) {
+    tile.todo.hidden = false;
+    tile.todo.textContent = card.title;
+    tile.todo.title = `Open this card\n${card.id}`;
+    tile.todo.onclick = () => navigate(`#/project/${project.id}/card/${encodeURIComponent(card.id)}`);
+    tile.done.hidden = false;
+    tile.done.onclick = () => toggleDone(project.id, card);
+  } else {
+    tile.todo.hidden = true;
+    tile.done.hidden = true;
+  }
+}
+
+/// Pick the column count whose tiles come closest to a terminal's 8:5 shape,
+/// the same score the native tiler uses.
+function layoutAgentWall() {
+  if (!agentsWall) return;
+  const count = agentsWall.tiles.size;
+  const grid = agentsWall.grid;
+  if (count === 0) {
+    grid.style.gridTemplateColumns = "1fr";
+    return;
+  }
+  const width = grid.clientWidth || 1;
+  const height = grid.clientHeight || 1;
+  let best = 1;
+  let bestScore = Infinity;
+  for (let cols = 1; cols <= count; cols += 1) {
+    const rows = Math.ceil(count / cols);
+    const aspect = width / cols / (height / rows);
+    const score = Math.abs(Math.log(aspect / (8 / 5)));
+    if (score < bestScore) {
+      bestScore = score;
+      best = cols;
+    }
+  }
+  grid.style.gridTemplateColumns = `repeat(${best}, minmax(0, 1fr))`;
+}
+
+/// A session row, used by a card's linked sessions.
 function sessionCard(projectId, session) {
   const attachable = session.attachable !== false;
   const button = el("button", {
@@ -1292,9 +1459,238 @@ function updateAttentionShortcut() {
 // Terminal
 // ---------------------------------------------------------------------------
 
-function fit() {
-  if (ghosttyEngine) terminal?.fit?.();
-  else fitAddon?.fit();
+const TERMINAL_FONT = '"JetBrainsMono Nerd Font", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+const XTERM_THEME = {
+  background: "#0f0f0e",
+  foreground: "#e4d5aa",
+  cursor: "#92705c",
+  selectionBackground: "rgba(146,112,92,0.35)",
+  black: "#0b0b0b",
+  red: "#b79167",
+  green: "#d6c783",
+  yellow: "#fff3a2",
+  blue: "#ad7260",
+  magenta: "#e09e74",
+  cyan: "#e0e58b",
+  white: "#e4d5aa",
+  brightBlack: "#696962",
+  brightRed: "#d4a570",
+  brightGreen: "#f1dd83",
+  brightYellow: "#ffee87",
+  brightBlue: "#cc836c",
+  brightMagenta: "#ffaf79",
+  brightCyan: "#f5fb8a",
+  brightWhite: "#ebe0bf",
+};
+
+/// Strip the terminal's own query replies from typed input: the daemon owns
+/// query replies, so a client that also parses must not echo them.
+function terminalInputFilter(data) {
+  return data
+    .replace(/\x1b\[[0-9;?]*[Rcn]/g, "")
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/gs, "")
+    .replace(/\x1bP[\s\S]*?\x1b\\/g, "");
+}
+
+/// One attached terminal: the renderer (libghostty-vt's WASM engine when the
+/// build ships it, xterm.js otherwise), the WebSocket to the daemon session,
+/// reconnect backoff, and input/resize. Reused by the full-screen session view
+/// and by every tile on the Agents wall, so the two can never drift.
+class TerminalView {
+  constructor(projectId, session, options = {}) {
+    this.projectId = projectId;
+    this.session = session;
+    this.readOnly = options.readOnly ?? session.state !== "running";
+    this.interactive = options.interactive !== false && !this.readOnly;
+    this.onStatus = options.onStatus || (() => {});
+    this.onGone = options.onGone || (() => {});
+    this.generation = 0;
+    this.socket = null;
+    this.terminal = null;
+    this.fitAddon = null;
+    this.observer = null;
+    this.reconnectTimer = null;
+    this.reconnectAttempts = 0;
+    this.applyingRemoteResize = false;
+    this.disposed = false;
+  }
+
+  mount(container) {
+    this.element = container;
+    this.terminal = ghosttyEngine
+      ? new GhosttyTerminal({ fontFamily: TERMINAL_FONT, fontSize: 13 })
+      : new Terminal({
+          cursorBlink: true,
+          disableStdin: this.readOnly,
+          convertEol: false,
+          fontFamily: TERMINAL_FONT,
+          fontSize: 13,
+          scrollback: 5000,
+          theme: XTERM_THEME,
+        });
+    this.fitAddon = new FitAddon();
+    this.terminal.loadAddon(this.fitAddon);
+    this.terminal.open(container);
+    if (this.interactive) {
+      this.terminal.onData((data) => this.sendInput(data));
+      this.terminal.onBinary((data) =>
+        this.sendBytes(Uint8Array.from(data, (char) => char.charCodeAt(0))));
+      this.terminal.onResize(({ cols, rows }) => {
+        if (!this.applyingRemoteResize) this.sendResize(cols, rows);
+      });
+    }
+    this.observer = new ResizeObserver(() => requestAnimationFrame(() => this.fit()));
+    this.observer.observe(container);
+    this.fit();
+    this.connect(false);
+  }
+
+  fit() {
+    if (this.disposed) return;
+    if (ghosttyEngine) this.terminal?.fit?.();
+    else this.fitAddon?.fit();
+  }
+
+  focus() {
+    this.terminal?.focus?.();
+  }
+
+  sendInput(data) {
+    if (!this.interactive || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+    const filtered = terminalInputFilter(data);
+    if (filtered) this.socket.send(new TextEncoder().encode(filtered));
+  }
+
+  sendBytes(bytes) {
+    if (this.socket?.readyState === WebSocket.OPEN && bytes.length) this.socket.send(bytes);
+  }
+
+  sendResize(cols, rows) {
+    if (!this.interactive || !this.socket || this.socket.readyState !== WebSocket.OPEN || !cols || !rows) return;
+    this.socket.send(JSON.stringify({ type: "resize", cols, rows }));
+  }
+
+  connect(reset) {
+    if (reset) this.terminal?.reset?.();
+    const url = new URL(
+      `api/projects/${this.projectId}/sessions/${encodeURIComponent(this.session.id)}/terminal`,
+      document.baseURI,
+    );
+    url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    if (ghosttyEngine) url.searchParams.set("engine", "ghostty");
+    const generation = ++this.generation;
+    const socket = new WebSocket(url.toString());
+    this.socket = socket;
+    socket.binaryType = "arraybuffer";
+    socket.addEventListener("open", () => {
+      if (generation !== this.generation) return;
+      this.setStatus(this.readOnly ? "Read-only" : "Connected", !this.readOnly);
+      this.fit();
+      if (this.interactive) this.sendResize(this.terminal?.cols, this.terminal?.rows);
+    });
+    socket.addEventListener("message", (message) => {
+      if (generation !== this.generation) return;
+      if (message.data instanceof ArrayBuffer) {
+        const bytes = new Uint8Array(message.data);
+        if (ghosttyEngine) {
+          // Tagged frames: 1 = lossless snapshot, 0 = raw output.
+          if (bytes[0] === 1) this.terminal?.loadSnapshot?.(bytes.subarray(1));
+          else this.terminal?.write?.(bytes.subarray(1));
+        } else {
+          this.terminal?.write?.(bytes);
+        }
+        return;
+      }
+      try {
+        const status = JSON.parse(message.data);
+        if (status.type === "error") this.setStatus(status.message, false, true);
+        else if (status.type === "resync_required") this.setStatus("Refreshing…", false, true);
+        else if (status.type === "resize") this.applyRemoteResize(status.cols, status.rows);
+        else if (status.type === "closed") this.markReadOnly("exited");
+      } catch {
+        // Non-JSON frames carry no status.
+      }
+    });
+    socket.addEventListener("close", () => {
+      if (generation !== this.generation) return;
+      this.socket = null;
+      if (!this.disposed) void this.retry();
+    });
+    socket.addEventListener("error", () => {
+      if (generation === this.generation) this.setStatus("Connection interrupted…", false, true);
+    });
+  }
+
+  applyRemoteResize(cols, rows) {
+    if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 2 || rows < 1) return;
+    this.applyingRemoteResize = true;
+    try {
+      this.terminal?.resize?.(cols, rows);
+    } finally {
+      this.applyingRemoteResize = false;
+    }
+  }
+
+  async retry() {
+    if (this.readOnly) return;
+    try {
+      const sessions = await request(`/api/projects/${this.projectId}/sessions`);
+      const current = sessions.find((item) => item.id === this.session.id);
+      if (!current) {
+        this.onGone();
+        return;
+      }
+      if (current.state !== "running") {
+        this.markReadOnly(current.state);
+        return;
+      }
+    } catch {
+      // A temporary HTTP outage falls through to the regular backoff.
+    }
+    if (this.disposed) return;
+    const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 8000);
+    this.reconnectAttempts += 1;
+    this.setStatus(`Reconnecting in ${Math.ceil(delay / 1000)}s…`, false, true);
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.disposed) this.connect(true);
+    }, delay);
+  }
+
+  markReadOnly(state) {
+    this.readOnly = true;
+    this.interactive = false;
+    this.session = { ...this.session, state };
+    this.setStatus("Read-only");
+  }
+
+  reconnectNow() {
+    if (this.readOnly || this.disposed) return;
+    window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.reconnectAttempts = 0;
+    this.socket?.close();
+    this.socket = null;
+    this.connect(true);
+  }
+
+  setStatus(message, connected = false, error = false) {
+    this.onStatus(message, connected, error);
+  }
+
+  dispose() {
+    this.disposed = true;
+    this.generation += 1;
+    window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.observer?.disconnect();
+    this.observer = null;
+    this.socket?.close();
+    this.socket = null;
+    this.terminal?.dispose?.();
+    this.terminal = null;
+    this.fitAddon = null;
+  }
 }
 
 function openSession(projectId, session) {
@@ -1302,75 +1698,32 @@ function openSession(projectId, session) {
 }
 
 function enterTerminal(projectId, session) {
+  singleTerminal?.dispose();
   terminalOpen = true;
-  terminalProjectId = projectId;
-  terminalSession = session;
   appShell.classList.add("session-open");
   main.classList.add("hidden");
   $("#terminal-view").classList.remove("hidden");
   $("#terminal-title").textContent = session.title || session.label;
-  const readOnly = session.state !== "running";
+
+  const status = $("#terminal-connection");
+  singleTerminal = new TerminalView(projectId, session, {
+    onStatus: (message, connected) => {
+      status.textContent = message;
+      status.classList.toggle("connected", connected);
+    },
+    onGone: () => closeTerminal(),
+  });
+  const readOnly = singleTerminal.readOnly;
   $("#reconnect-button").disabled = readOnly;
   document.querySelectorAll("[data-key]").forEach((button) => { button.disabled = readOnly; });
-  setTerminalStatus(readOnly ? "Read-only · use Back to choose another session" : "Connecting…", false, readOnly);
+  status.textContent = readOnly ? "Read-only · use Back to choose another session" : "Connecting…";
+  status.classList.remove("connected");
 
-  socketGeneration += 1;
-  currentSocket?.close();
-  currentSocket = null;
-  if (terminal) terminal.dispose();
-  reconnectAttempts = 0;
-  window.clearTimeout(reconnectTimer);
-  reconnectTimer = null;
-  terminal = ghosttyEngine
-    ? new GhosttyTerminal({
-        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-        fontSize: 14,
-        theme: { background: "#0d100d", foreground: "#e3e8df" },
-      })
-    : new Terminal({
-        cursorBlink: true,
-        disableStdin: readOnly,
-        convertEol: false,
-        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-        fontSize: 14,
-        scrollback: 5000,
-        theme: {
-          background: "#0d100d",
-          foreground: "#e3e8df",
-          cursor: "#b7d977",
-          selectionBackground: "#65754e77",
-          black: "#171a17",
-          red: "#e78376",
-          green: "#b7d977",
-          yellow: "#e8c474",
-          blue: "#8eacd0",
-          magenta: "#c1a0cc",
-          cyan: "#88c3b2",
-          white: "#dce2d7",
-          brightBlack: "#737d70",
-          brightRed: "#f09387",
-          brightGreen: "#c9eb8b",
-          brightYellow: "#f1d28a",
-          brightBlue: "#a6c2e4",
-          brightMagenta: "#d6b4e2",
-          brightCyan: "#a0d9c8",
-          brightWhite: "#f4f7ef",
-        },
-      });
-  fitAddon = new FitAddon();
-  terminal.loadAddon(fitAddon);
-  terminal.open($("#terminal"));
-  fit();
-  terminal.focus();
-
-  terminal.onData(sendTerminalInput);
-  terminal.onBinary((data) => sendTerminalBytes(Uint8Array.from(data, (char) => char.charCodeAt(0))));
-  terminal.onResize(({ cols, rows }) => {
-    if (!applyingRemoteResize && !readOnly) sendTerminalResize(cols, rows);
-  });
+  singleTerminal.mount($("#terminal"));
+  singleTerminal.focus();
   for (const button of document.querySelectorAll("[data-key]")) {
     button.onclick = () => {
-      terminal?.focus();
+      singleTerminal?.focus();
       const key = {
         esc: "\x1b",
         tab: "\t",
@@ -1381,164 +1734,17 @@ function enterTerminal(projectId, session) {
         left: "\x1b[D",
         right: "\x1b[C",
       }[button.dataset.key];
-      if (key) sendTerminalInput(key);
+      if (key) singleTerminal?.sendInput(key);
     };
   }
-  resizeObserver?.disconnect();
-  resizeObserver = new ResizeObserver(() => requestAnimationFrame(() => fit()));
-  resizeObserver.observe($(".terminal-frame"));
-  window.addEventListener("resize", fitTerminal);
-  window.visualViewport?.addEventListener("resize", fitTerminal);
-  connectTerminal(session, false);
+  window.addEventListener("resize", fitSingleTerminal);
+  window.visualViewport?.addEventListener("resize", fitSingleTerminal);
 }
 
-function terminalInputFilter(data) {
-  return data
-    .replace(/\x1b\[[0-9;?]*[Rcn]/g, "")
-    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/gs, "")
-    .replace(/\x1bP[\s\S]*?\x1b\\/g, "");
-}
-
-function sendTerminalInput(data) {
-  if (terminalSession?.state !== "running" || !currentSocket || currentSocket.readyState !== WebSocket.OPEN) return;
-  const filtered = terminalInputFilter(data);
-  if (filtered) currentSocket.send(new TextEncoder().encode(filtered));
-}
-
-function sendTerminalBytes(bytes) {
-  if (terminalSession?.state === "running" && currentSocket?.readyState === WebSocket.OPEN && bytes.length) currentSocket.send(bytes);
-}
-
-function connectTerminal(session, reset) {
-  if (reset) terminal?.reset();
-  const socketUrl = new URL(
-    `api/projects/${terminalProjectId}/sessions/${encodeURIComponent(session.id)}/terminal`,
-    document.baseURI,
-  );
-  socketUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  if (ghosttyEngine) socketUrl.searchParams.set("engine", "ghostty");
-  const generation = ++socketGeneration;
-  const socket = new WebSocket(socketUrl.toString());
-  currentSocket = socket;
-  socket.binaryType = "arraybuffer";
-  socket.addEventListener("open", () => {
-    if (generation !== socketGeneration) return;
-    setTerminalStatus(
-      session.state === "running" ? "Connected" : "Read-only · use Back to choose another session",
-      session.state === "running",
-    );
-    fit();
-    if (session.state === "running") sendTerminalResize(terminal?.cols, terminal?.rows);
-  });
-  socket.addEventListener("message", (message) => {
-    if (generation !== socketGeneration) return;
-    if (message.data instanceof ArrayBuffer) {
-      const bytes = new Uint8Array(message.data);
-      if (ghosttyEngine) {
-        // Tagged frames: 1 = lossless snapshot, 0 = raw output.
-        if (bytes[0] === 1) terminal?.loadSnapshot?.(bytes.subarray(1));
-        else terminal?.write(bytes.subarray(1));
-      } else {
-        terminal?.write(bytes);
-      }
-      return;
-    }
-    try {
-      const status = JSON.parse(message.data);
-      if (status.type === "error") setTerminalStatus(status.message, false, true);
-      if (status.type === "resync_required") setTerminalStatus("Refreshing terminal…", false, true);
-      if (status.type === "resize") applyRemoteResize(status.cols, status.rows);
-      if (status.type === "closed") setTerminalReadOnly("exited");
-    } catch {
-      setTerminalStatus(String(message.data), false, true);
-    }
-  });
-  socket.addEventListener("close", () => {
-    if (generation !== socketGeneration) return;
-    currentSocket = null;
-    if (!terminalSession) return;
-    void retryOrFinishSession(generation);
-  });
-  socket.addEventListener("error", () => {
-    if (generation === socketGeneration) setTerminalStatus("Connection interrupted…", false, true);
-  });
-}
-
-function sendTerminalResize(cols, rows) {
-  if (terminalSession?.state === "running" && currentSocket?.readyState === WebSocket.OPEN && cols && rows) {
-    currentSocket.send(JSON.stringify({ type: "resize", cols, rows }));
-  }
-}
-
-function applyRemoteResize(cols, rows) {
-  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 2 || rows < 1) return;
-  applyingRemoteResize = true;
-  try {
-    terminal?.resize(cols, rows);
-  } finally {
-    applyingRemoteResize = false;
-  }
-}
-
-function scheduleReconnect() {
-  if (reconnectTimer || terminalSession?.state !== "running") return;
-  const delay = Math.min(1000 * 2 ** reconnectAttempts, 8000);
-  reconnectAttempts += 1;
-  setTerminalStatus(`Reconnecting in ${Math.ceil(delay / 1000)}s…`, false, true);
-  reconnectTimer = window.setTimeout(() => {
-    reconnectTimer = null;
-    if (terminalSession?.state === "running") connectTerminal(terminalSession, true);
-  }, delay);
-}
-
-async function retryOrFinishSession(generation) {
-  const session = terminalSession;
-  if (!session || session.state !== "running") return;
-  try {
-    const sessions = await request(`/api/projects/${terminalProjectId}/sessions`);
-    const current = sessions.find((item) => item.id === session.id);
-    if (!current) {
-      closeTerminal();
-      return;
-    }
-    if (current.state !== "running") {
-      setTerminalReadOnly(current.state);
-      return;
-    }
-  } catch {
-    // A temporary HTTP outage is handled by the regular reconnect backoff.
-  }
-  if (generation === socketGeneration && terminalSession?.state === "running") scheduleReconnect();
-}
-
-function reconnectNow() {
-  if (terminalSession?.state !== "running") return;
-  window.clearTimeout(reconnectTimer);
-  reconnectTimer = null;
-  reconnectAttempts = 0;
-  const session = terminalSession;
-  currentSocket?.close();
-  currentSocket = null;
-  connectTerminal(session, true);
-}
-
-function setTerminalStatus(message, connected = false) {
-  const status = $("#terminal-connection");
-  status.textContent = message;
-  status.classList.toggle("connected", connected);
-}
-
-function setTerminalReadOnly(state) {
-  if (terminalSession) terminalSession = { ...terminalSession, state };
-  $("#reconnect-button").disabled = true;
-  document.querySelectorAll("[data-key]").forEach((button) => { button.disabled = true; });
-  setTerminalStatus("Read-only · use Back to choose another session");
-}
-
-function fitTerminal() {
+function fitSingleTerminal() {
   window.setTimeout(() => {
-    fit();
-    terminal?.focus();
+    singleTerminal?.fit();
+    singleTerminal?.focus();
   }, 60);
 }
 
@@ -1553,25 +1759,13 @@ function closeTerminal() {
   }
 }
 
-/// Tear the terminal down without touching the route.
+/// Tear the full-screen terminal down without touching the route.
 function exitTerminal() {
+  singleTerminal?.dispose();
+  singleTerminal = null;
   terminalOpen = false;
-  terminalSession = null;
-  terminalProjectId = null;
-  socketGeneration += 1;
-  window.clearTimeout(reconnectTimer);
-  reconnectTimer = null;
-  resizeObserver?.disconnect();
-  resizeObserver = null;
-  window.removeEventListener("resize", fitTerminal);
-  window.visualViewport?.removeEventListener("resize", fitTerminal);
-  if (currentSocket) {
-    currentSocket.close();
-    currentSocket = null;
-  }
-  terminal?.dispose();
-  terminal = null;
-  fitAddon = null;
+  window.removeEventListener("resize", fitSingleTerminal);
+  window.visualViewport?.removeEventListener("resize", fitSingleTerminal);
   $("#terminal-view").classList.add("hidden");
   appShell.classList.remove("session-open");
   main.classList.remove("hidden");
@@ -1601,8 +1795,11 @@ $("#terminal-attention-shortcut").addEventListener("click", () => {
 $("#refresh-button").addEventListener("click", () => refreshAll().catch((error) => showError(error.message)));
 $("#back-button").addEventListener("click", closeTerminal);
 $("#detach-button").addEventListener("click", closeTerminal);
-$("#reconnect-button").addEventListener("click", reconnectNow);
-window.addEventListener("beforeunload", () => currentSocket?.close());
+$("#reconnect-button").addEventListener("click", () => singleTerminal?.reconnectNow());
+window.addEventListener("beforeunload", () => {
+  singleTerminal?.dispose();
+  if (agentsWall) for (const tile of agentsWall.tiles.values()) tile.view.dispose();
+});
 
 loadProjects().catch((error) => {
   loadedProjects = true;

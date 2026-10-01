@@ -247,6 +247,32 @@ h2 { font-size: 1.25em; line-height: 1.25; letter-spacing: -.01em; margin-bottom
 .session-state.exited, .session-state.failed, .session-state.ended { color: var(--muted); }
 .session-arrow { color: var(--muted); font-size: 18px; margin-left: 2px; }
 
+/* ---- Agents wall: the workspace's live panels, tiled and interactive ---- */
+.main-content.wall-open { overflow: hidden; padding-bottom: 14px; }
+.agents-wall { height: 100%; max-width: none; display: flex; flex-direction: column; min-height: 0; }
+.agents-wall .wall-heading { margin-bottom: 10px; }
+.agents-wall .wall-heading h1 { font-size: 1.6em; }
+.agents-wall .wall-meta { font-size: 0.85em; }
+.agents-grid { flex: 1 1 auto; min-height: 0; display: grid; gap: 6px; }
+.agents-tile { display: flex; flex-direction: column; min-width: 0; min-height: 0; border: 1px solid var(--hairline); background: var(--bg); overflow: hidden; }
+.tile-header { display: flex; align-items: center; gap: 6px; min-height: 24px; padding: 2px 6px; border-bottom: 1px solid var(--hairline); }
+.tile-title { flex: 0 1 auto; min-width: 0; border: 0; background: none; color: var(--fg); font-size: 0.82em; font-weight: 700; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; padding: 1px 2px; border-radius: var(--radius-control); }
+.tile-title:hover { color: var(--accent); background: var(--surface-hover); }
+.tile-todo { flex: 1 1 auto; min-width: 0; border: 0; background: none; color: var(--muted); font-size: 0.8em; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; padding: 1px 2px; border-radius: var(--radius-control); }
+.tile-todo:hover { color: var(--fg); background: var(--surface-hover); }
+.tile-action { flex: 0 0 auto; border: 0; background: none; color: var(--muted); cursor: pointer; font-size: 0.85em; padding: 1px 4px; border-radius: var(--radius-control); }
+.tile-action:hover { background: var(--surface-hover); color: var(--fg); }
+.tile-body { flex: 1 1 auto; min-height: 0; }
+.tile-body canvas, .tile-body .xterm { width: 100%; height: 100%; }
+.wall-empty { grid-column: 1 / -1; align-self: start; }
+
+/* Activity signs: the dot vocabulary the native panel header shares. */
+.activity-dot { font-size: 0.8em; line-height: 1; }
+.activity-dot.sign-needs-you, .activity-dot.sign-waiting { color: var(--warning); }
+.activity-dot.sign-working { color: var(--accent); }
+.activity-dot.sign-running { color: rgba(146, 112, 92, 0.6); }
+.activity-dot.sign-idle, .activity-dot.sign-stopped { color: rgba(228, 213, 170, 0.45); }
+
 .page-error { margin-top: 20px; color: var(--warning); border: 1px solid rgba(183, 145, 103, 0.4); padding: 10px; border-radius: var(--radius-control); font-size: 0.92em; }
 
 /* ---- Terminal ---- */
