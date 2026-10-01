@@ -122,7 +122,8 @@ fn card_editor(
     text.add_css_class("card-edit-body");
     let text_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
-        .min_content_height(120)
+        .propagate_natural_height(true)
+        .min_content_height(48)
         .child(&text)
         .build();
 
