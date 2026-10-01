@@ -6049,28 +6049,40 @@ mod home_navigation_tests {
             );
         }
 
-        // Back on the cockpit, the project card grows with its to-dos: the
-        // list is a plain box, never an inner scroller that would cap the
-        // card at a fixed height and hide the rest behind a scrollbar.
+        // Back on the cockpit, the project card grows with its to-dos but
+        // keeps its width: the list scrolls only vertically, never caps the
+        // card's height, and never widens the card with a long to-do title.
         activate(&window, "win.show-home", None);
         let cockpit = stack.child_by_name("_home").unwrap();
-        assert!(
-            !widgets(&cockpit)
-                .iter()
-                .any(|widget| widget.has_css_class("todo-scroll")),
-            "the project card has no inner to-do scroller"
-        );
-        let lists: Vec<gtk::Widget> = widgets(&cockpit)
+        let scroll = widgets(&cockpit)
             .into_iter()
-            .filter(|widget| widget.has_css_class("todo-list"))
-            .collect();
-        assert_eq!(lists.len(), 1, "the project card lists its to-dos");
-        let list = &lists[0];
-        assert!(list.is::<gtk::Box>(), "the to-do list is a plain box");
-        assert!(
-            list.parent().is_none_or(|parent| !parent.is::<gtk::ScrolledWindow>()),
-            "the to-do list is not wrapped in a scroller"
+            .find(|widget| widget.has_css_class("todo-scroll"))
+            .expect("the project card lists its to-dos");
+        let scroll = scroll
+            .downcast::<gtk::ScrolledWindow>()
+            .expect("the to-do list is a scroller");
+        assert_eq!(
+            scroll.max_content_height(),
+            -1,
+            "the to-do list is not capped to a fixed height"
         );
+        assert_eq!(
+            scroll.hscrollbar_policy(),
+            gtk::PolicyType::Never,
+            "the to-do list does not claim its natural width"
+        );
+        let vadj = scroll.vadjustment();
+        assert!(
+            vadj.upper() <= vadj.page_size() + 0.5,
+            "the to-do list grows with its content instead of scrolling \
+             (content {}, viewport {})",
+            vadj.upper(),
+            vadj.page_size()
+        );
+        let list = widgets(&cockpit)
+            .into_iter()
+            .find(|widget| widget.has_css_class("todo-list"))
+            .expect("the scroller wraps the to-do list");
         assert!(
             list.first_child().is_some(),
             "the to-do list carries the project's to-dos"

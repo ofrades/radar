@@ -614,7 +614,7 @@ fn project_lane(app: &App, project: &Project) -> gtk::Widget {
         if open.is_empty() {
             lane.append(&quiet("No to-dos yet"));
         } else {
-            lane.append(&todo_list(app, project.id, &open));
+            lane.append(&todo_scroll(app, project.id, &open));
         }
     } else {
         lane.append(&quiet("No board"));
@@ -780,17 +780,26 @@ fn lane_rank(name: &str, done: bool) -> u8 {
     }
 }
 
-/// The open to-dos, laid out plainly: the lane grows with the work it holds,
-/// and Home's own scroller carries the page. No inner scrollbar and no "+N
-/// more" cut-off — every to-do a project has stays visible on its card.
-fn todo_list(app: &App, project_id: i64, open: &[(String, board::WorkCard)]) -> gtk::Widget {
+/// The open to-dos, in a scroller the card never cuts short: no height cap, so
+/// the lane grows with the work it holds and Home's own scroller carries the
+/// page. The scroller stays for the width it does *not* claim: a never
+/// horizontal policy contributes the list's minimum width, not its natural
+/// width, so a long to-do title never widens the card.
+fn todo_scroll(app: &App, project_id: i64, open: &[(String, board::WorkCard)]) -> gtk::Widget {
     let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
     list.add_css_class("todo-list");
     for (lane_name, card) in open {
         let note = latest_card_note(app, project_id, &card.id);
         list.append(&todo_row(app, project_id, lane_name, card, note.as_deref()));
     }
-    list.upcast()
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .child(&list)
+        .build();
+    scroll.add_css_class("todo-scroll");
+    scroll.upcast()
 }
 
 fn lane_footer(running: usize, stopped: usize) -> gtk::Widget {
