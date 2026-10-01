@@ -967,8 +967,14 @@ mod tests {
         }
         let after = top_row(&mut view.inner.borrow_mut());
         assert!(before.starts_with("L08"), "frozen live row: {before:?}");
-        assert!(after.starts_with("L05"), "older content after scroll: {after:?}");
-        assert!(sent.lock().is_empty(), "shell scrollback must not send input");
+        assert!(
+            after.starts_with("L05"),
+            "older content after scroll: {after:?}"
+        );
+        assert!(
+            sent.lock().is_empty(),
+            "shell scrollback must not send input"
+        );
         window.close();
     }
 

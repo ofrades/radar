@@ -20,6 +20,7 @@
 //! the agent away for a moment never interrupts it.
 
 mod activity_sign;
+mod agents;
 mod alert;
 mod board;
 mod card;
@@ -282,14 +283,12 @@ struct App {
     home_todo_drafts: Rc<RefCell<HashMap<i64, String>>>,
     /// The confetti layer thrown when a to-do is completed.
     confetti: confetti::Confetti,
-    /// The Agents page: every live session's real panel, tiled, with the
-    /// grouped list as a header strip. A persistent stack page — Home's
-    /// rebuild-on-every-event would tear attached terminals down mid-keystroke,
-    /// so this page updates in place instead.
-    agents_page: RefCell<Option<home::AgentsPage>>,
-    /// The page's tiles, by daemon session id. A tile owns an attachment; it
-    /// comes and goes with the session's presence in discovery.
-    agent_tiles: RefCell<HashMap<String, home::AgentTile>>,
+    /// The Agents page: every live session's real panel, tiled in the
+    /// workspace's own arrangement — drag to split, resizable dividers, the
+    /// works. A persistent stack page — Home's rebuild-on-every-event would
+    /// tear attached terminals down mid-keystroke, so this page updates in
+    /// place.
+    agents_page: RefCell<Option<agents::AgentsPage>>,
     /// Sessions the human closed on the Agents page: the tile leaves the wall
     /// but the program keeps running, exactly like closing a workspace panel.
     /// The id leaves the set when its session ends.
@@ -317,6 +316,8 @@ struct App {
 enum HomeView {
     Project(i64),
     Card(i64, String),
+    /// Navigation marker only: live panes remain on their persistent stack page.
+    Agents,
     /// Home's combined "Add a project" picker (its own stack page).
     AddProject,
 }
@@ -746,22 +747,10 @@ fn build_window(
     let adder = gtk::Box::new(gtk::Orientation::Vertical, 0);
     adder.add_css_class("home-view");
     adder.add_css_class("add-project-view");
-    let adder_header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    adder_header.add_css_class("home-view-bar");
-    let adder_back = gtk::Button::builder()
-        .icon_name("go-previous-symbolic")
-        .tooltip_text("Back to Home")
-        .build();
-    adder_back.add_css_class("flat");
-    adder_back.set_action_name(Some("win.home-back"));
-    adder_header.append(&adder_back);
-    let adder_title = gtk::Label::new(Some("Add a project"));
-    adder_title.add_css_class("heading");
-    adder_title.set_hexpand(true);
-    adder_title.set_xalign(0.0);
-    adder_header.append(&adder_title);
+    let adder_header = home::page_header("Add a project", None);
     let adder_choose = gtk::Button::with_label("Choose folder…");
     adder_choose.add_css_class("flat");
+    adder_choose.set_halign(gtk::Align::Start);
     adder_choose.set_tooltip_text(Some("Add a folder anywhere, with the system chooser"));
     adder_choose.set_action_name(Some("win.home-import-dialog"));
     adder_header.append(&adder_choose);
@@ -871,7 +860,6 @@ fn build_window(
         home_todo_drafts: Rc::new(RefCell::new(HashMap::new())),
         confetti,
         agents_page: RefCell::new(None),
-        agent_tiles: RefCell::new(HashMap::new()),
         dismissed_agents: RefCell::new(HashSet::new()),
         header_info: RefCell::new(HashMap::new()),
         current: RefCell::new(None),
@@ -2043,9 +2031,9 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         );
     }
     {
-        // The Agents page's tile close: the panel leaves the wall, its
+        // The Agents page's panel close: the panel leaves the wall, its
         // program keeps running — the same contract as closing a workspace
-        // panel. The tile can come back by the session ending and something
+        // panel. The panel can come back by the session ending and something
         // new starting under the id; the workspace panel is the other way in.
         let action = gio::SimpleAction::new(
             "agents-close",
@@ -2056,8 +2044,50 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             let Some(id) = parameter.and_then(|value| value.get::<String>()) else {
                 return;
             };
-            app_for_action.dismissed_agents.borrow_mut().insert(id);
-            app_for_action.sync_agents_page_if_visible();
+            app_for_action
+                .dismissed_agents
+                .borrow_mut()
+                .insert(id.clone());
+            if let Some(page) = app_for_action.agents_page.borrow().as_ref() {
+                agents::forget(&app_for_action, &page.board, &id);
+            }
+        });
+        app.window.add_action(&action);
+    }
+    {
+        // The Agents page's drag grammar, resolving its own board: the
+        // middle of a panel swaps, an edge splits.
+        let action = gio::SimpleAction::new(
+            "agents-swap",
+            Some(glib::VariantTy::new("(ss)").expect("two session ids")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((first, second)) = parameter.and_then(|value| value.get::<(String, String)>())
+            else {
+                return;
+            };
+            if let Some(page) = app_for_action.agents_page.borrow().as_ref() {
+                agents::swap(&app_for_action, &page.board, &first, &second);
+            }
+        });
+        app.window.add_action(&action);
+    }
+    {
+        let action = gio::SimpleAction::new(
+            "agents-nest-split",
+            Some(glib::VariantTy::new("(sss)").expect("two session ids and a zone")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((dragged, target, zone)) =
+                parameter.and_then(|value| value.get::<(String, String, String)>())
+            else {
+                return;
+            };
+            if let Some(page) = app_for_action.agents_page.borrow().as_ref() {
+                agents::nest(&app_for_action, &page.board, &dragged, &target, &zone);
+            }
         });
         app.window.add_action(&action);
     }
@@ -2516,8 +2546,10 @@ impl App {
                 }
             }
         }
-        for tile in self.agent_tiles.borrow().values() {
-            tile.pane.apply_theme(&theme);
+        if let Some(page) = self.agents_page.borrow().as_ref() {
+            for panel in page.board.panels.borrow().iter() {
+                panel.pane.apply_theme(&theme);
+            }
         }
         *self.theme.borrow_mut() = theme;
     }
@@ -2771,27 +2803,28 @@ impl App {
         gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
         self.home_shown.set(true);
         *self.current.borrow_mut() = None;
+        if !matches!(self.home_nav.borrow().last(), Some(HomeView::Agents)) {
+            self.home_nav.borrow_mut().push(HomeView::Agents);
+        }
         if self.agents_page.borrow().is_none() {
-            *self.agents_page.borrow_mut() = Some(home::agents_page());
+            *self.agents_page.borrow_mut() = Some(agents::page());
             if let Some(page) = self.agents_page.borrow().as_ref() {
                 self.stack.add_named(&page.root, Some("_agents"));
             }
         }
-        home::sync_agents_page(
-            self,
-            self.agents_page.borrow().as_ref().unwrap(),
-            &mut self.agent_tiles.borrow_mut(),
-        );
+        if let Some(page) = self.agents_page.borrow().as_ref() {
+            agents::sync(self, page);
+        }
         self.stack.set_visible_child_name("_agents");
         self.sync_toggles();
     }
 
-    /// In-flush the Agents page when it is the one on screen: tiles and strip
-    /// follow discovery; everything else is left alone.
+    /// In-flush the Agents page when it is the one on screen: panels follow
+    /// discovery; everything else is left alone.
     fn sync_agents_page_if_visible(&self) {
         if self.stack.visible_child_name().as_deref() == Some("_agents") {
             if let Some(page) = self.agents_page.borrow().as_ref() {
-                home::sync_agents_page(self, page, &mut self.agent_tiles.borrow_mut());
+                agents::sync(self, page);
             }
         }
     }
@@ -2805,8 +2838,8 @@ impl App {
         self.sync_toggles();
     }
 
-    /// Leave the current Home drill-down and return to the cockpit. The picker
-    /// is a separate stack page, so Back from it shows the cockpit explicitly.
+    /// Pop one destination, including persistent pages, without reconstructing
+    /// their live panes. Back from a conversation returns to its origin.
     fn home_back(self: &Rc<Self>) {
         gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
         self.home_nav.borrow_mut().pop();
@@ -2823,7 +2856,9 @@ impl App {
             self.show_home();
             return;
         }
-        if matches!(self.home_nav.borrow().last(), Some(HomeView::AddProject)) {
+        if matches!(self.home_nav.borrow().last(), Some(HomeView::Agents)) {
+            self.enter_agents_view();
+        } else if matches!(self.home_nav.borrow().last(), Some(HomeView::AddProject)) {
             self.stack.set_visible_child_name("_add");
         } else {
             self.stack.set_visible_child_name("_home");
@@ -6081,6 +6116,23 @@ mod home_navigation_tests {
                 Some(format!("project-{}", project.id).as_str())
             );
         }
+
+        // Agents is a drill-down origin too; returning must reuse its page.
+        activate(&window, "win.show-home", None);
+        activate(&window, "win.home-agents", None);
+        let agents_page = stack.child_by_name("_agents").unwrap();
+        activate(
+            &window,
+            "win.open-card",
+            Some(&(project.id, card.id.as_str()).to_variant()),
+        );
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        activate(&window, "win.home-back", None);
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_agents"));
+        assert_eq!(stack.child_by_name("_agents").unwrap(), agents_page);
+        activate(&window, "win.home-back", None);
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        activate(&window, "win.open-project", Some(&project.id.to_variant()));
 
         // The header's done control, beside the to-do title: mark the
         // session's to-do done from the workspace. The store records done,

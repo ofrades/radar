@@ -50,7 +50,7 @@ pub fn drop_intent(zone: &str, dragged: TabKey, target: TabKey) -> DropIntent {
 
 /// Which part of a panel a drop landed on: the half the drop implies, or the
 /// middle for a swap.
-fn drop_zone(width: i32, height: i32, x: f64, y: f64) -> &'static str {
+pub fn drop_zone(width: i32, height: i32, x: f64, y: f64) -> &'static str {
     let (fw, fh) = (width as f64, height as f64);
     if fw <= 0.0 || fh <= 0.0 {
         return "right";
@@ -70,12 +70,12 @@ fn drop_zone(width: i32, height: i32, x: f64, y: f64) -> &'static str {
 
 /// How far the edge indicator sits in from the panel's rim, so the panel's own
 /// border stays visible under it.
-const EDGE_PAD: i32 = 6;
+pub(super) const EDGE_PAD: i32 = 6;
 
 /// The margins that carve the edge rectangle down to the half `zone` points
 /// at — (left, right, top, bottom), inset by `pad`. A centre drop swaps, so it
 /// lights the whole panel.
-fn edge_margins(zone: &str, width: i32, height: i32, pad: i32) -> (i32, i32, i32, i32) {
+pub fn edge_margins(zone: &str, width: i32, height: i32, pad: i32) -> (i32, i32, i32, i32) {
     let (half_w, half_h) = (width / 2, height / 2);
     match zone {
         "top" => (pad, pad, pad, half_h),

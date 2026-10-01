@@ -7,7 +7,7 @@
 //!     actions to answer, approve, deny, or dismiss it in place.
 //!   * **Agents** — every agent running across every project in one list,
 //!     grouped by project, each row carrying its activity sign and a way to
-//!     open the session. The cockpit header's running count is the way in.
+//!     open the session. A large destination card on Home is the way in.
 //!   * **Projects** — a small, clickable card per project: its git state, its
 //!     board counts and its to-dos, each carrying the state of the session bound
 //!     to it. The card opens the project's own view, where its to-dos are
@@ -73,13 +73,16 @@ pub fn cockpit(app: &App) -> gtk::Widget {
         .filter(|session| live_agents::sidebar_session_is_live(session))
         .count();
 
-    // A one-line pulse for the whole workspace. The running count is the way
-    // into the agents view — every live session, every project.
+    // Home is a destination, not a toolbar: title and context first, then
+    // large cards that lead into the workspace.
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    header.add_css_class("home-hero");
+    let heading = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    heading.set_hexpand(true);
     let title = gtk::Label::new(Some("Home"));
-    title.add_css_class("heading");
+    title.add_css_class("hero-title");
     title.set_xalign(0.0);
-    header.append(&title);
+    heading.append(&title);
     let projects_label = match projects.len() {
         1 => "1 project".to_string(),
         count => format!("{count} projects"),
@@ -91,24 +94,20 @@ pub fn cockpit(app: &App) -> gtk::Widget {
     counts.add_css_class("caption");
     counts.add_css_class("dim-label");
     counts.set_hexpand(true);
-    counts.set_xalign(1.0);
-    header.append(&counts);
-    let agents = gtk::Button::builder()
-        .label(agents_button_text(running))
-        .tooltip_text("Every agent running, across all projects")
-        .action_name("win.home-agents")
-        .build();
-    agents.add_css_class("flat");
-    agents.add_css_class("agents-pulse");
-    header.append(&agents);
+    counts.set_xalign(0.0);
+    counts.set_wrap(true);
+    heading.append(&counts);
+    header.append(&heading);
     let shortcuts = gtk::Button::builder()
         .icon_name("view-more-symbolic")
         .tooltip_text("Tools and shortcuts · Alt+H")
         .action_name("win.hud")
         .build();
+    shortcuts.set_valign(gtk::Align::Center);
     header.append(&shortcuts);
     content.append(&header);
 
+    content.append(&agents_destination(running));
     needs_you_section(app, &content, &needs);
     projects_section(app, &content, &projects);
 
@@ -126,7 +125,7 @@ pub fn view(app: &App) -> gtk::Widget {
     match app.home_nav.borrow().last().cloned() {
         Some(super::HomeView::Project(project_id)) => project_view(app, project_id),
         Some(super::HomeView::Card(project_id, card_id)) => card_view(app, project_id, &card_id),
-        Some(super::HomeView::AddProject) => cockpit(app),
+        Some(super::HomeView::AddProject | super::HomeView::Agents) => cockpit(app),
         None => cockpit(app),
     }
 }
@@ -135,6 +134,7 @@ pub fn view(app: &App) -> gtk::Widget {
 fn card_view(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("home-view");
+    root.add_css_class("card-view");
     let project = app
         .projects
         .borrow()
@@ -150,391 +150,81 @@ fn card_view(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
     root.upcast()
 }
 
-/// The Back-to-Home header shared by the drill-down views.
+/// A readable way back, followed by the destination's hero title.
 fn view_header(title: &str, meta: Option<&str>) -> gtk::Widget {
-    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let meta = meta.map(|text| gtk::Label::new(Some(text)));
+    page_header(title, meta.as_ref()).upcast()
+}
+
+/// Shared by persistent pages too: their metadata can update without
+/// rebuilding the header or any live terminal beneath it.
+pub(super) fn page_header(title: &str, meta: Option<&gtk::Label>) -> gtk::Box {
+    let bar = gtk::Box::new(gtk::Orientation::Vertical, 10);
     bar.add_css_class("home-view-bar");
     let back = gtk::Button::builder()
-        .icon_name("go-previous-symbolic")
-        .tooltip_text("Back to Home")
+        .label("← Back")
+        .tooltip_text("Back to the previous view")
         .build();
     back.add_css_class("flat");
+    back.set_halign(gtk::Align::Start);
     back.set_action_name(Some("win.home-back"));
     bar.append(&back);
     let name = gtk::Label::new(Some(title));
     name.set_xalign(0.0);
-    name.add_css_class("heading");
+    name.add_css_class("hero-title");
+    name.set_wrap(true);
+    name.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     bar.append(&name);
     if let Some(meta) = meta {
-        let meta = gtk::Label::new(Some(meta));
         meta.add_css_class("caption");
         meta.add_css_class("dim-label");
-        meta.set_xalign(1.0);
+        meta.set_xalign(0.0);
+        meta.set_wrap(true);
         meta.set_hexpand(true);
-        bar.append(&meta);
+        bar.append(meta);
     }
-    bar.upcast()
+    bar
 }
 
-// ---- Agents: every live session, every project ----
+// ---- Agents: the page itself lives in agents.rs ----
 
-/// The Agents page: every agent running, across every project — the real
-/// panels, tiled like a workspace. This is a persistent stack page, NOT a
-/// Home drill-down: Home rebuilds on every journal event, and that would tear
-/// attached terminals down mid-keystroke. The page updates in place instead —
-/// tiles come and go with their sessions; panes are never rebuilt.
-pub(super) struct AgentsPage {
-    pub root: gtk::Widget,
-    pub meta: gtk::Label,
-    pub grid: gtk::FlowBox,
+/// A first-class Home destination, using the same big-card language as Projects.
+fn agents_destination(running: usize) -> gtk::Widget {
+    let button = gtk::Button::new();
+    button.add_css_class("destination-card");
+    button.set_action_name(Some("win.home-agents"));
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 18);
+    let icon = gtk::Image::from_icon_name("utilities-terminal-symbolic");
+    icon.set_pixel_size(32);
+    row.append(&icon);
+    let copy = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    copy.set_hexpand(true);
+    let title = gtk::Label::new(Some("Agents"));
+    title.add_css_class("destination-title");
+    title.set_xalign(0.0);
+    copy.append(&title);
+    let summary = gtk::Label::new(Some(&format!(
+        "{} · All projects, one workspace",
+        agents_count_text(running)
+    )));
+    summary.set_xalign(0.0);
+    summary.set_wrap(true);
+    summary.add_css_class("dim-label");
+    copy.append(&summary);
+    let hint = gtk::Label::new(Some("See agent panels and work with them in place"));
+    hint.set_xalign(0.0);
+    hint.set_wrap(true);
+    hint.add_css_class("caption");
+    hint.add_css_class("dim-label");
+    copy.append(&hint);
+    row.append(&copy);
+    row.append(&gtk::Image::from_icon_name("go-next-symbolic"));
+    button.set_child(Some(&row));
+    button.upcast()
 }
 
-/// One tile: a real agent panel (a pane attached to the daemon session) with
-/// the same header a workspace panel wears — activity dot, session name, its
-/// to-do, a done check, and a close that dismisses the tile while the
-/// program keeps running.
-pub(super) struct AgentTile {
-    pub pane: std::rc::Rc<super::pane::Pane>,
-    pub dot: gtk::Label,
-    /// The session's name, as the workspace's header shows it: the program's
-    /// own title when it reports one.
-    pub session_label: gtk::Label,
-    /// The to-do link and its done check: hidden unless the session carries
-    /// a board card.
-    pub todo_button: gtk::Button,
-    pub todo_label: gtk::Label,
-    pub todo_done: gtk::Button,
-    pub frame: gtk::Widget,
-    /// The process generation the attachment holds. A new pid under the same
-    /// stable id (a stop and a respawn) means the attachment is watching a
-    /// dead process — the tile re-attaches.
-    pub pid: Option<u32>,
-}
-
-pub(super) fn agents_page() -> AgentsPage {
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    root.add_css_class("home-view");
-    root.add_css_class("agents-view");
-
-    let meta = gtk::Label::new(None);
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    header.add_css_class("home-view-bar");
-    let back = gtk::Button::builder()
-        .icon_name("go-previous-symbolic")
-        .tooltip_text("Back to Home")
-        .build();
-    back.add_css_class("flat");
-    back.set_action_name(Some("win.home-back"));
-    header.append(&back);
-    let name = gtk::Label::new(Some("Agents"));
-    name.set_xalign(0.0);
-    name.add_css_class("heading");
-    header.append(&name);
-    meta.add_css_class("caption");
-    meta.add_css_class("dim-label");
-    meta.set_xalign(1.0);
-    meta.set_hexpand(true);
-    header.append(&meta);
-    root.append(&header);
-
-    // The panels: real panes attached to the live sessions, tiled and
-    // interactive. The FlowBox wraps; the page scrolls when agents overflow.
-    let grid = gtk::FlowBox::new();
-    grid.set_selection_mode(gtk::SelectionMode::None);
-    grid.set_min_children_per_line(1);
-    grid.set_max_children_per_line(2);
-    grid.set_homogeneous(true);
-    grid.set_row_spacing(10);
-    grid.set_column_spacing(10);
-    grid.set_valign(gtk::Align::Start);
-    grid.add_css_class("agents-grid");
-    let scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .vexpand(true)
-        .child(&grid)
-        .build();
-    scroll.add_css_class("home-scroll");
-    root.append(&scroll);
-
-    AgentsPage {
-        root: root.upcast(),
-        meta,
-        grid,
-    }
-}
-
-/// Bring the page in line with discovery: add a tile per new live session,
-/// drop the ones whose session is gone, refresh the headers. The panes
-/// themselves are never rebuilt.
-pub(super) fn sync_agents_page(
-    app: &App,
-    page: &AgentsPage,
-    tiles: &mut std::collections::HashMap<String, AgentTile>,
-) {
-    let groups = live_sessions_by_project(app);
-    // The meta describes the wall: live radar-managed sessions, minus the
-    // ones the human closed off it.
-    let dismissed = app.dismissed_agents.borrow();
-    let wall: usize = groups
-        .iter()
-        .map(|(_, rows)| {
-            rows.iter()
-                .filter(|s| {
-                    s.radar_session_id
-                        .as_ref()
-                        .is_some_and(|id| !dismissed.contains(id))
-                })
-                .count()
-        })
-        .sum();
-    drop(dismissed);
-    page.meta.set_text(&agents_button_text(wall));
-
-    // The tiles first: one per live radar-managed session (an external
-    // agent's terminal cannot be embedded; its workspace stays the way in).
-    // A session the human closed stays off the wall until it ends.
-    let theme = app.theme.borrow().clone();
-    for (project, rows) in &groups {
-        for session in rows {
-            let Some(id) = session.radar_session_id.clone() else {
-                continue;
-            };
-            if app.dismissed_agents.borrow().contains(&id) {
-                // The human closed this panel: off the wall, program keeps
-                // running. The tile goes with the request.
-                if let Some(stale) = tiles.remove(&id) {
-                    drop_tile(&page.grid, stale);
-                }
-                continue;
-            }
-            if let Some(existing) = tiles.get(&id) {
-                if existing.pid == session.pid {
-                    continue;
-                }
-            }
-            let Some(program) = crate::programs::by_id(&session.program_id) else {
-                continue;
-            };
-            // A respawned session (a new pid under the same id) first drops
-            // the stale attachment, then makes a fresh one.
-            if let Some(stale) = tiles.remove(&id) {
-                drop_tile(&page.grid, stale);
-            }
-            let tile = agent_tile(app, project, session, &program, &theme);
-            page.grid.insert(&tile.frame, -1);
-            tiles.insert(id, tile);
-        }
-    }
-    // Removal needs the FlowBoxChild the grid wrapped the frame in. A session
-    // that ended also leaves the dismissed set, so a future session under the
-    // same stable id shows again.
-    let gone: Vec<String> = tiles
-        .keys()
-        .filter(|id| {
-            !groups.iter().any(|(_, rows)| {
-                rows.iter()
-                    .any(|s| s.radar_session_id.as_ref() == Some(*id))
-            })
-        })
-        .cloned()
-        .collect();
-    for id in gone {
-        if let Some(tile) = tiles.remove(&id) {
-            drop_tile(&page.grid, tile);
-        }
-        app.dismissed_agents.borrow_mut().remove(&id);
-    }
-    // The headers: the dot breathes with the journal, the session name
-    // follows the program, and the to-do link reflects the store.
-    for (project, rows) in &groups {
-        for session in rows {
-            let Some(id) = session.radar_session_id.clone() else {
-                continue;
-            };
-            let Some(tile) = tiles.get(&id) else {
-                continue;
-            };
-            let sign = app.session_activity_sign(project.id, session);
-            tile.dot
-                .set_css_classes(&["activity-dot", sign.css_class()]);
-            tile.dot.set_tooltip_text(Some(sign.label()));
-            tile.session_label.set_text(&session.title);
-            match session
-                .card_id
-                .as_deref()
-                .and_then(|card_id| Some((card_id, app.card_title(project.id, card_id)?)))
-            {
-                Some((card_id, title)) => {
-                    tile.todo_label.set_text(&title);
-                    tile.todo_button.set_visible(true);
-                    tile.todo_button
-                        .set_action_target_value(Some(&(project.id, card_id).to_variant()));
-                    tile.todo_done.set_visible(true);
-                    tile.todo_done
-                        .set_action_target_value(Some(&(project.id, card_id).to_variant()));
-                }
-                None => {
-                    tile.todo_button.set_visible(false);
-                    tile.todo_done.set_visible(false);
-                }
-            }
-        }
-    }
-}
-
-fn drop_tile(grid: &gtk::FlowBox, tile: AgentTile) {
-    if let Some(child) = tile.frame.parent().and_downcast::<gtk::FlowBoxChild>() {
-        grid.remove(&child);
-    }
-}
-
-fn agent_tile(
-    app: &App,
-    project: &Project,
-    session: &live_agents::AgentSession,
-    program: &crate::programs::Program,
-    theme: &super::Theme,
-) -> AgentTile {
-    // The spec is the fallback: a live session attaches as-is, and only a
-    // vanished one runs this. Same program, same project, same card.
-    let session_id = session
-        .radar_session_id
-        .clone()
-        .unwrap_or_else(|| session.id.clone());
-    let mut options = app.launch_options();
-    options.card = session.card_id.clone();
-    let mut spec = program.command_spec(&options);
-    super::add_session_environment(
-        &mut spec,
-        project.id,
-        &project.path,
-        &app.session_home,
-        &session_id,
-    );
-    let pane = std::rc::Rc::new(super::pane::Pane::spawn(
-        &spec,
-        &project.path,
-        theme,
-        &session.title,
-        super::pane::ShiftEnter::for_slot(crate::db::Slot::Agent),
-        &app.session_home,
-        &session_id,
-    ));
-
-    let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    frame.add_css_class("agents-tile");
-    frame.set_size_request(430, 280);
-
-    // The same header a workspace panel wears: the activity sign, the
-    // session's name, its to-do with a done check, and a close on the right
-    // that leaves the program running. The classes are the panel header's
-    // own, so the look cannot drift from the workspace.
-    let head = gtk::Box::new(gtk::Orientation::Horizontal, 5);
-    head.add_css_class("panel-header");
-    head.add_css_class("panel-chip");
-    head.set_valign(gtk::Align::Center);
-    let dot = gtk::Label::new(Some("●"));
-    dot.set_css_classes(&["activity-dot"]);
-    dot.set_valign(gtk::Align::Center);
-    head.append(&dot);
-
-    let session_label = gtk::Label::new(Some(&session.title));
-    session_label.add_css_class("caption-heading");
-    session_label.add_css_class("pane-info");
-    session_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    session_label.set_xalign(0.0);
-    head.append(&session_label);
-
-    let todo_button = gtk::Button::new();
-    todo_button.add_css_class("flat");
-    todo_button.add_css_class("panel-todo");
-    todo_button.set_visible(false);
-    let todo_label = gtk::Label::new(None);
-    todo_label.add_css_class("caption");
-    todo_label.add_css_class("dim-label");
-    todo_label.add_css_class("pane-info");
-    todo_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    todo_label.set_xalign(0.0);
-    todo_button.set_child(Some(&todo_label));
-    todo_button.set_tooltip_text(Some("Open this card — read it, reply, edit it"));
-    todo_button.set_action_name(Some("win.open-card"));
-    head.append(&todo_button);
-
-    let todo_done = gtk::Button::builder()
-        .icon_name("object-select-symbolic")
-        .tooltip_text("Mark this to-do done")
-        .build();
-    todo_done.add_css_class("chip-done");
-    todo_done.set_valign(gtk::Align::Center);
-    todo_done.set_visible(false);
-    todo_done.set_action_name(Some("win.card-toggle-done"));
-    head.append(&todo_done);
-
-    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    spacer.set_hexpand(true);
-    head.append(&spacer);
-
-    let close = gtk::Button::builder()
-        .icon_name("window-close-symbolic")
-        .tooltip_text("Close this panel — its program keeps running")
-        .build();
-    close.add_css_class("flat");
-    close.add_css_class("chip-close");
-    close.set_valign(gtk::Align::Center);
-    close.set_action_name(Some("win.agents-close"));
-    close.set_action_target_value(Some(&session_id.to_variant()));
-    head.append(&close);
-    frame.append(&head);
-
-    frame.append(pane.widget());
-
-    // The program's own title feeds the tile header.
-    let session_for_observer = session_label.clone();
-    pane.set_info_observer(move |text| {
-        if let Some(text) = text {
-            session_for_observer.set_text(&text);
-        }
-    });
-
-    AgentTile {
-        pane,
-        dot,
-        session_label,
-        todo_button,
-        todo_label,
-        todo_done,
-        frame: frame.upcast(),
-        pid: session.pid,
-    }
-}
-
-/// The live sessions that belong to a project someone still has, in the
-/// sidebar's project order, most recently active session first.
-fn live_sessions_by_project(app: &App) -> Vec<(Project, Vec<live_agents::AgentSession>)> {
-    let index = app.agent_sessions.borrow();
-    app.projects
-        .borrow()
-        .iter()
-        .filter_map(|project| {
-            let mut rows: Vec<live_agents::AgentSession> = index
-                .by_project
-                .get(&project.id)?
-                .iter()
-                .filter(|session| live_agents::sidebar_session_is_live(session))
-                .cloned()
-                .collect();
-            if rows.is_empty() {
-                return None;
-            }
-            rows.sort_by_key(|session| std::cmp::Reverse(session.last_activity_at));
-            Some((project.clone(), rows))
-        })
-        .collect()
-}
-
-/// The agents page's one-line count, reused on the cockpit's header button.
-pub(super) fn agents_button_text(running: usize) -> String {
+/// Live count shared by Home's destination card and the Agents page.
+pub(super) fn agents_count_text(running: usize) -> String {
     match running {
         0 => "No agents".to_string(),
         1 => "1 running".to_string(),
@@ -1244,7 +934,7 @@ fn lane_column(app: &App, project_id: i64, lane: &board::LaneSummary) -> gtk::Wi
     let name = gtk::Label::new(Some(&lane.name));
     name.set_xalign(0.0);
     name.set_hexpand(true);
-    name.add_css_class("caption-heading");
+    name.add_css_class("heading");
     head.append(&name);
     let count = gtk::Label::new(Some(&lane.cards.len().to_string()));
     count.add_css_class("caption");
@@ -1517,7 +1207,7 @@ fn shorten(text: &str, limit: usize) -> String {
     short
 }
 
-fn quiet(text: &str) -> gtk::Label {
+pub(super) fn quiet(text: &str) -> gtk::Label {
     let label = gtk::Label::new(Some(text));
     label.add_css_class("caption");
     label.add_css_class("dim-label");
@@ -1711,7 +1401,11 @@ pub(super) fn create_project(app: &SharedApp, path: std::path::PathBuf) {
 
 #[cfg(test)]
 mod tests {
-    use super::{agents_button_text, lane_footer_text, valid_project_folder_name};
+    use super::{
+        agents_count_text, agents_destination, lane_footer_text, page_header,
+        valid_project_folder_name,
+    };
+    use adw::prelude::*;
 
     #[test]
     fn new_project_names_cannot_escape_the_parent_folder() {
@@ -1733,8 +1427,43 @@ mod tests {
 
     #[test]
     fn the_agents_count_reads_like_the_lanes_footer() {
-        assert_eq!(agents_button_text(0), "No agents");
-        assert_eq!(agents_button_text(1), "1 running");
-        assert_eq!(agents_button_text(4), "4 running");
+        assert_eq!(agents_count_text(0), "No agents");
+        assert_eq!(agents_count_text(1), "1 running");
+        assert_eq!(agents_count_text(4), "4 running");
+    }
+
+    #[test]
+    #[ignore = "requires a private D-Bus session and GTK display"]
+    fn navigation_cards_and_headers_are_explicit_destinations() {
+        gtk::init().unwrap();
+        for running in [0, 3] {
+            let card = agents_destination(running)
+                .downcast::<gtk::Button>()
+                .unwrap();
+            assert_eq!(card.action_name().as_deref(), Some("win.home-agents"));
+            assert!(card.has_css_class("destination-card"));
+            let actions = gtk::gio::SimpleActionGroup::new();
+            actions.add_action(&gtk::gio::SimpleAction::new("home-agents", None));
+            card.insert_action_group("win", Some(&actions));
+            assert!(card.is_sensitive());
+        }
+        let meta = gtk::Label::new(Some("3 running"));
+        let header = page_header("Agents", Some(&meta));
+        let back = header
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        assert_eq!(back.label().as_deref(), Some("← Back"));
+        assert_eq!(back.action_name().as_deref(), Some("win.home-back"));
+        let title = back
+            .next_sibling()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert!(title.has_css_class("hero-title"));
+        assert!(title.wraps());
+        meta.set_text("4 running");
+        assert_eq!(header.last_child().unwrap(), meta.upcast::<gtk::Widget>());
     }
 }
