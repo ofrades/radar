@@ -280,11 +280,6 @@ paned > separator:hover {
 .add-project-view .add-row-hint {
   color: @radar_accent;
 }
-/* The to-dos list scroller: flat, and only as tall as its contents allow. */
-.home-cockpit .todo-scroll {
-  background: none;
-  border: none;
-}
 /* The project view: the board's lanes as side-by-side columns. */
 .home-cockpit .project-column {
   padding: 16px;

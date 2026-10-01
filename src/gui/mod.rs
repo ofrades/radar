@@ -6049,8 +6049,34 @@ mod home_navigation_tests {
             );
         }
 
-        // Agents is a drill-down origin too; returning must reuse its page.
+        // Back on the cockpit, the project card grows with its to-dos: the
+        // list is a plain box, never an inner scroller that would cap the
+        // card at a fixed height and hide the rest behind a scrollbar.
         activate(&window, "win.show-home", None);
+        let cockpit = stack.child_by_name("_home").unwrap();
+        assert!(
+            !widgets(&cockpit)
+                .iter()
+                .any(|widget| widget.has_css_class("todo-scroll")),
+            "the project card has no inner to-do scroller"
+        );
+        let lists: Vec<gtk::Widget> = widgets(&cockpit)
+            .into_iter()
+            .filter(|widget| widget.has_css_class("todo-list"))
+            .collect();
+        assert_eq!(lists.len(), 1, "the project card lists its to-dos");
+        let list = &lists[0];
+        assert!(list.is::<gtk::Box>(), "the to-do list is a plain box");
+        assert!(
+            list.parent().is_none_or(|parent| !parent.is::<gtk::ScrolledWindow>()),
+            "the to-do list is not wrapped in a scroller"
+        );
+        assert!(
+            list.first_child().is_some(),
+            "the to-do list carries the project's to-dos"
+        );
+
+        // Agents is a drill-down origin too; returning must reuse its page.
         activate(&window, "win.home-agents", None);
         let agents_page = stack.child_by_name("_agents").unwrap();
         activate(

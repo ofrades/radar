@@ -547,12 +547,7 @@ pub(super) fn nest(
 /// A panel the human closed: off the wall, program keeps running — the same
 /// contract as closing a workspace panel. The caller records the dismissal.
 pub(super) fn forget(app: &App, board: &Rc<AgentsBoard>, session_id: &str) {
-    let removed = board
-        .panels
-        .borrow_mut()
-        .iter()
-        .position(|panel| panel.session_id == session_id)
-        .map(|position| board.panels.borrow_mut().remove(position));
+    let removed = take_first(&board.panels, |panel| panel.session_id == session_id);
     if let Some(panel) = removed {
         let mut tree = board.tree.borrow_mut().take();
         if let Some(node) = tree.take() {
@@ -561,6 +556,16 @@ pub(super) fn forget(app: &App, board: &Rc<AgentsBoard>, session_id: &str) {
         *board.tree.borrow_mut() = tree;
     }
     layout(app, board);
+}
+
+/// Remove the first item matching `predicate`, borrowing the cell only for the
+/// search and only for the removal — never both at once. Holding one
+/// `borrow_mut()` across a closure that borrows again panics a `RefCell`, and
+/// that panic takes the whole app down, so this is the one safe way to
+/// "find and remove" from a `RefCell<Vec<_>>`.
+fn take_first<T>(items: &RefCell<Vec<T>>, predicate: impl Fn(&T) -> bool) -> Option<T> {
+    let position = items.borrow().iter().position(|item| predicate(item))?;
+    Some(items.borrow_mut().remove(position))
 }
 
 fn agent_panel(
@@ -769,4 +774,22 @@ fn accept_drags(panel: &Rc<AgentPanel>) {
         true
     });
     panel.widget.add_controller(target);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_first;
+    use std::cell::RefCell;
+
+    /// Closing a panel used to hold one `borrow_mut()` across a closure that
+    /// borrowed again, which panics and crashes the app. `take_first` must
+    /// search and remove under separate borrows.
+    #[test]
+    fn take_first_borrows_once_at_a_time() {
+        let items = RefCell::new(vec!["a", "b", "c"]);
+        assert_eq!(take_first(&items, |item| *item == "b"), Some("b"));
+        assert_eq!(*items.borrow(), vec!["a", "c"]);
+        assert_eq!(take_first(&items, |item| *item == "z"), None);
+        assert_eq!(*items.borrow(), vec!["a", "c"]);
+    }
 }
