@@ -28,12 +28,12 @@ use crate::session::activity::{
 use crate::session::daemon::{Client, Command};
 
 /// The card's inline editor: the title and description each swap between the
-/// text they read and a field that edits them, and a Save/Cancel row appears
-/// while either is open. No modal and no separate Edit step.
+/// text they read and a field that edits them, and the controls row swaps to
+/// Save/Cancel while either is open. No modal and no separate Edit step.
 struct CardEditor {
     title: gtk::Stack,
     body: gtk::Stack,
-    actions: gtk::Widget,
+    controls: gtk::Stack,
 }
 
 /// Turn off text selection throughout a read view. A selectable label claims
@@ -50,36 +50,39 @@ fn make_unselectable(widget: &gtk::Widget) {
     }
 }
 
-/// Click `target` to open `stack`'s edit child, focus `focus`, and reveal the
-/// Save/Cancel row.
+/// Click `target` to open `field_stack`'s edit child, focus `focus`, and swap
+/// the controls row to its Save/Cancel child.
 fn open_on_click(
     target: &impl IsA<gtk::Widget>,
-    stack: &gtk::Stack,
+    field_stack: &gtk::Stack,
     focus: &impl IsA<gtk::Widget>,
-    actions: &impl IsA<gtk::Widget>,
+    controls_stack: &gtk::Stack,
 ) {
     target.set_cursor_from_name(Some("pointer"));
-    let stack = stack.clone();
+    let field_stack = field_stack.clone();
     let focus = focus.clone();
-    let actions = actions.clone();
+    let controls_stack = controls_stack.clone();
     let gesture = gtk::GestureClick::new();
     gesture.connect_released(move |_, _, _, _| {
-        stack.set_visible_child_name("edit");
-        actions.set_visible(true);
+        field_stack.set_visible_child_name("edit");
+        controls_stack.set_visible_child_name("edit");
         focus.grab_focus();
     });
     target.add_controller(gesture);
 }
 
 /// Build the inline editor for a card. Clicking the title or the description
-/// swaps that one element for a field in place; Save writes both through the
-/// board store with the card's revision and Cancel restores both. A failed save
-/// leaves the draft intact and shows the error, and `on_saved` runs on success
-/// (the caller re-reads the board). Socket I/O runs off the GTK thread.
+/// swaps that one element for a field in place and turns the controls row into
+/// Save/Cancel; Save writes both fields through the board store with the card's
+/// revision and Cancel restores both. A failed save leaves the draft intact and
+/// shows the error, and `on_saved` runs on success (the caller re-reads the
+/// board). Socket I/O runs off the GTK thread.
 fn card_editor(
     home: &Path,
     project_id: i64,
     card: &crate::session::board_store::StoredCard,
+    columns: &[String],
+    lane: &str,
     on_saved: impl Fn() + 'static,
 ) -> CardEditor {
     let title_view = gtk::Label::new(Some(&card.title));
@@ -131,23 +134,81 @@ fn card_editor(
     body_stack.add_named(&text_scroll, Some("edit"));
     body_stack.set_visible_child_name("view");
 
+    // The reading controls: close/reopen, move lane, open the project.
+    let view_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    view_controls.set_margin_top(2);
+    view_controls.set_valign(gtk::Align::Start);
+    let finish = gtk::Button::with_label(if card.done { "Reopen" } else { "Close to-do" });
+    finish.add_css_class("flat");
+    finish.set_action_name(Some("win.card-toggle-done"));
+    finish.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
+    view_controls.append(&finish);
+
+    // Display the rename (Backlog -> Todo) but keep the store's real name for
+    // the move: the dropdown's integers index into `columns`.
+    let labels: Vec<String> = columns
+        .iter()
+        .map(|name| board::lane_label(name).to_string())
+        .collect();
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let lanes = gtk::DropDown::from_strings(&refs);
+    lanes.set_valign(gtk::Align::Center);
+    lanes.set_tooltip_text(Some("Move to another lane"));
+    if let Some(index) = columns.iter().position(|name| name.as_str() == lane) {
+        lanes.set_selected(index as u32);
+    }
+    {
+        let current = lane.to_string();
+        let card_id = card.id.clone();
+        let columns = columns.to_vec();
+        lanes.connect_selected_notify(move |dropdown| {
+            let Some(column) = columns.get(dropdown.selected() as usize) else {
+                return;
+            };
+            if column == &current {
+                return;
+            }
+            let _ = gtk::prelude::WidgetExt::activate_action(
+                dropdown,
+                "win.card-move",
+                Some(&(project_id, card_id.as_str(), column.as_str()).to_variant()),
+            );
+        });
+    }
+    view_controls.append(&lanes);
+
+    let open_board = gtk::Button::with_label("Open project");
+    open_board.add_css_class("flat");
+    open_board.set_tooltip_text(Some("Open this project in Home"));
+    open_board.set_action_name(Some("win.home-project"));
+    open_board.set_action_target_value(Some(&project_id.to_variant()));
+    view_controls.append(&open_board);
+
+    // The editing controls, in the same place: Save, Cancel, and any error.
     let feedback = board::activity_label("", false);
     feedback.add_css_class("error");
     feedback.set_visible(false);
-    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let save = gtk::Button::with_label("Save");
     save.add_css_class("suggested-action");
-    buttons.append(&save);
     let cancel = gtk::Button::with_label("Cancel");
-    buttons.append(&cancel);
-    let actions = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    actions.append(&buttons);
-    actions.append(&feedback);
-    actions.set_visible(false);
+    let edit_controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    edit_controls.set_margin_top(2);
+    edit_controls.set_valign(gtk::Align::Start);
+    edit_controls.append(&save);
+    edit_controls.append(&cancel);
+    edit_controls.append(&feedback);
+
+    let controls_stack = gtk::Stack::new();
+    controls_stack.set_transition_type(gtk::StackTransitionType::None);
+    controls_stack.set_hhomogeneous(false);
+    controls_stack.set_vhomogeneous(false);
+    controls_stack.add_named(&view_controls, Some("view"));
+    controls_stack.add_named(&edit_controls, Some("edit"));
+    controls_stack.set_visible_child_name("view");
 
     make_unselectable(&body_view);
-    open_on_click(&title_view, &title_stack, &title, &actions);
-    open_on_click(&body_view, &body_stack, &text, &actions);
+    open_on_click(&title_view, &title_stack, &title, &controls_stack);
+    open_on_click(&body_view, &body_stack, &text, &controls_stack);
 
     let card_title = card.title.clone();
     let card_body = card.body.clone();
@@ -163,19 +224,19 @@ fn card_editor(
         let card_body = card_body.clone();
         let title_stack = title_stack.clone();
         let body_stack = body_stack.clone();
-        let actions = actions.clone();
+        let controls_stack = controls_stack.clone();
         cancel.connect_clicked(move |_| {
             title.set_text(&card_title);
             text.buffer().set_text(&card_body);
             title_stack.set_visible_child_name("view");
             body_stack.set_visible_child_name("view");
-            actions.set_visible(false);
+            controls_stack.set_visible_child_name("view");
         });
     }
 
     let title_out = title_stack.clone();
     let body_out = body_stack.clone();
-    let actions_out = actions.clone();
+    let controls_out = controls_stack.clone();
     let save_for_activate = save.clone();
     title.connect_activate(move |_| save_for_activate.emit_clicked());
     save.connect_clicked(move |save| {
@@ -193,7 +254,7 @@ fn card_editor(
         if new_title == card_title && new_body == card_body {
             title_stack.set_visible_child_name("view");
             body_stack.set_visible_child_name("view");
-            actions.set_visible(false);
+            controls_stack.set_visible_child_name("view");
             return;
         }
         feedback.set_visible(false);
@@ -228,17 +289,17 @@ fn card_editor(
             feedback.clone(),
             on_saved.clone(),
         );
-        let (title_stack, body_stack, actions) = (
+        let (title_stack, body_stack, controls_stack) = (
             title_stack.clone(),
             body_stack.clone(),
-            actions.clone(),
+            controls_stack.clone(),
         );
         gtk::glib::MainContext::default().spawn_local(async move {
             match rx.recv().await {
                 Ok(Ok(())) => {
                     title_stack.set_visible_child_name("view");
                     body_stack.set_visible_child_name("view");
-                    actions.set_visible(false);
+                    controls_stack.set_visible_child_name("view");
                     on_saved();
                 }
                 result => {
@@ -262,7 +323,7 @@ fn card_editor(
     CardEditor {
         title: title_out,
         body: body_out,
-        actions: actions_out.upcast(),
+        controls: controls_out,
     }
 }
 
@@ -292,22 +353,27 @@ mod editor_tests {
         };
         let saved = Rc::new(Cell::new(false));
         let saved_flag = saved.clone();
-        let editor = card_editor(home.path(), 1, &card, move || saved_flag.set(true));
+        let editor = card_editor(
+            home.path(),
+            1,
+            &card,
+            &["Todo".to_string()],
+            "Todo",
+            move || saved_flag.set(true),
+        );
         let title = editor
             .title
             .child_by_name("edit")
             .unwrap()
             .downcast::<gtk::Entry>()
             .unwrap();
-        let actions = editor.actions.clone();
-        let save = actions
-            .first_child()
-            .unwrap()
+        let edit_controls = editor.controls.child_by_name("edit").unwrap();
+        let save = edit_controls
             .first_child()
             .unwrap()
             .downcast::<gtk::Button>()
             .unwrap();
-        let feedback = actions
+        let feedback = edit_controls
             .last_child()
             .unwrap()
             .downcast::<gtk::Label>()
@@ -343,14 +409,14 @@ mod editor_tests {
             created_at_millis: 0,
             updated_at_millis: 0,
         };
-        let editor = card_editor(home.path(), 1, &card, || {});
+        let editor = card_editor(home.path(), 1, &card, &["Todo".to_string()], "Todo", || {});
         let root = gtk::Box::new(gtk::Orientation::Vertical, 16);
         root.set_margin_top(20);
         root.set_margin_start(20);
         root.set_margin_end(20);
         root.append(&editor.title);
         root.append(&editor.body);
-        root.append(&editor.actions);
+        root.append(&editor.controls);
         let window = gtk::Window::new();
         window.set_child(Some(&root));
         window.set_default_size(500, 400);
@@ -427,10 +493,10 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
     inner.set_margin_start(28);
     inner.set_margin_end(28);
 
-    // The card is edited where it is read: the title is a field and the
-    // description is a field, both always editable, with a Save row that
-    // appears only once something changes. No modal and no Edit button.
-    let editor = card_editor(&app.session_home, project_id, &card, {
+    // The card is edited where it is read: clicking the title or the
+    // description swaps that element for a field in place and turns the
+    // controls row into Save/Cancel. No modal and no Edit button.
+    let editor = card_editor(&app.session_home, project_id, &card, &columns, &lane, {
         let window = app.window.clone();
         move || {
             // Defer the re-read one turn: saving with Enter leaves focus in a
@@ -489,57 +555,7 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
     reading.append(&id_row);
 
     reading.append(&editor.body);
-    reading.append(&editor.actions);
-
-    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    controls.set_margin_top(2);
-    controls.set_valign(gtk::Align::Start);
-    let finish = gtk::Button::with_label(if card.done { "Reopen" } else { "Close to-do" });
-    finish.add_css_class("flat");
-    finish.set_action_name(Some("win.card-toggle-done"));
-    finish.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
-    controls.append(&finish);
-
-    // Display the rename (Backlog -> Todo) but keep the store's real name for
-    // the move: the dropdown's integers index into `columns`.
-    let labels: Vec<String> = columns
-        .iter()
-        .map(|name| board::lane_label(name).to_string())
-        .collect();
-    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-    let lanes = gtk::DropDown::from_strings(&refs);
-    lanes.set_valign(gtk::Align::Center);
-    lanes.set_tooltip_text(Some("Move to another lane"));
-    if let Some(index) = columns.iter().position(|name| name == &lane) {
-        lanes.set_selected(index as u32);
-    }
-    {
-        let current = lane.clone();
-        let card_id = card.id.clone();
-        let columns = columns.clone();
-        lanes.connect_selected_notify(move |dropdown| {
-            let Some(column) = columns.get(dropdown.selected() as usize) else {
-                return;
-            };
-            if column == &current {
-                return;
-            }
-            let _ = gtk::prelude::WidgetExt::activate_action(
-                dropdown,
-                "win.card-move",
-                Some(&(project_id, card_id.as_str(), column.as_str()).to_variant()),
-            );
-        });
-    }
-    controls.append(&lanes);
-
-    let open_board = gtk::Button::with_label("Open project");
-    open_board.add_css_class("flat");
-    open_board.set_tooltip_text(Some("Open this project in Home"));
-    open_board.set_action_name(Some("win.home-project"));
-    open_board.set_action_target_value(Some(&project_id.to_variant()));
-    controls.append(&open_board);
-    reading.append(&controls);
+    reading.append(&editor.controls);
 
     inner.append(&reading);
 
