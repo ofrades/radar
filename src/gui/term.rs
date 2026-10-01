@@ -107,7 +107,7 @@ pub struct TerminalView {
     /// The primary-button gesture, for probes that emit a synthetic press.
     click: gtk::GestureClick,
     /// The last pointer position in surface pixels, for mouse-report coords.
-    pointer: std::cell::Cell<(f32, f32)>,
+    pointer: Rc<std::cell::Cell<(f32, f32)>>,
     /// Smooth-scroll pixels not yet worth a row.
     pending: std::cell::Cell<f64>,
 }
@@ -152,7 +152,7 @@ impl TerminalView {
             anchor: std::cell::Cell::new(None),
             dragging: Rc::new(std::cell::Cell::new(false)),
             click: click.clone(),
-            pointer: std::cell::Cell::new((0.0, 0.0)),
+            pointer: Rc::new(std::cell::Cell::new((0.0, 0.0))),
             pending: std::cell::Cell::new(0.0),
         };
 
@@ -285,6 +285,10 @@ impl TerminalView {
         view.area.add_controller(click.clone());
 
         let motion = gtk::EventControllerMotion::new();
+        let pointer_for_enter = view.pointer.clone();
+        motion.connect_enter(move |_controller, px, py| {
+            pointer_for_enter.set((px as f32, py as f32));
+        });
         let view_for_motion = view.clone();
         motion.connect_motion(move |_controller, px, py| {
             // Always remember the pointer: mouse-report coords for the wheel.
@@ -870,6 +874,103 @@ fn prefix_alt(bytes: &[u8], alt: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise the separate GTK callback captures, not just the encoder.
+    /// The fixture is frozen: wheel input must target the conversation cell,
+    /// not the application's header at cell 1,1.
+    #[test]
+    #[ignore = "requires a GTK display; run with GDK_BACKEND=broadway"]
+    fn gtk_motion_and_scroll_share_the_pointer_position() {
+        gtk::init().unwrap();
+        let view = TerminalView::new("monospace", 12.0);
+        let window = gtk::Window::new();
+        window.set_default_size(640, 480);
+        window.set_child(Some(view.widget()));
+        window.present();
+        let context = glib::MainContext::default();
+        for _ in 0..20 {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        view.feed(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        let sent = std::sync::Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = sent.clone();
+        view.set_input(move |bytes| sink.lock().push(bytes.to_vec()));
+        let (px, py) = {
+            let inner = view.inner.borrow();
+            (inner.metrics.cell_w * 4.5, inner.metrics.cell_h * 5.5)
+        };
+        let controllers = view.area.observe_controllers();
+        let mut moved = false;
+        let mut scrolled = false;
+        for i in 0..controllers.n_items() {
+            let controller = controllers.item(i).unwrap();
+            if let Some(motion) = controller.downcast_ref::<gtk::EventControllerMotion>() {
+                motion.emit_by_name::<()>("motion", &[&px, &py]);
+                moved = true;
+            }
+        }
+        for i in 0..controllers.n_items() {
+            let controller = controllers.item(i).unwrap();
+            if let Some(wheel) = controller.downcast_ref::<gtk::EventControllerScroll>() {
+                wheel.emit_by_name::<bool>("scroll", &[&0.0f64, &-1.0f64]);
+                scrolled = true;
+            }
+        }
+        assert!(moved && scrolled, "exercise the installed GTK controllers");
+        assert_eq!(
+            *sent.lock(),
+            vec![b"\x1b[<64;5;6M".to_vec(); 3],
+            "scroll must target the pointer's conversation cell, not cell 1,1"
+        );
+
+        // Smooth trackpad deltas cross a row only after accumulating. The
+        // wheel callback's captured view must use the motion callback's
+        // latest coordinates for those events too.
+        sent.lock().clear();
+        let scroll_capture = view.clone();
+        scroll_capture.wheel_rows(-0.25);
+        scroll_capture.wheel_rows(-0.25);
+        scroll_capture.wheel_rows(-0.25);
+        assert!(sent.lock().is_empty(), "sub-row gestures must accumulate");
+        scroll_capture.wheel_rows(-0.25);
+        assert_eq!(*sent.lock(), vec![b"\x1b[<64;5;6M".to_vec()]);
+        sent.lock().clear();
+        scroll_capture.wheel_rows(1.0);
+        assert_eq!(*sent.lock(), vec![b"\x1b[<65;5;6M".to_vec()]);
+
+        // Frozen primary-screen output: compare actual rendered content,
+        // never screenshots of a conversation still producing new output.
+        let top_row = |inner: &mut Inner| {
+            inner.render.frame(&inner.term).lines[0]
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+        };
+        let before = {
+            let mut inner = view.inner.borrow_mut();
+            inner.term = Terminal::new(10, 3);
+            for i in 0..10 {
+                inner.term.write(format!("L{i:02}\r\n").as_bytes());
+            }
+            top_row(&mut inner)
+        };
+        sent.lock().clear();
+        for i in 0..controllers.n_items() {
+            let controller = controllers.item(i).unwrap();
+            if let Some(wheel) = controller.downcast_ref::<gtk::EventControllerScroll>() {
+                wheel.emit_by_name::<bool>("scroll", &[&0.0f64, &-1.0f64]);
+            }
+        }
+        let after = top_row(&mut view.inner.borrow_mut());
+        assert!(before.starts_with("L08"), "frozen live row: {before:?}");
+        assert!(after.starts_with("L05"), "older content after scroll: {after:?}");
+        assert!(sent.lock().is_empty(), "shell scrollback must not send input");
+        window.close();
+    }
 
     /// The Send bundle a re-entrant resize callback needs: it re-draws the
     /// view, so it must reach the same `Inner`. The sink type demands Send,
