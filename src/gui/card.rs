@@ -252,15 +252,16 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
         .map(|lane| lane.name.clone())
         .unwrap_or_default();
 
-    let inner = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    inner.set_margin_top(12);
-    inner.set_margin_bottom(12);
-    inner.set_margin_start(16);
-    inner.set_margin_end(16);
+    let inner = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    inner.set_margin_top(24);
+    inner.set_margin_bottom(28);
+    inner.set_margin_start(28);
+    inner.set_margin_end(28);
 
     let title = gtk::Label::new(Some(&card.title));
     title.set_xalign(0.0);
     title.set_wrap(true);
+    title.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     title.add_css_class("card-panel-title");
     inner.append(&title);
 

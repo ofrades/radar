@@ -194,14 +194,37 @@ paned > separator:hover {
   background: none;
 }
 
-/* Home cockpit: a Basecamp-style portfolio. Projects are lanes; each lane
-   carries its board counts, its open to-dos and its running sessions. */
+/* Project-first pages: hero titles, roomy cards, then a deliberate drill-down.
+   Terminal chrome stays compact; these rules only dress navigation surfaces. */
+.hero-title {
+  font-size: 2.4em;
+  font-weight: 800;
+}
+.home-hero {
+  margin-bottom: 8px;
+}
+.home-cockpit button.destination-card {
+  padding: 24px;
+  border: 1px solid @radar_hairline;
+  border-radius: {panel_radius_inner};
+  background-color: @radar_surface;
+}
+.home-cockpit button.destination-card:hover {
+  border-color: alpha(@radar_accent, 0.5);
+  background-color: @radar_surface_hover;
+}
+.destination-title {
+  font-size: 1.5em;
+  font-weight: 700;
+}
+/* Home cockpit: a Basecamp-style portfolio. */
 .home-cockpit .cockpit-heading {
-  margin-top: 6px;
+  margin-top: 14px;
+  font-size: 1.25em;
 }
 /* One project's lane card: header, chips, its to-dos and its sessions. */
 .home-cockpit .lane {
-  padding: 12px;
+  padding: 20px;
   border: 1px solid @radar_hairline;
   border-radius: {panel_radius_inner};
   background-color: alpha(@radar_fg, 0.025);
@@ -264,8 +287,17 @@ paned > separator:hover {
 }
 /* The project view: the board's lanes as side-by-side columns. */
 .home-cockpit .project-column {
-  padding-top: 8px;
-  border-top: 1px solid @radar_hairline;
+  padding: 16px;
+  border: 1px solid @radar_hairline;
+  border-radius: {panel_radius_inner};
+  background-color: @radar_surface;
+}
+.project-view .todo-row {
+  padding: 10px 6px;
+  margin-top: 8px;
+  border: 1px solid @radar_hairline;
+  border-radius: {control_radius};
+  background-color: @radar_bg;
 }
 /* Activity signs: one status-dot vocabulary, shared by Home's project lanes,
    session rows, card chips and the workspace pane headers. The dot's colour is
@@ -438,7 +470,7 @@ paned > separator:hover {
 }
 .home-cockpit .attention-card {
   border: 1px solid alpha(@radar_warning, 0.32);
-  border-radius: {control_radius};
+  border-radius: {panel_radius_inner};
   background-color: alpha(@radar_warning, 0.06);
 }
 .home-cockpit .agent-state-dot {
@@ -461,18 +493,6 @@ paned > separator:hover {
   border: 1px solid @radar_hairline;
   border-radius: 10px;
   padding: 2px 6px 6px;
-}
-/* The cockpit header's way into the agents view: a quiet count that reads
-   as part of the pulse, not a toolbar button. */
-.home-cockpit button.agents-pulse {
-  padding: 2px 9px;
-  border-radius: 99px;
-  font-size: 0.9em;
-  color: @radar_accent;
-  background-color: @radar_accent_soft;
-}
-.home-cockpit button.agents-pulse:hover {
-  background-color: alpha(@radar_accent, 0.18);
 }
 .home-cockpit button.todo-tick {
   min-width: 22px;
@@ -506,8 +526,8 @@ paned > separator:hover {
   background-color: @radar_bg;
 }
 .card-panel-title {
-  font-size: 1.15em;
-  font-weight: 700;
+  font-size: 2em;
+  font-weight: 800;
 }
 .card-panel-body {
   color: alpha(@radar_fg, 0.75);
@@ -526,8 +546,9 @@ paned > separator:hover {
   font-size: 0.85em;
 }
 .card-panel .thread-row {
-  padding: 6px 8px;
-  border-radius: {control_radius};
+  padding: 16px;
+  border: 1px solid @radar_hairline;
+  border-radius: {panel_radius_inner};
   background-color: alpha(@radar_fg, 0.04);
 }
 .card-panel .thread-you {
@@ -562,7 +583,13 @@ paned > separator:hover {
   background-color: @radar_bg;
 }
 .home-view-bar {
-  padding: 12px 16px 6px;
+  padding: 20px 28px 16px;
+  border-bottom: 1px solid @radar_hairline;
+}
+/* The card itself owns the hero title; the parent is breadcrumb context. */
+.card-view .home-view-bar .hero-title {
+  font-size: 1em;
+  color: @radar_muted;
 }
 .home-view-bar button {
   min-width: 28px;

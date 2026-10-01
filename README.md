@@ -14,7 +14,7 @@ terminal. It gathers every project into Basecamp-style lanes:
 
 - **Needs you** — every unresolved approval, question or failure, newest first,
   each with the actions to answer, approve, deny or dismiss it in place.
-- **Agents** — the header's running count opens a workspace of the real agent
+- **Agents** — a large Home card opens a workspace of the real agent
   panels: every live session across every project, tiled and interactive —
   type into any pane right there. Each pane wears the workspace panel's own
   header — its activity sign, the session's name, the to-do it works on
@@ -141,7 +141,7 @@ choices in this same overlay.
 cockpit when you have projects: a needs-you inbox over a row of project lanes,
 each with its to-dos (every one showing the state of the session bound to it)
 and board counts, and the actions to drive them without opening a terminal.
-The header's **running count** opens the **Agents** page — a big tiled
+The **Agents card** on Home opens the **Agents** page — a big tiled
 workspace of every live agent panel across every project, type-in-place,
 each pane wearing the workspace panel's own header (its to-do opens the
 card; close leaves the program running). A
