@@ -303,6 +303,9 @@ struct App {
     /// glib monotonic clock. Enter events a mapped widget synthesizes under a
     /// parked pointer must not read as mouse intent.
     pointer_motion_ms: Cell<i64>,
+    /// The project-card column count the current Home was built for, so a
+    /// resize only rebuilds Home when the masonry actually changes shape.
+    home_columns: Cell<usize>,
 }
 
 #[derive(Clone)]
@@ -875,6 +878,7 @@ fn build_window(
         add_tx,
         add_rx: RefCell::new(add_rx),
         pointer_motion_ms: Cell::new(0),
+        home_columns: Cell::new(0),
     });
 
     register_actions(&state, app);
@@ -892,6 +896,25 @@ fn build_window(
         }
         window.set_visible(false);
         glib::Propagation::Stop
+    });
+    // Home's project masonry follows the window width: rebuild it when the
+    // column count changes, not on every pixel of a resize drag.
+    let state_for_resize = Rc::downgrade(&state);
+    window.connect_realize(move |window| {
+        let Some(surface) = window.surface() else {
+            return;
+        };
+        let state = state_for_resize.clone();
+        surface.connect_layout(move |_, width, _| {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            let columns = home::home_column_count(width);
+            if state.home_columns.replace(columns) != columns {
+                let state = state.clone();
+                glib::idle_add_local_once(move || state.refresh_home());
+            }
+        });
     });
     start_status_drainer(&state);
     start_activity_drainer(&state);
@@ -6091,6 +6114,21 @@ mod home_navigation_tests {
         assert!(
             list.first_child().is_some(),
             "the to-do list carries the project's to-dos"
+        );
+        let masonry = widgets(&cockpit)
+            .into_iter()
+            .find(|widget| widget.has_css_class("lane-grid"))
+            .expect("the projects masonry is present");
+        let masonry = masonry
+            .downcast::<gtk::Box>()
+            .expect("the masonry is a box, not a flow box");
+        assert_eq!(masonry.orientation(), gtk::Orientation::Horizontal);
+        let column = masonry.first_child().expect("the masonry has a column");
+        assert!(
+            widgets(&column)
+                .iter()
+                .any(|widget| widget.has_css_class("lane")),
+            "the column holds the project card"
         );
 
         // Agents is a drill-down origin too; returning must reuse its page.

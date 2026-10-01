@@ -474,21 +474,39 @@ fn projects_section(app: &App, content: &gtk::Box, projects: &[Project]) {
     // project cards, that opens Home's Add-a-project picker.
     content.append(&add_project_card(app));
 
-    let grid = gtk::FlowBox::new();
-    grid.set_selection_mode(gtk::SelectionMode::None);
-    // At most three columns, but allow a narrow window to wrap to one.
-    let per_line = projects.len().clamp(1, 3) as u32;
-    grid.set_min_children_per_line(1);
-    grid.set_max_children_per_line(per_line);
-    grid.set_homogeneous(true);
-    grid.set_row_spacing(14);
-    grid.set_column_spacing(14);
-    grid.set_valign(gtk::Align::Start);
+    // Masonry, not a grid: cards stack at their own height in side-by-side
+    // columns, so a short card never leaves a hole the size of the tallest
+    // card beside it. The column count follows the window (see
+    // `home_column_count`); `projects_section` is rebuilt when it changes.
+    let columns = home_column_count(app.window.width())
+        .min(projects.len())
+        .max(1);
+    let grid = gtk::Box::new(gtk::Orientation::Horizontal, 14);
     grid.add_css_class("lane-grid");
-    for project in projects {
-        grid.insert(&project_lane(app, project), -1);
+    grid.set_homogeneous(true);
+    grid.set_valign(gtk::Align::Start);
+    grid.set_hexpand(true);
+    let stacks: Vec<gtk::Box> = (0..columns)
+        .map(|_| {
+            let column = gtk::Box::new(gtk::Orientation::Vertical, 14);
+            column.set_valign(gtk::Align::Start);
+            column.set_hexpand(true);
+            column
+        })
+        .collect();
+    for (index, project) in projects.iter().enumerate() {
+        stacks[index % columns].append(&project_lane(app, project));
+    }
+    for stack in stacks {
+        grid.append(&stack);
     }
     content.append(&grid);
+}
+
+/// How many project-card columns fit a window this wide: roughly 340px per
+/// column, never more than three, never fewer than one.
+pub(super) fn home_column_count(window_width: i32) -> usize {
+    ((window_width - 56).max(0) / 340).clamp(1, 3) as usize
 }
 
 /// The way a project is born, leading the Projects section: one big dashed
@@ -1407,10 +1425,19 @@ pub(super) fn create_project(app: &SharedApp, path: std::path::PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::{
-        agents_count_text, agents_destination, lane_footer_text, page_header,
+        agents_count_text, agents_destination, home_column_count, lane_footer_text, page_header,
         valid_project_folder_name,
     };
     use adw::prelude::*;
+
+    #[test]
+    fn the_project_masonry_uses_one_to_three_columns() {
+        assert_eq!(home_column_count(0), 1);
+        assert_eq!(home_column_count(500), 1);
+        assert_eq!(home_column_count(749), 2);
+        assert_eq!(home_column_count(1100), 3);
+        assert_eq!(home_column_count(1512), 3);
+    }
 
     #[test]
     fn new_project_names_cannot_escape_the_parent_folder() {

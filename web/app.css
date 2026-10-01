@@ -129,7 +129,8 @@ h2 { font-size: 1.25em; line-height: 1.25; letter-spacing: -.01em; margin-bottom
 .destination-arrow { color: var(--muted); font-size: 20px; }
 
 /* ---- Home: project lanes ---- */
-.lane-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: 14px; align-items: start; }
+.lane-grid { columns: 320px 3; column-gap: 14px; }
+.lane-grid > .lane { break-inside: avoid; margin-bottom: 14px; }
 .lane {
   display: flex; flex-direction: column; gap: 8px; padding: 20px;
   background: var(--lane-bg); border: 1px solid var(--hairline); border-radius: var(--radius-inner);
