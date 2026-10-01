@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn supported_agents_resume_last_or_exact_provider_session() {
         let by_id = |id: &str| crate::programs::by_id(id).unwrap();
-        for id in ["omp", "cursor-agent"] {
+        for id in ["omp", "pi", "cursor-agent"] {
             let program = by_id(id);
             let resumed = command_spec(
                 &program,
@@ -592,6 +592,12 @@ mod tests {
         assert_eq!(
             command_spec(&by_id("omp"), &exact).argv,
             vec!["omp", "--resume=session-42"]
+        );
+        // Pi's `--session-id` reopens the exact conversation, or creates it
+        // when radar named a fresh one.
+        assert_eq!(
+            command_spec(&by_id("pi"), &exact).argv,
+            vec!["pi", "--session-id", "session-42"]
         );
         assert_eq!(
             command_spec(&by_id("cursor-agent"), &exact).argv,

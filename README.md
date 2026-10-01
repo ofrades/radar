@@ -235,7 +235,7 @@ radar open api-server       # what its tabs resolve to, command per tab
 radar agents                # agents, omarchy's default, what is installed
 radar programs diff         # the registry, by kind
 radar prefs                 # resolved preference per slot
-radar prefs agent omp        # set one of OpenCode, OMP, or Cursor
+radar prefs agent omp        # set one of OpenCode, OMP, Pi, or Cursor
 radar web [--port 8787]     # responsive browser client on localhost
 radar pin / move / rename / remove / prune
 radar board                 # the project's kanban, from radar's store
@@ -244,9 +244,9 @@ radar hook guard            # the board's pre-edit check, for harness hooks
 radar doctor                # environment check
 ```
 
-New agent selections are limited to OpenCode, OMP (Oh My Pi), and Cursor. Other
-registered agents remain available to restore existing tabs, but do not appear
-in agent selectors or resolve as new/default agent choices.
+New agent selections are limited to OpenCode, OMP (Oh My Pi), Pi, and Cursor.
+Other registered agents remain available to restore existing tabs, but do not
+appear in agent selectors or resolve as new/default agent choices.
 
 ## Persistent session daemon (client/server groundwork)
 
@@ -286,13 +286,13 @@ snapshot into its own engine, so close/reopen mid-escape restores the exact
 screen, modes, scrollback and unfinished parser input.
 
 Agent conversation history is provider-specific. Radar imports and reopens exact
-OpenCode conversations from OpenCode's JSON session list. OpenCode, OMP, and
+OpenCode conversations from OpenCode's JSON session list. OpenCode, OMP, Pi, and
 Cursor can resume the last conversation; exact resume flags are configured when
-a provider session ID is available. OMP and Cursor sessions started in another
-terminal appear as external-terminal rows that focus the original terminal;
-Radar does not claim those separate processes are attached to its PTY. Their
-history is not imported unless the CLI provides a supported machine-readable
-session list.
+a provider session ID is available. OMP, Pi, and Cursor sessions started in
+another terminal appear as external-terminal rows that focus the original
+terminal; Radar does not claim those separate processes are attached to its PTY.
+Their history is not imported unless the CLI provides a supported
+machine-readable session list.
 
 ## Remote browser client
 

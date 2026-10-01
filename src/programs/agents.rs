@@ -26,7 +26,7 @@ struct AgentDef {
 }
 
 /// Agent providers Radar currently offers for new selections.
-const SUPPORTED_AGENT_IDS: &[&str] = &["opencode", "omp", "cursor-agent"];
+pub const SUPPORTED_AGENT_IDS: &[&str] = &["opencode", "omp", "pi", "cursor-agent"];
 
 pub fn is_supported(id: &str) -> bool {
     SUPPORTED_AGENT_IDS.contains(&id)
@@ -165,7 +165,7 @@ const AGENTS: &[AgentDef] = &[
         auto: &[],
         args: &[],
         env_unset: &[],
-        description: "Pi",
+        description: "pi coding agent",
         omarchy: true,
     },
     AgentDef {
@@ -234,7 +234,7 @@ impl AgentDef {
         // A resumed launch reopens the project's last conversation, which
         // is the session a claimed card's agent was working in.
         let resume: &[&str] = match self.id {
-            "opencode" | "claude" | "omp" | "cursor-agent" => &["--continue"],
+            "opencode" | "claude" | "omp" | "pi" | "cursor-agent" => &["--continue"],
             "codex" => &["resume", "--last"],
             _ => &[],
         };
@@ -243,16 +243,18 @@ impl AgentDef {
         // session id a claim's agent had (db::agent_sessions).
         program.resume_session = match self.id {
             "opencode" => "--session {id}".to_string(),
+            "pi" => "--session-id {id}".to_string(),
             "claude" | "cursor-agent" => "--resume {id}".to_string(),
             "codex" => "resume {id}".to_string(),
             "omp" => "--resume={id}".to_string(),
             _ => String::new(),
         };
-        // OpenCode's `--session` creates the conversation if the id is new, so
-        // radar can name a fresh launch's conversation up front (an exact 1:1
-        // link to the board card) instead of reading its store after the fact.
-        // The other CLIs' flags only resume; a fresh launch there stays a guess.
-        program.create_session = self.id == "opencode";
+        // OpenCode's `--session` and Pi's `--session-id` both create the
+        // conversation if the id is new, so radar can name a fresh launch's
+        // conversation up front (an exact 1:1 link to the board card) instead
+        // of reading its store after the fact. The other CLIs' flags only
+        // resume; a fresh launch there stays a guess.
+        program.create_session = self.id == "opencode" || self.id == "pi";
         // How a launch hands the agent its initial prompt: a bare positional
         // argument for most CLIs, a flag for the one whose positional means
         // something else — opencode's positional is its project *directory*,
@@ -377,11 +379,12 @@ mod tests {
     #[test]
     fn supported_agents_declare_documented_resume_forms() {
         let by_id = |id: &str| programs().into_iter().find(|p| p.id == id).unwrap();
-        for id in ["opencode", "omp", "cursor-agent"] {
+        for id in ["opencode", "omp", "pi", "cursor-agent"] {
             assert_eq!(by_id(id).resume_args, vec!["--continue"], "{id}");
             assert!(!by_id(id).resume_session.is_empty(), "{id}");
         }
         assert_eq!(by_id("omp").resume_session, "--resume={id}");
+        assert_eq!(by_id("pi").resume_session, "--session-id {id}");
         assert_eq!(by_id("cursor-agent").resume_session, "--resume {id}");
         assert_eq!(by_id("opencode").resume_session, "--session {id}");
     }
@@ -392,15 +395,19 @@ mod tests {
         // opencode's positional argument is its project directory, so a
         // positional card prompt would make it chdir into the prompt text.
         assert_eq!(by_id("opencode").prompt_flag.as_deref(), Some("--prompt"));
-        for id in ["claude", "codex", "omp", "cursor-agent", "crush"] {
+        // Pi takes a positional message like the rest of the CLIs.
+        for id in ["claude", "codex", "omp", "pi", "cursor-agent", "crush"] {
             assert_eq!(by_id(id).prompt_flag, None, "{id}");
         }
     }
 
     #[test]
-    fn only_opencode_can_create_a_conversation_under_a_chosen_id() {
+    fn only_opencode_and_pi_can_create_a_conversation_under_a_chosen_id() {
         let by_id = |id: &str| programs().into_iter().find(|p| p.id == id).unwrap();
+        // Both `opencode --session` and `pi --session-id` create the
+        // conversation when the id is new, so a fresh launch can name it.
         assert!(by_id("opencode").create_session);
+        assert!(by_id("pi").create_session);
         // The others' flags only resume an existing conversation, so a fresh
         // launch there must not be handed a made-up id.
         for id in ["omp", "cursor-agent", "claude", "codex", "crush"] {
@@ -409,13 +416,13 @@ mod tests {
     }
 
     #[test]
-    fn supported_agent_choices_are_exactly_the_three_providers() {
+    fn supported_agent_choices_are_exactly_the_four_providers() {
         let mut ids: Vec<_> = supported_programs()
             .into_iter()
             .map(|program| program.id)
             .collect();
         ids.sort();
-        assert_eq!(ids, vec!["cursor-agent", "omp", "opencode"]);
+        assert_eq!(ids, vec!["cursor-agent", "omp", "opencode", "pi"]);
         assert!(selectable_agents()
             .iter()
             .all(|program| is_supported(&program.id)));

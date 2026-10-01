@@ -18,11 +18,11 @@ daemon. The daemon and CLI API can also be used independently.
 The daemon shares a terminal process and its PTY stream. It does not make two
 independently launched agent CLIs share a conversation. OpenCode has a
 machine-readable session list, so Radar imports its project history and reopens
-the exact provider session when selected. OMP and Cursor support continuing or
-resuming through their own CLI flags, but their history is not imported without a
-supported machine-readable listing interface. A live external agent is shown as
-an external-terminal row; selecting it focuses the terminal that owns it rather
-than implying Radar has attached to its conversation or PTY.
+the exact provider session when selected. OMP, Pi, and Cursor support continuing
+or resuming through their own CLI flags, but their history is not imported
+without a supported machine-readable listing interface. A live external agent is
+shown as an external-terminal row; selecting it focuses the terminal that owns it
+rather than implying Radar has attached to its conversation or PTY.
 
 If a later GUI attach finds the daemon socket missing or refused, the GUI starts
 the daemon and retries that attach once. A daemon crash still loses its

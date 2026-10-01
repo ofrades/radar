@@ -92,15 +92,16 @@ pub struct Program {
     /// the CLI has no such flag radar knows.
     pub resume_session: String,
     /// Can the CLI *create* a conversation under an id radar picks, using
-    /// the same flag as `resume_session` (OpenCode's `--session` creates
-    /// one if it does not exist)? Then a fresh launch can be given an exact
-    /// conversation id up front, instead of radar guessing one from the
-    /// CLI's store after the fact. False for CLIs whose flag only resumes.
+    /// the same flag as `resume_session` (OpenCode's `--session` and Pi's
+    /// `--session-id` create one if it does not exist)? Then a fresh launch
+    /// can be given an exact conversation id up front, instead of radar
+    /// guessing one from the CLI's store after the fact. False for CLIs
+    /// whose flag only resumes.
     pub create_session: bool,
     /// The flag that carries an initial prompt, for the CLIs whose bare
     /// positional argument is not a prompt: opencode's positional is its
     /// project *directory*, so its prompt goes through `--prompt`. The
-    /// rest (claude, codex, omp, cursor-agent) take a positional prompt,
+    /// rest (claude, codex, omp, pi, cursor-agent) take a positional prompt,
     /// which is `None`.
     pub prompt_flag: Option<String>,
     /// Environment variables to remove for this program.

@@ -896,6 +896,16 @@ mod tests {
             Some("01omp42".to_string())
         );
 
+        // Pi's exact-session flag is a separate value, like Codex's.
+        let pi = crate::programs::by_id("pi").unwrap();
+        let argv = ["pi", "--session-id", "ses_radar2abc"]
+            .map(str::to_string)
+            .to_vec();
+        assert_eq!(
+            explicit_session_id(&pi, &argv),
+            Some("ses_radar2abc".to_string())
+        );
+
         let cursor = crate::programs::by_id("cursor-agent").unwrap();
         let argv = ["cursor-agent", "--resume", "chat-42"]
             .map(str::to_string)

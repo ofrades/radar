@@ -2043,7 +2043,8 @@ fn prefs(db: &Db, slot: Option<String>, program: Option<String>, json: bool) -> 
                 if slot == Slot::Agent {
                     anyhow::ensure!(
                         agents::is_supported(id),
-                        "selectable agents are opencode, omp, and cursor-agent"
+                        "selectable agents are {}",
+                        agents::SUPPORTED_AGENT_IDS.join(", ")
                     );
                 }
             }
