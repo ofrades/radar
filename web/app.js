@@ -17,116 +17,165 @@ let ghosttyEngine = false;
   }
 })();
 
-function fit() {
-  if (ghosttyEngine) terminal?.fit?.();
-  else fitAddon?.fit();
-}
+// ---------------------------------------------------------------------------
+// Small DOM helpers
+// ---------------------------------------------------------------------------
 
 const $ = (selector) => document.querySelector(selector);
-const projectList = $("#project-list");
-const dashboard = $("#dashboard");
-const terminalView = $("#terminal-view");
-const mainContent = $(".main-content");
+
+function el(tag, props = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props)) {
+    if (value == null || value === false) continue;
+    if (key === "class") node.className = value;
+    else if (key === "text") node.textContent = value;
+    else if (key === "html") node.innerHTML = value;
+    else if (key === "dataset") Object.assign(node.dataset, value);
+    else if (key.startsWith("on") && typeof value === "function") {
+      node.addEventListener(key.slice(2).toLowerCase(), value);
+    } else if (value === true) node.setAttribute(key, "");
+    else node.setAttribute(key, value);
+  }
+  for (const child of children.flat()) {
+    if (child == null || child === false) continue;
+    node.append(child.nodeType ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[char]));
+}
+
+/// Inline markdown, escaped first so only the tags below can appear.
+function inlineMarkdown(text) {
+  let html = escapeHtml(text);
+  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>");
+  html = html.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>',
+  );
+  return html;
+}
+
+/// A tiny, safe Markdown renderer: headings, fenced code, lists, paragraphs,
+/// bold/italic/inline-code/links. Enough for a card body and thread messages.
+function renderMarkdown(text) {
+  const root = el("div", { class: "markdown" });
+  const lines = String(text ?? "").replace(/\r\n/g, "\n").split("\n");
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (/^\s*```/.test(line)) {
+      const language = line.replace(/^\s*```/, "").trim();
+      const code = [];
+      index += 1;
+      while (index < lines.length && !/^\s*```/.test(lines[index])) {
+        code.push(lines[index]);
+        index += 1;
+      }
+      index += 1;
+      root.append(el("pre", {}, el("code", {
+        class: language ? `language-${language}` : "",
+        text: code.join("\n"),
+      })));
+      continue;
+    }
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (heading) {
+      root.append(el("h4", { class: "md-heading", html: inlineMarkdown(heading[2]) }));
+      index += 1;
+      continue;
+    }
+    if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
+      const ordered = /^\s*\d+\./.test(line);
+      const list = el(ordered ? "ol" : "ul");
+      while (index < lines.length && /^\s*([-*+]|\d+\.)\s+/.test(lines[index])) {
+        list.append(el("li", {
+          html: inlineMarkdown(lines[index].replace(/^\s*([-*+]|\d+\.)\s+/, "")),
+        }));
+        index += 1;
+      }
+      root.append(list);
+      continue;
+    }
+    if (line.trim() === "") {
+      index += 1;
+      continue;
+    }
+    const paragraph = [];
+    while (
+      index < lines.length &&
+      lines[index].trim() !== "" &&
+      !/^\s*```/.test(lines[index]) &&
+      !/^#{1,6}\s/.test(lines[index]) &&
+      !/^\s*([-*+]|\d+\.)\s+/.test(lines[index])
+    ) {
+      paragraph.push(lines[index]);
+      index += 1;
+    }
+    root.append(el("p", { html: paragraph.map(inlineMarkdown).join("<br>") }));
+  }
+  return root;
+}
+
+function relativeTime(millis) {
+  if (!millis) return "";
+  const seconds = Math.max(0, Math.floor((Date.now() - millis) / 1000));
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+const main = $("#main");
 const appShell = $(".app-shell");
 const serverState = $("#server-state");
-const pageError = $("#page-error");
+const pageErrorHost = el("div", { class: "page-error hidden", id: "page-error" });
+
 let projects = [];
-let projectSessions = new Map();
-let expandedProjects = new Set();
-let selectedProject = null;
+const progress = new Map();
+let loadedProjects = false;
+let online = true;
+let renderPending = false;
+
+const pendingResponses = new Set();
+const answerDrafts = new Map();
+const commentDrafts = new Map();
+const noticedAttention = new Set();
+const initializedAttention = new Set();
+
+let editingCard = null;
+
+// Terminal state
+let terminalOpen = false;
+let lastNonSessionHash = "#/";
 let currentSocket = null;
 let terminal = null;
 let terminalSession = null;
+let terminalProjectId = null;
 let fitAddon = null;
 let resizeObserver = null;
-let refreshTimer = null;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
 let socketGeneration = 0;
 let applyingRemoteResize = false;
-let latestAttentionSnapshot = null;
-const answerDrafts = new Map();
-const projectProgress = new Map();
-const pendingResponses = new Set();
-let refreshInFlight = null;
-const noticedAttention = new Set();
-const initializedAttention = new Set();
 
-function syncAppViewport() {
-  const viewport = window.visualViewport;
-  if (!viewport) return;
-  appShell.style.setProperty("--visual-viewport-height", `${viewport.height}px`);
-  appShell.style.setProperty("--visual-viewport-offset-top", `${viewport.offsetTop}px`);
-}
-
-syncAppViewport();
-window.addEventListener("resize", syncAppViewport);
-window.visualViewport?.addEventListener("resize", syncAppViewport);
-window.visualViewport?.addEventListener("scroll", syncAppViewport);
-
-function updateAttentionShortcut() {
-  let count = 0;
-  for (const project of projects) {
-    const snapshot = projectProgress.get(project.id)?.snapshot;
-    if (!snapshot) continue;
-    const unresolved = snapshot.attention.filter((item) => item.resolved_at_millis == null);
-    count += unresolved.length;
-    const fresh = unresolved.filter((item) => !noticedAttention.has(item.id) && item.seen_at_millis == null);
-    if (initializedAttention.has(project.id) && fresh.length) {
-      showToast(`${project.name}: ${fresh.length} new request${fresh.length === 1 ? "" : "s"} need your attention`);
-    }
-    for (const item of unresolved) noticedAttention.add(item.id);
-    initializedAttention.add(project.id);
-  }
-  for (const selector of ["#attention-shortcut", "#terminal-attention-shortcut"]) {
-    const button = $(selector);
-    button.classList.toggle("hidden", count === 0);
-    button.textContent = `${count} need you`;
-    button.setAttribute("aria-label", `${count} unresolved requests. Open project attention.`);
-  }
-}
-
-async function openAttention() {
-  const project = projects.find((item) => projectProgress.get(item.id)?.snapshot?.attention.some((request) => request.resolved_at_millis == null));
-  if (!project) return;
-  selectedProject = project;
-  expandedProjects.add(project.id);
-  const url = new URL(document.baseURI);
-  url.searchParams.set("project", String(project.id));
-  history.replaceState(null, "", url);
-  if (!terminalView.classList.contains("hidden")) detach();
-  await loadProjectData();
-  $("#attention-section").scrollIntoView({ block: "start" });
-  $("#attention-list button, #attention-list textarea")?.focus({ preventScroll: true });
-}
-
-function boardProgress(board) {
-  const columns = board?.columns || [];
-  const total = columns.reduce((sum, column) => sum + column.cards.length, 0);
-  const count = (name) => columns.filter((column) => column.name.trim().toLowerCase() === name)
-    .reduce((sum, column) => sum + column.cards.length, 0);
-  return { total, done: count("done"), active: count("in progress"), review: count("review") };
-}
-
-function agentProgress(projectId, session) {
-  const snapshot = projectProgress.get(projectId)?.snapshot;
-  const waiting = snapshot?.attention?.filter((item) =>
-    item.session_id === session.id && item.resolved_at_millis == null) || [];
-  if (waiting.length) return `${waiting.length} awaiting response`;
-  if (session.state !== "running") return session.state;
-  const event = snapshot?.events?.findLast((item) =>
-    item.session_id === session.id && item.kind === "agent_state_changed");
-  return event ? `${event.payload.data.state.replaceAll("_", " ")} · ${relativeTime(event.at_millis)}` : "Activity unknown";
-}
-
-function agentWork(projectId, session) {
-  if (!session.claim) return "";
-  const columns = projectProgress.get(projectId)?.board?.columns || [];
-  return columns.flatMap((column) => {
-    const count = column.cards.filter((card) => card.claimed_by === session.claim).length;
-    return count ? [`${count} ${column.name.toLowerCase()}`] : [];
-  }).join(" · ");
-}
+// ---------------------------------------------------------------------------
+// Requests
+// ---------------------------------------------------------------------------
 
 async function request(path, options = {}) {
   const url = new URL(path.replace(/^\/+/, ""), document.baseURI);
@@ -140,13 +189,14 @@ async function request(path, options = {}) {
 }
 
 function showError(message) {
-  pageError.textContent = message;
-  pageError.classList.remove("hidden");
+  pageErrorHost.textContent = message;
+  pageErrorHost.classList.remove("hidden");
+  if (!pageErrorHost.isConnected) main.append(pageErrorHost);
 }
 
 function clearError() {
-  pageError.classList.add("hidden");
-  pageError.textContent = "";
+  pageErrorHost.classList.add("hidden");
+  pageErrorHost.textContent = "";
 }
 
 function showToast(message) {
@@ -157,488 +207,1083 @@ function showToast(message) {
   showToast.timeout = window.setTimeout(() => toast.classList.add("hidden"), 2600);
 }
 
-function renderProjects(focusProjectId = null) {
-  const focused = projectList.contains(document.activeElement) ? { ...document.activeElement.dataset } : null;
-  projectList.replaceChildren();
-  $("#project-count").textContent = String(projects.length);
+function setOnline(value) {
+  online = value;
+  serverState.classList.toggle("online", value);
+  serverState.setAttribute("aria-label", value ? "Progress up to date" : "Progress unavailable — retrying");
+}
 
-  for (const project of projects) {
-    const entry = document.createElement("div");
-    entry.className = "project-entry";
-    const projectId = String(project.id);
-    const sessions = projectSessions.get(project.id) || [];
-    const agents = sessions.filter((session) => session.slot === "agent");
-    const expanded = expandedProjects.has(project.id);
+// ---------------------------------------------------------------------------
+// Data access
+// ---------------------------------------------------------------------------
 
-    const row = document.createElement("div");
-    row.className = "project-row";
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "project-link";
-    button.dataset.projectId = projectId;
-    button.title = project.path;
-    button.setAttribute("aria-label", `${project.name}, ${project.path}`);
-    if (project.id === selectedProject?.id) {
-      button.classList.add("active");
-      button.setAttribute("aria-current", "page");
-    }
+function projectById(id) {
+  return projects.find((project) => project.id === Number(id)) || null;
+}
 
-    const symbol = document.createElement("span");
-    symbol.className = "project-symbol";
-    symbol.setAttribute("aria-hidden", "true");
-    symbol.textContent = "⌂";
+function projectProgress(id) {
+  return progress.get(Number(id)) || null;
+}
 
-    const copy = document.createElement("span");
-    copy.className = "project-link-copy";
-    const name = document.createElement("span");
-    name.className = "project-link-name";
-    name.textContent = project.name;
-    const path = document.createElement("span");
-    path.className = "project-link-path";
-    path.textContent = project.path;
-    copy.append(name, path);
-    button.append(symbol, copy);
-    const progress = projectProgress.get(project.id);
-    const summary = document.createElement("span");
-    summary.className = "project-progress";
-    if (progress?.snapshot) {
-      const { total, done, active, review } = boardProgress(progress.board);
-      const waiting = progress.snapshot.attention.filter((item) => item.resolved_at_millis == null).length;
-      summary.textContent = `${progress.stale ? "Offline · " : ""}${progress.board ? `${done}/${total} done${active ? ` · ${active} in progress` : ""}${review ? ` · ${review} review` : ""}` : "No board"}${waiting ? ` · ${waiting} need you` : ""}`;
-      summary.classList.toggle("needs-attention", waiting > 0);
-      button.title += `\n${summary.textContent}`;
-    } else {
-      summary.textContent = progress?.stale ? "Progress unavailable" : "Loading progress…";
-    }
-    copy.append(summary);
+function boardOf(projectId) {
+  return projectProgress(projectId)?.board || null;
+}
 
-    const toggle = document.createElement("button");
-    toggle.type = "button";
-    toggle.className = "project-toggle";
-    toggle.dataset.toggleProjectId = projectId;
-    toggle.setAttribute("aria-expanded", String(expanded));
-    toggle.setAttribute("aria-label", `${expanded ? "Collapse" : "Expand"} agents for ${project.name}`);
-    toggle.textContent = expanded ? "⌄" : "›";
-    row.append(button, toggle);
-    entry.append(row);
+function snapshotOf(projectId) {
+  return projectProgress(projectId)?.snapshot || null;
+}
 
-    if (expanded) {
-      const agentList = document.createElement("div");
-      agentList.className = "project-agents";
-      agentList.setAttribute("aria-label", `Agents in ${project.name}`);
-      if (agents.length) {
-        for (const agent of agents) {
-          const agentButton = document.createElement("button");
-          agentButton.type = "button";
-          agentButton.className = "project-agent";
-          agentButton.dataset.sessionId = agent.id;
-          agentButton.dataset.agentProjectId = projectId;
-          agentButton.disabled = agent.attachable === false;
-          agentButton.title = agentButton.disabled ? "Ended conversation — reopen from Radar desktop" : `Open session: ${agent.title || agent.program || agent.label}`;
-          const status = document.createElement("span");
-          status.className = `project-agent-status ${agent.state}`;
-          status.setAttribute("aria-hidden", "true");
-          const label = document.createElement("span");
-          label.className = "project-agent-name";
-          label.textContent = agent.title || agent.program || agent.label;
-          const agentCopy = document.createElement("span");
-          agentCopy.className = "project-agent-copy";
-          const progressLabel = document.createElement("span");
-          progressLabel.className = "project-agent-progress";
-          progressLabel.textContent = agentProgress(project.id, agent);
-          agentCopy.append(label, progressLabel);
-          const work = agentWork(project.id, agent);
-          if (work) {
-            const workLabel = document.createElement("span");
-            workLabel.className = "project-agent-progress";
-            workLabel.textContent = work;
-            agentCopy.append(workLabel);
-          }
-          agentButton.append(status, agentCopy);
-          agentList.append(agentButton);
-        }
-      } else {
-        const empty = document.createElement("span");
-        empty.className = "project-agent-empty";
-        empty.textContent = "No agents";
-        agentList.append(empty);
-      }
-      entry.append(agentList);
-    }
-    projectList.append(entry);
-  }
+function sessionsOf(projectId) {
+  return projectProgress(projectId)?.sessions || [];
+}
 
-  if (!projects.length) {
-    const empty = document.createElement("p");
-    empty.className = "project-empty";
-    empty.textContent = "No projects yet";
-    projectList.append(empty);
-  }
+function lanesOf(projectId) {
+  return boardOf(projectId)?.lanes || [];
+}
 
-  if (focusProjectId !== null) {
-    projectList.querySelector(`[data-project-id="${focusProjectId}"]`)?.focus({ preventScroll: true });
-  } else if (focused) {
-    const key = focused.sessionId ? "sessionId" : focused.toggleProjectId ? "toggleProjectId" : "projectId";
-    [...projectList.querySelectorAll("button")].find((button) =>
-      button.dataset[key] === focused[key] && (key !== "sessionId" || button.dataset.agentProjectId === focused.agentProjectId))?.focus({ preventScroll: true });
+function cardsOf(projectId) {
+  return boardOf(projectId)?.cards || [];
+}
+
+function cardById(projectId, cardId) {
+  return cardsOf(projectId).find((card) => card.id === cardId) || null;
+}
+
+function laneKind(projectId, laneId) {
+  return lanesOf(projectId).find((lane) => lane.id === laneId)?.kind || "custom";
+}
+
+function laneRank(projectId, laneId) {
+  switch (laneKind(projectId, laneId)) {
+    case "in_progress": return 0;
+    case "review": return 1;
+    case "todo": return 2;
+    case "done": return 9;
+    default: return 3;
   }
 }
 
-async function loadProjects() {
-  clearError();
-  projects = await request("/api/projects");
-  serverState.classList.add("online");
-  serverState.setAttribute("aria-label", "Server connected");
+/// Open cards (not in a done-kind lane), ordered In progress, Review, Todo.
+function openCards(projectId) {
+  return cardsOf(projectId)
+    .filter((card) => !card.done)
+    .slice()
+    .sort((a, b) => {
+      const rank = laneRank(projectId, a.lane_id) - laneRank(projectId, b.lane_id);
+      return rank !== 0 ? rank : a.position - b.position;
+    });
+}
 
-  const preferred = new URLSearchParams(location.search).get("project");
-  selectedProject = projects.find((project) => String(project.id) === preferred) || projects[0] || null;
-  if (selectedProject) expandedProjects.add(selectedProject.id);
-  renderProjects();
+function doneCount(projectId) {
+  return cardsOf(projectId).filter((card) => card.done).length;
+}
 
-  if (!projects.length) {
-    $("#project-title").textContent = "No projects yet";
-    $("#project-path").textContent = "Add a project in Radar on your computer first.";
-    renderSessions([]);
-    renderActivity(null);
-    renderAttention(null);
-    renderBoard(null);
-    $("#new-shell-button").disabled = true;
+function openTodoCount() {
+  return projects.reduce((sum, project) => sum + openCards(project.id).length, 0);
+}
+
+function runningSessions(projectId) {
+  return sessionsOf(projectId).filter((session) => session.state === "running");
+}
+
+function stoppedSessions(projectId) {
+  return sessionsOf(projectId).filter((session) => session.state !== "running" && session.attachable !== false);
+}
+
+function unresolvedAttention() {
+  const items = [];
+  for (const project of projects) {
+    for (const item of snapshotOf(project.id)?.attention || []) {
+      if (item.resolved_at_millis == null) items.push({ project, item });
+    }
+  }
+  items.sort((a, b) => b.item.created_at_millis - a.item.created_at_millis);
+  return items;
+}
+
+function attentionForCard(projectId, cardId) {
+  return (snapshotOf(projectId)?.attention || []).filter(
+    (item) => item.card_id === cardId && item.resolved_at_millis == null,
+  );
+}
+
+/// The latest agent note on a card — what was done, visible without opening a
+/// terminal.
+function latestNote(projectId, cardId) {
+  const events = snapshotOf(projectId)?.events || [];
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.card_id !== cardId || !event.session_id) continue;
+    if (event.payload?.type === "message") {
+      const text = (event.payload.data?.text || "").split("\n")[0].trim();
+      if (text) return text.length > 96 ? `${text.slice(0, 95)}…` : text;
+    }
+  }
+  return null;
+}
+
+/// The one attachable session bound to a claim, if it is unambiguous.
+function claimSession(projectId, claim) {
+  if (!claim) return null;
+  const matches = sessionsOf(projectId).filter(
+    (session) => session.claim === claim && session.attachable !== false,
+  );
+  return matches.length === 1 ? matches[0] : null;
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+
+function parseRoute() {
+  const raw = location.hash.replace(/^#\/?/, "");
+  const parts = raw.split("/").filter(Boolean).map((part) => decodeURIComponent(part));
+  if (parts[0] === "agents") return { name: "agents" };
+  if (parts[0] === "project" && parts[1]) {
+    if (parts[2] === "card" && parts[3]) {
+      return { name: "card", projectId: Number(parts[1]), cardId: parts.slice(3).join("/") };
+    }
+    if (parts[2] === "session" && parts[3]) {
+      return { name: "session", projectId: Number(parts[1]), sessionId: parts.slice(3).join("/") };
+    }
+    return { name: "project", projectId: Number(parts[1]) };
+  }
+  return { name: "home" };
+}
+
+function navigate(hash) {
+  if (location.hash === hash) render();
+  else location.hash = hash;
+}
+
+window.addEventListener("hashchange", () => {
+  if (parseRoute().name !== "session") lastNonSessionHash = location.hash || "#/";
+  editingCard = null;
+  render();
+});
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+function editableFocused() {
+  const active = document.activeElement;
+  if (!active) return false;
+  const editable = active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable;
+  return editable && main.contains(active);
+}
+
+function scheduleRender() {
+  if (terminalOpen) return;
+  if (editableFocused()) {
+    renderPending = true;
     return;
   }
-  $("#new-shell-button").disabled = false;
-  await loadProjectData();
+  renderPending = false;
+  render();
 }
 
-async function refreshProjectSessions() {
-  if (refreshInFlight) return refreshInFlight;
-  refreshInFlight = (async () => {
-    const results = await Promise.all(projects.map(async (project) => {
-      try {
-        const [sessions, snapshot, board] = await Promise.all([
-          request(`/api/projects/${project.id}/sessions`),
-          request(`/api/projects/${project.id}/activity`),
-          request(`/api/projects/${project.id}/board`),
-        ]);
-        projectSessions.set(project.id, sessions);
-        projectProgress.set(project.id, { snapshot, board, stale: false });
-        return true;
-      } catch (error) {
-        const progress = projectProgress.get(project.id);
-        if (progress) progress.stale = true;
-        else projectProgress.set(project.id, { stale: true });
-        if (selectedProject?.id === project.id) showError(`Progress unavailable: ${error.message}`);
-        return false;
-      }
-    }));
-    const online = results.every(Boolean);
-    serverState.classList.toggle("online", online);
-    serverState.setAttribute("aria-label", online ? "Progress up to date" : "Progress unavailable — retrying");
-    if (online) clearError();
-    updateAttentionShortcut();
-    renderProjects();
-  })().finally(() => { refreshInFlight = null; });
-  return refreshInFlight;
-}
+document.addEventListener("focusout", () => {
+  if (!renderPending) return;
+  window.setTimeout(() => {
+    if (!editableFocused()) scheduleRender();
+  }, 0);
+});
 
-async function loadProjectData() {
-  const project = selectedProject;
-  if (!project) return;
-  $("#project-title").textContent = project.name;
-  $("#project-path").textContent = project.path;
-  await refreshProjectSessions();
-  if (selectedProject?.id !== project.id) return;
-  const progress = projectProgress.get(project.id);
-  renderSessions(projectSessions.get(project.id) || []);
-  renderAttention(progress?.snapshot);
-  renderActivity(progress?.snapshot);
-  renderBoard(progress?.board);
-}
-
-function renderBoard(board) {
-  const list = $("#board-columns");
-  const scrollTop = list.scrollTop;
-  list.replaceChildren();
-  const { total, done } = boardProgress(board);
-  $("#board-summary").textContent = board ? `${done} of ${total} done` : "No board";
-  $("#todo-add-form").classList.toggle("hidden", !board);
-  $("#board-empty").classList.toggle("hidden", total > 0);
-  $("#board-empty").textContent = board ? "No to-dos yet. Type one above." : "This project has no enabled board.";
-  for (const column of board?.columns || []) {
-    const section = document.createElement("section");
-    section.className = "board-column";
-    const heading = document.createElement("h3");
-    heading.textContent = `${column.name} · ${column.cards.length}`;
-    section.append(heading);
-    for (const card of column.cards) {
-      const item = document.createElement("div");
-      item.className = "board-card";
-      const title = document.createElement("span");
-      title.textContent = card.title;
-      item.append(title);
-      if (card.claimed_by) {
-        const matches = (projectSessions.get(selectedProject.id) || []).filter((session) =>
-          session.claim === card.claimed_by && session.attachable !== false);
-        const claim = document.createElement(matches.length === 1 ? "button" : "small");
-        claim.textContent = `@${card.claimed_by}`;
-        if (matches.length === 1) {
-          claim.type = "button";
-          claim.className = "board-claim";
-          claim.title = "Open this agent’s session";
-          claim.addEventListener("click", () => attach(matches[0]));
-        }
-        item.append(claim);
-      }
-      section.append(item);
-    }
-    list.append(section);
+function render() {
+  const route = parseRoute();
+  if (route.name === "session") {
+    renderSessionRoute(route);
+    return;
   }
-  list.scrollTop = scrollTop;
+  if (terminalOpen) exitTerminal();
+  main.replaceChildren();
+  const error = $("#page-error");
+  let view;
+  switch (route.name) {
+    case "agents":
+      view = renderAgents();
+      break;
+    case "project":
+      view = renderProject(route.projectId);
+      break;
+    case "card":
+      view = renderCard(route.projectId, route.cardId);
+      break;
+    default:
+      view = renderHome();
+  }
+  main.append(view, pageErrorHost);
+  if (error) error.classList.add("hidden");
 }
 
-function renderSessions(items) {
-  const list = $("#session-list");
-  const empty = $("#sessions-empty");
-  list.replaceChildren();
-  // Server order is authoritative (newest activity first); the client-side
-  // sort keeps old cached payloads from jumping around before refresh.
-  const ordered = [...items].sort(
-    (a, b) => (b.last_activity_ms || 0) - (a.last_activity_ms || 0),
+/// A session route either enters the terminal or explains why it cannot.
+function renderSessionRoute(route) {
+  if (terminalOpen && terminalSession?.id === route.sessionId && terminalProjectId === route.projectId) {
+    return;
+  }
+  if (!loadedProjects || !progress.has(route.projectId)) {
+    if (terminalOpen) exitTerminal();
+    main.replaceChildren(el("div", { class: "home-view" },
+      hero("Session", "Loading…", () => navigate(lastNonSessionHash || "#/")),
+    ), pageErrorHost);
+    return;
+  }
+  const session = sessionsOf(route.projectId).find((item) => item.id === route.sessionId);
+  if (!session || session.attachable === false) {
+    if (terminalOpen) exitTerminal();
+    main.replaceChildren(el("div", { class: "home-view" },
+      hero("Session", session ? "That conversation has ended. Reopen it from the Radar desktop app." : "That session is no longer available.", () => navigate(lastNonSessionHash || "#/")),
+    ), pageErrorHost);
+    return;
+  }
+  enterTerminal(route.projectId, session);
+}
+
+function hero(title, summary, back) {
+  const heading = el("div", { class: "page-heading" },
+    el("div", {},
+      back ? el("button", { class: "back-button", type: "button", onclick: back }, el("span", {}, "‹"), " Back") : null,
+      el("p", { class: "eyebrow" }, "RADAR"),
+      el("h1", { text: title }),
+      el("p", { class: "project-summary", text: summary }),
+    ),
   );
-  empty.classList.toggle("hidden", ordered.length > 0);
-  for (const session of ordered) {
-    // Catalog-only history has no live PTY: the terminal route must never
-    // see its id. Render it as an inert record, not an attach button.
-    const attachable = session.attachable !== false;
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "session-card";
-    button.disabled = !attachable;
-    button.title = attachable
-      ? "Open session"
-      : "Ended conversation — reopen it from the Radar desktop app";
-    button.setAttribute(
-      "aria-label",
-      `${attachable ? "Open session" : "Ended conversation"}: ${session.title || session.label}`,
+  return heading;
+}
+
+function sectionHeading(title, trailing) {
+  return el("div", { class: "section-heading" },
+    el("div", {}, el("h2", { text: title })),
+    trailing ? el("span", { class: "project-summary", text: trailing }) : null,
+  );
+}
+
+// ---- Home ----
+
+function renderHome() {
+  const wrap = el("div", { class: "dashboard home" });
+  if (!loadedProjects) {
+    wrap.append(hero("Home", "Loading your workspace…"));
+    return wrap;
+  }
+  if (!projects.length) {
+    wrap.append(hero("Home", "No projects yet"));
+    wrap.append(el("div", { class: "empty-card" },
+      el("strong", {}, "Add a project in Radar on your computer."),
+      el("span", {}, "The web client is a remote view of the workspace Radar already knows."),
+    ));
+    return wrap;
+  }
+
+  const needs = unresolvedAttention();
+  const running = projects.reduce((sum, project) => sum + runningSessions(project.id).length, 0);
+  const projectLabel = projects.length === 1 ? "1 project" : `${projects.length} projects`;
+  wrap.append(hero("Home", `${projectLabel} · ${needs.length} need you`));
+  wrap.append(agentsDestination(running));
+
+  if (needs.length) {
+    wrap.append(sectionHeading("Needs you", `${needs.length} open`));
+    for (const { project, item } of needs) wrap.append(attentionCard(project, item));
+  }
+
+  const toDos = openTodoCount();
+  wrap.append(sectionHeading("Projects", toDos === 1 ? "1 to-do" : `${toDos} to-dos`));
+  const grid = el("div", { class: "lane-grid" });
+  for (const project of projects) grid.append(projectLane(project));
+  wrap.append(grid);
+  return wrap;
+}
+
+function agentsDestination(running) {
+  const count = running === 0 ? "No agents" : running === 1 ? "1 running" : `${running} running`;
+  return el("button", {
+    class: "destination-card",
+    type: "button",
+    onclick: () => navigate("#/agents"),
+  },
+    el("span", { class: "destination-icon", "aria-hidden": "true" }, "✳"),
+    el("span", { class: "destination-copy" },
+      el("span", { class: "destination-title" }, "Agents"),
+      el("span", { class: "destination-summary" }, `${count} · All projects, one workspace`),
+      el("span", { class: "destination-hint" }, "Open a live session and work in it"),
+    ),
+    el("span", { class: "destination-arrow", "aria-hidden": "true" }, "›"),
+  );
+}
+
+function projectLane(project) {
+  const lane = el("article", { class: "lane" });
+  const board = boardOf(project.id);
+  const stale = projectProgress(project.id)?.stale;
+
+  lane.append(el("header", { class: "lane-header" },
+    el("button", {
+      class: "lane-name",
+      type: "button",
+      title: project.path,
+      onclick: () => navigate(`#/project/${project.id}`),
+    }, project.name),
+    el("span", { class: "lane-path", text: project.path }),
+  ));
+
+  const pills = el("div", { class: "lane-pills" });
+  let anyPill = false;
+  for (const boardLane of board?.lanes || []) {
+    if (boardLane.kind === "done") continue;
+    const count = cardsOf(project.id).filter((card) => card.lane_id === boardLane.id && !card.done).length;
+    if (!count) continue;
+    anyPill = true;
+    pills.append(el("span", { class: `pill ${pillClass(boardLane.kind)}` }, `${boardLane.name} ${count}`));
+  }
+  if (!anyPill) pills.append(el("span", { class: "pill" }, board ? "No open to-dos" : "No board"));
+  lane.append(pills);
+
+  lane.append(todoAddForm(project.id));
+
+  lane.append(el("p", { class: "lane-section" }, "To-dos"));
+  const open = openCards(project.id);
+  if (!board) {
+    lane.append(el("p", { class: "quiet" }, stale ? "Board unavailable" : "No board"));
+  } else if (!open.length) {
+    lane.append(el("p", { class: "quiet" }, "No to-dos yet"));
+  } else {
+    const list = el("div", { class: "todo-list" });
+    for (const card of open) list.append(todoRow(project.id, card));
+    lane.append(list);
+  }
+
+  lane.append(el("footer", { class: "lane-foot" }, laneFooterText(project.id)));
+  return lane;
+}
+
+function pillClass(kind) {
+  if (kind === "in_progress") return "pill-active";
+  if (kind === "review") return "pill-review";
+  if (kind === "done") return "pill-done";
+  return "";
+}
+
+function laneFooterText(projectId) {
+  const running = runningSessions(projectId).length;
+  const stopped = stoppedSessions(projectId).length;
+  const live = running === 0 ? "no agents" : running === 1 ? "1 running" : `${running} running`;
+  if (!stopped) return live;
+  return `${live} · ${stopped} stopped`;
+}
+
+function todoAddForm(projectId) {
+  const input = el("input", {
+    class: "todo-add-input",
+    type: "text",
+    placeholder: "Add a to-do…",
+    "aria-label": "Add a to-do",
+  });
+  const form = el("form", { class: "todo-add" }, input);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const title = input.value.trim();
+    if (!title) return;
+    input.value = "";
+    addTodo(projectId, title);
+  });
+  return form;
+}
+
+function todoRow(projectId, card) {
+  const row = el("div", { class: "todo-row" });
+  const tick = el("button", {
+    class: `todo-tick${card.done ? " done" : ""}`,
+    type: "button",
+    title: card.done ? "Reopen this to-do" : "Close this to-do",
+    "aria-label": card.done ? "Reopen to-do" : "Close to-do",
+    onclick: (event) => {
+      event.stopPropagation();
+      toggleDone(projectId, card);
+    },
+  }, el("span", { class: "todo-box" }));
+  row.append(tick);
+
+  const open = el("button", {
+    class: "todo",
+    type: "button",
+    title: `Open this card\n${card.id}`,
+    onclick: () => navigate(`#/project/${projectId}/card/${encodeURIComponent(card.id)}`),
+  }, el("span", { class: `todo-title${card.done ? " done" : ""}`, text: card.title }));
+  const copy = el("div", { class: "todo-copy" }, open);
+  const meta = el("div", { class: "todo-meta" });
+  if (card.claim) {
+    const session = claimSession(projectId, card.claim);
+    if (session) {
+      meta.append(el("button", {
+        class: "todo-claim link",
+        type: "button",
+        title: "Open this agent's session",
+        onclick: (event) => { event.stopPropagation(); openSession(projectId, session); },
+      }, `@${card.claim}`));
+    } else {
+      meta.append(el("span", { class: "todo-claim", text: `@${card.claim}` }));
+    }
+  }
+  const note = latestNote(projectId, card.id);
+  if (note) meta.append(el("span", { class: "todo-note", text: note }));
+  if (meta.childNodes.length) copy.append(meta);
+  row.append(copy);
+  return row;
+}
+
+// ---- Project ----
+
+function renderProject(projectId) {
+  const project = projectById(projectId);
+  if (!project) return missingView("That project is no longer available.");
+  const wrap = el("div", { class: "home-view project-view" });
+  const board = boardOf(projectId);
+  const done = doneCount(projectId);
+  const open = openCards(projectId).length;
+  wrap.append(hero(project.name, `${project.path} · ${open} open · ${done} done`, () => navigate("#/")));
+  wrap.append(el("div", { class: "project-actions" },
+    el("button", {
+      class: "small-button",
+      type: "button",
+      onclick: () => createShell(projectId),
+    }, "＋ New terminal"),
+  ));
+  wrap.append(todoAddForm(projectId));
+
+  if (!board) {
+    wrap.append(el("div", { class: "empty-card" },
+      el("strong", {}, "No board for this project."),
+      el("span", {}, projectProgress(projectId)?.stale ? "The board is temporarily unavailable." : "Enable the board in Radar on your computer."),
+    ));
+    return wrap;
+  }
+
+  const columns = el("div", { class: "project-columns" });
+  for (const boardLane of board.lanes) {
+    if (boardLane.kind === "done") continue;
+    const cards = cardsOf(projectId)
+      .filter((card) => card.lane_id === boardLane.id && !card.done)
+      .sort((a, b) => a.position - b.position);
+    const column = el("section", { class: "project-column" },
+      el("h3", {}, el("span", { text: boardLane.name }), el("span", { class: "column-count", text: String(cards.length) })),
     );
-    const icon = document.createElement("span");
-    icon.className = "session-icon";
-    icon.textContent = session.slot === "agent" ? "✳" : session.slot === "editor" ? "▤" : "⌘";
-    const copy = document.createElement("span");
-    copy.className = "session-copy";
-    const title = document.createElement("span");
-    title.className = "session-title";
-    title.textContent = session.title || session.label;
-    const subtitle = document.createElement("span");
-    subtitle.className = "session-subtitle";
-    const age = session.last_activity_ms ? ` · ${relativeTime(session.last_activity_ms)}` : "";
-    subtitle.textContent = `${session.label}${age} · ${session.detail || (session.pid ? `PID ${session.pid}` : session.program || "Radar session")}`;
-    copy.append(title, subtitle);
-    const state = document.createElement("span");
-    state.className = `session-state ${session.state}`;
-    state.textContent = session.state;
-    const arrow = document.createElement("span");
-    arrow.className = "session-arrow";
-    arrow.textContent = attachable ? "›" : "";
-    button.append(icon, copy, state, arrow);
-    if (attachable) button.addEventListener("click", () => attach(session));
-    list.append(button);
+    const list = el("div", { class: "column-cards" });
+    for (const card of cards) list.append(todoRow(projectId, card));
+    if (!cards.length) list.append(el("p", { class: "quiet" }, "Nothing here"));
+    column.append(list);
+    columns.append(column);
   }
+  wrap.append(columns);
+  return wrap;
 }
 
-function attentionReason(item) {
-  if (item.card_id) return `Card ${item.card_id} · ${item.kind}`;
-  if (item.session_id) return `${item.session_id} · ${item.kind}`;
-  return item.kind;
+// ---- Card ----
+
+function renderCard(projectId, cardId) {
+  const project = projectById(projectId);
+  if (!project) return missingView("That project is no longer available.");
+  const card = cardById(projectId, cardId);
+  if (!card) {
+    return el("div", { class: "home-view card-view" },
+      hero("Card", "This card is no longer on the board", () => navigate(`#/project/${projectId}`)),
+      el("p", { class: "quiet" }, projectProgress(projectId) ? "It may have been removed or moved." : "Loading the card…"),
+    );
+  }
+
+  const wrap = el("div", { class: "home-view card-view" });
+  wrap.append(hero(card.title, cardMeta(projectId, card), () => navigate(`#/project/${projectId}`)));
+
+  wrap.append(el("div", { class: "card-id" },
+    el("code", { text: card.id }),
+    el("button", {
+      class: "small-button",
+      type: "button",
+      onclick: async () => {
+        try {
+          await navigator.clipboard.writeText(card.id);
+          showToast("Card id copied");
+        } catch {
+          showToast(card.id);
+        }
+      },
+    }, "Copy id"),
+  ));
+
+  if (card.body.trim()) {
+    const body = renderMarkdown(card.body);
+    body.classList.add("card-body");
+    wrap.append(body);
+  }
+
+  if (editingCard === card.id) {
+    wrap.append(cardEditForm(projectId, card));
+  } else {
+    wrap.append(cardControls(projectId, card));
+  }
+
+  wrap.append(el("h2", { class: "lane-section" }, "Linked sessions"));
+  const linked = card.claim
+    ? sessionsOf(projectId).filter((session) => session.claim === card.claim && session.attachable !== false)
+    : [];
+  if (!linked.length) {
+    wrap.append(el("p", { class: "quiet" }, card.claim ? `No live session for @${card.claim}` : "No session on this card yet."));
+  } else {
+    for (const session of linked) wrap.append(sessionCard(projectId, session));
+  }
+
+  wrap.append(el("h2", { class: "lane-section" }, "Conversation"));
+  wrap.append(cardThread(projectId, card));
+
+  wrap.append(cardReplyForm(projectId, card));
+  return wrap;
 }
 
-function renderAttention(snapshot) {
-  latestAttentionSnapshot = snapshot;
-  const list = $("#attention-list");
-  if (list.contains(document.activeElement)) return;
-  const empty = $("#attention-empty");
-  const items = snapshot?.attention?.filter((item) => item.resolved_at_millis == null) || [];
-  const unresolvedIds = new Set(items.map((item) => item.id));
-  for (const answer of list.querySelectorAll("textarea[data-attention-id]")) {
-    if (unresolvedIds.has(answer.dataset.attentionId)) {
-      answerDrafts.set(answer.dataset.attentionId, answer.value);
+function cardMeta(projectId, card) {
+  const project = projectById(projectId);
+  const lane = lanesOf(projectId).find((item) => item.id === card.lane_id);
+  const parts = [];
+  if (project) parts.push(project.name);
+  parts.push(lane?.name || card.lane);
+  if (card.claim) parts.push(`@${card.claim}`);
+  if (card.done) parts.push("done");
+  return parts.join(" · ");
+}
+
+function cardControls(projectId, card) {
+  const controls = el("div", { class: "card-controls" });
+  controls.append(el("button", {
+    class: "small-button",
+    type: "button",
+    onclick: () => { editingCard = card.id; render(); },
+  }, "Edit"));
+
+  controls.append(el("button", {
+    class: card.done ? "small-button" : "primary-button",
+    type: "button",
+    onclick: () => toggleDone(projectId, card),
+  }, card.done ? "Reopen" : "Close to-do"));
+
+  const lanes = lanesOf(projectId);
+  const select = el("select", { class: "lane-select", "aria-label": "Move to another lane" });
+  for (const lane of lanes) {
+    select.append(el("option", {
+      value: lane.name,
+      selected: lane.id === card.lane_id,
+    }, lane.name));
+  }
+  select.addEventListener("change", () => moveCard(projectId, card, select.value));
+  controls.append(select);
+
+  controls.append(el("button", {
+    class: "small-button",
+    type: "button",
+    onclick: () => navigate(`#/project/${projectId}`),
+  }, "Open project"));
+  return controls;
+}
+
+function cardEditForm(projectId, card) {
+  const title = el("input", { class: "todo-add-input", type: "text", value: card.title, "aria-label": "Card title" });
+  const body = el("textarea", { class: "card-body-edit", rows: 8, "aria-label": "Card body" });
+  body.value = card.body;
+  const error = el("p", { class: "card-error hidden" });
+  const form = el("form", { class: "card-edit" },
+    title,
+    body,
+    error,
+    el("div", { class: "card-controls" },
+      el("button", { class: "primary-button", type: "submit" }, "Save"),
+      el("button", { class: "small-button", type: "button", onclick: () => { editingCard = null; render(); } }, "Cancel"),
+    ),
+  );
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const nextTitle = title.value.trim();
+    if (!nextTitle) {
+      error.textContent = "A card needs a title.";
+      error.classList.remove("hidden");
+      return;
     }
-  }
-  for (const id of answerDrafts.keys()) {
-    if (!unresolvedIds.has(id)) answerDrafts.delete(id);
-  }
-  list.replaceChildren();
-  empty.classList.toggle("hidden", items.length > 0);
-  const count = $("#attention-count");
-  count.textContent = String(items.length);
-  count.classList.toggle("hidden", items.length === 0);
-
-  for (const item of items) {
-    const card = document.createElement("article");
-    card.className = "attention-card";
-    const title = document.createElement("h3");
-    card.dataset.attentionId = item.id;
-    card.setAttribute("aria-busy", String(pendingResponses.has(item.id)));
-    title.textContent = item.reason;
-    const meta = document.createElement("div");
-    meta.className = "attention-meta";
-    meta.textContent = attentionReason(item);
-    const actions = document.createElement("div");
-    actions.className = "attention-actions";
-    const allowed = new Set(item.allowed_actions || []);
-
-    if (allowed.has("answer")) {
-      const form = document.createElement("form");
-      form.className = "answer-box";
-      const answer = document.createElement("textarea");
-      answer.dataset.attentionId = item.id;
-      answer.placeholder = "Write a reply…";
-      answer.setAttribute("aria-label", "Reply to agent");
-      answer.rows = 1;
-      answer.value = answerDrafts.get(item.id) || "";
-      answer.addEventListener("input", () => answerDrafts.set(item.id, answer.value));
-      const send = document.createElement("button");
-      send.className = "small-button";
-      send.type = "submit";
-      send.textContent = "Reply";
-      form.append(answer, send);
-      form.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        await resolveAttention(item, "answer", answer.value);
+    try {
+      await mutateCard(projectId, card.id, {
+        action: "update",
+        title: nextTitle,
+        body: body.value,
+        revision: card.revision,
       });
-      actions.append(form);
+      editingCard = null;
+      showToast("Card saved");
+      await refreshAll({ quiet: true });
+      render();
+    } catch (requestError) {
+      error.textContent = `Could not save: ${requestError.message}`;
+      error.classList.remove("hidden");
     }
-    for (const action of ["approve", "deny", "dismiss"]) {
-      if (!allowed.has(action)) continue;
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = action === "approve" ? "primary-button compact" : "small-button";
-      button.textContent = action[0].toUpperCase() + action.slice(1);
-      button.addEventListener("click", () => resolveAttention(item, action));
-      actions.append(button);
+  });
+  return form;
+}
+
+function cardThread(projectId, card) {
+  const thread = el("div", { class: "thread" });
+  const events = (snapshotOf(projectId)?.events || [])
+    .filter((event) => event.card_id === card.id)
+    .slice()
+    .sort((a, b) => a.sequence - b.sequence);
+  const attention = attentionForCard(projectId, card.id);
+
+  if (!events.length && !attention.length) {
+    thread.append(el("p", { class: "quiet" }, "No activity on this card yet"));
+    return thread;
+  }
+
+  for (const event of events) {
+    const payload = event.payload || {};
+    if (payload.type === "message") {
+      const author = event.session_id ? "Agent" : "You";
+      thread.append(threadMessage(author, payload.data?.text || "", event.at_millis));
+    } else if (payload.type === "board_changed") {
+      thread.append(el("p", { class: "thread-system", text: boardChangeText(payload.data || {}) }));
+    } else if (payload.type === "attention_resolved") {
+      const data = payload.data || {};
+      thread.append(el("p", { class: "thread-system", text: `Answered: ${responseText(data.response)}` }));
     }
-    card.append(title, meta, actions);
-    if (pendingResponses.has(item.id)) {
-      for (const control of card.querySelectorAll("button, textarea")) control.disabled = true;
-      meta.textContent = "Sending response…";
+  }
+
+  for (const item of attention) {
+    thread.append(attentionCard(projectOfId(projectId), item));
+  }
+  return thread;
+}
+
+function projectOfId(projectId) {
+  return projectById(projectId) || { id: projectId, name: `project ${projectId}`, path: "" };
+}
+
+function threadMessage(author, text, atMillis) {
+  const row = el("div", { class: `thread-row ${author === "You" ? "thread-you" : "thread-agent"}` });
+  row.append(el("div", { class: "thread-head" },
+    el("span", { class: "thread-author", text: author }),
+    el("span", { class: "thread-age", text: relativeTime(atMillis) }),
+  ));
+  row.append(renderMarkdown(text));
+  return row;
+}
+
+function boardChangeText(data) {
+  const action = data.action || "updated";
+  const label = ({
+    added: "Added to the board",
+    board_card_added: "Added to the board",
+    moved: "Moved",
+    board_card_moved: "Moved",
+    claimed: "Claimed",
+    board_card_claimed: "Claimed",
+    released: "Released",
+    board_card_released: "Released",
+    done: "Closed",
+    board_card_done: "Closed",
+    completed: "Closed",
+    board_card_completed: "Closed",
+    reopened: "Reopened",
+    board_card_reopened: "Reopened",
+    edited: "Edited",
+    board_card_edited: "Edited",
+  })[action] || action.replaceAll("_", " ");
+  return data.column ? `${label} · ${data.column}` : label;
+}
+
+function responseText(response) {
+  if (response == null) return "";
+  if (typeof response === "string") return response;
+  if (response.answer != null) return response.answer;
+  if (response === "approve") return "approved";
+  return String(response);
+}
+
+function cardReplyForm(projectId, card) {
+  const input = el("input", {
+    class: "reply-input",
+    type: "text",
+    placeholder: "Reply, or leave the agent a note…",
+    "aria-label": "Reply to card",
+    value: commentDrafts.get(card.id) || "",
+  });
+  input.addEventListener("input", () => commentDrafts.set(card.id, input.value));
+  const form = el("form", { class: "reply-row" },
+    input,
+    el("button", { class: "primary-button", type: "submit" }, "Send"),
+  );
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    commentDrafts.delete(card.id);
+    try {
+      await request(`/api/projects/${projectId}/cards/${encodeURIComponent(card.id)}/comments`, {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      });
+      await refreshAll({ quiet: true });
+      render();
+    } catch (error) {
+      input.value = text;
+      commentDrafts.set(card.id, text);
+      showToast(error.message);
     }
-    list.append(card);
+  });
+  return form;
+}
+
+// ---- Agents ----
+
+function renderAgents() {
+  const wrap = el("div", { class: "home-view agents-view" });
+  if (!loadedProjects) {
+    wrap.append(hero("Agents", "Loading…", () => navigate("#/")));
+    return wrap;
+  }
+  const running = projects.reduce((sum, project) => sum + runningSessions(project.id).length, 0);
+  const count = running === 0 ? "No agents" : running === 1 ? "1 running" : `${running} running`;
+  wrap.append(hero("Agents", `${count} · All projects, one workspace`, () => navigate("#/")));
+
+  let any = false;
+  for (const project of projects) {
+    const sessions = sessionsOf(project.id);
+    if (!sessions.length) continue;
+    any = true;
+    wrap.append(el("h2", { class: "lane-section" }, project.name));
+    const list = el("div", { class: "session-list" });
+    for (const session of sessions) list.append(sessionCard(project.id, session));
+    wrap.append(list);
+  }
+  if (!any) {
+    wrap.append(el("div", { class: "empty-card" },
+      el("strong", {}, "No sessions yet."),
+      el("span", {}, "Start an agent in Radar on your computer, or a terminal in a project."),
+    ));
+  }
+  return wrap;
+}
+
+function sessionCard(projectId, session) {
+  const attachable = session.attachable !== false;
+  const button = el("button", {
+    class: "session-card",
+    type: "button",
+    disabled: !attachable,
+    title: attachable ? "Open session" : "Ended conversation — reopen it from the Radar desktop app",
+    "aria-label": `${attachable ? "Open session" : "Ended conversation"}: ${session.title || session.label}`,
+  },
+    el("span", { class: "session-icon", "aria-hidden": "true" },
+      session.slot === "agent" ? "✳" : session.slot === "editor" ? "▤" : "⌘"),
+    el("span", { class: "session-copy" },
+      el("span", { class: "session-title", text: session.title || session.label }),
+      el("span", { class: "session-subtitle", text: sessionSubtitle(session) }),
+    ),
+    el("span", { class: `session-state ${session.state}`, text: session.state }),
+    el("span", { class: "session-arrow", text: attachable ? "›" : "" }),
+  );
+  if (attachable) button.addEventListener("click", () => openSession(projectId, session));
+  return button;
+}
+
+function sessionSubtitle(session) {
+  const age = session.last_activity_ms ? ` · ${relativeTime(session.last_activity_ms)}` : "";
+  const detail = session.detail || (session.pid ? `PID ${session.pid}` : session.program || "Radar session");
+  return `${session.label}${age} · ${detail}`;
+}
+
+// ---- Needs you (attention) ----
+
+function attentionCard(project, item) {
+  const card = el("article", { class: "attention-card" });
+  card.dataset.attentionId = item.id;
+  card.setAttribute("aria-busy", String(pendingResponses.has(item.id)));
+  const top = el("div", { class: "attention-top" },
+    el("span", { class: "attention-kind", text: `${item.kind} · ${project.name}` }),
+    el("span", { class: "attention-age", text: relativeTime(item.created_at_millis) }),
+  );
+  card.append(top);
+  card.append(renderMarkdown(item.reason));
+
+  const target = el("div", { class: "attention-meta" });
+  if (item.card_id) {
+    target.append(el("button", {
+      class: "link",
+      type: "button",
+      onclick: () => navigate(`#/project/${project.id}/card/${encodeURIComponent(item.card_id)}`),
+    }, `Card ${shortId(item.card_id)}`));
+  }
+  if (item.session_id) {
+    const session = sessionsOf(project.id).find((row) => row.id === item.session_id && row.attachable !== false);
+    if (session) {
+      target.append(el("button", {
+        class: "link",
+        type: "button",
+        onclick: () => openSession(project.id, session),
+      }, `Agent ${shortId(item.session_id)}`));
+    } else {
+      target.append(el("span", { text: `Agent ${shortId(item.session_id)}` }));
+    }
+  }
+  if (target.childNodes.length) card.append(target);
+
+  const actions = el("div", { class: "attention-actions" });
+  const allowed = new Set(item.allowed_actions || []);
+  if (allowed.has("answer")) {
+    const answer = el("textarea", {
+      class: "answer-input",
+      rows: 1,
+      placeholder: "Write a reply…",
+      "aria-label": "Reply to agent",
+    });
+    answer.value = answerDrafts.get(item.id) || "";
+    answer.addEventListener("input", () => answerDrafts.set(item.id, answer.value));
+    const form = el("form", { class: "answer-box" },
+      answer,
+      el("button", { class: "small-button", type: "submit" }, "Reply"),
+    );
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      resolveAttention(project.id, item, { action: "answer", answer: answer.value });
+    });
+    actions.append(form);
+  }
+  for (const action of ["approve", "deny", "dismiss"]) {
+    if (!allowed.has(action)) continue;
+    actions.append(el("button", {
+      class: action === "approve" ? "primary-button compact" : "small-button",
+      type: "button",
+      onclick: () => resolveAttention(project.id, item, { action }),
+    }, action[0].toUpperCase() + action.slice(1)));
+  }
+  if (item.seen_at_millis == null) {
+    actions.append(el("button", {
+      class: "small-button",
+      type: "button",
+      onclick: () => resolveAttention(project.id, item, { change: "seen" }),
+    }, "Mark seen"));
+  }
+  if (item.acknowledged_at_millis == null) {
+    actions.append(el("button", {
+      class: "small-button",
+      type: "button",
+      onclick: () => resolveAttention(project.id, item, { change: "acknowledge" }),
+    }, "Acknowledge"));
+  }
+  card.append(actions);
+
+  if (pendingResponses.has(item.id)) {
+    for (const control of card.querySelectorAll("button, textarea")) control.disabled = true;
+    card.append(el("p", { class: "quiet" }, "Sending response…"));
+  }
+  return card;
+}
+
+function shortId(id) {
+  if (!id) return "";
+  return id.length > 14 ? `${id.slice(0, 8)}…` : id;
+}
+
+function missingView(message) {
+  return el("div", { class: "home-view" },
+    hero("Radar", message, () => navigate("#/")),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Mutations
+// ---------------------------------------------------------------------------
+
+async function mutateCard(projectId, cardId, body) {
+  const board = await request(`/api/projects/${projectId}/cards/${encodeURIComponent(cardId)}`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  const entry = progress.get(projectId);
+  if (entry) entry.board = board;
+  return board;
+}
+
+async function addTodo(projectId, title) {
+  try {
+    const board = await request(`/api/projects/${projectId}/board`, {
+      method: "POST",
+      body: JSON.stringify({ title }),
+    });
+    const entry = progress.get(projectId);
+    if (entry) entry.board = board;
+    render();
+    focusTodoInput(projectId);
+  } catch (error) {
+    showToast(error.message);
   }
 }
 
-async function resolveAttention(item, action, answer) {
+/// Start the user's login shell in a project and open it.
+async function createShell(projectId) {
+  try {
+    const session = await request(`/api/projects/${projectId}/sessions`, {
+      method: "POST",
+      body: "{}",
+    });
+    await refreshAll({ quiet: true });
+    openSession(projectId, session);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function focusTodoInput(projectId) {
+  const route = parseRoute();
+  if (route.name === "project" && route.projectId === projectId) {
+    main.querySelector(".todo-add-input")?.focus({ preventScroll: true });
+  }
+}
+
+async function toggleDone(projectId, card) {
+  try {
+    await mutateCard(projectId, card.id, {
+      action: card.done ? "reopen" : "complete",
+      revision: card.revision,
+    });
+    render();
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function moveCard(projectId, card, lane) {
+  try {
+    await mutateCard(projectId, card.id, { action: "move", lane, revision: card.revision });
+    showToast(`Moved to ${lane}`);
+    render();
+  } catch (error) {
+    showToast(error.message);
+    render();
+  }
+}
+
+async function resolveAttention(projectId, item, body) {
   if (pendingResponses.has(item.id)) return;
-  const projectId = item.project_id;
   pendingResponses.add(item.id);
   const focused = document.activeElement;
-  if (focused && $("#attention-list").contains(focused)) focused.blur();
-  renderAttention(latestAttentionSnapshot);
+  if (focused && main.contains(focused)) focused.blur();
+  render();
   try {
-    const payload = { revision: item.revision, action };
-    if (answer !== undefined) payload.answer = answer;
     await request(`/api/projects/${projectId}/attention/${encodeURIComponent(item.id)}`, {
       method: "POST",
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ revision: item.revision, ...body }),
     });
     answerDrafts.delete(item.id);
     showToast("Response sent");
-    await loadProjectData();
   } catch (error) {
     showToast(error.message);
   } finally {
     pendingResponses.delete(item.id);
-    if (selectedProject?.id === projectId) await loadProjectData();
+    await refreshAll({ quiet: true });
+    render();
   }
 }
 
-function eventText(event) {
-  const payload = event.payload?.data || {};
-  switch (event.kind) {
-    case "agent_state_changed":
-      return `Agent ${payload.state || "changed state"}${payload.message ? ` · ${payload.message}` : ""}`;
-    case "reported": return payload.text || "Agent update";
-    case "attention_requested": return `Needs attention · ${payload.reason || "Agent request"}`;
-    case "attention_resolved": return `Request resolved · ${payload.request_id || ""}`;
-    case "session_lifecycle": return `Session ${payload.state || "updated"}${payload.detail ? ` · ${payload.detail}` : ""}`;
-    case "board_changed": {
-      const action = (payload.action || "board updated").replaceAll("_", " ");
-      const transition = payload.from_column && payload.column
-        ? ` · ${payload.from_column} → ${payload.column}`
-        : payload.column ? ` · ${payload.column}` : "";
-      return `${action[0].toUpperCase()}${action.slice(1)}${payload.title ? ` · ${payload.title}` : ""}${transition}`;
-    }
-    case "command_result": return payload.detail || "Command completed";
-    default: return event.kind.replaceAll("_", " ");
-  }
-}
+// ---------------------------------------------------------------------------
+// Data loading
+// ---------------------------------------------------------------------------
 
-function relativeTime(millis) {
-  const seconds = Math.max(0, Math.floor((Date.now() - millis) / 1000));
-  if (seconds < 60) return "just now";
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-  return `${Math.floor(seconds / 86400)}d ago`;
-}
-
-function renderActivity(snapshot) {
-  const list = $("#activity-list");
-  const empty = $("#activity-empty");
-  const events = snapshot?.events?.slice(-8).reverse() || [];
-  list.replaceChildren();
-  empty.classList.toggle("hidden", events.length > 0);
-  for (const event of events) {
-    const item = document.createElement("div");
-    item.className = "activity-card";
-    const marker = document.createElement("span");
-    marker.className = "activity-marker";
-    const copy = document.createElement("div");
-    copy.className = "activity-copy";
-    const text = document.createElement("p");
-    text.className = "activity-text";
-    text.textContent = eventText(event);
-    const time = document.createElement("time");
-    time.className = "activity-time";
-    time.textContent = relativeTime(event.at_millis);
-    copy.append(text, time);
-    item.append(marker, copy);
-    list.append(item);
-  }
-}
-
-function terminalInputFilter(data) {
-  return data
-    .replace(/\x1b\[[0-9;?]*[Rcn]/g, "")
-    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/gs, "")
-    .replace(/\x1bP[\s\S]*?\x1b\\/g, "");
-}
-
-function sendTerminalInput(data) {
-  if (terminalSession?.state !== "running" || !currentSocket || currentSocket.readyState !== WebSocket.OPEN) return;
-  const filtered = terminalInputFilter(data);
-  if (filtered) currentSocket.send(new TextEncoder().encode(filtered));
-}
-
-function sendTerminalBytes(bytes) {
-  if (terminalSession?.state === "running" && currentSocket?.readyState === WebSocket.OPEN && bytes.length) currentSocket.send(bytes);
-}
-
-function attach(session) {
-  if (!selectedProject) return;
+async function loadProjects() {
   clearError();
+  projects = await request("/api/projects");
+  loadedProjects = true;
+  setOnline(true);
+  updateAttentionShortcut();
+  render();
+  await refreshAll({ quiet: true });
+}
+
+async function refreshAll({ quiet = false } = {}) {
+  if (!projects.length) {
+    render();
+    return;
+  }
+  const results = await Promise.all(projects.map(async (project) => {
+    try {
+      const [sessions, snapshot, board] = await Promise.all([
+        request(`/api/projects/${project.id}/sessions`),
+        request(`/api/projects/${project.id}/activity`),
+        request(`/api/projects/${project.id}/board`),
+      ]);
+      progress.set(project.id, { sessions, snapshot, board, stale: false });
+      return true;
+    } catch (error) {
+      const existing = progress.get(project.id);
+      if (existing) existing.stale = true;
+      else progress.set(project.id, { sessions: [], snapshot: null, board: null, stale: true });
+      if (!quiet) showError(`Progress unavailable: ${error.message}`);
+      return false;
+    }
+  }));
+  const allOnline = results.every(Boolean);
+  setOnline(allOnline);
+  if (allOnline) clearError();
+  updateAttentionShortcut();
+  scheduleRender();
+}
+
+function updateAttentionShortcut() {
+  let count = 0;
+  for (const project of projects) {
+    const snapshot = snapshotOf(project.id);
+    if (!snapshot) continue;
+    const unresolved = snapshot.attention.filter((item) => item.resolved_at_millis == null);
+    count += unresolved.length;
+    const fresh = unresolved.filter((item) => !noticedAttention.has(item.id) && item.seen_at_millis == null);
+    if (initializedAttention.has(project.id) && fresh.length) {
+      showToast(`${project.name}: ${fresh.length} new request${fresh.length === 1 ? "" : "s"} need your attention`);
+    }
+    for (const item of unresolved) noticedAttention.add(item.id);
+    initializedAttention.add(project.id);
+  }
+  for (const selector of ["#attention-shortcut", "#terminal-attention-shortcut"]) {
+    const button = $(selector);
+    if (!button) continue;
+    button.classList.toggle("hidden", count === 0);
+    button.textContent = `${count} need you`;
+    button.setAttribute("aria-label", `${count} unresolved requests. Open Home.`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Terminal
+// ---------------------------------------------------------------------------
+
+function fit() {
+  if (ghosttyEngine) terminal?.fit?.();
+  else fitAddon?.fit();
+}
+
+function openSession(projectId, session) {
+  navigate(`#/project/${projectId}/session/${encodeURIComponent(session.id)}`);
+}
+
+function enterTerminal(projectId, session) {
+  terminalOpen = true;
+  terminalProjectId = projectId;
+  terminalSession = session;
   appShell.classList.add("session-open");
-  dashboard.classList.add("hidden");
-  terminalView.classList.remove("hidden");
-  mainContent.classList.add("terminal-open");
+  main.classList.add("hidden");
+  $("#terminal-view").classList.remove("hidden");
   $("#terminal-title").textContent = session.title || session.label;
   const readOnly = session.state !== "running";
   $("#reconnect-button").disabled = readOnly;
   document.querySelectorAll("[data-key]").forEach((button) => { button.disabled = readOnly; });
-  setTerminalStatus(readOnly ? "Read-only · use Workspace to choose another session" : "Connecting…", false, readOnly);
+  setTerminalStatus(readOnly ? "Read-only · use Back to choose another session" : "Connecting…", false, readOnly);
 
   socketGeneration += 1;
   currentSocket?.close();
   currentSocket = null;
   if (terminal) terminal.dispose();
-  terminalSession = session;
   reconnectAttempts = 0;
   window.clearTimeout(reconnectTimer);
   reconnectTimer = null;
@@ -649,35 +1294,35 @@ function attach(session) {
         theme: { background: "#0d100d", foreground: "#e3e8df" },
       })
     : new Terminal({
-    cursorBlink: true,
-    disableStdin: readOnly,
-    convertEol: false,
-    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-    fontSize: 14,
-    scrollback: 5000,
-    theme: {
-      background: "#0d100d",
-      foreground: "#e3e8df",
-      cursor: "#b7d977",
-      selectionBackground: "#65754e77",
-      black: "#171a17",
-      red: "#e78376",
-      green: "#b7d977",
-      yellow: "#e8c474",
-      blue: "#8eacd0",
-      magenta: "#c1a0cc",
-      cyan: "#88c3b2",
-      white: "#dce2d7",
-      brightBlack: "#737d70",
-      brightRed: "#f09387",
-      brightGreen: "#c9eb8b",
-      brightYellow: "#f1d28a",
-      brightBlue: "#a6c2e4",
-      brightMagenta: "#d6b4e2",
-      brightCyan: "#a0d9c8",
-      brightWhite: "#f4f7ef",
-    },
-  });
+        cursorBlink: true,
+        disableStdin: readOnly,
+        convertEol: false,
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+        fontSize: 14,
+        scrollback: 5000,
+        theme: {
+          background: "#0d100d",
+          foreground: "#e3e8df",
+          cursor: "#b7d977",
+          selectionBackground: "#65754e77",
+          black: "#171a17",
+          red: "#e78376",
+          green: "#b7d977",
+          yellow: "#e8c474",
+          blue: "#8eacd0",
+          magenta: "#c1a0cc",
+          cyan: "#88c3b2",
+          white: "#dce2d7",
+          brightBlack: "#737d70",
+          brightRed: "#f09387",
+          brightGreen: "#c9eb8b",
+          brightYellow: "#f1d28a",
+          brightBlue: "#a6c2e4",
+          brightMagenta: "#d6b4e2",
+          brightCyan: "#a0d9c8",
+          brightWhite: "#f4f7ef",
+        },
+      });
   fitAddon = new FitAddon();
   terminal.loadAddon(fitAddon);
   terminal.open($("#terminal"));
@@ -690,7 +1335,6 @@ function attach(session) {
     if (!applyingRemoteResize && !readOnly) sendTerminalResize(cols, rows);
   });
   for (const button of document.querySelectorAll("[data-key]")) {
-    button.disabled = readOnly;
     button.onclick = () => {
       terminal?.focus();
       const key = {
@@ -714,10 +1358,27 @@ function attach(session) {
   connectTerminal(session, false);
 }
 
+function terminalInputFilter(data) {
+  return data
+    .replace(/\x1b\[[0-9;?]*[Rcn]/g, "")
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/gs, "")
+    .replace(/\x1bP[\s\S]*?\x1b\\/g, "");
+}
+
+function sendTerminalInput(data) {
+  if (terminalSession?.state !== "running" || !currentSocket || currentSocket.readyState !== WebSocket.OPEN) return;
+  const filtered = terminalInputFilter(data);
+  if (filtered) currentSocket.send(new TextEncoder().encode(filtered));
+}
+
+function sendTerminalBytes(bytes) {
+  if (terminalSession?.state === "running" && currentSocket?.readyState === WebSocket.OPEN && bytes.length) currentSocket.send(bytes);
+}
+
 function connectTerminal(session, reset) {
   if (reset) terminal?.reset();
   const socketUrl = new URL(
-    `api/projects/${selectedProject.id}/sessions/${encodeURIComponent(session.id)}/terminal`,
+    `api/projects/${terminalProjectId}/sessions/${encodeURIComponent(session.id)}/terminal`,
     document.baseURI,
   );
   socketUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -729,9 +1390,7 @@ function connectTerminal(session, reset) {
   socket.addEventListener("open", () => {
     if (generation !== socketGeneration) return;
     setTerminalStatus(
-      session.state === "running"
-        ? "Connected"
-        : "Read-only · use Workspace to choose another session",
+      session.state === "running" ? "Connected" : "Read-only · use Back to choose another session",
       session.state === "running",
     );
     fit();
@@ -774,7 +1433,7 @@ function connectTerminal(session, reset) {
 function sendTerminalResize(cols, rows) {
   if (terminalSession?.state === "running" && currentSocket?.readyState === WebSocket.OPEN && cols && rows) {
     currentSocket.send(JSON.stringify({ type: "resize", cols, rows }));
-}
+  }
 }
 
 function applyRemoteResize(cols, rows) {
@@ -802,10 +1461,10 @@ async function retryOrFinishSession(generation) {
   const session = terminalSession;
   if (!session || session.state !== "running") return;
   try {
-    const sessions = await request(`/api/projects/${selectedProject.id}/sessions`);
+    const sessions = await request(`/api/projects/${terminalProjectId}/sessions`);
     const current = sessions.find((item) => item.id === session.id);
     if (!current) {
-      detach();
+      closeTerminal();
       return;
     }
     if (current.state !== "running") {
@@ -829,16 +1488,17 @@ function reconnectNow() {
   connectTerminal(session, true);
 }
 
-function setTerminalStatus(message, connected = false, error = false) {
+function setTerminalStatus(message, connected = false) {
   const status = $("#terminal-connection");
   status.textContent = message;
   status.classList.toggle("connected", connected);
 }
+
 function setTerminalReadOnly(state) {
   if (terminalSession) terminalSession = { ...terminalSession, state };
   $("#reconnect-button").disabled = true;
   document.querySelectorAll("[data-key]").forEach((button) => { button.disabled = true; });
-  setTerminalStatus("Read-only · use Workspace to choose another session");
+  setTerminalStatus("Read-only · use Back to choose another session");
 }
 
 function fitTerminal() {
@@ -848,8 +1508,22 @@ function fitTerminal() {
   }, 60);
 }
 
-function detach() {
+function closeTerminal() {
+  const target = lastNonSessionHash || "#/";
+  if (location.hash !== target) {
+    exitTerminal();
+    location.hash = target;
+  } else {
+    exitTerminal();
+    render();
+  }
+}
+
+/// Tear the terminal down without touching the route.
+function exitTerminal() {
+  terminalOpen = false;
   terminalSession = null;
+  terminalProjectId = null;
   socketGeneration += 1;
   window.clearTimeout(reconnectTimer);
   reconnectTimer = null;
@@ -864,127 +1538,46 @@ function detach() {
   terminal?.dispose();
   terminal = null;
   fitAddon = null;
-  terminalView.classList.add("hidden");
+  $("#terminal-view").classList.add("hidden");
   appShell.classList.remove("session-open");
-  mainContent.classList.remove("terminal-open");
-  dashboard.classList.remove("hidden");
-  loadProjectData().catch((error) => showError(error.message));
+  main.classList.remove("hidden");
 }
 
-async function addTodo(title) {
-  const project = selectedProject;
-  const trimmed = title.trim();
-  if (!project || !trimmed) return;
-  try {
-    const board = await request(`/api/projects/${project.id}/board`, {
-      method: "POST",
-      body: JSON.stringify({ title: trimmed }),
-    });
-    const progress = projectProgress.get(project.id);
-    if (progress) progress.board = board;
-    if (selectedProject?.id === project.id) {
-      renderBoard(board);
-      renderProjects();
-    }
-    $("#todo-add-input")?.focus({ preventScroll: true });
-  } catch (error) {
-    showToast(error.message);
-  }
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+
+function syncAppViewport() {
+  const viewport = window.visualViewport;
+  if (!viewport) return;
+  appShell.style.setProperty("--visual-viewport-height", `${viewport.height}px`);
+  appShell.style.setProperty("--visual-viewport-offset-top", `${viewport.offsetTop}px`);
 }
 
-async function createShell() {
-  const project = selectedProject;
-  if (!project) return;
-  const button = $("#new-shell-button");
-  button.disabled = true;
-  try {
-    const session = await request(`/api/projects/${project.id}/sessions`, {
-      method: "POST",
-      body: "{}",
-    });
-    if (selectedProject?.id === project.id) attach(session);
-  } catch (error) {
-    showError(error.message);
-  } finally {
-    button.disabled = false;
-  }
-}
+syncAppViewport();
+window.addEventListener("resize", syncAppViewport);
+window.visualViewport?.addEventListener("resize", syncAppViewport);
+window.visualViewport?.addEventListener("scroll", syncAppViewport);
 
-projectList.addEventListener("click", (event) => {
-  const agentButton = event.target.closest("[data-session-id]");
-  if (agentButton) {
-    const projectId = Number(agentButton.dataset.agentProjectId);
-    const sessions = projectSessions.get(projectId) || [];
-    const session = sessions.find((item) => item.id === agentButton.dataset.sessionId);
-    const project = projects.find((item) => item.id === projectId);
-    if (session && session.attachable !== false && project) {
-      selectedProject = project;
-      const url = new URL(document.baseURI);
-      url.searchParams.set("project", String(projectId));
-      history.replaceState(null, "", url);
-      renderProjects();
-      attach(session);
-    }
-    return;
-  }
-
-  const toggle = event.target.closest("[data-toggle-project-id]");
-  if (toggle) {
-    const projectId = Number(toggle.dataset.toggleProjectId);
-    if (expandedProjects.has(projectId)) expandedProjects.delete(projectId);
-    else expandedProjects.add(projectId);
-    renderProjects();
-    return;
-  }
-
-  const button = event.target.closest("[data-project-id]");
-  if (!button) return;
-  const project = projects.find((item) => item.id === Number(button.dataset.projectId));
-  if (!project) return;
-
-  const alreadySelected = selectedProject?.id === project.id;
-  selectedProject = project;
-  expandedProjects.add(project.id);
-  renderProjects(project.id);
-  const projectUrl = new URL(document.baseURI);
-  projectUrl.searchParams.set("project", String(project.id));
-  history.replaceState(null, "", projectUrl);
-  if (!terminalView.classList.contains("hidden")) {
-    detach();
-  } else if (!alreadySelected) {
-    clearError();
-    loadProjectData().catch((error) => showError(error.message));
-  }
+$("#attention-shortcut").addEventListener("click", () => navigate("#/"));
+$("#terminal-attention-shortcut").addEventListener("click", () => {
+  lastNonSessionHash = "#/";
+  closeTerminal();
 });
-$("#attention-list").addEventListener("focusout", () => {
-  window.setTimeout(() => {
-    if (!$("#attention-list").contains(document.activeElement) && latestAttentionSnapshot) {
-      renderAttention(latestAttentionSnapshot);
-    }
-  }, 0);
-});
-$("#attention-shortcut").addEventListener("click", openAttention);
-$("#terminal-attention-shortcut").addEventListener("click", openAttention);
-$("#new-shell-button").addEventListener("click", createShell);
-$("#todo-add-form").addEventListener("submit", (event) => {
-  event.preventDefault();
-  const input = $("#todo-add-input");
-  const title = input.value;
-  input.value = "";
-  addTodo(title);
-});
-$("#refresh-button").addEventListener("click", () => loadProjectData().catch((error) => showError(error.message)));
-$("#back-button").addEventListener("click", detach);
-$("#detach-button").addEventListener("click", detach);
+$("#refresh-button").addEventListener("click", () => refreshAll().catch((error) => showError(error.message)));
+$("#back-button").addEventListener("click", closeTerminal);
+$("#detach-button").addEventListener("click", closeTerminal);
 $("#reconnect-button").addEventListener("click", reconnectNow);
 window.addEventListener("beforeunload", () => currentSocket?.close());
 
 loadProjects().catch((error) => {
-  serverState.classList.remove("online");
-  serverState.setAttribute("aria-label", "Server unavailable");
+  loadedProjects = true;
+  setOnline(false);
   showError(error.message);
+  render();
 });
-refreshTimer = window.setInterval(() => {
-  loadProjectData().catch((error) => showError(error.message));
+
+window.setInterval(() => {
+  if (terminalOpen) return;
+  refreshAll({ quiet: true }).catch(() => {});
 }, 3000);
-void refreshTimer;

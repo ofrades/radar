@@ -2,44 +2,67 @@
 
 `radar web` starts a local HTTP/WebSocket client for the existing session daemon.
 It binds to `127.0.0.1` by default (port `8787`) and does not expose the daemon's
-private Unix socket. The web page uses xterm.js to render terminal bytes and
-provides a responsive project view with sessions, activity, outstanding
-attention requests, and expandable project-sidebar agent lists. Live and
-registry-retained rows are “Open session” actions: running sessions open as
-interactive terminals; ended daemon sessions open their retained terminal
-screen read-only.
+private Unix socket. The page uses xterm.js — or the libghostty-vt WASM engine
+when the build ships it — to render terminal bytes.
 
-Opening a session switches to an immersive terminal view that hides project
-navigation so the terminal uses the available viewport; **Workspace** returns
-to the project view.
+## Information architecture (native Home parity)
+
+The browser client is the native Home, remotely. It is project-first and has no
+permanent sidebar; navigation is a drill-down with a real Back:
+
+- **Home** (`#/`) — the cockpit. A hero line ("N projects · M need you"), an
+  **Agents** destination card, a **Needs you** lane of every unresolved request
+  across every project with its answer/approve/deny/dismiss/mark-seen/
+  acknowledge actions, and a **Projects** lane: one card per project with its
+  board pills (lane name and open count), a to-do input, its open to-dos
+  (tick to close, open to read), each carrying its claim and latest agent note,
+  and a footer pulse of running and stopped agents.
+- **Project** (`#/project/{id}`) — the project's board as columns (Todo, In
+  progress, Review; the Done lane is where finished work leaves the board).
+  A to-do opens its conversation.
+- **Card** (`#/project/{id}/card/{cardId}`) — the card as a conversation: its
+  markdown body, its stable id with a copy button, controls to edit, close or
+  reopen and move it between lanes, its linked sessions, its thread (human and
+  agent messages, board transitions, resolved answers, and any unresolved
+  request with its actions), and a reply box.
+- **Agents** (`#/agents`) — every project's sessions in one place; a running or
+  retained session opens interactively, catalog-only history is inert.
+- **Session** (`#/project/{id}/session/{sessionId}`) — a deep-linkable terminal.
+  Opening a session hides navigation and gives the terminal the viewport;
+  **Back** returns to where you were, and the browser's own back/forward work.
+
+Running sessions open as interactive terminals; ended daemon sessions open
+their retained terminal screen read-only. Catalog-only rows are marked
+**ended** and deliberately inert, because the daemon no longer has a terminal to
+attach to; reopen such a conversation from the native Radar sidebar, where
+provider resume links are available when the provider exposed a stable session
+id.
 
 On mobile, the app shell follows the browser's visual viewport. When the
 on-screen keyboard opens, the terminal reflows into the remaining space above
 it.
 
-The session endpoint also includes durable catalog history. Catalog-only rows
-are sorted by their provider activity time and marked **ended**; they are
-deliberately inert because the daemon no longer has a terminal to attach to.
-The browser identifies that state instead of sending a request that can only
-fail. Reopen such a conversation from the native Radar sidebar, where provider
-resume links are available when the provider exposed a stable session id. Use
-**Workspace** to return to the project and choose another live session.
-
 The workspace refreshes each registered project's board, activity, and session
-summary together. Project rows show completed work (the **Done** column alone
-defines completion), active/review counts, unresolved requests, and explicit
-reported agent state. Board claim links appear only when a claim resolves to one
-exact attachable session; ambiguous or ended claims are not guessed. The
-**Board progress** view shows the project's live card columns, while the
-attention shortcut remains available in the terminal and jumps to the first
-outstanding request without clearing it. Progress polling retains the last
-snapshot and marks it unavailable when a refresh fails.
+summary together. Board claim links appear only when a claim resolves to one
+exact attachable session; ambiguous or ended claims are not guessed. Progress
+polling retains the last snapshot and marks it unavailable when a refresh fails,
+and never rebuilds a view under a control you are typing in.
 
-The board is served from the daemon's store, not a file: `/api/projects/{id}/board`
-returns the project's lanes and cards, and card mutations (revision-checked)
-publish a `BoardChanged` activity event so every open client refreshes. The
-native desktop also delivers deduplicated attention notifications; opening one
-takes you to the relevant Board, and the request stays unresolved until you
+The board is served from the daemon's store, not a file:
+`/api/projects/{id}/board` returns the project's lanes and cards. Mutations are
+revision-checked and publish a `BoardChanged` activity event so every open
+client refreshes:
+
+- `POST /api/projects/{id}/board` — add a to-do.
+- `POST /api/projects/{id}/cards/{card}` — one mutation: `update` (title/body),
+  `move` (lane), `claim`, `release`, `complete`, `reopen`, or `remove`.
+- `POST /api/projects/{id}/cards/{card}/comments` — a human reply on the card's
+  thread (a durable activity event keyed by the card's stable id).
+- `POST /api/projects/{id}/attention/{request}` — an answer/approval/denial/
+  dismissal, or the non-resolving `seen` / `acknowledge` change.
+
+The native desktop also delivers deduplicated attention notifications; opening
+one takes you to the relevant Board, and the request stays unresolved until you
 answer or explicitly dismiss it.
 
 ## Run locally
@@ -77,15 +100,19 @@ starts, run `systemctl --user disable --now radar-web.service`. Re-run
 
 Terminal input and resize are sent to the shared session; as with native attach,
 the most recent resize sets the terminal dimensions for all attached views.
-The server sends an atomic bounded ANSI display replay and then sequenced live
-output. This restores the active screen and common modes, but not every hidden
-emulator/parser state; see the compatibility boundary in
+When the build ships the libghostty-vt WASM module the server sends a lossless
+binary snapshot on attach and the raw byte stream after it, so the browser
+restores the exact screen, modes, scrollback and cursor — the same snapshot the
+native clients consume (see [`libghostty-vt.md`](libghostty-vt.md)). Without the
+WASM module the xterm.js fallback restores the active screen and common modes
+through the daemon's bounded ANSI replay; see the compatibility boundary in
 [`session-daemon.md`](session-daemon.md).
 
 The inbox reads durable project attention requests and sends revision-checked
 answers/approvals to the daemon. Requests created with
 `radar activity request --wait` can receive those typed responses. Agent output
-appears in the feed when the agent reports it through Radar's activity API.
+appears in a card's thread and in the project feed when the agent reports it
+through Radar's activity API.
 
 ## Reach it over Tailscale
 
@@ -114,4 +141,13 @@ web process when the client should no longer be reachable.
 
 The terminal frontend vendors `@xterm/xterm` 6.0.0 and `@xterm/addon-fit`
 0.11.0 from npm under `web/vendor/`, with their MIT license files alongside.
-They are served locally so the browser does not need a public CDN.
+They are served locally at `/assets/xterm.mjs`, `/assets/fit-addon.mjs` and
+`/assets/xterm.css`, so the browser needs no public CDN. The libghostty-vt WASM
+module (`/assets/ghostty-vt.wasm`) is built by `build.rs`; when it loads, the
+page uses it instead of xterm.js.
+
+The WASM engine runs on a 32-bit target, so the sized structs it reads
+(`GhosttyRenderStateColors`, `GhosttyRenderStateCursor`,
+`GhosttyTerminalScrollViewport`) are laid out with a 4-byte `size_t`. The
+offsets in `web/ghostty-terminal.mjs` must match that wasm32 layout, not the
+host's 64-bit layout.

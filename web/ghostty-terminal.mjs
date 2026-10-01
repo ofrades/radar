@@ -38,10 +38,26 @@ const MOUSE_BUTTON_FIVE = 5; // wheel down
 const MOUSE_ENCODER_OPT_SIZE = 2;
 const SUCCESS = 0;
 
-// Struct sizes/offsets from the pinned ABI (repr(C)).
-const COLORS_SIZE = 8 + 3 + 3 + 3 + 1 + 768;
+// Struct sizes/offsets for the wasm32 ABI. This module runs in WebAssembly,
+// where `size_t` is 4 bytes and pointers are 32-bit; the sized structs below
+// are laid out with that width, not the host's 8-byte `size_t`. (GhosttyStyle
+// happens to keep its field offsets either way, because the `uint64_t` in its
+// color union forces 8-byte alignment; the color and cursor structs do not.)
+//
+// GhosttyRenderStateColors: size_t(4) background(3) foreground(3) cursor(3)
+//   cursor_has_value(1) palette[256](768) => 782, padded to 784.
+// GhosttyRenderStateCursor: size_t(4) viewport_has_value(1) pad(1)
+//   viewport_x(2) viewport_y(2) wide_tail(1) visible(1) blinking(1)
+//   password_input(1) pad(2) visual_style(4) => 20.
+// GhosttyStyle: size_t(4) pad(4) three 16-byte colors(48) eight bools(8)
+//   underline(4) => 68, padded to 72.
+// GhosttyTerminalScrollViewport: size_t(4) tag(4) value(16) => 24.
+const COLORS_SIZE = 784;
+const COLORS_BACKGROUND = 4;
+const COLORS_FOREGROUND = 7;
+const COLORS_PALETTE = 14;
 const STYLE_SIZE = 72;
-const CURSOR_SIZE = 24;
+const CURSOR_SIZE = 20;
 const SCROLL_DELTA = 2;
 // GhosttyTerminalModeConfig { mode: u16, value: bool }.
 const MODE_CONFIG_SIZE = 4;
@@ -178,25 +194,25 @@ class Engine {
     this.e.ghostty_wasm_free(rowsPtr, 2);
 
     const colorsPtr = this.e.ghostty_wasm_alloc(COLORS_SIZE);
-    this.view().setBigUint64(colorsPtr, BigInt(COLORS_SIZE), true);
+    this.view().setUint32(colorsPtr, COLORS_SIZE, true);
     this.e.ghostty_render_state_get(state, DATA_COLORS, colorsPtr);
     const u8 = this.bytes();
-    const background = [u8[colorsPtr + 8], u8[colorsPtr + 9], u8[colorsPtr + 10]];
-    const foreground = [u8[colorsPtr + 11], u8[colorsPtr + 12], u8[colorsPtr + 13]];
+    const background = [u8[colorsPtr + COLORS_BACKGROUND], u8[colorsPtr + COLORS_BACKGROUND + 1], u8[colorsPtr + COLORS_BACKGROUND + 2]];
+    const foreground = [u8[colorsPtr + COLORS_FOREGROUND], u8[colorsPtr + COLORS_FOREGROUND + 1], u8[colorsPtr + COLORS_FOREGROUND + 2]];
     for (let i = 0; i < 256; i++) {
-      const o = colorsPtr + 18 + i * 3;
+      const o = colorsPtr + COLORS_PALETTE + i * 3;
       palette[i] = [u8[o], u8[o + 1], u8[o + 2]];
     }
     this.e.ghostty_wasm_free(colorsPtr, COLORS_SIZE);
 
     const cursorPtr = this.e.ghostty_wasm_alloc(CURSOR_SIZE);
-    this.view().setBigUint64(cursorPtr, BigInt(CURSOR_SIZE), true);
+    this.view().setUint32(cursorPtr, CURSOR_SIZE, true);
     this.e.ghostty_render_state_get(state, DATA_CURSOR, cursorPtr);
     const cursor = {
-      hasValue: u8[cursorPtr + 8] !== 0,
-      x: this.view().getUint16(cursorPtr + 10, true),
-      y: this.view().getUint16(cursorPtr + 12, true),
-      visible: u8[cursorPtr + 15] !== 0,
+      hasValue: u8[cursorPtr + 4] !== 0,
+      x: this.view().getUint16(cursorPtr + 6, true),
+      y: this.view().getUint16(cursorPtr + 8, true),
+      visible: u8[cursorPtr + 11] !== 0,
     };
     this.e.ghostty_wasm_free(cursorPtr, CURSOR_SIZE);
 
@@ -230,7 +246,7 @@ class Engine {
           this.e.ghostty_wasm_free(bufPtr, len * 4);
         }
         const stylePtr = this.e.ghostty_wasm_alloc(STYLE_SIZE);
-        this.view().setBigUint64(stylePtr, BigInt(STYLE_SIZE), true);
+        this.view().setUint32(stylePtr, STYLE_SIZE, true);
         this.e.ghostty_render_state_row_cells_get(cells, CELLS_DATA_STYLE, stylePtr);
         const flags = this.bytes();
         const style = {
@@ -428,6 +444,22 @@ export class GhosttyTerminal {
     }
   }
 
+  /**
+   * Resize to explicit dimensions, mirroring xterm.js. Used when the server
+   * reports another attached view's resize; the local listener is not told,
+   * so the client does not echo the change back.
+   */
+  resize(cols, rows) {
+    if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) return;
+    if (cols === this.cols && rows === this.rows) return;
+    this.cols = cols;
+    this.rows = rows;
+    this.ready.then(() => {
+      this.engine.e.ghostty_terminal_resize(this.terminal, cols, rows, 0, 0);
+      this.render();
+    });
+  }
+
   write(bytes) {
     if (!this.terminal) {
       this.pending.push(bytes);
@@ -509,9 +541,11 @@ export class GhosttyTerminal {
 
   scroll(delta) {
     this.ready.then(() => {
-      // The struct is passed by value; in wasm that is an indirect pointer.
+      // GhosttyTerminalScrollViewport is passed indirectly: size(4) tag(4)
+      // value(16, 8-aligned).
       const ptr = this.engine.e.ghostty_wasm_alloc(24);
-      this.engine.view().setInt32(ptr, SCROLL_DELTA, true);
+      this.engine.view().setUint32(ptr, 24, true);
+      this.engine.view().setInt32(ptr + 4, SCROLL_DELTA, true);
       this.engine.view().setBigInt64(ptr + 8, BigInt(delta), true);
       this.engine.e.ghostty_terminal_scroll_viewport(this.terminal, ptr);
       this.engine.e.ghostty_wasm_free(ptr, 24);
@@ -610,7 +644,8 @@ export class GhosttyTerminal {
   scrollBottom() {
     this.ready.then(() => {
       const ptr = this.engine.e.ghostty_wasm_alloc(24);
-      this.engine.view().setInt32(ptr, 1, true); // SCROLL_VIEWPORT_BOTTOM
+      this.engine.view().setUint32(ptr, 24, true);
+      this.engine.view().setInt32(ptr + 4, 1, true); // SCROLL_VIEWPORT_BOTTOM
       this.engine.e.ghostty_terminal_scroll_viewport(this.terminal, ptr);
       this.engine.e.ghostty_wasm_free(ptr, 24);
       this.scheduleRender();

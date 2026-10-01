@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::{self, Paths};
 use crate::db::{Db, Project};
 use crate::session::activity::{
-    ActivitySnapshot, AttentionChange, AttentionResponse, ChangeAttention,
+    ActivityKind, ActivityPayload, ActivitySnapshot, AttentionChange, AttentionResponse,
+    ChangeAttention, PublishActivity,
 };
 use crate::session::board_store::BoardState;
 use crate::session::catalog::CatalogFilter;
@@ -31,6 +32,11 @@ const INDEX: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const APP_CSS: &str = include_str!("../web/app.css");
 const GHOSTTY_TERMINAL_JS: &str = include_str!("../web/ghostty-terminal.mjs");
+/// The vendored xterm.js fallback. `app.js` imports these by URL, so they must
+/// be served from the same `assets/` path the module graph resolves against.
+const XTERM_JS: &str = include_str!("../web/vendor/xterm.mjs");
+const FIT_ADDON_JS: &str = include_str!("../web/vendor/fit-addon.mjs");
+const XTERM_CSS: &str = include_str!("../web/vendor/xterm.css");
 /// The browser's libghostty-vt module, built by `build.rs`.
 const GHOSTTY_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ghostty-vt.wasm"));
 
@@ -63,6 +69,9 @@ async fn async_run(home: PathBuf, port: u16) -> Result<()> {
         .route("/", get(index))
         .route("/assets/app.js", get(app_js))
         .route("/assets/app.css", get(app_css))
+        .route("/assets/xterm.css", get(xterm_css))
+        .route("/assets/xterm.mjs", get(xterm_js))
+        .route("/assets/fit-addon.mjs", get(fit_addon_js))
         .route("/assets/ghostty-terminal.mjs", get(ghostty_terminal_js))
         .route("/assets/ghostty-vt.wasm", get(ghostty_wasm))
         .route("/api/projects", get(projects))
@@ -74,6 +83,14 @@ async fn async_run(home: PathBuf, port: u16) -> Result<()> {
         .route(
             "/api/projects/{project_id}/board",
             get(board_snapshot).post(add_card),
+        )
+        .route(
+            "/api/projects/{project_id}/cards/{card_id}",
+            post(mutate_card),
+        )
+        .route(
+            "/api/projects/{project_id}/cards/{card_id}/comments",
+            post(comment_card),
         )
         .route(
             "/api/projects/{project_id}/attention/{request_id}",
@@ -104,6 +121,18 @@ async fn app_js() -> impl IntoResponse {
 
 async fn app_css() -> impl IntoResponse {
     static_asset("text/css; charset=utf-8", APP_CSS.as_bytes())
+}
+
+async fn xterm_css() -> impl IntoResponse {
+    static_asset("text/css; charset=utf-8", XTERM_CSS.as_bytes())
+}
+
+async fn xterm_js() -> impl IntoResponse {
+    static_asset("text/javascript; charset=utf-8", XTERM_JS.as_bytes())
+}
+
+async fn fit_addon_js() -> impl IntoResponse {
+    static_asset("text/javascript; charset=utf-8", FIT_ADDON_JS.as_bytes())
 }
 
 async fn ghostty_terminal_js() -> impl IntoResponse {
@@ -423,23 +452,27 @@ async fn board_snapshot(
     RoutePath(project_id): RoutePath<i64>,
     State(state): State<WebState>,
 ) -> ApiResult<Json<Option<BoardState>>> {
-    let db = open_db(&state.home)?;
+    Ok(Json(board_for(&state.home, project_id)?))
+}
+
+/// The project's board if its board is enabled, `None` otherwise. Shared by the
+/// read route and every card mutation, so a mutation returns the refreshed
+/// board in one trip.
+fn board_for(home: &Path, project_id: i64) -> ApiResult<Option<BoardState>> {
+    let db = open_db(home)?;
     let Some(project) = db.project(project_id).map_err(ApiError::internal)? else {
-        return Ok(Json(None));
+        return Ok(None);
     };
     if !db
         .project_settings(project.id)
         .map_err(ApiError::internal)?
         .board_enabled
     {
-        return Ok(Json(None));
+        return Ok(None);
     }
-
     // The board lives in the daemon's store, not a file.
-    match Client::request(&state.home, Command::BoardState { project_id })
-        .map_err(ApiError::internal)?
-    {
-        Response::BoardState(board) => Ok(Json(Some(board))),
+    match Client::request(home, Command::BoardState { project_id }).map_err(ApiError::internal)? {
+        Response::BoardState(board) => Ok(Some(board)),
         _ => Err(ApiError::internal(
             "daemon returned an unexpected board response",
         )),
@@ -501,12 +534,172 @@ async fn add_card(
             ))
         }
     }
-    match Client::request(&state.home, Command::BoardState { project_id })
-        .map_err(ApiError::internal)?
+    Ok(Json(board_for(&state.home, project_id)?))
+}
+
+/// One card mutation from the browser: edit, move, claim/release, close or
+/// reopen. Revision-checked exactly like the native client, so two writers
+/// cannot silently clobber each other; the refreshed board comes back so the
+/// client renders in one trip.
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum CardMutation {
+    Update {
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        revision: Option<u64>,
+    },
+    Move {
+        lane: String,
+        #[serde(default)]
+        revision: Option<u64>,
+    },
+    Claim {
+        claim: String,
+        #[serde(default)]
+        revision: Option<u64>,
+    },
+    Release {
+        #[serde(default)]
+        revision: Option<u64>,
+    },
+    Complete {
+        #[serde(default)]
+        revision: Option<u64>,
+    },
+    Reopen {
+        #[serde(default)]
+        revision: Option<u64>,
+    },
+    Remove,
+}
+
+async fn mutate_card(
+    RoutePath((project_id, card_id)): RoutePath<(i64, String)>,
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(mutation): Json<CardMutation>,
+) -> ApiResult<Json<Option<BoardState>>> {
+    require_same_origin(&headers)?;
+    require_project(&state.home, project_id)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let command = |label: &str| format!("web-{label}-{}-{now:x}", std::process::id());
+    let home = &state.home;
+    match mutation {
+        CardMutation::Update {
+            title,
+            body,
+            revision,
+        } => {
+            let title = title.map(|title| title.trim().to_string());
+            if title.as_deref() == Some("") {
+                return Err(ApiError::bad_request("a card needs a title"));
+            }
+            daemon::board_card_update(
+                home,
+                project_id,
+                &card_id,
+                title.as_deref(),
+                body.as_deref(),
+                revision,
+                &command("edit"),
+            )
+            .map_err(ApiError::internal)?;
+        }
+        CardMutation::Move { lane, revision } => {
+            daemon::board_card_move(home, project_id, &card_id, &lane, revision, &command("move"))
+                .map_err(ApiError::internal)?;
+        }
+        CardMutation::Claim { claim, revision } => {
+            let claim = claim.trim();
+            if claim.is_empty() {
+                return Err(ApiError::bad_request("a claim needs a name"));
+            }
+            daemon::board_card_claim(
+                home,
+                project_id,
+                &card_id,
+                Some(claim),
+                revision,
+                &command("claim"),
+            )
+            .map_err(ApiError::internal)?;
+        }
+        CardMutation::Release { revision } => {
+            daemon::board_card_claim(
+                home,
+                project_id,
+                &card_id,
+                None,
+                revision,
+                &command("release"),
+            )
+            .map_err(ApiError::internal)?;
+        }
+        CardMutation::Complete { revision } => {
+            daemon::board_card_complete(home, project_id, &card_id, revision, &command("done"))
+                .map_err(ApiError::internal)?;
+        }
+        CardMutation::Reopen { revision } => {
+            daemon::board_card_reopen(home, project_id, &card_id, revision, &command("reopen"))
+                .map_err(ApiError::internal)?;
+        }
+        CardMutation::Remove => {
+            daemon::board_card_remove(home, project_id, &card_id, &command("remove"))
+                .map_err(ApiError::internal)?;
+        }
+    }
+    Ok(Json(board_for(home, project_id)?))
+}
+
+#[derive(Deserialize)]
+struct NewComment {
+    text: String,
+}
+
+/// A human reply on a card. The comment is a durable activity event in the
+/// project journal, keyed by the card's stable id — the same thread the native
+/// card view and `radar card show` read.
+async fn comment_card(
+    RoutePath((project_id, card_id)): RoutePath<(i64, String)>,
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(comment): Json<NewComment>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_same_origin(&headers)?;
+    require_project(&state.home, project_id)?;
+    let text = comment.text.trim();
+    if text.is_empty() {
+        return Err(ApiError::bad_request("a comment needs text"));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    match Client::request(
+        &state.home,
+        Command::PublishActivity(PublishActivity {
+            project_id,
+            command_id: format!("web-comment-{}-{now:x}", std::process::id()),
+            session_id: None,
+            card_id: Some(card_id),
+            kind: ActivityKind::Reported,
+            payload: ActivityPayload::Message {
+                text: text.to_string(),
+            },
+        }),
+    )
+    .map_err(ApiError::internal)?
     {
-        Response::BoardState(board) => Ok(Json(Some(board))),
+        Response::ActivityPublished(event) => Ok(Json(serde_json::json!({ "event": event }))),
         _ => Err(ApiError::internal(
-            "daemon returned an unexpected board response",
+            "daemon returned an unexpected activity response",
         )),
     }
 }
@@ -523,8 +716,14 @@ enum ReplyAction {
 #[derive(Deserialize)]
 struct AttentionReply {
     revision: u64,
-    action: ReplyAction,
+    #[serde(default)]
+    action: Option<ReplyAction>,
+    #[serde(default)]
     answer: Option<String>,
+    /// A non-answering state change: `seen` or `acknowledge`. Reading a
+    /// request must not resolve it, so these stay distinct from `action`.
+    #[serde(default)]
+    change: Option<String>,
 }
 
 async fn respond_attention(
@@ -535,20 +734,34 @@ async fn respond_attention(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_same_origin(&headers)?;
     require_project(&state.home, project_id)?;
-    let response = match reply.action {
-        ReplyAction::Answer => AttentionResponse::Answer(
-            reply
-                .answer
-                .filter(|answer| !answer.trim().is_empty())
-                .ok_or_else(|| ApiError::bad_request("answer text is required"))?,
-        ),
-        ReplyAction::Approve if reply.answer.is_none() => AttentionResponse::Approve,
-        ReplyAction::Deny if reply.answer.is_none() => AttentionResponse::Deny,
-        ReplyAction::Dismiss if reply.answer.is_none() => AttentionResponse::Dismiss,
-        _ => {
-            return Err(ApiError::bad_request(
-                "answer is only valid for the answer action",
-            ))
+    let change = match reply.change.as_deref() {
+        Some("seen") => AttentionChange::MarkSeen,
+        Some("acknowledge") => AttentionChange::Acknowledge,
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "unknown attention change: {other}"
+            )))
+        }
+        None => {
+            let action = reply
+                .action
+                .ok_or_else(|| ApiError::bad_request("an action is required"))?;
+            AttentionChange::Respond(match action {
+                ReplyAction::Answer => AttentionResponse::Answer(
+                    reply
+                        .answer
+                        .filter(|answer| !answer.trim().is_empty())
+                        .ok_or_else(|| ApiError::bad_request("answer text is required"))?,
+                ),
+                ReplyAction::Approve if reply.answer.is_none() => AttentionResponse::Approve,
+                ReplyAction::Deny if reply.answer.is_none() => AttentionResponse::Deny,
+                ReplyAction::Dismiss if reply.answer.is_none() => AttentionResponse::Dismiss,
+                _ => {
+                    return Err(ApiError::bad_request(
+                        "answer is only valid for the answer action",
+                    ))
+                }
+            })
         }
     };
     let now = SystemTime::now()
@@ -562,7 +775,7 @@ async fn respond_attention(
             request_id,
             command_id: format!("web-{}-{now:x}", std::process::id()),
             expected_revision: reply.revision,
-            change: AttentionChange::Respond(response),
+            change,
         }),
     )
     .map_err(ApiError::internal)?
@@ -1111,6 +1324,72 @@ mod tests {
             session_label("web-project-17-shell-123"),
             ("Web shell".to_string(), Some("shell".to_string()), None)
         );
+    }
+
+    #[test]
+    fn card_mutations_parse_from_the_browser_shape() {
+        let update: CardMutation = serde_json::from_value(serde_json::json!({
+            "action": "update",
+            "title": "New title",
+            "body": "Body",
+            "revision": 4
+        }))
+        .unwrap();
+        match update {
+            CardMutation::Update {
+                title,
+                body,
+                revision,
+            } => {
+                assert_eq!(title.as_deref(), Some("New title"));
+                assert_eq!(body.as_deref(), Some("Body"));
+                assert_eq!(revision, Some(4));
+            }
+            _ => panic!("expected an update"),
+        }
+
+        let release: CardMutation =
+            serde_json::from_value(serde_json::json!({ "action": "release" })).unwrap();
+        assert!(matches!(release, CardMutation::Release { revision: None }));
+
+        let complete: CardMutation =
+            serde_json::from_value(serde_json::json!({ "action": "complete", "revision": 2 }))
+                .unwrap();
+        assert!(matches!(
+            complete,
+            CardMutation::Complete { revision: Some(2) }
+        ));
+
+        let move_to: CardMutation =
+            serde_json::from_value(serde_json::json!({ "action": "move", "lane": "Review" }))
+                .unwrap();
+        match move_to {
+            CardMutation::Move { lane, revision } => {
+                assert_eq!(lane, "Review");
+                assert_eq!(revision, None);
+            }
+            _ => panic!("expected a move"),
+        }
+    }
+
+    #[test]
+    fn attention_replies_accept_seen_and_acknowledge_without_an_action() {
+        let seen: AttentionReply = serde_json::from_value(serde_json::json!({
+            "revision": 2,
+            "change": "seen"
+        }))
+        .unwrap();
+        assert_eq!(seen.change.as_deref(), Some("seen"));
+        assert!(seen.action.is_none());
+
+        let answered: AttentionReply = serde_json::from_value(serde_json::json!({
+            "revision": 1,
+            "action": "answer",
+            "answer": "yes"
+        }))
+        .unwrap();
+        assert_eq!(answered.answer.as_deref(), Some("yes"));
+        assert!(answered.change.is_none());
     }
 
     #[test]

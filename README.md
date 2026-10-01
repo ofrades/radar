@@ -296,11 +296,13 @@ session list.
 
 ## Remote browser client
 
-`radar web` serves a responsive browser workspace on `127.0.0.1:8787`: choose a
-project, see its Radar-launched sessions and activity, answer outstanding agent
-requests, open running sessions interactively or ended sessions read-only, and
-start a project shell. Detaching the web terminal leaves a running session alive.
-The browser decodes the same libghostty-vt snapshots via WASM and renders
+`radar web` serves the native Home on `127.0.0.1:8787`: the same project-first
+cockpit, remote. Home gathers every project into **Needs you**, **Agents** and
+**Projects** lanes; a project opens its board, and a to-do opens its card
+conversation — read the body, reply to the thread, edit, move or close it.
+Running sessions open as interactive terminals, ended sessions read-only, and a
+session has its own shareable URL. Detaching the web terminal leaves the session
+alive. The browser decodes the same libghostty-vt snapshots via WASM and renders
 `RenderState` to a canvas.
 
 To keep the client running with your user session, install and enable the

@@ -17,7 +17,7 @@ and keep developer tools explicit, rather than copying Basecamp's colours.
 | Empty Home | Already project-first | Keep the single Add a project action |
 | Developer workspace | Fixed kind-based splits and window-based nested-divider sizes waste available space | Shared responsive tiler with the global Agents workspace; keep compact pane headers and keyboard shortcuts |
 | Preferences, edit dialogs and shortcuts | Focused secondary controls, not primary destinations | Keep them secondary; no new navigation or duplicated settings on Home |
-| Remote web client | Separate, older sidebar-based surface | Not changed in this native pass; aligning its information architecture is a follow-up |
+| Remote web client | Separate, older sidebar-based surface | Aligned to this information architecture: Home's Basecamp lanes (Needs you, Agents, Projects), the project board, and the card conversation; see [`web-client.md`](web-client.md) |
 
 ## Navigation rules
 
