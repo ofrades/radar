@@ -29,6 +29,16 @@ terminal. It gathers every project into Basecamp-style lanes:
 
 Cards open conversations inside Home; opening a session or **Open workspace**
 is an explicit step into developer tools. Going Home never stops a program.
+
+Project workspaces and the global **Agents** workspace share automatic panel
+tiling. Adding or removing a panel rebalances the space; resizing the window
+chooses rows appropriate to the available width and height. Rows share height,
+panels within a row share width, and the final row uses its full width. There
+is no fixed agent-left or terminal-bottom bias. Terminals are resized, not
+restarted. Header drags create a manual arrangement; **Auto arrange** on either
+workspace resets it and returns to responsive tiling. Divider adjustments keep
+their local proportion as the window changes size.
+
 Session rows prefer a meaningful terminal title and fall back to the
 provider's conversation title, retaining it when the terminal reports only a
 generic program name.
@@ -101,6 +111,9 @@ the GTK app; without it the CLI and the session daemon still work.
   build, render Home's board, and, with `--notify`, raise a card question and
   assert the GUI emits a desktop `Notify`. Runs against a scratch `RADAR_HOME`
   and a private D-Bus session, so your real state and desktop are untouched.
+- `bash scripts/layout-smoke.sh` — isolated native panel allocation checks:
+  add/remove panels, wide/tall viewport reflow, full coverage without overflow,
+  and proportional manual-divider resizing.
 
 ## Using it
 

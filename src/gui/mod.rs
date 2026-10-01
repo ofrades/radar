@@ -6,15 +6,8 @@
 //! screen, and the layout arranges them the same way every time. Each open
 //! primitive is a panel of its own: panels tile the workspace, never share a
 //! header. Drag a panel by its header and drop it on another's edge to split,
-//! on its middle to swap places. The classic arrangement:
-//!
-//!   ┌──────────┬───────────────────────────────┐
-//!   │ ▣ ▤ ◫ ▦  │   editor      │      agent     │
-//!   │ filter + │               ├────────────────┤
-//!   │ project  │               │      diff      │
-//!   │ project  ├───────────────┴────────────────┤
-//!   │ project  │            terminal            │
-//!   └──────────┴───────────────────────────────┘
+//! on its middle to swap places. Automatic tiling fits rows to the available
+//! space; manual header drags override it until Auto arrange is chosen.
 //!
 //! Hiding a primitive detaches its widget; the program keeps running, so putting
 //! the agent away for a moment never interrupts it.
@@ -39,6 +32,7 @@ mod split;
 mod style;
 pub mod term;
 mod theme;
+mod tiling;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -111,8 +105,7 @@ pub fn run(paths: Paths, db: Db) -> Result<()> {
 /// Each panel holds exactly one tab — one header, one program. Tabs are
 /// per-key, so radar can run two agent panels side by side; the dock, the
 /// chords and the HUD keep aiming at a primitive's first tab. The layout
-/// places panels by kind: agent on the left, changes and editor stacked beside
-/// it, commands along the bottom.
+/// fits panels to the available space, sharing the global Agents tiler.
 struct Workspace {
     project: Project,
     /// Open tabs, by key.
@@ -130,7 +123,7 @@ struct Workspace {
     holder: gtk::Box,
     /// The panes to return to after a zoom, with the arrangement it had.
     zoom: RefCell<Option<ZoomState>>,
-    /// The user's manual arrangement. None keeps the classic auto layout;
+    /// The user's manual arrangement. None keeps responsive auto tiling;
     /// the first edge-drop split plants it, and pruning keeps it honest.
     tree: RefCell<Option<split::Node<Panel>>>,
     /// Divider drags are frequent; persist their last position once the drag
@@ -721,6 +714,13 @@ fn build_window(
     new_session.set_tooltip_text(Some("New agent session on a to-do"));
     new_session.set_action_name(Some("win.new-session"));
     workspace_bar.append(&new_session);
+    let arrange = gtk::Button::with_label("Auto arrange");
+    arrange.add_css_class("flat");
+    arrange.set_tooltip_text(Some(
+        "Fit all panels to the available space; reset manual arrangement",
+    ));
+    arrange.set_action_name(Some("win.workspace-auto-arrange"));
+    workspace_bar.append(&arrange);
     let tools = gtk::Button::with_label("Tools & shortcuts");
     tools.add_css_class("flat");
     tools.set_action_name(Some("win.hud"));
@@ -2055,6 +2055,35 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         app.window.add_action(&action);
     }
     {
+        let app = app.clone();
+        add(
+            "workspace-auto-arrange",
+            Box::new(move || {
+                if let Some(workspace) = app.current_workspace() {
+                    if let Some((panels, _)) = workspace.zoom.borrow_mut().take() {
+                        *workspace.panels.borrow_mut() = panels;
+                    }
+                    workspace.tree.borrow_mut().take();
+                    workspace.positions.borrow_mut().clear();
+                    app.layout(&workspace);
+                    app.sync_toggles();
+                    app.persist_primitives(&workspace);
+                }
+            }),
+        );
+    }
+    {
+        let app = app.clone();
+        add(
+            "agents-auto-arrange",
+            Box::new(move || {
+                if let Some(page) = app.agents_page.borrow().as_ref() {
+                    agents::auto_arrange(&app, &page.board);
+                }
+            }),
+        );
+    }
+    {
         // The Agents page's drag grammar, resolving its own board: the
         // middle of a panel swaps, an edge splits.
         let action = gio::SimpleAction::new(
@@ -2424,7 +2453,7 @@ impl App {
             .borrow()
             .as_ref()
             .map(split::Node::leaves)
-            .or_else(|| auto_node(&workspace.panels()).map(|tree| tree.leaves()))
+            .or_else(|| auto_node(workspace, &workspace.panels()).map(|tree| tree.leaves()))
             .unwrap_or_default()
     }
 
@@ -5044,7 +5073,7 @@ impl App {
         {
             let mut tree = workspace.tree.borrow_mut();
             if tree.is_none() {
-                *tree = auto_node(&workspace.panels());
+                *tree = auto_node(workspace, &workspace.panels());
             }
             let Some(tree) = tree.as_mut() else {
                 return;
@@ -5085,7 +5114,7 @@ impl App {
         {
             let mut tree = workspace.tree.borrow_mut();
             if tree.is_none() {
-                *tree = auto_node(&workspace.panels());
+                *tree = auto_node(workspace, &workspace.panels());
             }
             let Some(tree) = tree.as_mut() else {
                 return;
@@ -5152,9 +5181,9 @@ impl App {
                 .collect();
             let mut tree = match existing {
                 Some(tree) => tree.take_leaf(&dragged_panel),
-                None => auto_node(&others),
+                None => auto_node(workspace, &others),
             }
-            .or_else(|| auto_node(&others));
+            .or_else(|| auto_node(workspace, &others));
             let (first, second) = if dragged_first {
                 (
                     split::Node::leaf(&dragged_panel),
@@ -5244,9 +5273,16 @@ impl App {
         self.set_tab_program(workspace, key, program, visible);
     }
 
-    /// Arrange the panes: agent on the left, changes and editor stacked beside
-    /// it, commands along the bottom. Whatever is not open is not there.
+    /// Fit every visible panel to the space, unless the user arranged a tree.
     fn layout(&self, workspace: &Rc<Workspace>) {
+        let focus = self
+            .window
+            .focus_widget()
+            .filter(|focus| focus.is_ancestor(&workspace.holder));
+        if focus.is_some() {
+            gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
+        }
+        tiling::detach_dividers(&workspace.dividers.borrow());
         workspace.dividers.borrow_mut().clear();
         let panels = workspace.panels();
 
@@ -5303,12 +5339,26 @@ impl App {
 
         let root = match workspace.tree.borrow().as_ref() {
             Some(tree) => self.build_tree(workspace, tree),
-            None => match auto_node(&panels) {
-                Some(tree) => self.build_tree(workspace, &tree),
-                None => return,
-            },
+            None => {
+                let workspace = Rc::downgrade(workspace);
+                tiling::automatic(
+                    panels
+                        .iter()
+                        .map(|panel| panel.widget.clone().upcast())
+                        .collect(),
+                    &self.window,
+                    move |dividers| {
+                        if let Some(workspace) = workspace.upgrade() {
+                            *workspace.dividers.borrow_mut() = dividers;
+                        }
+                    },
+                )
+            }
         };
         workspace.holder.append(&root);
+        if let Some(focus) = focus.filter(|focus| focus.is_ancestor(&workspace.holder)) {
+            focus.grab_focus();
+        }
         trace(&format!(
             "layout: {} pane(s) {:?}",
             panels.len(),
@@ -5365,18 +5415,10 @@ impl App {
         paned.set_start_child(Some(first));
         paned.set_end_child(Some(second));
 
-        let extent = if orientation == gtk::Orientation::Horizontal {
-            self.window.width().max(700)
-        } else {
-            self.window.height().max(500)
-        };
-        paned.set_position(
-            workspace
-                .positions
-                .borrow()
-                .get(key)
-                .copied()
-                .unwrap_or((extent as f64 * fraction) as i32),
+        tiling::fit_divider(
+            &paned,
+            fraction,
+            workspace.positions.borrow().get(key).copied(),
         );
 
         let workspace_for_position = workspace.clone();
@@ -5390,28 +5432,7 @@ impl App {
             schedule_workspace_save(db_for_position.clone(), workspace_for_position.clone());
         });
 
-        let resize_keys = gtk::EventControllerKey::new();
-        resize_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let paned_for_keys = paned.clone();
-        let window_for_keys = self.window.clone();
-        resize_keys.connect_key_pressed(move |_, key, _, _| {
-            let focused = window_for_keys
-                .focus_widget()
-                .is_some_and(|focus| focus == paned_for_keys.clone().upcast::<gtk::Widget>());
-            if !focused {
-                return glib::Propagation::Proceed;
-            }
-            let delta = match (orientation, key) {
-                (gtk::Orientation::Horizontal, gtk::gdk::Key::Left)
-                | (gtk::Orientation::Vertical, gtk::gdk::Key::Up) => -16,
-                (gtk::Orientation::Horizontal, gtk::gdk::Key::Right)
-                | (gtk::Orientation::Vertical, gtk::gdk::Key::Down) => 16,
-                _ => return glib::Propagation::Proceed,
-            };
-            paned_for_keys.set_position(paned_for_keys.position().saturating_add(delta));
-            glib::Propagation::Stop
-        });
-        paned.add_controller(resize_keys);
+        tiling::keyboard_resize(&paned, &self.window);
         workspace.dividers.borrow_mut().push(paned.clone());
         paned.upcast()
     }
@@ -5612,12 +5633,6 @@ fn schedule_workspace_save(db: SharedDb, workspace: Rc<Workspace>) {
     *workspace.save_timeout.borrow_mut() = Some(source);
 }
 
-/// The kind a panel runs — auto layout places panels by kind, however many
-/// instances a kind has grown.
-fn anchor_kind(panel: &Rc<Panel>) -> Option<Slot> {
-    panel.key().map(|key| key.slot)
-}
-
 fn panel_id(panel: &Rc<Panel>) -> Option<TabKey> {
     panel.key()
 }
@@ -5758,93 +5773,10 @@ fn agent_tab_for_session(
         .unwrap_or(next_key)
 }
 
-/// The classic arrangement as a tree: agent-anchored main pane on the left,
-/// the rest stacked on the side, shell panes along the bottom. Mirrors the
-/// ratios and divider keys this used to build directly, so saved divider
-/// positions keep working in auto mode.
-fn auto_node(panels: &[Rc<Panel>]) -> Option<split::Node<Panel>> {
-    let bottom: Vec<Rc<Panel>> = panels
-        .iter()
-        .filter(|panel| anchor_kind(panel) == Some(Slot::Shell))
-        .cloned()
-        .collect();
-    let rest: Vec<Rc<Panel>> = panels
-        .iter()
-        .filter(|panel| !bottom.iter().any(|other| Rc::ptr_eq(other, panel)))
-        .cloned()
-        .collect();
-    let main_left = rest
-        .iter()
-        .find(|panel| anchor_kind(panel) == Some(Slot::Agent))
-        .cloned()
-        .or_else(|| rest.first().cloned());
-    let side: Vec<Rc<Panel>> = rest
-        .iter()
-        .filter(|panel| match &main_left {
-            Some(main) => !Rc::ptr_eq(main, panel),
-            None => true,
-        })
-        .cloned()
-        .collect();
-
-    let side_node = fold_nodes(&side, split::Axis::Vertical, 0.5, "side");
-    let main = match (&main_left, side_node) {
-        (Some(main), Some(side)) => Some(split::Node::split(
-            split::Axis::Horizontal,
-            0.42,
-            "main",
-            split::Node::leaf(main),
-            side,
-        )),
-        (Some(main), None) => Some(split::Node::leaf(main)),
-        (None, Some(side)) => Some(side),
-        (None, None) => None,
-    };
-    let bottom_node = fold_nodes(&bottom, split::Axis::Horizontal, 0.55, "bottom");
-    match (main, bottom_node) {
-        (Some(main), Some(bottom)) => Some(split::Node::split(
-            split::Axis::Vertical,
-            0.68,
-            "outer",
-            main,
-            bottom,
-        )),
-        (Some(main), None) => Some(main),
-        (None, Some(bottom)) => Some(bottom),
-        (None, None) => None,
-    }
-}
-
-/// Fold panes into nested splits along one axis, from the back, alternating
-/// sides — the same shape the widget fold built, so divider keys line up.
-fn fold_nodes(
-    panels: &[Rc<Panel>],
-    axis: split::Axis,
-    ratio: f64,
-    key: &str,
-) -> Option<split::Node<Panel>> {
-    let mut iter = panels.iter().rev();
-    let mut acc = split::Node::leaf(iter.next()?);
-    for (index, panel) in iter.enumerate() {
-        acc = if index % 2 == 0 {
-            split::Node::split(
-                axis,
-                ratio,
-                format!("{key}{index}"),
-                split::Node::leaf(panel),
-                acc,
-            )
-        } else {
-            split::Node::split(
-                axis,
-                ratio,
-                format!("{key}{index}"),
-                acc,
-                split::Node::leaf(panel),
-            )
-        };
-    }
-    Some(acc)
+/// Capture the same auto arrangement the responsive container currently uses
+/// when a drag turns it into a manual tree.
+fn auto_node(workspace: &Workspace, panels: &[Rc<Panel>]) -> Option<split::Node<Panel>> {
+    split::auto_node(panels, workspace.holder.width(), workspace.holder.height())
 }
 
 /// Append a line to a debug log when `RADAR_TRACE` is set.

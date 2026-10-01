@@ -1,8 +1,7 @@
 //! The pane arrangement tree.
 //!
-//! Auto mode (no tree) keeps the classic arrangement: the agent-anchored main
-//! pane on the left, everything else stacked on the side, shell panes along
-//! the bottom. The first manual body-drop ("split this pane in two") plants a
+//! Auto mode (no tree) fits rows of panels to the available space. The first
+//! manual body-drop ("split this pane in two") plants a
 //! tree, and from then on the arrangement is whatever the tree says — panes
 //! divide where you drop, panes that go away are pruned, and a tree that
 //! collapses to a single pane switches back to auto.
@@ -11,6 +10,68 @@
 //! without a display.
 
 use std::rc::Rc;
+
+/// Row counts for a space-filling layout. Prefer terminal-shaped panels (8:5),
+/// rather than choosing columns from panel count alone. An incomplete final
+/// row shares its full width; no empty grid cells waste workspace space.
+pub fn auto_rows(count: usize, width: i32, height: i32) -> Vec<usize> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let aspect = f64::from(width.max(1)) / f64::from(height.max(1));
+    let score = |rows: usize| {
+        let small = count / rows;
+        let large_rows = count % rows;
+        let small_rows = rows - large_rows;
+        let error = |cols: usize| (aspect * rows as f64 / cols as f64 / 1.6).ln().powi(2);
+        (small_rows * small) as f64 * error(small)
+            + if large_rows == 0 {
+                0.0
+            } else {
+                (large_rows * (small + 1)) as f64 * error(small + 1)
+            }
+    };
+    let rows = (1..=count)
+        .min_by(|a, b| score(*a).total_cmp(&score(*b)))
+        .unwrap_or(1);
+    (0..rows)
+        .map(|row| count / rows + usize::from(row < count % rows))
+        .collect()
+}
+
+/// Equal-height rows, equal-width panels within each row. Divider ratios are
+/// local shares, not pixel positions derived from the top-level window.
+pub fn auto_node<L>(panels: &[Rc<L>], width: i32, height: i32) -> Option<Node<L>> {
+    let planned_rows = auto_rows(panels.len(), width, height);
+    fn row<L>(panels: &[Rc<L>], path: &str) -> Node<L> {
+        if panels.len() == 1 {
+            return Node::leaf(&panels[0]);
+        }
+        let mid = panels.len().div_ceil(2);
+        Node::split(
+            Axis::Horizontal,
+            mid as f64 / panels.len() as f64,
+            path,
+            row(&panels[..mid], &format!("{path}-a")),
+            row(&panels[mid..], &format!("{path}-b")),
+        )
+    }
+    fn rows<L>(panels: &[Rc<L>], counts: &[usize], path: &str) -> Node<L> {
+        if counts.len() == 1 {
+            return row(panels, path);
+        }
+        let mid = counts.len().div_ceil(2);
+        let cut: usize = counts[..mid].iter().sum();
+        Node::split(
+            Axis::Vertical,
+            mid as f64 / counts.len() as f64,
+            path,
+            rows(&panels[..cut], &counts[..mid], &format!("{path}-a")),
+            rows(&panels[cut..], &counts[mid..], &format!("{path}-b")),
+        )
+    }
+    (!panels.is_empty()).then(|| rows(panels, &planned_rows, "auto"))
+}
 
 /// Which way a split divides the space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +276,49 @@ impl<L> Node<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_rows_follow_available_space_not_just_count() {
+        assert_eq!(auto_rows(0, 1200, 800), Vec::<usize>::new());
+        assert_eq!(auto_rows(1, 1200, 800), vec![1]);
+        assert_eq!(auto_rows(4, 1600, 1000), vec![2, 2]);
+        assert_eq!(auto_rows(4, 3200, 500), vec![4]);
+        assert_eq!(auto_rows(4, 500, 1600), vec![1, 1, 1, 1]);
+        assert_eq!(auto_rows(5, 1500, 800), vec![3, 2]);
+    }
+
+    #[test]
+    fn auto_layout_keeps_every_panel_once_in_stable_order() {
+        for count in 1..=32 {
+            let panels: Vec<_> = (0..count).map(Rc::new).collect();
+            for (width, height) in [(1600, 900), (600, 1200), (0, 0)] {
+                let tree = auto_node(&panels, width, height).unwrap();
+                assert_eq!(ids(&tree), (0..count).collect::<Vec<_>>());
+                let rows = auto_rows(count, width, height);
+                assert_eq!(rows.iter().sum::<usize>(), count);
+                assert!(rows.iter().all(|cols| *cols > 0));
+                assert!(rows.iter().max().unwrap() - rows.iter().min().unwrap() <= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn auto_divider_ratios_share_local_space_equally() {
+        let panels: Vec<_> = (0..3).map(Rc::new).collect();
+        let tree = auto_node(&panels, 2400, 500).unwrap();
+        let Node::Split {
+            axis, ratio, first, ..
+        } = tree
+        else {
+            panic!("expected split");
+        };
+        assert_eq!(axis, Axis::Horizontal);
+        assert_eq!(ratio, 2.0 / 3.0);
+        let Node::Split { ratio, .. } = *first else {
+            panic!("expected nested split");
+        };
+        assert_eq!(ratio, 0.5);
+    }
 
     /// (1 | 2) / 3 — a horizontal split of 1 and 2, vertical with 3 below.
     /// The handles come back so tests can refer to the very same leaves.

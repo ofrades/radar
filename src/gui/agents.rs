@@ -79,7 +79,16 @@ pub(super) fn page() -> AgentsPage {
     root.add_css_class("agents-view");
 
     let meta = gtk::Label::new(None);
-    root.append(&super::home::page_header("Agents", Some(&meta)));
+    let header = super::home::page_header("Agents", Some(&meta));
+    let arrange = gtk::Button::with_label("Auto arrange");
+    arrange.add_css_class("flat");
+    arrange.set_halign(gtk::Align::Start);
+    arrange.set_tooltip_text(Some(
+        "Fit all panels to the available space; reset manual arrangement",
+    ));
+    arrange.set_action_name(Some("win.agents-auto-arrange"));
+    header.append(&arrange);
+    root.append(&header);
 
     // The wall: the workspace's arrangement, filling the page — panels side
     // by side, stacked, split and swapped by drag, dividers resizable.
@@ -301,39 +310,27 @@ pub(super) fn sync(app: &App, page: &AgentsPage) {
         .set_text(&super::home::agents_count_text(board.panels.borrow().len()));
 }
 
-/// The workspace's classic arrangement, for a wall of agents: a balanced
-/// side-by-side/stacked split, alternating axes as the count grows — two
-/// panels side by side, four in a 2x2, five with the odd one taking a half.
-fn auto_node(panels: &[Rc<AgentPanel>], depth: usize) -> Option<Node<AgentPanel>> {
-    match panels {
-        [] => None,
-        [one] => Some(Node::leaf(one)),
-        many => {
-            let mid = many.len().div_ceil(2);
-            let axis = if depth % 2 == 0 {
-                split::Axis::Horizontal
-            } else {
-                split::Axis::Vertical
-            };
-            let first = auto_node(&many[..mid], depth + 1);
-            let second = auto_node(&many[mid..], depth + 1);
-            match (first, second) {
-                (Some(first), Some(second)) => Some(Node::split(
-                    axis,
-                    0.5,
-                    format!("agents-auto-{depth}-{mid}"),
-                    first,
-                    second,
-                )),
-                (one, other) => one.or(other),
-            }
-        }
-    }
+fn auto_node(board: &AgentsBoard, panels: &[Rc<AgentPanel>]) -> Option<Node<AgentPanel>> {
+    split::auto_node(panels, board.holder.width(), board.holder.height())
+}
+
+pub(super) fn auto_arrange(app: &App, board: &Rc<AgentsBoard>) {
+    board.tree.borrow_mut().take();
+    board.positions.borrow_mut().clear();
+    layout(app, board);
 }
 
 /// Render the arrangement into the holder. Structural changes only — a
 /// relayout re-parents live panels, which is safe but not free.
 fn layout(app: &App, board: &Rc<AgentsBoard>) {
+    let focus = app
+        .window
+        .focus_widget()
+        .filter(|focus| focus.is_ancestor(&board.holder));
+    if focus.is_some() {
+        gtk::prelude::GtkWindowExt::set_focus(&app.window, None::<&gtk::Widget>);
+    }
+    super::tiling::detach_dividers(&board.dividers.borrow());
     board.dividers.borrow_mut().clear();
     let panels = board.panels.borrow().clone();
 
@@ -351,12 +348,26 @@ fn layout(app: &App, board: &Rc<AgentsBoard>) {
 
     let root = match board.tree.borrow().as_ref() {
         Some(tree) => build_tree(app, board, tree),
-        None => match auto_node(&panels, 0) {
-            Some(tree) => build_tree(app, board, &tree),
-            None => return,
-        },
+        None => {
+            let board = Rc::downgrade(board);
+            super::tiling::automatic(
+                panels
+                    .iter()
+                    .map(|panel| panel.widget.clone().upcast())
+                    .collect(),
+                &app.window,
+                move |dividers| {
+                    if let Some(board) = board.upgrade() {
+                        *board.dividers.borrow_mut() = dividers;
+                    }
+                },
+            )
+        }
     };
     board.holder.append(&root);
+    if let Some(focus) = focus.filter(|focus| focus.is_ancestor(&board.holder)) {
+        focus.grab_focus();
+    }
 }
 
 fn build_tree(app: &App, board: &Rc<AgentsBoard>, node: &Node<AgentPanel>) -> gtk::Widget {
@@ -404,19 +415,7 @@ fn stacked(
     paned.set_start_child(Some(first));
     paned.set_end_child(Some(second));
 
-    let extent = if orientation == gtk::Orientation::Horizontal {
-        app.window.width().max(700)
-    } else {
-        app.window.height().max(500)
-    };
-    paned.set_position(
-        board
-            .positions
-            .borrow()
-            .get(key)
-            .copied()
-            .unwrap_or((extent as f64 * fraction) as i32),
-    );
+    super::tiling::fit_divider(&paned, fraction, board.positions.borrow().get(key).copied());
 
     let board_for_position = Rc::clone(board);
     let key = key.to_string();
@@ -427,28 +426,7 @@ fn stacked(
             .insert(key.clone(), paned.position());
     });
 
-    let resize_keys = gtk::EventControllerKey::new();
-    resize_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let paned_for_keys = paned.clone();
-    let window_for_keys = app.window.clone();
-    resize_keys.connect_key_pressed(move |_, key, _, _| {
-        let focused = window_for_keys
-            .focus_widget()
-            .is_some_and(|focus| focus == paned_for_keys.clone().upcast::<gtk::Widget>());
-        if !focused {
-            return glib::Propagation::Proceed;
-        }
-        let delta = match (orientation, key) {
-            (gtk::Orientation::Horizontal, gtk::gdk::Key::Left)
-            | (gtk::Orientation::Vertical, gtk::gdk::Key::Up) => -16,
-            (gtk::Orientation::Horizontal, gtk::gdk::Key::Right)
-            | (gtk::Orientation::Vertical, gtk::gdk::Key::Down) => 16,
-            _ => return glib::Propagation::Proceed,
-        };
-        paned_for_keys.set_position(paned_for_keys.position().saturating_add(delta));
-        glib::Propagation::Stop
-    });
-    paned.add_controller(resize_keys);
+    super::tiling::keyboard_resize(&paned, &app.window);
     board.dividers.borrow_mut().push(paned.clone());
     paned.upcast()
 }
@@ -474,7 +452,7 @@ pub(super) fn swap(app: &App, board: &Rc<AgentsBoard>, first_id: &str, second_id
     let mut tree = {
         let mut guard = board.tree.borrow_mut();
         if guard.is_none() {
-            *guard = auto_node(&board.panels.borrow().clone(), 0);
+            *guard = auto_node(board, &board.panels.borrow());
         }
         guard.take()
     };
@@ -543,9 +521,9 @@ pub(super) fn nest(
             .collect();
         let mut tree = match existing {
             Some(tree) => tree.take_leaf(&dragged_panel),
-            None => auto_node(&others, 0),
+            None => auto_node(board, &others),
         }
-        .or_else(|| auto_node(&others, 0));
+        .or_else(|| auto_node(board, &others));
         let (first, second) = if dragged_first {
             (Node::leaf(&dragged_panel), Node::leaf(&target_panel))
         } else {

@@ -15,7 +15,7 @@ and keep developer tools explicit, rather than copying Basecamp's colours.
 | Agents | Different compact header despite being a Home destination | Same hero/back header; retain persistent live panes and their arrangement |
 | Add project | Another custom toolbar header | Same hero/back header with an explicit Choose folder action; keep the existing search/add/create flow |
 | Empty Home | Already project-first | Keep the single Add a project action |
-| Developer workspace | Dense controls are useful inside a tool | Keep compact pane headers and keyboard shortcuts; entered explicitly from the project |
+| Developer workspace | Fixed kind-based splits and window-based nested-divider sizes waste available space | Shared responsive tiler with the global Agents workspace; keep compact pane headers and keyboard shortcuts |
 | Preferences, edit dialogs and shortcuts | Focused secondary controls, not primary destinations | Keep them secondary; no new navigation or duplicated settings on Home |
 | Remote web client | Separate, older sidebar-based surface | Not changed in this native pass; aligning its information architecture is a follow-up |
 
@@ -38,3 +38,21 @@ and keep developer tools explicit, rather than copying Basecamp's colours.
 5. Agents: typing and layout survive metadata updates and returning Home.
 6. Narrow window: Home cards wrap and project columns remain scrollable.
 7. Theme changes continue to recolour cards; terminals retain compact chrome.
+
+## Workspace sizing follow-up
+
+Both workspaces use one pure row planner, scored against terminal-shaped 8:5
+panels using the actual content allocation. It distributes panels in stable
+order, with equal row heights and equal panel widths within each row; the last
+row stretches rather than leaving blank cells. Membership changes rebuild the
+automatic arrangement; viewport changes only reparent panels if the row plan
+changes. Existing terminal widgets/processes are retained. Nested dividers use
+their own allocation, including the separator, instead of the window's size.
+
+Manual header drags remain an override. Auto arrange clears that override and
+stale divider positions (and exits a project-panel zoom), without reviving
+dismissed global panels. Dividers retain their local proportions on resize.
+With many panels, auto mode allows shrinking below comfortable minimum sizes
+so it still fits; use project zoom for focused work.
+
+Check with `bash scripts/layout-smoke.sh` and `bash scripts/home-smoke.sh`.
