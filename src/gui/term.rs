@@ -760,8 +760,12 @@ fn wheel_scroll(
 
     if term.mouse_tracking() {
         mouse.sync(term, spot.screen_px, spot.cell_px);
-        let bytes = mouse.wheel(up, spot.pos);
-        if !bytes.is_empty() {
+        // One press per row: a program scrolls per event received.
+        for _ in 0..count {
+            let bytes = mouse.wheel(up, spot.pos);
+            if bytes.is_empty() {
+                break;
+            }
             send(&bytes);
         }
         return;
@@ -964,11 +968,11 @@ mod tests {
         assert!(reentered.get(), "the resize callback must run");
     }
 
-    /// A wheel spot matching an 80×24 view of 8×16 cells.
+    /// A wheel spot matching an 80×32 view of 8×16 cells.
     fn spot(pos: (f32, f32)) -> WheelSpot {
         WheelSpot {
             pos,
-            screen_px: (80, 24),
+            screen_px: (80, 32),
             cell_px: (8, 16),
         }
     }
@@ -1049,14 +1053,18 @@ mod tests {
         wheel_scroll(
             &mut term,
             &mut mouse,
-            -1,
+            -3,
             spot((16.0, 16.0)),
             &mut |bytes| {
                 sent.push(bytes.to_vec());
             },
         );
 
-        assert_eq!(sent.len(), 1, "one tick, one press: {sent:?}");
+        assert_eq!(
+            sent,
+            vec![b"\x1b[<64;3;2M".to_vec(); 3],
+            "three rows, three presses: {sent:?}"
+        );
         let after_top: String = render.frame(&term).lines[0]
             .cells
             .iter()

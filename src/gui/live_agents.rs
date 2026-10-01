@@ -41,6 +41,11 @@ pub(super) struct AgentSession {
     /// The board to-do the process was launched for (`RADAR_CARD_ID`), when
     /// readable. Stable for the process's life, unlike the card's claim.
     pub card_id: Option<String>,
+    /// The process behind the entry, when there is one: a live registry
+    /// session's child, or an external process. A new pid under the same
+    /// stable id means the session was respawned — views attached to the old
+    /// process re-attach.
+    pub pid: Option<u32>,
     pub last_activity_at: i64,
     pub running: bool,
     pub archived: bool,
@@ -261,6 +266,7 @@ pub(super) fn discover(
             external: None,
             catalog_id: entry.as_ref().map(|entry| entry.id),
             claim_id: status.pid.and_then(programs::launch::radar_agent_of),
+            pid: status.pid,
             card_id: status
                 .pid
                 .and_then(programs::launch::radar_card_of)
@@ -304,6 +310,7 @@ pub(super) fn discover(
             radar_session_id: entry.radar_session_id.clone(),
             provider_session_id: Some(entry.provider_session_id.clone()),
             claim_id: None,
+            pid: None,
             card_id: entry.card_id.clone(),
             last_activity_at: entry.last_activity_at,
             running: entry.lifecycle == "running",
@@ -477,6 +484,7 @@ fn external_sessions(
             radar_session_id: None,
             provider_session_id: explicit_session_id(&process.program, &process.argv),
             claim_id: programs::launch::radar_agent_of(process.pid),
+            pid: Some(process.pid),
             card_id: programs::launch::radar_card_of(process.pid),
             last_activity_at: now,
             running: true,
@@ -931,6 +939,7 @@ mod tests {
             radar_session_id: None,
             provider_session_id: Some("thread-7".to_string()),
             claim_id: None,
+            pid: None,
             card_id: None,
             last_activity_at: 0,
             running: false,
@@ -1019,6 +1028,7 @@ mod tests {
             catalog_id: None,
             radar_session_id: radar.map(str::to_string),
             claim_id: None,
+            pid: None,
             card_id: None,
             provider_session_id: provider.map(str::to_string),
             last_activity_at: 0,

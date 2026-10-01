@@ -6,9 +6,10 @@
 //! splits that panel in two and the dragged one takes the half; a middle drop
 //! swaps the two panels' places. There is no grouping.
 //!
-//! A panel's header says what it is and what it is for: the session's name and,
-//! for an agent, the board to-do it corresponds to. There is nothing to click
-//! but close — the panel is a view, not a control surface.
+//! A panel's header says what it is and what it is for: the session's name
+//! and, for an agent, the board to-do it corresponds to — the to-do title
+//! opens its card view, and a check beside it marks the to-do done. Nothing
+//! else but close: the panel is a view, not a control surface.
 //!
 //! Both sides talk to the window through actions, so this module needs no
 //! reference back to the app.
@@ -101,6 +102,9 @@ struct Chip {
     /// around the label opens the to-do; the label keeps the quiet look.
     todo_button: gtk::Button,
     todo: gtk::Label,
+    /// Marks the to-do done from right here, beside its title. One-way: a
+    /// done to-do's panel hides by the workspace-visibility policy.
+    todo_done: gtk::Button,
 }
 
 pub struct Panel {
@@ -419,6 +423,11 @@ impl Panel {
         );
         match self.todo_link.borrow().clone() {
             Some((project_id, card_id)) => {
+                chip.todo_done.set_visible(true);
+                chip.todo_done
+                    .set_action_name(Some("win.session-todo-done"));
+                chip.todo_done
+                    .set_action_target_value(Some(&(project_id, card_id.as_str()).to_variant()));
                 if let Some(key) = self.key() {
                     chip.todo_button.set_action_target_value(Some(
                         &(project_id, key.as_str(), card_id.as_str()).to_variant(),
@@ -430,6 +439,9 @@ impl Panel {
                 }
             }
             None => {
+                chip.todo_done.set_visible(false);
+                chip.todo_done.set_action_name(None);
+                chip.todo_done.set_action_target_value(None);
                 chip.todo_button.set_action_name(None);
                 chip.todo_button.set_action_target_value(None);
             }
@@ -502,6 +514,18 @@ impl Panel {
         todo_button.set_visible(false);
         row.append(&todo_button);
 
+        // Marking the to-do done from right there — the same quiet-control
+        // look as close. The card's panel hides when the store says done;
+        // the program keeps running.
+        let todo_done = gtk::Button::builder()
+            .icon_name("object-select-symbolic")
+            .tooltip_text("Mark this to-do done")
+            .build();
+        todo_done.add_css_class("chip-done");
+        todo_done.set_valign(gtk::Align::Center);
+        todo_done.set_visible(false);
+        row.append(&todo_done);
+
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         row.append(&spacer);
@@ -533,6 +557,7 @@ impl Panel {
             session,
             todo_button,
             todo,
+            todo_done,
         });
         self.header.append(&row);
         self.apply_labels();

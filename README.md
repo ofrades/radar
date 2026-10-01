@@ -14,10 +14,12 @@ terminal. It gathers every project into Basecamp-style lanes:
 
 - **Needs you** — every unresolved approval, question or failure, newest first,
   each with the actions to answer, approve, deny or dismiss it in place.
-- **Agents** — the header's running count opens a view of every agent running,
-  across every project: grouped by project, each row carrying its activity
-  sign, its program, the to-do it was launched for and when it was last heard
-  from; a click opens the session.
+- **Agents** — the header's running count opens a workspace of the real agent
+  panels: every live session across every project, tiled and interactive —
+  type into any pane right there. A strip of session chips (state dot, title)
+  sits above; clicking a chip focuses its pane. A session's panel attaches to
+  the running daemon session and follows it in place — new sessions gain a
+  tile, ended ones lose theirs, and a respawn under the same id re-attaches.
 - **Projects** — a lane per project: its to-dos (the board's cards, ticked once
   Done), its board's lane counts, and its running and external sessions. A
   to-do opens its card; **Open board** opens the project's full kanban. A big
@@ -139,9 +141,9 @@ choices in this same overlay.
 cockpit when you have projects: a needs-you inbox over a row of project lanes,
 each with its to-dos (every one showing the state of the session bound to it)
 and board counts, and the actions to drive them without opening a terminal.
-The header's **running count** opens the **Agents** view — every agent running
-across every project, grouped by project, each row with its activity sign,
-program, to-do and last-heard-from time; clicking a row opens that session. A
+The header's **running count** opens the **Agents** page — a big tiled
+workspace of every live agent panel across every project, type-in-place,
+with a strip of session chips above (a chip focuses its pane). A
 big **Add a project** card above the lanes opens one picker: search the scan
 root for a folder to add, or type a
 name to create a new folder without initializing Git — the new project's view
@@ -158,7 +160,10 @@ in Home — its lanes and to-dos. **New session** (the toolbar's ＋) starts an
 agent right from the workspace: pick one of the project's open to-dos and the
 default agent starts attached to it, claiming it. Asking for an agent when
 none is on screen — the dock's Agent button, `Alt+A` — opens the same picker;
-the overlay's Actions row does too, while an agent is already up.
+the overlay's Actions row does too, while an agent is already up. An agent
+panel's header shows the to-do its session works on: the title opens the
+card's conversation, and a check beside it marks the to-do done — the panel
+then hides, the program keeps running.
 
 **Every pane header carries its own controls, right on the chip**: the
 program's live info beside its name, a ▾ dropdown to change that program —

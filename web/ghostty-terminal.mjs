@@ -15,6 +15,14 @@ const DATA_ROWS = 2;
 const DATA_ROW_ITERATOR = 4;
 const DATA_CURSOR = 18;
 const DATA_COLORS = 19;
+// --- Terminal data kinds (must match include/ghostty/vt/terminal.h) ----------
+const DATA_ACTIVE_SCREEN = 6;
+const DATA_MOUSE_TRACKING = 11;
+const DATA_MODE = 37;
+const SCREEN_ALTERNATE = 1;
+// DEC private modes the wheel policy reads.
+const CURSOR_KEYS_MODE = 1; // DECCKM
+const ALT_SCROLL_MODE = 1007; // wheel = cursor keys on the alternate screen
 const ROW_DATA_CELLS = 3;
 const ROW_DATA_VIEWPORT_Y = 6;
 const CELLS_DATA_STYLE = 2;
@@ -23,6 +31,11 @@ const CELLS_DATA_GRAPHEMES_BUF = 4;
 const CELLS_DATA_BG_COLOR = 5;
 const CELLS_DATA_FG_COLOR = 6;
 const CELLS_DATA_SELECTED = 7;
+// --- Mouse encoder values (must match include/ghostty/vt/mouse/) ------------
+const MOUSE_ACTION_PRESS = 0;
+const MOUSE_BUTTON_FOUR = 4; // wheel up
+const MOUSE_BUTTON_FIVE = 5; // wheel down
+const MOUSE_ENCODER_OPT_SIZE = 2;
 const SUCCESS = 0;
 
 // Struct sizes/offsets from the pinned ABI (repr(C)).
@@ -30,6 +43,8 @@ const COLORS_SIZE = 8 + 3 + 3 + 3 + 1 + 768;
 const STYLE_SIZE = 72;
 const CURSOR_SIZE = 24;
 const SCROLL_DELTA = 2;
+// GhosttyTerminalModeConfig { mode: u16, value: bool }.
+const MODE_CONFIG_SIZE = 4;
 
 let enginePromise = null;
 
@@ -93,6 +108,59 @@ class Engine {
     const result = this.e.ghostty_render_state_new(0, slot);
     if (result !== SUCCESS) throw new Error(`render state: ${result}`);
     return this.e.ghostty_wasm_take_opaque(slot);
+  }
+
+  /**
+   * A mouse encoder and its reusable event, for turning wheel ticks into the
+   * wheel-button reports a program asked for.
+   */
+  mouseEncoder() {
+    const slot = this.allocOpaque();
+    const result = this.e.ghostty_mouse_encoder_new(0, slot);
+    if (result !== SUCCESS) throw new Error(`mouse encoder: ${result}`);
+    const encoder = this.e.ghostty_wasm_take_opaque(slot);
+    const eventSlot = this.allocOpaque();
+    const event = this.e.ghostty_mouse_event_new(0, eventSlot);
+    if (event !== SUCCESS) throw new Error(`mouse event: ${event}`);
+    return { encoder, event: this.e.ghostty_wasm_take_opaque(eventSlot) };
+  }
+
+  /**
+   * An i32 terminal datum, or null when the engine has no value for it.
+   */
+  int32(terminal, data) {
+    const ptr = this.e.ghostty_wasm_alloc(8);
+    this.bytes().fill(0, ptr, ptr + 8);
+    const ok = this.e.ghostty_terminal_get(terminal, data, ptr) === SUCCESS;
+    const value = this.view().getInt32(ptr, true);
+    this.e.ghostty_wasm_free(ptr, 8);
+    return ok ? value : null;
+  }
+
+  /**
+   * A boolean terminal datum, or null.
+   */
+  flag(terminal, data) {
+    const ptr = this.e.ghostty_wasm_alloc(4);
+    this.bytes().fill(0, ptr, ptr + 4);
+    const ok = this.e.ghostty_terminal_get(terminal, data, ptr) === SUCCESS;
+    const value = this.bytes()[ptr] !== 0;
+    this.e.ghostty_wasm_free(ptr, 4);
+    return ok ? value : null;
+  }
+
+  /**
+   * A DEC private mode's value, or null. GhosttyTerminalModeConfig is
+   * { mode: u16, value: bool } with the value at offset 2.
+   */
+  mode(terminal, number) {
+    const ptr = this.e.ghostty_wasm_alloc(MODE_CONFIG_SIZE);
+    this.view().setUint16(ptr, number, true);
+    this.bytes()[ptr + 2] = 0;
+    const ok = this.e.ghostty_terminal_get(terminal, DATA_MODE, ptr) === SUCCESS;
+    const value = this.bytes()[ptr + 2] !== 0;
+    this.e.ghostty_wasm_free(ptr, MODE_CONFIG_SIZE);
+    return ok ? value : null;
   }
 
   /** Read one frame. `terminal` is the handle. */
@@ -182,9 +250,10 @@ class Engine {
           ...style,
         });
       }
+      this.e.ghostty_render_state_row_cells_free(cells);
       lines.push({ y, cells: row });
     }
-    this.e.ghostty_render_state_row_cells_free(cells);
+    // The cells handle is per-row (block scope), so it is freed inside.
     this.e.ghostty_render_state_row_iterator_free(iterator);
     this.e.ghostty_render_state_clean(state);
     return { cols, rows, background, foreground, cursor, lines };
@@ -274,12 +343,14 @@ export class GhosttyTerminal {
     this.resizeListeners = [];
     this.binaryListeners = [];
     this.pending = [];
+    this.pendingWheel = 0;
     this.disposed = false;
     this.renderScheduled = false;
     this.ready = (async () => {
       this.engine = new Engine(await loadGhostty());
       this.terminal = this.engine.terminal(this.cols, this.rows);
       this.state = this.engine.renderState();
+      this.mouse = this.engine.mouseEncoder();
       for (const bytes of this.pending) this.write(bytes);
       this.pending = [];
       this.render();
@@ -319,7 +390,7 @@ export class GhosttyTerminal {
       "wheel",
       (event) => {
         event.preventDefault();
-        this.scroll(event.deltaY < 0 ? -3 : 3);
+        this.wheel(event.deltaY, event.deltaMode);
       },
       { passive: false },
     );
@@ -448,6 +519,94 @@ export class GhosttyTerminal {
     });
   }
 
+  /**
+   * One wheel event. Deltas arrive in three units (pixel, line, page); all
+   * become rows and queue through the shared accumulator, so fractional
+   * trackpad deltas add up to whole rows.
+   */
+  wheel(deltaY, deltaMode) {
+    if (deltaMode === 1) {
+      // Lines.
+      this.pendingWheel += deltaY;
+    } else if (deltaMode === 2) {
+      // Pages.
+      this.pendingWheel += deltaY * this.rows;
+    } else {
+      // Pixels: a row per cell height of travel.
+      this.pendingWheel += deltaY / this.cellHeight;
+    }
+    const rows = Math.trunc(this.pendingWheel);
+    this.pendingWheel -= rows;
+    if (rows !== 0) this.wheelRows(rows);
+  }
+
+  /**
+   * A wheel gesture of `rows` rows (negative scrolls up into history).
+   *
+   * A TUI on the alternate screen has no scrollback to move, so the wheel is
+   * program input — upstream Ghostty's Surface.scrollCallback policy: with
+   * alt-scroll (DECSET 1007) and no mouse reporting it becomes cursor keys in
+   * the mode DECCKM chose; with mouse reporting it becomes an encoded wheel
+   * report and the program scrolls itself. Otherwise the primary screen's
+   * scrollback scrolls, as on any terminal.
+   */
+  wheelRows(rows) {
+    this.ready.then(() => {
+      const engine = this.engine;
+      const alt = engine.int32(this.terminal, DATA_ACTIVE_SCREEN) === SCREEN_ALTERNATE;
+      const tracking = engine.flag(this.terminal, DATA_MOUSE_TRACKING);
+      if (alt && tracking === false && engine.mode(this.terminal, ALT_SCROLL_MODE) === true) {
+        const sequence = engine.mode(this.terminal, CURSOR_KEYS_MODE)
+          ? (rows < 0 ? "\x1bOA" : "\x1bOB")
+          : (rows < 0 ? "\x1b[A" : "\x1b[B");
+        for (let i = 0; i < Math.abs(rows); i++) this.emit(sequence);
+        return;
+      }
+      if (tracking === true) {
+        // One report per row: a program scrolls per event received.
+        for (let i = 0; i < Math.abs(rows); i++) {
+          const report = this.wheelReport(rows < 0);
+          if (!report) break;
+          this.emit(report);
+        }
+        return;
+      }
+      this.scroll(rows);
+    });
+  }
+
+  /**
+   * Encode one wheel tick as a wheel-button press. Empty (null) when the
+   * program has no mouse reporting on — the encoder emits nothing for a
+   * terminal that never asked.
+   *
+   * The event position stays at the default (cell 1,1): the wasm ABI hands
+   * the position struct to set_position indirectly and the JS side cannot
+   * reproduce that pointer, and wheel handlers key off the button, not the
+   * cell. The encoder's protocol state re-syncs from the terminal on every
+   * call, so mode changes are picked up immediately.
+   */
+  wheelReport(up) {
+    const e = this.engine.e;
+    e.ghostty_mouse_encoder_setopt_from_terminal(this.mouse.encoder, this.terminal);
+    e.ghostty_mouse_event_set_action(this.mouse.event, MOUSE_ACTION_PRESS);
+    e.ghostty_mouse_event_set_button(this.mouse.event, up ? MOUSE_BUTTON_FOUR : MOUSE_BUTTON_FIVE);
+    const out = e.ghostty_wasm_alloc(64);
+    const lenPtr = e.ghostty_wasm_alloc(4);
+    const result = e.ghostty_mouse_encoder_encode(this.mouse.encoder, this.mouse.event, out, 64, lenPtr);
+    const len = this.engine.view().getUint32(lenPtr, true);
+    const bytes =
+      result === SUCCESS && len > 0 ? this.engine.bytes().slice(out, out + len) : null;
+    e.ghostty_wasm_free(out, 64);
+    e.ghostty_wasm_free(lenPtr, 4);
+    return bytes ? String.fromCharCode(...bytes) : null;
+  }
+
+  /** Hand program input to the data listeners (a string of char codes). */
+  emit(text) {
+    for (const listener of this.dataListeners) listener(text);
+  }
+
   scrollBottom() {
     this.ready.then(() => {
       const ptr = this.engine.e.ghostty_wasm_alloc(24);
@@ -488,6 +647,11 @@ export class GhosttyTerminal {
 
   dispose() {
     this.disposed = true;
+    if (this.mouse) {
+      this.engine.e.ghostty_mouse_event_free(this.mouse.event);
+      this.engine.e.ghostty_mouse_encoder_free(this.mouse.encoder);
+      this.mouse = null;
+    }
     this.element && (this.element.innerHTML = "");
   }
 }

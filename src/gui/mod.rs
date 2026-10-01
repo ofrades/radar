@@ -282,6 +282,14 @@ struct App {
     home_todo_drafts: Rc<RefCell<HashMap<i64, String>>>,
     /// The confetti layer thrown when a to-do is completed.
     confetti: confetti::Confetti,
+    /// The Agents page: every live session's real panel, tiled, with the
+    /// grouped list as a header strip. A persistent stack page — Home's
+    /// rebuild-on-every-event would tear attached terminals down mid-keystroke,
+    /// so this page updates in place instead.
+    agents_page: RefCell<Option<home::AgentsPage>>,
+    /// The page's tiles, by daemon session id. A tile owns an attachment; it
+    /// comes and goes with the session's presence in discovery.
+    agent_tiles: RefCell<HashMap<String, home::AgentTile>>,
     /// What each pane's program last said about itself — its name and its own
     /// live title, or its exit — keyed by (project, tab).
     header_info: RefCell<HashMap<(i64, TabKey), String>>,
@@ -305,8 +313,6 @@ struct App {
 enum HomeView {
     Project(i64),
     Card(i64, String),
-    /// Every agent running, across every project, in one list.
-    Agents,
     /// Home's combined "Add a project" picker (its own stack page).
     AddProject,
 }
@@ -860,6 +866,8 @@ fn build_window(
         home_focus_todo: Cell::new(None),
         home_todo_drafts: Rc::new(RefCell::new(HashMap::new())),
         confetti,
+        agents_page: RefCell::new(None),
+        agent_tiles: RefCell::new(HashMap::new()),
         header_info: RefCell::new(HashMap::new()),
         current: RefCell::new(None),
         add_list,
@@ -981,13 +989,13 @@ fn build_window(
             state_for_new.open_home_add();
         });
     }
-    // Development aid: open Home's running-agents view on startup, so every
-    // project's live sessions can be checked without clicking.
+    // Development aid: open Home's running-agents page on startup, so every
+    // project's live panels can be checked without clicking.
     // RADAR_OPEN_AGENTS=1.
     if std::env::var("RADAR_OPEN_AGENTS").is_ok() {
         let state_for_agents = state.clone();
         glib::timeout_add_local_once(Duration::from_millis(1700), move || {
-            state_for_agents.enter_home_view(HomeView::Agents);
+            state_for_agents.enter_agents_view();
         });
     }
     // Development aid: throw the completion confetti on startup, so the burst
@@ -1912,6 +1920,25 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         app.window.add_action(&action);
     }
     {
+        // The agent panel header's done control, beside the to-do title:
+        // close the session's to-do from right there. One-way — Home's
+        // checkbox owns reopen.
+        let action = gio::SimpleAction::new(
+            "session-todo-done",
+            Some(glib::VariantTy::new("(xs)").expect("a project and card ID")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((project_id, card_id)) =
+                parameter.and_then(|value| value.get::<(i64, String)>())
+            else {
+                return;
+            };
+            app_for_action.complete_session_todo(project_id, &card_id);
+        });
+        app.window.add_action(&action);
+    }
+    {
         let action = gio::SimpleAction::new(
             "todo-session",
             Some(glib::VariantTy::new("(xs)").expect("a project and session identity")),
@@ -2002,11 +2029,12 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         app.window.add_action(&action);
     }
     {
-        // Home's running-agents view: every live session, every project.
+        // Home's running-agents page: every live session's real panel,
+        // tiled, across every project.
         let app_for_action = app.clone();
         add(
             "home-agents",
-            Box::new(move || app_for_action.enter_home_view(HomeView::Agents)),
+            Box::new(move || app_for_action.enter_agents_view()),
         );
     }
     {
@@ -2464,6 +2492,9 @@ impl App {
                 }
             }
         }
+        for tile in self.agent_tiles.borrow().values() {
+            tile.pane.apply_theme(&theme);
+        }
         *self.theme.borrow_mut() = theme;
     }
 
@@ -2570,6 +2601,43 @@ impl App {
         }
     }
 
+    /// The agent panel header's done control: close the session's to-do from
+    /// right there. One-way — a done to-do's panel hides by the
+    /// workspace-visibility policy while the program keeps running; Home's
+    /// checkbox owns reopening.
+    fn complete_session_todo(&self, project_id: i64, card_id: &str) {
+        let done = self
+            .board_states
+            .borrow()
+            .get(&project_id)
+            .and_then(|state| state.cards.iter().find(|card| card.id == card_id))
+            .map(|card| card.done);
+        match done {
+            Some(true) => return, // already done: the panel is on its way out
+            None => {
+                self.toast("That to-do is no longer on the board");
+                return;
+            }
+            Some(false) => {}
+        }
+        let command = gui_command_id("done");
+        match crate::session::daemon::board_card_complete(
+            &self.session_home,
+            project_id,
+            card_id,
+            None,
+            &command,
+        ) {
+            Ok(_) => {
+                self.refresh_board_summary(project_id);
+                // Done cards leave the lanes; the burst is the send-off.
+                self.confetti.celebrate();
+                self.toast("Done. 🎉");
+            }
+            Err(error) => self.toast(&format!("Could not update the to-do: {error}")),
+        }
+    }
+
     /// Close an open to-do or reopen a done one, straight from Home. Goes
     /// through the board store, then re-reads the summary so the lane updates.
     fn toggle_card_done(&self, project_id: i64, card_id: &str) {
@@ -2671,6 +2739,37 @@ impl App {
     /// Drill into a project's own view inside Home.
     fn open_home_project(&self, project_id: i64) {
         self.enter_home_view(HomeView::Project(project_id));
+    }
+
+    /// The Agents page: every live session's real panel, tiled. A persistent
+    /// stack page (see the field docs); entering syncs it with discovery.
+    fn enter_agents_view(self: &Rc<Self>) {
+        gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
+        self.home_shown.set(true);
+        *self.current.borrow_mut() = None;
+        if self.agents_page.borrow().is_none() {
+            *self.agents_page.borrow_mut() = Some(home::agents_page());
+            if let Some(page) = self.agents_page.borrow().as_ref() {
+                self.stack.add_named(&page.root, Some("_agents"));
+            }
+        }
+        home::sync_agents_page(
+            self,
+            self.agents_page.borrow().as_ref().unwrap(),
+            &mut self.agent_tiles.borrow_mut(),
+        );
+        self.stack.set_visible_child_name("_agents");
+        self.sync_toggles();
+    }
+
+    /// In-flush the Agents page when it is the one on screen: tiles and strip
+    /// follow discovery; everything else is left alone.
+    fn sync_agents_page_if_visible(&self) {
+        if self.stack.visible_child_name().as_deref() == Some("_agents") {
+            if let Some(page) = self.agents_page.borrow().as_ref() {
+                home::sync_agents_page(self, page, &mut self.agent_tiles.borrow_mut());
+            }
+        }
     }
 
     fn enter_home_view(&self, view: HomeView) {
@@ -3765,6 +3864,12 @@ impl App {
         // state (search text, scroll); refresh it by staying on it.
         if matches!(self.home_nav.borrow().last(), Some(HomeView::AddProject)) {
             self.stack.set_visible_child_name("_add");
+            return;
+        }
+        // The Agents page is the same deal: its tiles are live attached
+        // terminals, so it updates in place instead of being rebuilt.
+        if self.stack.visible_child_name().as_deref() == Some("_agents") {
+            self.sync_agents_page_if_visible();
             return;
         }
         if self.stack.visible_child_name().as_deref() != Some("_home") {
@@ -5952,6 +6057,44 @@ mod home_navigation_tests {
                 Some(format!("project-{}", project.id).as_str())
             );
         }
+
+        // The header's done control, beside the to-do title: mark the
+        // session's to-do done from the workspace. The store records done,
+        // the panel hides, the program keeps running.
+        let workspace_child = stack
+            .child_by_name(&format!("project-{}", project.id))
+            .unwrap();
+        assert!(widgets(&workspace_child)
+            .iter()
+            .filter_map(|widget| widget.downcast_ref::<gtk::Button>())
+            .any(|button| button.action_name().as_deref() == Some("win.session-todo")));
+        activate(
+            &window,
+            "win.session-todo-done",
+            Some(&(project.id, card.id.as_str()).to_variant()),
+        );
+        wait_until(|| {
+            matches!(
+                crate::session::daemon::Client::request(
+                    &paths.data_dir,
+                    crate::session::daemon::Command::BoardState {
+                        project_id: project.id
+                    },
+                ),
+                Ok(crate::session::daemon::Response::BoardState(ref state))
+                    if state.cards.iter().any(|c| c.id == card.id && c.done)
+            )
+        });
+        wait_until(|| {
+            !widgets(&workspace_child)
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Button>())
+                .any(|button| button.action_name().as_deref() == Some("win.session-todo"))
+        });
+        assert!(
+            db.tabs(project.id).unwrap().is_empty(),
+            "a done to-do's panel hides; its program keeps running"
+        );
         let crate::session::daemon::Response::Sessions(sessions) =
             crate::session::daemon::Client::request(
                 &paths.data_dir,

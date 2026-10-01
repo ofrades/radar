@@ -113,7 +113,8 @@ paned > separator:hover {
 }
 /* A chip's own controls sit quiet until hovered. */
 .panel-header .panel-chip button.chip-menu,
-.panel-header .panel-chip button.chip-close {
+.panel-header .panel-chip button.chip-close,
+.panel-header .panel-chip button.chip-done {
   min-width: 22px;
   min-height: 22px;
   padding: 0;
@@ -121,7 +122,8 @@ paned > separator:hover {
   color: alpha(@radar_fg, 0.45);
 }
 .panel-header .panel-chip button.chip-menu:hover,
-.panel-header .panel-chip button.chip-close:hover {
+.panel-header .panel-chip button.chip-close:hover,
+.panel-header .panel-chip button.chip-done:hover {
   color: @radar_fg;
   background-color: @radar_surface_hover;
 }
@@ -449,6 +451,28 @@ paned > separator:hover {
 }
 .home-cockpit button.agent-row:hover {
   background-color: @radar_surface_hover;
+}
+/* The Agents page: real panels, tiled, under a strip of session chips. */
+.home-view.agents-view .agents-strip {
+  margin: 6px 22px 2px;
+}
+.home-view.agents-view .agents-strip-row {
+  margin: 0;
+}
+.home-view.agents-view .agents-chip {
+  padding: 1px 8px;
+  border-radius: 99px;
+}
+.home-view.agents-view .agents-chip:hover {
+  background-color: @radar_surface_hover;
+}
+.home-view.agents-view .agents-grid {
+  margin: 10px 22px 20px;
+}
+.home-view.agents-view .agents-tile {
+  border: 1px solid @radar_hairline;
+  border-radius: 10px;
+  padding: 4px 6px 6px;
 }
 /* The cockpit header's way into the agents view: a quiet count that reads
    as part of the pulse, not a toolbar button. */
