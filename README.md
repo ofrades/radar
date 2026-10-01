@@ -16,10 +16,10 @@ terminal. It gathers every project into Basecamp-style lanes:
   each with the actions to answer, approve, deny or dismiss it in place.
 - **Agents** — the header's running count opens a workspace of the real agent
   panels: every live session across every project, tiled and interactive —
-  type into any pane right there. A strip of session chips (state dot, title)
-  sits above; clicking a chip focuses its pane. A session's panel attaches to
-  the running daemon session and follows it in place — new sessions gain a
-  tile, ended ones lose theirs, and a respawn under the same id re-attaches.
+  type into any pane right there. Each pane wears the workspace panel's own
+  header — its activity sign, the session's name, the to-do it works on
+  (click opens the card), a done check, and a close that keeps the program
+  running.
 - **Projects** — a lane per project: its to-dos (the board's cards, ticked once
   Done), its board's lane counts, and its running and external sessions. A
   to-do opens its card; **Open board** opens the project's full kanban. A big
@@ -143,7 +143,8 @@ each with its to-dos (every one showing the state of the session bound to it)
 and board counts, and the actions to drive them without opening a terminal.
 The header's **running count** opens the **Agents** page — a big tiled
 workspace of every live agent panel across every project, type-in-place,
-with a strip of session chips above (a chip focuses its pane). A
+each pane wearing the workspace panel's own header (its to-do opens the
+card; close leaves the program running). A
 big **Add a project** card above the lanes opens one picker: search the scan
 root for a folder to add, or type a
 name to create a new folder without initializing Git — the new project's view

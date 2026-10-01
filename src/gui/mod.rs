@@ -290,6 +290,10 @@ struct App {
     /// The page's tiles, by daemon session id. A tile owns an attachment; it
     /// comes and goes with the session's presence in discovery.
     agent_tiles: RefCell<HashMap<String, home::AgentTile>>,
+    /// Sessions the human closed on the Agents page: the tile leaves the wall
+    /// but the program keeps running, exactly like closing a workspace panel.
+    /// The id leaves the set when its session ends.
+    dismissed_agents: RefCell<HashSet<String>>,
     /// What each pane's program last said about itself — its name and its own
     /// live title, or its exit — keyed by (project, tab).
     header_info: RefCell<HashMap<(i64, TabKey), String>>,
@@ -868,6 +872,7 @@ fn build_window(
         confetti,
         agents_page: RefCell::new(None),
         agent_tiles: RefCell::new(HashMap::new()),
+        dismissed_agents: RefCell::new(HashSet::new()),
         header_info: RefCell::new(HashMap::new()),
         current: RefCell::new(None),
         add_list,
@@ -2036,6 +2041,25 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             "home-agents",
             Box::new(move || app_for_action.enter_agents_view()),
         );
+    }
+    {
+        // The Agents page's tile close: the panel leaves the wall, its
+        // program keeps running — the same contract as closing a workspace
+        // panel. The tile can come back by the session ending and something
+        // new starting under the id; the workspace panel is the other way in.
+        let action = gio::SimpleAction::new(
+            "agents-close",
+            Some(glib::VariantTy::new("s").expect("a session id")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some(id) = parameter.and_then(|value| value.get::<String>()) else {
+                return;
+            };
+            app_for_action.dismissed_agents.borrow_mut().insert(id);
+            app_for_action.sync_agents_page_if_visible();
+        });
+        app.window.add_action(&action);
     }
     {
         // The card detail's Edit control: the board's card dialog.
