@@ -6071,6 +6071,11 @@ mod home_navigation_tests {
             gtk::PolicyType::Never,
             "the to-do list does not claim its natural width"
         );
+        assert_eq!(
+            scroll.vscrollbar_policy(),
+            gtk::PolicyType::Never,
+            "the to-do list grows instead of scrolling"
+        );
         let vadj = scroll.vadjustment();
         assert!(
             vadj.upper() <= vadj.page_size() + 0.5,

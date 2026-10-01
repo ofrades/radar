@@ -780,11 +780,13 @@ fn lane_rank(name: &str, done: bool) -> u8 {
     }
 }
 
-/// The open to-dos, in a scroller the card never cuts short: no height cap, so
-/// the lane grows with the work it holds and Home's own scroller carries the
-/// page. The scroller stays for the width it does *not* claim: a never
-/// horizontal policy contributes the list's minimum width, not its natural
-/// width, so a long to-do title never widens the card.
+/// The open to-dos, in a scroller that never scrolls: both policies are Never,
+/// so the list contributes its full size and the lane grows to fit every to-do
+/// — Home's own scroller carries the page. The scroller stays (rather than a
+/// plain box) for the width it does *not* claim: a never horizontal policy
+/// contributes the list's minimum width, not its natural width, so a long
+/// to-do title grows the card's height, never its width. The lane's top
+/// alignment then lets each card keep its own height within the shared row.
 fn todo_scroll(app: &App, project_id: i64, open: &[(String, board::WorkCard)]) -> gtk::Widget {
     let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
     list.add_css_class("todo-list");
@@ -794,7 +796,7 @@ fn todo_scroll(app: &App, project_id: i64, open: &[(String, board::WorkCard)]) -
     }
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
         .propagate_natural_height(true)
         .child(&list)
         .build();
