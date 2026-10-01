@@ -286,6 +286,12 @@ function runningSessions(projectId) {
   return sessionsOf(projectId).filter((session) => session.state === "running");
 }
 
+/// Radar-launched agent sessions — the native Agents wall only ever holds the
+/// `agent` slot, never a shell, editor or diff tool.
+function agentSessions(projectId) {
+  return runningSessions(projectId).filter((session) => session.slot === "agent");
+}
+
 function stoppedSessions(projectId) {
   return sessionsOf(projectId).filter((session) => session.state !== "running" && session.attachable !== false);
 }
@@ -475,7 +481,7 @@ function renderHome() {
   }
 
   const needs = unresolvedAttention();
-  const running = projects.reduce((sum, project) => sum + runningSessions(project.id).length, 0);
+  const running = projects.reduce((sum, project) => sum + agentSessions(project.id).length, 0);
   const projectLabel = projects.length === 1 ? "1 project" : `${projects.length} projects`;
   wrap.append(hero("Home", `${projectLabel} · ${needs.length} need you`));
   wrap.append(agentsDestination(running));
@@ -563,7 +569,7 @@ function pillClass(kind) {
 }
 
 function laneFooterText(projectId) {
-  const running = runningSessions(projectId).length;
+  const running = agentSessions(projectId).length;
   const stopped = stoppedSessions(projectId).length;
   const live = running === 0 ? "no agents" : running === 1 ? "1 running" : `${running} running`;
   if (!stopped) return live;
@@ -936,19 +942,49 @@ function cardReplyForm(projectId, card) {
 
 // ---- Agents ----
 
+/// The sessions that belong on the Agents wall, mirroring the native policy
+/// (`src/gui/agents.rs`): live sessions whose to-do is live work. A card in a
+/// Todo or Done lane — or one that left the board — keeps the session off the
+/// wall without stopping it; a session with no bound to-do is unjudged and
+/// shows. Ended/catalog-only history never stands here.
+function agentWall(projectId) {
+  return agentSessions(projectId).filter((session) => {
+    const cardId = sessionCardId(projectId, session);
+    if (!cardId) return true;
+    const card = cardById(projectId, cardId);
+    if (!card) return false;
+    return cardIsLiveWork(projectId, card);
+  });
+}
+
+/// The card a session is working: the one whose claim names the session's
+/// agent (the same exact match the board's claim links use).
+function sessionCardId(projectId, session) {
+  if (!session.claim) return null;
+  return cardsOf(projectId).find((card) => card.claim === session.claim)?.id || null;
+}
+
+function cardIsLiveWork(projectId, card) {
+  if (card.done) return false;
+  const lane = lanesOf(projectId).find((item) => item.id === card.lane_id);
+  if (lane) return lane.kind !== "todo" && lane.kind !== "done";
+  const name = (card.lane || "").toLowerCase();
+  return name !== "todo" && name !== "backlog" && name !== "done";
+}
+
 function renderAgents() {
   const wrap = el("div", { class: "home-view agents-view" });
   if (!loadedProjects) {
     wrap.append(hero("Agents", "Loading…", () => navigate("#/")));
     return wrap;
   }
-  const running = projects.reduce((sum, project) => sum + runningSessions(project.id).length, 0);
-  const count = running === 0 ? "No agents" : running === 1 ? "1 running" : `${running} running`;
+  const wall = projects.flatMap((project) => agentWall(project.id));
+  const count = wall.length === 0 ? "No agents" : wall.length === 1 ? "1 running" : `${wall.length} running`;
   wrap.append(hero("Agents", `${count} · All projects, one workspace`, () => navigate("#/")));
 
   let any = false;
   for (const project of projects) {
-    const sessions = sessionsOf(project.id);
+    const sessions = agentWall(project.id);
     if (!sessions.length) continue;
     any = true;
     wrap.append(el("h2", { class: "lane-section" }, project.name));
@@ -958,8 +994,8 @@ function renderAgents() {
   }
   if (!any) {
     wrap.append(el("div", { class: "empty-card" },
-      el("strong", {}, "No sessions yet."),
-      el("span", {}, "Start an agent in Radar on your computer, or a terminal in a project."),
+      el("strong", {}, "No agent panels yet."),
+      el("span", {}, "Open a project and start a session from a to-do. Active work appears here; a to-do still in Todo or already done keeps its session off this wall, and its program keeps running."),
     ));
   }
   return wrap;

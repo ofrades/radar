@@ -1066,8 +1066,15 @@ fn canonical_project_root(project: &Project) -> PathBuf {
         .unwrap_or_else(|_| project.path.clone())
 }
 
+/// A session with a stable project id belongs to exactly that project; only a
+/// session without one (a custom shell, say) falls back to its working
+/// directory. The id is authoritative, so overlapping project paths cannot
+/// list another project's session twice.
 fn session_belongs_to_project(status: &Status, project_id: i64, project_root: &Path) -> bool {
-    session_project_id(&status.id) == Some(project_id) || status.cwd.starts_with(project_root)
+    match session_project_id(&status.id) {
+        Some(id) => id == project_id,
+        None => status.cwd.starts_with(project_root),
+    }
 }
 
 fn list_sessions(home: &Path) -> ApiResult<Vec<Status>> {
@@ -1294,6 +1301,18 @@ mod tests {
             &make_status("custom-shell", "/work/another-project"),
             17,
             root,
+        ));
+        // A stable id wins over a working directory inside another project's
+        // root, so an overlapping path never lists one session twice.
+        assert!(!session_belongs_to_project(
+            &make_status("project-17-agent-0-claude", "/work/other-project"),
+            42,
+            Path::new("/work/other-project"),
+        ));
+        assert!(session_belongs_to_project(
+            &make_status("project-17-agent-0-claude", "/work/other-project"),
+            17,
+            Path::new("/work/project"),
         ));
     }
 

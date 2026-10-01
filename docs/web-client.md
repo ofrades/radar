@@ -25,8 +25,12 @@ permanent sidebar; navigation is a drill-down with a real Back:
   reopen and move it between lanes, its linked sessions, its thread (human and
   agent messages, board transitions, resolved answers, and any unresolved
   request with its actions), and a reply box.
-- **Agents** (`#/agents`) — every project's sessions in one place; a running or
-  retained session opens interactively, catalog-only history is inert.
+- **Agents** (`#/agents`) — the live agent wall, mirroring the native policy:
+  only running `agent`-slot sessions whose bound to-do is live work. A to-do
+  still in Todo, already done, or gone from the board keeps its session off the
+  wall without stopping its program; a session with no to-do is unjudged and
+  shows. Ended catalog history never stands here. A session opens interactively;
+  catalog-only history is inert.
 - **Session** (`#/project/{id}/session/{sessionId}`) — a deep-linkable terminal.
   Opening a session hides navigation and gives the terminal the viewport;
   **Back** returns to where you were, and the browser's own back/forward work.
