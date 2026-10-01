@@ -441,15 +441,13 @@ function renderSessionRoute(route) {
 }
 
 function hero(title, summary, back) {
-  const heading = el("div", { class: "page-heading" },
+  return el("div", { class: "page-heading" },
     el("div", {},
       back ? el("button", { class: "back-button", type: "button", onclick: back }, el("span", {}, "‹"), " Back") : null,
-      el("p", { class: "eyebrow" }, "RADAR"),
       el("h1", { text: title }),
       el("p", { class: "project-summary", text: summary }),
     ),
   );
-  return heading;
 }
 
 function sectionHeading(title, trailing) {
@@ -502,7 +500,7 @@ function agentsDestination(running) {
     type: "button",
     onclick: () => navigate("#/agents"),
   },
-    el("span", { class: "destination-icon", "aria-hidden": "true" }, "✳"),
+    el("span", { class: "destination-icon", "aria-hidden": "true" }, ">_"),
     el("span", { class: "destination-copy" },
       el("span", { class: "destination-title" }, "Agents"),
       el("span", { class: "destination-summary" }, `${count} · All projects, one workspace`),

@@ -65,6 +65,17 @@ The native desktop also delivers deduplicated attention notifications; opening
 one takes you to the relevant Board, and the request stays unresolved until you
 answer or explicitly dismiss it.
 
+## Visual system
+
+The browser client wears the same visual system as the native app: the mono UI
+face, a near-black canvas, hairline borders, faint fills over the canvas, and
+omarchy's panel roundness. The tokens in `web/app.css` mirror the active omarchy
+theme (`~/.local/state/omarchy/current/theme/colors.toml`) and Hyprland's live
+`decoration:rounding`; the accent is the theme's accent sobered toward the
+foreground and background exactly as `src/gui/style.rs` does. On a machine whose
+rounding is `0` every surface is square, like the native app. Update the tokens
+when the theme changes (reading them live over an endpoint is a follow-up).
+
 ## Run locally
 
 ```sh
