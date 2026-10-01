@@ -27,60 +27,64 @@ use crate::session::activity::{
 };
 use crate::session::daemon::{Client, Command};
 
-/// Store-backed editor. A failed save leaves the draft intact; optimistic
-/// revisions prevent overwriting another editor or agent's changes. Socket I/O
-/// runs off the GTK thread so the dialog stays responsive while saving.
-pub(super) fn edit_dialog(
-    parent: &impl IsA<gtk::Window>,
+/// The inline card editor: a title entry, a body view, Save/Cancel and an
+/// error line. It has no window of its own — the card detail swaps its controls
+/// for this form in place, so a card is edited where it is read. A failed save
+/// leaves the draft intact; optimistic revisions prevent overwriting another
+/// editor's or agent's change. Socket I/O runs off the GTK thread, and the
+/// caller decides what to do on success or cancel through the two callbacks.
+fn inline_edit_form(
     home: &Path,
     project_id: i64,
-    card: crate::session::board_store::StoredCard,
+    card: &crate::session::board_store::StoredCard,
     on_saved: impl Fn() + 'static,
-) -> gtk::Window {
-    let window = gtk::Window::builder()
-        .title("Edit card")
-        .transient_for(parent)
-        .modal(true)
-        .default_width(460)
-        .default_height(340)
-        .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    content.set_margin_top(14);
-    content.set_margin_bottom(14);
-    content.set_margin_start(14);
-    content.set_margin_end(14);
+    on_cancel: impl Fn() + 'static,
+) -> gtk::Widget {
+    let form = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    form.add_css_class("card-edit");
     let title = gtk::Entry::new();
     title.set_text(&card.title);
     title.set_placeholder_text(Some("Title"));
-    content.append(&title);
+    title.add_css_class("card-edit-title");
+    form.append(&title);
     let body = gtk::TextView::new();
     body.buffer().set_text(&card.body);
     body.set_wrap_mode(gtk::WrapMode::WordChar);
+    body.add_css_class("card-edit-body");
     let scroll = gtk::ScrolledWindow::builder()
-        .min_content_height(160)
+        .min_content_height(120)
         .vexpand(true)
         .child(&body)
         .build();
-    content.append(&scroll);
+    form.append(&scroll);
     let feedback = board::activity_label("", false);
     feedback.add_css_class("error");
     feedback.set_visible(false);
-    content.append(&feedback);
+    form.append(&feedback);
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    buttons.set_halign(gtk::Align::End);
-    let cancel = gtk::Button::with_label("Cancel");
-    let window_for_cancel = window.clone();
-    cancel.connect_clicked(move |_| window_for_cancel.close());
-    buttons.append(&cancel);
+    buttons.set_halign(gtk::Align::Start);
     let save = gtk::Button::with_label("Save");
     save.add_css_class("suggested-action");
     buttons.append(&save);
-    content.append(&buttons);
-    window.set_child(Some(&content));
+    let cancel = gtk::Button::with_label("Cancel");
+    buttons.append(&cancel);
+    form.append(&buttons);
+
+    let on_cancel = Rc::new(on_cancel);
+    {
+        let on_cancel = on_cancel.clone();
+        cancel.connect_clicked(move |_| on_cancel());
+    }
 
     let home = home.to_path_buf();
-    let window_for_save = window.clone();
+    let card_title = card.title.clone();
+    let card_body = card.body.clone();
+    let card_id = card.id.clone();
+    let revision = card.revision;
     let on_saved = Rc::new(on_saved);
+    let on_cancel_for_save = on_cancel.clone();
+    let save_for_activate = save.clone();
+    title.connect_activate(move |_| save_for_activate.emit_clicked());
     save.connect_clicked(move |save| {
         let new_title = title.text().trim().to_string();
         if new_title.is_empty() {
@@ -93,8 +97,8 @@ pub(super) fn edit_dialog(
         let text = buffer
             .text(&buffer.start_iter(), &buffer.end_iter(), false)
             .to_string();
-        if new_title == card.title && text == card.body {
-            window_for_save.close();
+        if new_title == card_title && text == card_body {
+            on_cancel_for_save();
             return;
         }
         feedback.set_visible(false);
@@ -104,8 +108,7 @@ pub(super) fn edit_dialog(
         body.set_sensitive(false);
         save.set_label("Saving…");
         let home = home.clone();
-        let card_id = card.id.clone();
-        let revision = card.revision;
+        let card_id = card_id.clone();
         let command = super::gui_command_id("edit");
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
@@ -122,8 +125,7 @@ pub(super) fn edit_dialog(
             .map_err(|error| error.to_string());
             let _ = tx.send_blocking(result);
         });
-        let (window, save, cancel, title, body, feedback, on_saved) = (
-            window_for_save.clone(),
+        let (save, cancel, title, body, feedback, on_saved) = (
             save.clone(),
             cancel.clone(),
             title.clone(),
@@ -133,10 +135,7 @@ pub(super) fn edit_dialog(
         );
         gtk::glib::MainContext::default().spawn_local(async move {
             match rx.recv().await {
-                Ok(Ok(())) => {
-                    window.close();
-                    on_saved();
-                }
+                Ok(Ok(())) => on_saved(),
                 result => {
                     let error = match result {
                         Ok(Err(error)) => error,
@@ -154,19 +153,18 @@ pub(super) fn edit_dialog(
             }
         });
     });
-    window.present();
-    window
+    form.upcast()
 }
 
 #[cfg(test)]
 mod editor_tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     #[ignore = "requires a private D-Bus session and GTK display"]
-    fn editor_validates_titles_and_closes_unchanged_without_writing() {
+    fn inline_editor_validates_titles_and_skips_unchanged_saves() {
         gtk::init().unwrap();
-        let parent = gtk::Window::new();
         let home = tempfile::tempdir().unwrap();
         let card = crate::session::board_store::StoredCard {
             id: "card".into(),
@@ -182,11 +180,16 @@ mod editor_tests {
             created_at_millis: 0,
             updated_at_millis: 0,
         };
-        let window = edit_dialog(&parent, home.path(), 1, card, || {
-            panic!("unchanged card was saved")
-        });
-        let content = window.child().unwrap();
-        let title = content
+        let cancelled = Rc::new(Cell::new(false));
+        let cancel_flag = cancelled.clone();
+        let form = inline_edit_form(
+            home.path(),
+            1,
+            &card,
+            || panic!("unchanged card was saved"),
+            move || cancel_flag.set(true),
+        );
+        let title = form
             .first_child()
             .unwrap()
             .downcast::<gtk::Entry>()
@@ -198,23 +201,22 @@ mod editor_tests {
             .unwrap()
             .downcast::<gtk::Label>()
             .unwrap();
-        let save = content
+        let save = form
             .last_child()
             .unwrap()
-            .last_child()
+            .first_child()
             .unwrap()
             .downcast::<gtk::Button>()
             .unwrap();
         title.set_text("   ");
         save.emit_clicked();
-        assert!(window.is_visible());
         assert!(feedback.is_visible());
         assert_eq!(feedback.text(), "A card needs a title.");
+        assert!(!cancelled.get());
         title.set_text("Original");
         save.emit_clicked();
-        assert!(!window.is_visible());
+        assert!(cancelled.get());
         assert!(home.path().read_dir().unwrap().next().is_none());
-        parent.close();
     }
 }
 
@@ -309,13 +311,31 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
         inner.append(&body);
     }
 
-    // Controls.
+    // Controls, and the inline editor that takes their place: a card is edited
+    // where it is read, with no modal in the way.
+    let editor = gtk::Stack::new();
+    editor.set_transition_type(gtk::StackTransitionType::None);
+
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     controls.set_margin_top(2);
     let edit = gtk::Button::with_label("Edit");
     edit.add_css_class("flat");
-    edit.set_action_name(Some("win.card-edit"));
-    edit.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
+    edit.set_tooltip_text(Some("Edit this card's title and description here"));
+    {
+        let editor = editor.downgrade();
+        edit.connect_clicked(move |_| {
+            if let Some(editor) = editor.upgrade() {
+                editor.set_visible_child_name("edit");
+                // Put the caret in the title so editing starts immediately.
+                if let Some(title) = editor
+                    .child_by_name("edit")
+                    .and_then(|form| form.first_child())
+                {
+                    title.grab_focus();
+                }
+            }
+        });
+    }
     controls.append(&edit);
     let finish = gtk::Button::with_label(if card.done { "Reopen" } else { "Close to-do" });
     finish.add_css_class("flat");
@@ -362,7 +382,44 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
     open_board.set_action_name(Some("win.home-project"));
     open_board.set_action_target_value(Some(&project_id.to_variant()));
     controls.append(&open_board);
-    inner.append(&controls);
+    editor.add_named(&controls, Some("view"));
+
+    let form = inline_edit_form(
+        &app.session_home,
+        project_id,
+        &card,
+        {
+            let editor = editor.downgrade();
+            move || {
+                if let Some(editor) = editor.upgrade() {
+                    editor.set_visible_child_name("view");
+                    // Defer the re-read one turn: the focused field is hidden
+                    // here, and the refresh guard skips a rebuild while an
+                    // editable still holds focus. Saving with Enter would
+                    // otherwise leave the card showing its old text.
+                    let editor = editor.clone();
+                    gtk::glib::idle_add_local_once(move || {
+                        let _ = gtk::prelude::WidgetExt::activate_action(
+                            &editor,
+                            "win.card-saved",
+                            Some(&project_id.to_variant()),
+                        );
+                    });
+                }
+            }
+        },
+        {
+            let editor = editor.downgrade();
+            move || {
+                if let Some(editor) = editor.upgrade() {
+                    editor.set_visible_child_name("view");
+                }
+            }
+        },
+    );
+    editor.add_named(&form, Some("edit"));
+    editor.set_visible_child_name("view");
+    inner.append(&editor);
 
     let session_heading = board::activity_label("Linked sessions", false);
     session_heading.add_css_class("lane-section");

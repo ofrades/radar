@@ -26,11 +26,13 @@
   Canonical kinds win; joined lane names are used only without a lane record.
   Both existing and newly discovered sessions use it. Hiding does not stop an
   agent process.
-- `gui::card::edit_dialog` owns the editor UI and async save lifecycle. Saves run
-  on a worker thread, duplicate clicks are disabled, failures remain visible
-  with the draft intact, and revision checks remain mandatory. Unchanged cards
-  close without a mutation; blank titles get inline validation. Successful
-  saves use the existing board refresh/synchronization path.
+- `gui::card::inline_edit_form` owns the editor UI and async save lifecycle.
+  Saves run on a worker thread, duplicate clicks are disabled, failures remain
+  visible with the draft intact, and revision checks remain mandatory. Unchanged
+  cards leave edit mode without a mutation; blank titles get inline validation.
+  Successful saves use the existing board refresh/synchronization path.
+  (Originally a modal dialog; now the form swaps in where the card controls sit,
+  so a card is edited inline in Home's card detail.)
 
 ## Verification
 

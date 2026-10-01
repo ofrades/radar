@@ -573,6 +573,30 @@ paned > separator:hover {
 .card-panel .error {
   color: @radar_warning;
 }
+/* The card's inline editor: it takes the controls' place in the panel. */
+.card-panel .card-edit entry.card-edit-title {
+  font-size: 1.5em;
+  font-weight: 700;
+  padding: 4px 1px;
+  min-height: 0;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  border-bottom: 1px solid alpha(@radar_fg, 0.22);
+  border-radius: 0;
+  box-shadow: none;
+}
+.card-panel .card-edit entry.card-edit-title:focus {
+  border-bottom-color: @radar_accent;
+}
+.card-panel .card-edit textview.card-edit-body {
+  padding: 8px;
+  border: 1px solid @radar_hairline;
+  border-radius: {control_radius};
+}
+.card-panel .card-edit textview.card-edit-body:focus {
+  border-color: @radar_accent;
+}
 /* The card detail is Home's right-hand rail. */
 .card-panel-top {
   padding: 8px 10px;

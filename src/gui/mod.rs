@@ -2144,17 +2144,16 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         app.window.add_action(&action);
     }
     {
-        // The card detail's Edit control: the board's card dialog.
+        // The card detail's inline editor saved: re-read the board so the card
+        // shows the title and body it just wrote.
         let action = gio::SimpleAction::new(
-            "card-edit",
-            Some(glib::VariantTy::new("(xs)").expect("a project and card ID")),
+            "card-saved",
+            Some(glib::VariantTy::new("x").expect("a project ID")),
         );
         let app_for_action = app.clone();
         action.connect_activate(move |_, parameter| {
-            if let Some((project_id, card_id)) =
-                parameter.and_then(|value| value.get::<(i64, String)>())
-            {
-                app_for_action.edit_home_card(project_id, &card_id);
+            if let Some(project_id) = parameter.and_then(|value| value.get::<i64>()) {
+                app_for_action.refresh_board_summary(project_id);
             }
         });
         app.window.add_action(&action);
@@ -2916,32 +2915,6 @@ impl App {
             self.stack.set_visible_child_name("_home");
             self.refresh_home();
         }
-    }
-
-    /// Edit a card's title and body through a small store-backed dialog.
-    fn edit_home_card(self: &Rc<Self>, project_id: i64, card_id: &str) {
-        let card = self
-            .board_states
-            .borrow()
-            .get(&project_id)
-            .and_then(|state| state.cards.iter().find(|card| card.id == card_id))
-            .cloned();
-        let Some(card) = card else {
-            self.toast("That card is no longer on the board");
-            return;
-        };
-        let app = Rc::downgrade(self);
-        card::edit_dialog(
-            &self.window,
-            &self.session_home,
-            project_id,
-            card,
-            move || {
-                if let Some(app) = app.upgrade() {
-                    app.refresh_board_summary(project_id);
-                }
-            },
-        );
     }
 
     /// Move a card to another lane through the store.
