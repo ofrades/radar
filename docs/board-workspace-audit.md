@@ -100,6 +100,49 @@ Durable launch-time bindings require the new daemon binary and take effect on
 its next restart. Do not forcibly restart the real daemon while it owns live
 work. Existing live processes still link via `RADAR_CARD_ID`; older history can
 only link where an exact legacy claim binding survives. Unknown historic links
-are not fabricated. This follow-up supersedes the earlier “no storage
+are not fabricated.
+
+## Autonomous native journeys — r2-fzg
+
+- Workspace **＋** opens **To-dos & sessions** in the shared HUD, not a sidebar.
+  Creation, conversation, status and agent/conversation selection reuse the
+  Tools & shortcuts shell. Panel-to-task navigation stays in the workspace.
+  Auto arrange lives in Tools & shortcuts; the project label is not navigation.
+- **Create & start** creates and assigns a task to the default agent. Enter
+  creates without starting work. Board work does not launch unrelated layout
+  presets, switch to a terminal, or change the last-project preference.
+- The conversation is primary; terminal inspection is a collapsed optional
+  section. **Send to agent** starts work or follows up on the same linked
+  conversation, even after Review released its claim. Follow-ups on Done reopen
+  the task. Outcomes still come from agent comments and board transitions, not
+  guesses from process exit or terminal output.
+- A selected stopped conversation resumes with a fresh runtime/claim and the
+  new task's environment. Its exact catalog row and task association are merged
+  together. Running workers cannot be reassigned or interrupted by this picker.
+- Commands resolve live workers from the daemon, not a mapped GTK terminal.
+  Conversation routing queries the catalog by card identity instead of relying
+  on a possibly stale sidebar discovery snapshot. Persistent many-to-many task
+  links survive claim release, exact-conversation reassignment and restart.
+  Todo/In progress/Review use the same authoritative session-open action.
+  Bare sessions become linked when their exact daemon-owned agent claims a task;
+  recoverable claim bindings are persisted when opening them. Missing exact
+  links expose reconnection controls instead of guessing the last conversation.
+- Exact provider identity travels in the spawn environment and is bound by the
+  daemon after Create records the catalog row; the GUI's earlier binding raced
+  asynchronous creation. Beads board snapshots now expose the same effective
+  revision the daemon validates, including multiple mutations in one timestamp.
+
+Verification includes an isolated Broadway smoke with inert agent executables:
+workspace creation/navigation; board create/start; live Review follow-up;
+stopped exact resume; rendered agent summary; human completion and reopening;
+conversation reassignment with durable task binding; and choosing a fresh Pi
+agent. No real agent CLI is launched by this test. Separate daemon tests assert
+exact spawn identity and task binding are recorded together, and a regression
+forces coarse Beads timestamps to check snapshot revisions.
+
+These changes require the new daemon for atomic exact binding and card-filtered
+catalog queries. Install and restart it only at an agreed safe point: stopping
+it terminates all its running sessions. A GUI-only reload cannot roll out the
+server fixes. Web-client journey parity is not changed by this native work. This follow-up supersedes the earlier “no storage
 migration” scope: it adds a backward-compatible catalog column, not a board
 storage migration.

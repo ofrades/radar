@@ -20,10 +20,8 @@ pub struct Primitive {
     pub program_id: String,
     pub widget: gtk::Widget,
     pub pane: Option<Rc<Pane>>,
-    /// The provider conversation this pane was launched on, when the launch
-    /// named one exactly (`--session <id>`). How a sidebar row recognizes
-    /// its own conversation in a tab: showing a running tab is only honest
-    /// when it really is the conversation the row points at.
+    /// The pane's current exact conversation. Initialized by an exact resume,
+    /// then refreshed from provider reports, including in-provider switches.
     pub launched_session: RefCell<Option<String>>,
 }
 

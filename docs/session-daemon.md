@@ -16,11 +16,10 @@ daemon. The daemon and CLI API can also be used independently.
 ## Agent conversations versus terminal sessions
 
 The daemon shares a terminal process and its PTY stream. It does not make two
-independently launched agent CLIs share a conversation. OpenCode has a
-machine-readable session list, so Radar imports its project history and reopens
-the exact provider session when selected. OMP, Pi, and Cursor support continuing
-or resuming through their own CLI flags, but their history is not imported
-without a supported machine-readable listing interface. A live external agent is
+independently launched agent CLIs share a conversation. The four supported
+providers — OpenCode, OMP, Pi and Cursor — report their actual conversation
+identity, and Radar reads their saved history to validate exact Resume requests.
+A requested or launch-time ID is not proof that a conversation exists. A live external agent is
 shown as an external-terminal row; selecting it focuses the terminal that owns it
 rather than implying Radar has attached to its conversation or PTY.
 
@@ -164,23 +163,32 @@ daemon restarts as catalog rows, without implying their processes survived.
   missing from the registry at reconciliation time, e.g. after a daemon
   restart — the row ends. A running row is never a claim that the process is
   alive; it is corrected on the next list.
-- `CatalogSeen` backfills a live session the daemon has no record for, and
-  `CatalogBind` adopts the provider's own conversation id for a radar-spawned
-  row (exit capture). Provider histories import as throttled upserts (60 s per
-  project, currently OpenCode): the importer requests up to 10,000 rows,
-  preserves the provider's `updated` timestamp as activity, and binds a
-  conversation that matches a young running Radar row instead of duplicating
-  it.
+- `CatalogSeen` backfills a live session the daemon has no record for.
+  `SessionIdentify` records a provider callback scoped to the exact worker
+  incarnation. Spawn registration and callbacks are serialized so startup
+  cannot overwrite an early identity report. Switching conversations preserves
+  the old row and its task links, and attaches the runtime to the new row.
+  A callback from an old worker or a Pi/OMP child cannot steal the parent's link.
+- Provider histories import as throttled upserts (60 s per project). OpenCode
+  supplies up to 10,000 rows through its standalone CLI; Pi/OMP JSONL headers
+  and Cursor's project-scoped SQLite metadata supply their exact stored IDs.
+  An import never binds a worker using creation-time proximity or newest-session
+  guesses. An unreadable or changed store cannot authorize a Resume.
 - Every catalog refresh archives ended or failed rows whose last activity is
   more than seven days old. Running rows are never auto-archived merely
   because their last title/activity update is old. `CatalogArchive(id,
   archived)` remains available for explicit presentation changes.
-- Cursor Agent exposes `cursor-agent ls` as an interactive workspace chat
-  picker, but the command has no documented machine-readable output or stable
-  history-record schema (non-interactive use enters the TUI and cannot be
-  imported safely). Radar therefore discovers Cursor while its process is
-  running, but does not scrape private stores or parse the picker UI; durable
-  old Cursor capture needs a provider-supported export/list contract.
+- Resume validates the exact project-scoped conversation before spawning any
+  child. Missing, empty or unreadable history produces an error, not a fresh
+  session. Pi creation uses `--session-id`; Resume uses `--session`. OpenCode's
+  create-if-missing flag is protected by the same pre-spawn validation.
+- `radar setup` installs the provider integrations globally: Pi's `session_start`
+  and before-turn callbacks, OMP's start/switch and before-turn callbacks,
+  OpenCode's reactive TUI route observer, and Cursor's session/prompt/tool hooks.
+  Cursor skips `sessionStart` on exact resume; a validated saved target supplies
+  the initial link, and prompt/tool callbacks record subsequent actual identity.
+  Native/CLI worker launches also install these integrations; an installation
+  error prevents a native launch. External terminals are not adopted.
 - `CatalogList(projects, filter, query, limit)` returns rows newest-activity
   first; the client supplies the project roster. `CatalogArchive(id, archived)`
   is presentation state only — it hides a row from the active list and never
@@ -188,6 +196,19 @@ daemon restarts as catalog rows, without implying their processes survived.
 - Catalog rows without a live radar session are history. The native sidebar
   reopens them exactly when the provider exposed a session id (resume
   template); otherwise the row says so instead of guessing "last".
+
+### Active conversation identity
+
+Use `radar session identity` inside a worker (or `--id <runtime-id>` outside it)
+for the daemon's authoritative provider/conversation pair. Do not use an
+immutable launch environment variable for deployment handoffs. Fresh launches
+are not durably bound until the provider reports its identity; validated exact
+resumes can be bound immediately. The provider callbacks also update the claim's
+exact link, so it does not remain attached to the launch conversation.
+
+Protocol version 4 is required. Installing the binary or hooks does not upgrade
+an already-running daemon or inject extensions into already-running agents.
+Activate together at a safe restart point; daemon shutdown ends hosted processes.
 
 Attention creation and its source event share one transaction. Requests survive
 daemon restarts with stable request/source-event IDs, revision, reason, target,

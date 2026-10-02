@@ -25,6 +25,7 @@ pub struct Installed {
     pub opencode: Option<PathBuf>,
     pub omp: Option<PathBuf>,
     pub claude: Option<PathBuf>,
+    pub session_hooks: Vec<PathBuf>,
     pub git_hooks_dir: Option<PathBuf>,
     pub git_hooks_path_set: bool,
 }
@@ -147,6 +148,7 @@ pub fn install_global(home: &Path) -> Result<Installed> {
     write_if_changed(&omp, OMP_EXTENSION)?;
 
     let claude = merge_claude_settings(&home.join(".claude/settings.json"))?;
+    let session_hooks = install_session_hooks(home)?;
 
     let (git_hooks_dir, git_hooks_path_set) = install_git_hooks(home)?;
 
@@ -155,9 +157,78 @@ pub fn install_global(home: &Path) -> Result<Installed> {
         opencode: Some(opencode),
         omp: Some(omp),
         claude: Some(claude),
+        session_hooks,
         git_hooks_dir: Some(git_hooks_dir),
         git_hooks_path_set,
     })
+}
+
+/// Session identity is required even when the project's board is disabled.
+pub fn install_default_session_hooks() -> Result<Vec<PathBuf>> {
+    let home = std::env::var_os("RADAR_SKILLS_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .context("No home directory for provider integrations")?;
+    install_session_hooks(&home)
+}
+
+fn install_session_hooks(home: &Path) -> Result<Vec<PathBuf>> {
+    let pi = home.join(".pi/agent/extensions/radar-session.js");
+    let omp = home.join(".omp/agent/extensions/radar-session.ts");
+    let extension = include_str!("session/hooks/pi.js");
+    write_if_changed(&pi, extension)?;
+    write_if_changed(
+        &omp,
+        &extension.replace(
+            "pi.on(\"session_start\", identify);",
+            "pi.on(\"session_start\", identify);\n  pi.on(\"session_switch\", identify);",
+        ),
+    )?;
+    let dir = home.join(".config/opencode/plugins/radar-session");
+    write_if_changed(
+        &dir.join("package.json"),
+        r#"{"name":"radar-session","type":"module","exports":{".":"./index.js","./tui":"./tui.js"}}"#,
+    )?;
+    write_if_changed(
+        &dir.join("index.js"),
+        "export default { id: 'radar-session', setup() {} };\n",
+    )?;
+    let opencode = dir.join("tui.js");
+    write_if_changed(&opencode, include_str!("session/hooks/opencode-tui.js"))?;
+    let cursor = home.join(".cursor/radar-session.sh");
+    write_if_changed(&cursor, include_str!("session/hooks/cursor.sh"))?;
+    let settings = home.join(".cursor/hooks.json");
+    let mut root: serde_json::Value = if settings.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&settings)?)?
+    } else {
+        serde_json::json!({"version": 1, "hooks": {}})
+    };
+    let hooks = root
+        .as_object_mut()
+        .context("Cursor settings must be an object")?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("Cursor hooks must be an object")?;
+    let command = format!(
+        "sh '{}'",
+        cursor.display().to_string().replace('\'', "'\\''")
+    );
+    for event in ["sessionStart", "beforeSubmitPrompt", "preToolUse"] {
+        let entries = hooks
+            .entry(event)
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .context("Cursor hook list must be an array")?;
+        if !entries.iter().any(|entry| entry["command"] == command) {
+            entries.push(serde_json::json!({"command":command,"timeout":10,"failClosed":true}));
+        }
+    }
+    write_if_changed(
+        &settings,
+        &format!("{}\n", serde_json::to_string_pretty(&root)?),
+    )?;
+    Ok(vec![pi, omp, opencode, cursor, settings])
 }
 
 /// The default install: the current user's home.

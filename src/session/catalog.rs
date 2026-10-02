@@ -41,6 +41,9 @@ pub struct Entry {
     /// Stable todo association, independent of mutable board claims.
     #[serde(default)]
     pub card_id: Option<String>,
+    /// Every task this exact conversation has served, including prior assignments.
+    #[serde(default)]
+    pub card_ids: Vec<String>,
     /// `radar` when radar spawned it, `provider` when imported from history.
     pub source: String,
     pub title: Option<String>,
@@ -118,8 +121,8 @@ pub(crate) fn is_generic_session_title(
 }
 
 /// Bump when the table below changes; add the next step to `SCHEMA_STEPS`.
-const SCHEMA_VERSION: i64 = 2;
-const SCHEMA_STEPS: [&str; 2] = [
+const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_STEPS: [&str; 3] = [
     r#"
     CREATE TABLE IF NOT EXISTS sessions (
         id                 INTEGER PRIMARY KEY,
@@ -141,6 +144,16 @@ const SCHEMA_STEPS: [&str; 2] = [
         ON sessions(project_id, last_activity_at DESC);
 "#,
     "ALTER TABLE sessions ADD COLUMN card_id TEXT;",
+    r#"
+    CREATE TABLE session_cards (
+        session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        card_id TEXT NOT NULL,
+        PRIMARY KEY(session_id, card_id)
+    );
+    CREATE INDEX session_cards_card ON session_cards(card_id);
+    INSERT INTO session_cards(session_id, card_id)
+        SELECT id, card_id FROM sessions WHERE card_id IS NOT NULL;
+"#,
 ];
 
 impl SessionCatalog {
@@ -165,6 +178,7 @@ impl SessionCatalog {
 
     fn initialize(conn: rusqlite::Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         super::schema::migrate(&conn, SCHEMA_VERSION, &SCHEMA_STEPS)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -194,7 +208,15 @@ impl SessionCatalog {
         now_ms: i64,
         card_id: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn.lock();
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction()?;
+        conn.execute("UPDATE sessions SET radar_session_id = NULL, lifecycle = 'ended',
+                ended_at = COALESCE(ended_at, ?2)
+            WHERE radar_session_id = ?1 AND NOT (project_id = ?3 AND provider = ?4 AND provider_session_id = ?1)",
+            params![radar_id, now_ms, project_id, program])?;
+        conn.execute("DELETE FROM session_cards WHERE session_id IN
+            (SELECT id FROM sessions WHERE project_id = ?1 AND provider = ?2 AND provider_session_id = ?3)",
+            params![project_id, program, radar_id])?;
         conn.execute(
             "INSERT INTO sessions (project_id, provider, provider_session_id, radar_session_id,
                                    source, title, cwd, created_at, last_activity_at,
@@ -215,6 +237,12 @@ impl SessionCatalog {
                 card_id
             ],
         )?;
+        if let Some(card_id) = card_id {
+            conn.execute("INSERT OR IGNORE INTO session_cards(session_id, card_id)
+                SELECT id, ?4 FROM sessions WHERE project_id = ?1 AND provider = ?2 AND provider_session_id = ?3",
+                params![project_id, program, radar_id, card_id])?;
+        }
+        conn.commit()?;
         Ok(())
     }
 
@@ -235,15 +263,82 @@ impl SessionCatalog {
             "UPDATE sessions SET lifecycle = 'running', ended_at = NULL,
                                   last_activity_at = MAX(last_activity_at, ?2),
                                   card_id = COALESCE(?3, card_id)
-              WHERE radar_session_id = ?1 AND source = 'radar'",
+              WHERE radar_session_id = ?1",
             params![radar_id, now_ms, card_id],
         )?;
+        if let Some(card_id) = card_id {
+            conn.execute(
+                "INSERT OR IGNORE INTO session_cards(session_id, card_id)
+                SELECT id, ?2 FROM sessions WHERE radar_session_id = ?1",
+                params![radar_id, card_id],
+            )?;
+        }
         drop(conn);
         if updated == 0 {
             self.record_radar_with_card(project_id, radar_id, program, cwd, now_ms, card_id)
         } else {
             Ok(())
         }
+    }
+
+    /// Link a claim to its exact daemon-owned runtime without losing older task links.
+    pub fn associate_card(&self, project_id: i64, radar_id: &str, card_id: &str) -> Result<()> {
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction()?;
+        conn.execute(
+            "UPDATE sessions SET card_id = COALESCE(card_id, ?3)
+            WHERE project_id = ?1 AND radar_session_id = ?2",
+            params![project_id, radar_id, card_id],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO session_cards(session_id, card_id)
+            SELECT id, ?3 FROM sessions WHERE project_id = ?1 AND radar_session_id = ?2",
+            params![project_id, radar_id, card_id],
+        )?;
+        conn.commit()?;
+        Ok(())
+    }
+
+    pub fn runtime_conversation(&self, radar_id: &str) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT provider, provider_session_id FROM sessions
+            WHERE radar_session_id = ?1 AND provider_session_id != ?1",
+                [radar_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn link_conversation(
+        &self,
+        project_id: i64,
+        provider: &str,
+        conversation: &str,
+        card_id: &str,
+    ) -> Result<()> {
+        let mut connection = self.conn.lock();
+        let conn = connection.transaction()?;
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM sessions WHERE project_id = ?1
+            AND provider = ?2 AND provider_session_id = ?3",
+                params![project_id, provider, conversation],
+                |row| row.get(0),
+            )
+            .context("The exact conversation is not in the catalog")?;
+        conn.execute(
+            "UPDATE sessions SET card_id = COALESCE(card_id, ?2) WHERE id = ?1",
+            params![id, card_id],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO session_cards(session_id, card_id) VALUES (?1, ?2)",
+            params![id, card_id],
+        )?;
+        conn.commit()?;
+        Ok(())
     }
 
     /// Pull catalog rows toward live daemon truth: titles follow the
@@ -348,10 +443,10 @@ impl SessionCatalog {
     ) -> Result<()> {
         let mut connection = self.conn.lock();
         let conn = connection.transaction()?;
-        let Some((id, project_id, title, lifecycle, card_id)) = conn
+        let Some((mut id, project_id, title, lifecycle, card_id, previous)) = conn
             .query_row(
-                "SELECT id, project_id, title, lifecycle, card_id FROM sessions
-                  WHERE radar_session_id = ?1 AND source = 'radar'
+                "SELECT id, project_id, title, lifecycle, card_id, provider_session_id FROM sessions
+                  WHERE radar_session_id = ?1
                   ORDER BY (provider_session_id = radar_session_id) DESC, created_at DESC LIMIT 1",
                 params![radar_id],
                 |row| {
@@ -361,13 +456,36 @@ impl SessionCatalog {
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
             .optional()?
         else {
-            return Ok(());
+            anyhow::bail!("No runtime catalog record exists for {radar_id}");
         };
+        if previous != radar_id && previous != provider_session_id {
+            // A provider switch changes the viewport, never the durable conversation.
+            conn.execute(
+                "UPDATE sessions SET radar_session_id = NULL, lifecycle = 'ended',
+                ended_at = COALESCE(ended_at, ?2) WHERE id = ?1",
+                params![id, now_ms],
+            )?;
+            conn.execute(
+                "INSERT INTO sessions(project_id, provider, provider_session_id,
+                radar_session_id, source, cwd, created_at, last_activity_at, lifecycle, card_id)
+                SELECT project_id, provider, ?2, ?2, 'radar', cwd, ?3, ?3, ?4, card_id
+                FROM sessions WHERE id = ?1",
+                params![id, radar_id, now_ms, lifecycle],
+            )?;
+            id = conn.last_insert_rowid();
+            if let Some(card) = &card_id {
+                conn.execute(
+                    "INSERT INTO session_cards(session_id, card_id) VALUES (?1, ?2)",
+                    params![id, card],
+                )?;
+            }
+        }
         // A pane is a runtime slot, not a conversation identity. Its previous
         // conversations retain their todo links but cannot impersonate this run.
         conn.execute(
@@ -395,6 +513,11 @@ impl SessionCatalog {
             )
             ? > 0;
         if merged {
+            conn.execute("INSERT OR IGNORE INTO session_cards(session_id, card_id)
+                SELECT target.id, link.card_id FROM sessions target JOIN session_cards link
+                    ON link.session_id = ?1
+                WHERE target.project_id = ?2 AND target.provider = ?3 AND target.provider_session_id = ?4",
+                params![id, project_id, provider, provider_session_id])?;
             conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         } else {
             conn.execute(
@@ -408,9 +531,8 @@ impl SessionCatalog {
         Ok(())
     }
 
-    /// Upsert one provider-history page. A conversation that matches a young
-    /// running radar row (the agent registered its session at startup) binds
-    /// to that row instead of inserting a duplicate.
+    /// Import history by exact identity. Creation times never identify a worker:
+    /// multiple conversations can start in the same project at the same instant.
     pub fn import_provider(
         &self,
         project_id: i64,
@@ -431,15 +553,12 @@ impl SessionCatalog {
             // titles authoritative.
             let bound = conn
                 .query_row(
-                    "UPDATE sessions SET provider_session_id = ?4,
-                                         last_activity_at = MAX(last_activity_at, ?5),
-                                         cwd = CASE WHEN cwd = '' THEN ?6 ELSE cwd END
-                     WHERE project_id = ?1 AND provider = ?2 AND source = 'radar'
-                       AND lifecycle = 'running'
-                       AND (provider_session_id = radar_session_id OR provider_session_id = ?4)
-                       AND ABS(created_at - ?3) < 15000
+                    "UPDATE sessions SET last_activity_at = MAX(last_activity_at, ?4),
+                                         cwd = CASE WHEN cwd = '' THEN ?5 ELSE cwd END
+                     WHERE project_id = ?1 AND provider = ?2
+                       AND provider_session_id = ?3
                      RETURNING id, title",
-                    params![project_id, provider, created, session.id, activity, cwd_text],
+                    params![project_id, provider, session.id, activity, cwd_text],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
                 )
                 .optional()?;
@@ -528,7 +647,8 @@ impl SessionCatalog {
         if query.is_some() {
             sql.push_str(
                 " AND (title LIKE '%' || ? || '%' OR provider LIKE '%' || ? || '%'
-                      OR provider_session_id LIKE '%' || ? || '%')",
+                      OR provider_session_id LIKE '%' || ? || '%' OR EXISTS
+                        (SELECT 1 FROM session_cards link WHERE link.session_id = sessions.id AND link.card_id = ?))",
             );
         }
         sql.push_str(" ORDER BY last_activity_at DESC, created_at DESC LIMIT ?");
@@ -547,10 +667,11 @@ impl SessionCatalog {
             parameters.push(Box::new(like.to_string()));
             parameters.push(Box::new(like.to_string()));
             parameters.push(Box::new(like.to_string()));
+            parameters.push(Box::new(like.to_string()));
         }
         parameters.push(Box::new(limit));
 
-        let rows = stmt
+        let mut rows = stmt
             .query_map(
                 parameters
                     .iter()
@@ -573,10 +694,18 @@ impl SessionCatalog {
                         lifecycle: row.get(11)?,
                         archived_at: row.get(12)?,
                         card_id: row.get(13)?,
+                        card_ids: Vec::new(),
                     })
                 },
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut links = conn
+            .prepare("SELECT card_id FROM session_cards WHERE session_id = ?1 ORDER BY card_id")?;
+        for row in &mut rows {
+            row.card_ids = links
+                .query_map([row.id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+        }
         Ok(rows)
     }
 
@@ -826,6 +955,79 @@ mod tests {
     }
 
     #[test]
+    fn conversation_links_survive_reassignment_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        {
+            let catalog = SessionCatalog::open(&path).unwrap();
+            catalog
+                .record_radar_with_card(
+                    3,
+                    "project-3-agent-0-pi",
+                    "pi",
+                    Path::new("/w"),
+                    1,
+                    Some("todo-a"),
+                )
+                .unwrap();
+            catalog
+                .bind_provider("project-3-agent-0-pi", "pi", "saved", 2)
+                .unwrap();
+            catalog
+                .record_radar_with_card(
+                    3,
+                    "project-3-agent-1-pi",
+                    "pi",
+                    Path::new("/w"),
+                    3,
+                    Some("todo-b"),
+                )
+                .unwrap();
+            catalog
+                .bind_provider("project-3-agent-1-pi", "pi", "saved", 4)
+                .unwrap();
+        }
+        let catalog = SessionCatalog::open(&path).unwrap();
+        for card in ["todo-a", "todo-b"] {
+            let rows = catalog
+                .list(&[3], CatalogFilter::All, Some(card), 100)
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].provider_session_id, "saved");
+            assert_eq!(rows[0].card_id.as_deref(), Some("todo-b"));
+            assert_eq!(rows[0].card_ids, ["todo-a", "todo-b"]);
+        }
+        catalog
+            .link_conversation(3, "pi", "saved", "todo-c")
+            .unwrap();
+        assert!(catalog
+            .link_conversation(4, "pi", "saved", "wrong-project")
+            .is_err());
+        let rows = catalog
+            .list(&[3], CatalogFilter::All, Some("todo-c"), 100)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].card_id.as_deref(), Some("todo-b"));
+    }
+
+    #[test]
+    fn a_claim_links_a_bare_session_without_replacing_its_conversation() {
+        let catalog = SessionCatalog::open_in_memory().unwrap();
+        let runtime = "project-3-agent-0-pi";
+        catalog
+            .record_radar(3, runtime, "pi", Path::new("/w"), 1)
+            .unwrap();
+        catalog.bind_provider(runtime, "pi", "saved", 2).unwrap();
+        catalog.associate_card(3, runtime, "todo-a").unwrap();
+        let rows = catalog
+            .list(&[3], CatalogFilter::All, Some("todo-a"), 100)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider_session_id, "saved");
+        assert_eq!(rows[0].card_ids, ["todo-a"]);
+    }
+
+    #[test]
     fn a_reused_pane_without_a_todo_does_not_inherit_the_old_binding() {
         let catalog = SessionCatalog::open_in_memory().unwrap();
         let id = "project-3-agent-0-opencode";
@@ -956,6 +1158,9 @@ mod tests {
             .record_radar(3, radar_id, "opencode", Path::new("/w"), created_at)
             .unwrap();
         catalog
+            .bind_provider(radar_id, "opencode", "ses_42", created_at)
+            .unwrap();
+        catalog
             .import_provider(
                 3,
                 "opencode",
@@ -1006,6 +1211,9 @@ mod tests {
             .record_radar(3, radar_id, "opencode", Path::new("/w"), created_at)
             .unwrap();
         catalog
+            .bind_provider(radar_id, "opencode", "ses_42", created_at)
+            .unwrap();
+        catalog
             .reconcile(
                 &[status(radar_id, Lifecycle::Running, Some("OpenCode"))],
                 created_at + 1_000,
@@ -1053,7 +1261,42 @@ mod tests {
     }
 
     #[test]
-    fn importing_binds_a_young_running_radar_row_instead_of_duplicating() {
+    fn a_provider_session_switch_preserves_both_conversations_and_task_links() {
+        for provider in crate::programs::agents::SUPPORTED_AGENT_IDS {
+            let catalog = catalog();
+            let runtime = format!("project-3-agent-0-{provider}");
+            catalog
+                .record_radar_with_card(3, &runtime, provider, Path::new("/w"), 1000, Some("task"))
+                .unwrap();
+            catalog
+                .bind_provider(&runtime, provider, "original", 1001)
+                .unwrap();
+            catalog
+                .bind_provider(&runtime, provider, "switched", 1002)
+                .unwrap();
+            let rows = catalog.list(&[3], CatalogFilter::All, None, 10).unwrap();
+            assert_eq!(
+                rows.len(),
+                2,
+                "{provider}: switching must not rename the original history"
+            );
+            let old = rows
+                .iter()
+                .find(|row| row.provider_session_id == "original")
+                .unwrap();
+            assert_eq!(old.radar_session_id, None);
+            assert_eq!(old.card_ids, vec!["task"]);
+            let current = rows
+                .iter()
+                .find(|row| row.provider_session_id == "switched")
+                .unwrap();
+            assert_eq!(current.radar_session_id.as_deref(), Some(runtime.as_str()));
+            assert_eq!(current.card_ids, vec!["task"]);
+        }
+    }
+
+    #[test]
+    fn importing_history_never_guesses_a_runtime_from_creation_time() {
         let catalog = catalog();
         let radar_id = "project-3-agent-0-opencode";
         catalog
@@ -1074,10 +1317,18 @@ mod tests {
             )
             .unwrap();
         let rows = catalog.list(&[3], CatalogFilter::Active, None, 10).unwrap();
-        assert_eq!(rows.len(), 1, "the running row adopts the provider id");
-        assert_eq!(rows[0].provider_session_id, "ses_new");
-        assert_eq!(rows[0].radar_session_id.as_deref(), Some(radar_id));
-        assert_eq!(rows[0].lifecycle, "running");
+        assert_eq!(rows.len(), 2, "history cannot identify the running worker");
+        let live = rows
+            .iter()
+            .find(|row| row.radar_session_id.as_deref() == Some(radar_id))
+            .unwrap();
+        assert_eq!(live.provider_session_id, radar_id);
+        assert_eq!(live.lifecycle, "running");
+        let history = rows
+            .iter()
+            .find(|row| row.provider_session_id == "ses_new")
+            .unwrap();
+        assert_eq!(history.radar_session_id, None);
 
         // An older conversation imports as plain history.
         catalog
@@ -1095,7 +1346,7 @@ mod tests {
             )
             .unwrap();
         let rows = catalog.list(&[3], CatalogFilter::All, None, 10).unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         let old = rows
             .iter()
             .find(|r| r.provider_session_id == "ses_old")

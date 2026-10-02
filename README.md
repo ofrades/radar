@@ -168,11 +168,17 @@ Home. Going home never stops a program; the panes keep running behind it.
 Project **⋮** menus provide name editing, project defaults, pinning, ordering,
 and archive. Archive hides the project while preserving its tasks, settings
 and sessions; adding its folder again restores it. No project files are deleted.
-Inside a workspace, the compact top toolbar exposes tools and shortcuts;
-**Board** (or `Alt+K`, or clicking the project name) opens the project's board
-in Home — its lanes and to-dos. **New session** (the toolbar's ＋) starts an
-agent right from the workspace: pick one of the project's open to-dos and the
-default agent starts attached to it, claiming it. Asking for an agent when
+Inside a workspace, the compact top toolbar exposes tools and shortcuts.
+The toolbar's **＋** opens **To-dos & sessions** in the shared Tools & shortcuts
+dialog: create tasks, read conversations, choose an agent or stopped conversation,
+and edit, move or close tasks.
+**Create & start** creates a task and starts the default agent on either surface;
+Enter in the input creates a to-do without starting it.
+Opening a panel's to-do uses that same dialog without navigating away.
+**Board** (or `Alt+K`) opens the project's board in Home — its lanes and to-dos.
+Task session controls resolve exact conversations independently of Todo,
+In progress or Review. Links survive releasing claims and reusing a conversation
+for another task; missing links expose agent/conversation recovery controls. Asking for an agent when
 none is on screen — the dock's Agent button, `Alt+A` — opens the same picker;
 the overlay's Actions row does too, while an agent is already up. An agent
 panel's header shows the to-do its session works on: the title opens the
@@ -396,7 +402,17 @@ there. Basecamp-style, **Home drills down in place**: clicking a to-do opens
 the **card** (its body rendered as Markdown, its thread, a reply box, and
 controls to edit, move and close it), and **Open board** opens the project's
 board as columns of cards — each with a **Back** arrow to the cockpit. Session
-rows are clickable too: the whole row opens the session.
+rows are clickable too: the whole row opens the session. Starting work or
+sending a reply stays on the current surface; opening a session is explicit.
+The conversation is the main surface; agent conversations are an optional
+collapsed section. **Send to agent** starts work or delivers a follow-up,
+including after Review releases the claim. A follow-up on a completed task
+reopens it. Exact conversation links survive process exit; no unrelated "last"
+conversation is substituted.
+An unassigned card offers **Assign and start** to choose an installed agent or
+continue a stopped conversation, binding its new run to this task. Running
+workers are not reassigned, and claimed cards cannot be stolen through that
+control.
 
 ### The convention
 

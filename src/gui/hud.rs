@@ -14,7 +14,7 @@ use adw::prelude::*;
 use gtk::glib;
 
 use super::primitive::label_for;
-use super::{accel_hint, icon_name, SharedApp};
+use super::{accel_hint, icon_name, App, SharedApp};
 use crate::db::{Slot, TabKey};
 use crate::programs::{self, Program};
 
@@ -48,8 +48,7 @@ enum Kind {
     /// a small enum beside primitive and card rows, and the payload is the
     /// only large one.
     Program(Slot, Box<Program>),
-    /// Start the project's default agent on this board card — how the
-    /// workspace creates a session (agents are 1:1 with board to-dos).
+    /// Open the task's conversation without leaving the workspace.
     Card(i64, String),
     /// Fire a `win.` action, no parameter.
     Action(&'static str),
@@ -69,9 +68,12 @@ pub struct Hud {
     list: gtk::ListBox,
     /// Rows in list order, with the text the filter matches.
     rows: RefCell<Vec<(gtk::ListBoxRow, String, Kind)>>,
-    /// The panel is showing the to-do picker (`present_cards`): rows that
-    /// re-open the picker keep it up instead of closing the panel.
-    picker: Cell<bool>,
+    /// The project and optional task currently shown in this shared dialog.
+    task_project: Cell<Option<i64>>,
+    task_card: RefCell<Option<String>>,
+    back: gtk::Button,
+    creation: gtk::Box,
+    details: gtk::Box,
 }
 
 impl Hud {
@@ -92,6 +94,12 @@ impl Hud {
 
         let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         title.add_css_class("hud-title");
+        let back = gtk::Button::from_icon_name("go-previous-symbolic");
+        back.add_css_class("flat");
+        back.set_tooltip_text(Some("Back to to-dos"));
+        back.set_action_name(Some("win.new-session"));
+        back.set_visible(false);
+        title.append(&back);
         let heading = gtk::Label::new(Some("Keys and primitives"));
         heading.add_css_class("heading");
         heading.set_xalign(0.0);
@@ -101,7 +109,16 @@ impl Hud {
         hint.add_css_class("caption");
         hint.add_css_class("dim-label");
         title.append(&hint);
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.add_css_class("flat");
+        close.set_tooltip_text(Some("Close dialog"));
+        close.set_action_name(Some("win.hud"));
+        title.append(&close);
         card.append(&title);
+        let creation = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        creation.add_css_class("hud-creation");
+        creation.set_visible(false);
+        card.append(&creation);
 
         let search = gtk::SearchEntry::new();
         search.set_placeholder_text(Some("Filter primitives and keys…"));
@@ -119,6 +136,10 @@ impl Hud {
         scroll.set_max_content_height(460);
         scroll.set_propagate_natural_height(true);
         card.append(&scroll);
+        let details = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        details.add_css_class("hud-task");
+        details.set_visible(false);
+        card.append(&details);
 
         Rc::new(Hud {
             root,
@@ -127,7 +148,11 @@ impl Hud {
             scroll,
             list,
             rows: RefCell::new(Vec::new()),
-            picker: Cell::new(false),
+            task_project: Cell::new(None),
+            task_card: RefCell::new(None),
+            back,
+            creation,
+            details,
         })
     }
 
@@ -142,7 +167,7 @@ impl Hud {
     /// Bring the panel up over the workspace: fresh rows (visibility
     /// changes), empty filter, the keys on the filter box.
     pub fn present(&self, app: &SharedApp) {
-        self.picker.set(false);
+        self.reset_tasks();
         self.heading.set_text("Keys and primitives");
         self.search
             .set_placeholder_text(Some("Filter primitives and keys…"));
@@ -159,7 +184,7 @@ impl Hud {
         if matches!(slot, Slot::Board | Slot::Custom) {
             return;
         }
-        self.picker.set(false);
+        self.reset_tasks();
         self.heading
             .set_text(&format!("Choose a {} program", label_for(slot)));
         self.search.set_placeholder_text(Some("Filter programs…"));
@@ -170,35 +195,134 @@ impl Hud {
         self.search.grab_focus();
     }
 
-    /// Show the project's open to-dos to start a session on. The workspace's
-    /// create-a-session form: agents are 1:1 with board to-dos, so a new
-    /// session picks the to-do it will work on.
-    pub fn present_cards(&self, app: &SharedApp, project_id: i64) {
-        self.picker.set(true);
-        self.heading.set_text("Start a session on a to-do");
+    /// One workspace entry point for creating work and opening task conversations.
+    pub fn present_cards(&self, app: &App, project_id: i64) {
+        gtk::prelude::GtkWindowExt::set_focus(&app.window, None::<&gtk::Widget>);
+        if self.task_project.get() != Some(project_id) {
+            self.search.set_text("");
+        }
+        self.task_project.set(Some(project_id));
+        self.task_card.borrow_mut().take();
+        self.heading.set_text("To-dos & sessions");
         self.search.set_placeholder_text(Some("Filter to-dos…"));
-        self.rebuild_cards(app, project_id);
-        self.search.set_text("");
-        self.apply_filter("");
+        self.back.set_visible(false);
+        self.details.set_visible(false);
+        self.creation.set_visible(true);
+        self.search.set_visible(true);
+        self.scroll.set_visible(true);
+        self.scroll
+            .set_max_content_height((app.window.height() - 220).clamp(120, 460));
+        self.refresh_tasks(app);
         self.root.set_visible(true);
         self.search.grab_focus();
     }
 
-    pub fn close(&self, app: &SharedApp) {
+    pub fn present_task(&self, app: &App, project_id: i64, card_id: &str) {
+        self.task_project.set(Some(project_id));
+        *self.task_card.borrow_mut() = Some(card_id.to_string());
+        self.heading.set_text("To-do conversation");
+        self.back.set_visible(true);
+        self.creation.set_visible(false);
+        self.search.set_visible(false);
+        self.scroll.set_visible(false);
+        self.details.set_visible(true);
+        self.details
+            .set_height_request((app.window.height() - 160).clamp(240, 600));
+        self.replace_task(app, project_id, card_id);
+        self.root.set_visible(true);
+        self.back.grab_focus();
+    }
+
+    fn replace_task(&self, app: &App, project_id: i64, card_id: &str) {
+        if app
+            .window
+            .focus_widget()
+            .is_some_and(|focus| focus.is_ancestor(&self.details))
+        {
+            gtk::prelude::GtkWindowExt::set_focus(&app.window, None::<&gtk::Widget>);
+        }
+        while let Some(child) = self.details.first_child() {
+            self.details.remove(&child);
+        }
+        self.details
+            .append(&super::card::detail(app, project_id, card_id));
+    }
+
+    pub fn refresh_tasks(&self, app: &App) {
+        let Some(project_id) = self.task_project.get() else {
+            return;
+        };
+        if app.home_focus_todo.get().is_none() {
+            if let Some(focus) = app.window.focus_widget() {
+                if (focus.is_ancestor(&self.creation) || focus.is_ancestor(&self.details))
+                    && (focus.is::<gtk::Editable>() || focus.is::<gtk::TextView>())
+                {
+                    return;
+                }
+            }
+        }
+        let card_id = self.task_card.borrow().clone();
+        if let Some(card_id) = card_id {
+            self.replace_task(app, project_id, &card_id);
+        } else {
+            if app
+                .window
+                .focus_widget()
+                .is_some_and(|focus| focus.is_ancestor(&self.creation))
+            {
+                gtk::prelude::GtkWindowExt::set_focus(&app.window, None::<&gtk::Widget>);
+            }
+            while let Some(child) = self.creation.first_child() {
+                self.creation.remove(&child);
+            }
+            self.creation
+                .append(&super::home::todo_add_entry(app, project_id));
+            self.rebuild_cards(app, project_id);
+            self.apply_filter(&self.search.text());
+        }
+    }
+
+    fn reset_tasks(&self) {
+        self.task_project.set(None);
+        self.task_card.borrow_mut().take();
+        self.creation.set_visible(false);
+        self.details.set_visible(false);
+        self.back.set_visible(false);
+        self.search.set_visible(true);
+        self.scroll.set_visible(true);
+        self.scroll.set_max_content_height(460);
+        while let Some(child) = self.details.first_child() {
+            self.details.remove(&child);
+        }
+        while let Some(child) = self.creation.first_child() {
+            self.creation.remove(&child);
+        }
+    }
+
+    pub fn close_tasks(&self, app: &App) {
+        if self.task_project.get().is_some() {
+            self.close(app);
+        }
+    }
+
+    pub fn close(&self, app: &App) {
         if !self.root.is_visible() {
             return;
         }
-        self.picker.set(false);
-        self.root.set_visible(false);
-        self.search.set_text("");
-        // The keys go back to the program you were looking at — unless the
-        // row just activated already moved them there. Opening a primitive
-        // from a row focuses it; refocusing the workspace would yank the
-        // keys out of the panel the row just opened.
         let focus_in_hud = app
             .window
             .focus_widget()
             .is_some_and(|focus| focus.is_ancestor(&self.root));
+        if focus_in_hud {
+            gtk::prelude::GtkWindowExt::set_focus(&app.window, None::<&gtk::Widget>);
+        }
+        self.root.set_visible(false);
+        self.search.set_text("");
+        self.reset_tasks();
+        // The keys go back to the program you were looking at — unless the
+        // row just activated already moved them there. Opening a primitive
+        // from a row focuses it; refocusing the workspace would yank the
+        // keys out of the panel the row just opened.
         if focus_in_hud {
             app.refocus_workspace();
         }
@@ -210,7 +334,7 @@ impl Hud {
         if !self.root.is_visible() {
             return;
         }
-        if self.search.text().is_empty() {
+        if self.task_card.borrow().is_some() || self.search.text().is_empty() {
             self.close(app);
         } else {
             self.search.set_text("");
@@ -360,10 +484,10 @@ impl Hud {
                 "all projects overview",
             ),
             (
-                "New agent session…",
+                "To-dos & sessions…",
                 "",
                 "win.new-session",
-                "start an agent on a to-do",
+                "create work choose agent conversation tasks",
             ),
             (
                 "This project's board",
@@ -378,6 +502,12 @@ impl Hud {
                 "create or add",
             ),
             ("Preferences…", "Alt+,", "win.preferences", "settings prefs"),
+            (
+                "Auto arrange panels",
+                "",
+                "win.workspace-auto-arrange",
+                "reset layout fit panels",
+            ),
             ("Zoom the focused pane", "Alt+F", "win.zoom", "maximize"),
             ("Refresh", "Alt+R", "win.refresh", "reload status"),
         ] {
@@ -432,7 +562,7 @@ impl Hud {
 
     /// The project's open to-dos, Home's order, each row starting the
     /// project's default agent attached to that card.
-    fn rebuild_cards(&self, app: &SharedApp, project_id: i64) {
+    fn rebuild_cards(&self, app: &App, project_id: i64) {
         self.clear_rows();
         let rows = app
             .board_states
@@ -441,7 +571,7 @@ impl Hud {
             .map(card_rows)
             .unwrap_or_default();
         if rows.is_empty() {
-            let row = self.row_widget(None, "No open to-dos — add one in Home", None, None);
+            let row = self.row_widget(None, "No open to-dos — create one above", None, None);
             row.set_selectable(false);
             row.set_activatable(false);
             self.push(row, "no open to-dos".to_string(), Kind::Info);
@@ -475,7 +605,7 @@ impl Hud {
                     .activate_action("win.primitive-activate", Some(&slot.as_str().to_variant()));
                 // Asking for an agent with none to show opens this panel's
                 // to-do picker; the picker is the answer, so it stays up.
-                if matches!(slot, Slot::Agent) && self.picker.get() {
+                if matches!(slot, Slot::Agent) && self.task_project.get().is_some() {
                     return;
                 }
             }
@@ -487,14 +617,15 @@ impl Hud {
             }
             Kind::Card(project_id, card_id) => {
                 let _ = row.activate_action(
-                    "win.card-session-create",
+                    "win.open-card",
                     Some(&(project_id, card_id.as_str()).to_variant()),
                 );
+                return;
             }
             Kind::Action(action) => {
                 let _ = row.activate_action(action, None);
                 // The new-session row re-opens this panel as the picker.
-                if action == "win.new-session" && self.picker.get() {
+                if action == "win.new-session" && self.task_project.get().is_some() {
                     return;
                 }
             }

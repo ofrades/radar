@@ -613,8 +613,15 @@ async fn mutate_card(
             .map_err(ApiError::internal)?;
         }
         CardMutation::Move { lane, revision } => {
-            daemon::board_card_move(home, project_id, &card_id, &lane, revision, &command("move"))
-                .map_err(ApiError::internal)?;
+            daemon::board_card_move(
+                home,
+                project_id,
+                &card_id,
+                &lane,
+                revision,
+                &command("move"),
+            )
+            .map_err(ApiError::internal)?;
         }
         CardMutation::Claim { claim, revision } => {
             let claim = claim.trim();
@@ -1164,6 +1171,7 @@ mod tests {
             provider_session_id: format!("ses_{id}"),
             radar_session_id: radar_id.map(str::to_string),
             card_id: None,
+            card_ids: Vec::new(),
             source: "provider".to_string(),
             title: Some(format!("Conversation {id}")),
             cwd: PathBuf::from("/work/project"),

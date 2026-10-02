@@ -857,14 +857,19 @@ fn provider_binding_upgrades_a_session_row() {
         id: id.into(),
         argv: vec!["/bin/sh".into(), "-c".into(), "sleep 60".into()],
         cwd: daemon.home.path().join("project-99"),
-        env: Vec::new(),
+        env: vec![
+            ("RADAR_AGENT".into(), "worker".into()),
+            ("RADAR_SESSION_PROVIDER".into(), "opencode".into()),
+        ],
         env_remove: Vec::new(),
         dims: Dims { cols: 80, rows: 24 },
     }));
-    daemon.request(Request::CatalogBind {
+    daemon.request(Request::SessionIdentify {
         radar_id: id.into(),
+        instance: "worker".into(),
         provider: "opencode".into(),
-        provider_session_id: "ses_manual".into(),
+        conversation: "ses_manual".into(),
+        reporter_pid: 0,
     });
 
     let entries = catalog_entries(&daemon, catalog_list(&daemon, CatalogFilter::Active));
@@ -872,6 +877,174 @@ fn provider_binding_upgrades_a_session_row() {
     assert_eq!(entries[0].provider_session_id, "ses_manual");
     assert_eq!(entries[0].radar_session_id.as_deref(), Some(id));
     let _ = daemon.request(Request::Stop { id: id.into() });
+}
+
+#[test]
+fn provider_report_and_todo_binding_are_recorded_together() {
+    use radar::session::catalog::CatalogFilter;
+    let daemon = Daemon::start();
+    std::fs::create_dir_all(daemon.home.path().join("project-99")).unwrap();
+    for (id, card) in [
+        ("project-99-agent-1-opencode", "todo-first"),
+        ("project-99-agent-2-opencode", "todo-next"),
+    ] {
+        daemon.request(Request::Create(Spawn {
+            id: id.into(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 60".into()],
+            cwd: daemon.home.path().join("project-99"),
+            env: vec![
+                ("RADAR_CARD_ID".into(), card.into()),
+                (
+                    "RADAR_PROVIDER_SESSION_ID".into(),
+                    "ses_unverified_launch".into(),
+                ),
+                ("RADAR_SESSION_PROVIDER".into(), "opencode".into()),
+                ("RADAR_AGENT".into(), id.into()),
+            ],
+            env_remove: Vec::new(),
+            dims: Dims { cols: 80, rows: 24 },
+        }));
+        daemon.request(Request::SessionIdentify {
+            radar_id: id.into(),
+            instance: id.into(),
+            provider: "opencode".into(),
+            conversation: "ses_exact".into(),
+            reporter_pid: 0,
+        });
+        let entries = catalog_entries(&daemon, catalog_list(&daemon, CatalogFilter::All));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].provider_session_id, "ses_exact");
+        assert_eq!(entries[0].card_id.as_deref(), Some(card));
+        assert_eq!(entries[0].radar_session_id.as_deref(), Some(id));
+        let mut query = catalog_list(&daemon, CatalogFilter::All);
+        if let Request::CatalogList { query, .. } = &mut query {
+            *query = Some(card.to_string());
+        }
+        assert_eq!(catalog_entries(&daemon, query).len(), 1);
+        daemon.request(Request::Stop { id: id.into() });
+    }
+}
+
+#[test]
+fn all_supported_provider_switches_survive_restart_without_guessing_or_losing_history() {
+    use radar::session::catalog::CatalogFilter;
+    let mut daemon = Daemon::start();
+    let cwd = daemon.home.path().join("project-99");
+    std::fs::create_dir_all(&cwd).unwrap();
+    for provider in radar::programs::agents::SUPPORTED_AGENT_IDS {
+        let id = format!("project-99-agent-0-{provider}");
+        let response = daemon.request(Request::Create(Spawn {
+            id: id.clone(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 60".into()],
+            cwd: cwd.clone(),
+            env: vec![
+                ("RADAR_CARD_ID".into(), "task".into()),
+                ("RADAR_AGENT".into(), "worker-one".into()),
+                ("RADAR_SESSION_PROVIDER".into(), provider.to_string()),
+                ("RADAR_PROVIDER_SESSION_ID".into(), "stale-launch-id".into()),
+            ],
+            env_remove: Vec::new(),
+            dims: Dims { cols: 80, rows: 24 },
+        }));
+        let Response::Status(status) = response else {
+            panic!("expected session")
+        };
+        let entries = catalog_entries(&daemon, catalog_list(&daemon, CatalogFilter::All));
+        assert!(!entries
+            .iter()
+            .any(|entry| entry.provider_session_id == "stale-launch-id"));
+        let report = |conversation: &str, instance: &str, reporter_pid| Request::SessionIdentify {
+            radar_id: id.clone(),
+            instance: instance.into(),
+            provider: provider.to_string(),
+            conversation: conversation.into(),
+            reporter_pid,
+        };
+        assert!(Client::request(
+            daemon.home.path(),
+            report("wrong", "previous-worker", status.pid.unwrap())
+        )
+        .is_err());
+        if matches!(*provider, "pi" | "omp") {
+            assert!(Client::request(daemon.home.path(), report("child", "worker-one", 0)).is_err());
+        }
+        for conversation in ["original", "switched", "original"] {
+            daemon.request(report(conversation, "worker-one", status.pid.unwrap()));
+        }
+        daemon.request(Request::CatalogSeen {
+            project_id: 99,
+            radar_id: id.clone(),
+            program: provider.to_string(),
+            cwd: cwd.clone(),
+        });
+        let entries = catalog_entries(&daemon, catalog_list(&daemon, CatalogFilter::All));
+        let rows: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.provider == *provider)
+            .collect();
+        assert_eq!(rows.len(), 2, "{provider}");
+        let original = rows
+            .iter()
+            .find(|entry| entry.provider_session_id == "original")
+            .unwrap();
+        assert_eq!(original.radar_session_id.as_deref(), Some(id.as_str()));
+        assert_eq!(original.card_ids, ["task"]);
+        let switched = rows
+            .iter()
+            .find(|entry| entry.provider_session_id == "switched")
+            .unwrap();
+        assert_eq!(switched.radar_session_id, None);
+        assert_eq!(switched.card_ids, ["task"]);
+    }
+    daemon.restart();
+    let entries = catalog_entries(&daemon, catalog_list(&daemon, CatalogFilter::All));
+    assert_eq!(entries.len(), 8);
+    assert!(entries
+        .iter()
+        .all(|entry| entry.lifecycle == "ended" && entry.card_ids == ["task"]));
+}
+
+#[test]
+fn missing_resume_is_refused_before_any_process_or_empty_transcript_is_created() {
+    let daemon = Daemon::start();
+    for provider in radar::programs::agents::SUPPORTED_AGENT_IDS {
+        let id = format!("project-99-agent-0-{provider}");
+        let marker = daemon.home.path().join(format!("{provider}-launched"));
+        let result = Client::request(
+            daemon.home.path(),
+            Request::Create(Spawn {
+                id,
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("touch {}", marker.display()),
+                ],
+                cwd: daemon.home.path().to_path_buf(),
+                env: vec![
+                    (
+                        "HOME".into(),
+                        daemon.home.path().to_string_lossy().into_owned(),
+                    ),
+                    ("RADAR_SESSION_PROVIDER".into(), provider.to_string()),
+                    (
+                        "RADAR_RESUME_SESSION_ID".into(),
+                        "definitely-missing".into(),
+                    ),
+                ],
+                env_remove: Vec::new(),
+                dims: Dims { cols: 80, rows: 24 },
+            }),
+        );
+        assert!(
+            result.is_err(),
+            "{provider}: missing Resume must fail closed"
+        );
+        assert!(!marker.exists(), "{provider}: the child must not run");
+    }
+    let Response::Sessions(sessions) = daemon.request(Request::List) else {
+        panic!("expected list")
+    };
+    assert!(sessions.is_empty());
 }
 
 /// The daemon's attach snapshot is a real libghostty-vt snapshot: detach and

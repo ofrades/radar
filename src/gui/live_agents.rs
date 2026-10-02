@@ -41,6 +41,7 @@ pub(super) struct AgentSession {
     /// The board to-do the process was launched for (`RADAR_CARD_ID`), when
     /// readable. Stable for the process's life, unlike the card's claim.
     pub card_id: Option<String>,
+    pub card_ids: Vec<String>,
     /// The process behind the entry, when there is one: a live registry
     /// session's child, or an external process. A new pid under the same
     /// stable id means the session was respawned — views attached to the old
@@ -271,6 +272,10 @@ pub(super) fn discover(
                 .pid
                 .and_then(programs::launch::radar_card_of)
                 .or_else(|| entry.as_ref().and_then(|entry| entry.card_id.clone())),
+            card_ids: entry
+                .as_ref()
+                .map(|entry| entry.card_ids.clone())
+                .unwrap_or_default(),
             radar_session_id: Some(status.id.clone()),
             provider_session_id: entry
                 .as_ref()
@@ -296,26 +301,7 @@ pub(super) fn discover(
             // died with one. Reconcile ends it server-side; skip until then.
             continue;
         }
-        let program = programs::by_id(&entry.provider);
-        let title = session_title(entry.title.as_deref(), program.as_ref())
-            .unwrap_or_else(|| fallback_title(&entry.provider));
-        sessions.push(AgentSession {
-            project_id: entry.project_id,
-            id: format!("catalog-{}", entry.id),
-            title,
-            program_id: entry.provider.clone(),
-            tab_key: None,
-            external: None,
-            catalog_id: Some(entry.id),
-            radar_session_id: entry.radar_session_id.clone(),
-            provider_session_id: Some(entry.provider_session_id.clone()),
-            claim_id: None,
-            pid: None,
-            card_id: entry.card_id.clone(),
-            last_activity_at: entry.last_activity_at,
-            running: entry.lifecycle == "running",
-            archived: entry.archived_at.is_some(),
-        });
+        sessions.push(catalog_session(entry));
     }
 
     #[cfg(target_os = "linux")]
@@ -331,6 +317,30 @@ pub(super) fn discover(
         sessions,
         history_limited,
     })
+}
+
+pub(super) fn catalog_session(entry: &catalog::Entry) -> AgentSession {
+    let program = programs::by_id(&entry.provider);
+    let title = session_title(entry.title.as_deref(), program.as_ref())
+        .unwrap_or_else(|| fallback_title(&entry.provider));
+    AgentSession {
+        project_id: entry.project_id,
+        id: format!("catalog-{}", entry.id),
+        title,
+        program_id: entry.provider.clone(),
+        tab_key: None,
+        external: None,
+        catalog_id: Some(entry.id),
+        radar_session_id: entry.radar_session_id.clone(),
+        provider_session_id: Some(entry.provider_session_id.clone()),
+        claim_id: None,
+        pid: None,
+        card_id: entry.card_id.clone(),
+        card_ids: entry.card_ids.clone(),
+        last_activity_at: entry.last_activity_at,
+        running: entry.lifecycle == "running",
+        archived: entry.archived_at.is_some(),
+    }
 }
 
 fn session_title(title: Option<&str>, program: Option<&Program>) -> Option<String> {
@@ -486,6 +496,9 @@ fn external_sessions(
             claim_id: programs::launch::radar_agent_of(process.pid),
             pid: Some(process.pid),
             card_id: programs::launch::radar_card_of(process.pid),
+            card_ids: programs::launch::radar_card_of(process.pid)
+                .into_iter()
+                .collect(),
             last_activity_at: now,
             running: true,
             archived: false,
@@ -792,6 +805,9 @@ mod tests {
         let catalog =
             super::catalog::SessionCatalog::open(&daemon.home.path().join("run/catalog.sqlite"))
                 .unwrap();
+        catalog
+            .bind_provider(radar_id, "opencode", "ses_42", imported_at)
+            .unwrap();
         assert_eq!(
             catalog
                 .import_provider(
@@ -898,7 +914,7 @@ mod tests {
 
         // Pi's exact-session flag is a separate value, like Codex's.
         let pi = crate::programs::by_id("pi").unwrap();
-        let argv = ["pi", "--session-id", "ses_radar2abc"]
+        let argv = ["pi", "--session", "ses_radar2abc"]
             .map(str::to_string)
             .to_vec();
         assert_eq!(
@@ -951,6 +967,7 @@ mod tests {
             claim_id: None,
             pid: None,
             card_id: None,
+            card_ids: Vec::new(),
             last_activity_at: 0,
             running: false,
             archived: false,
@@ -1040,6 +1057,7 @@ mod tests {
             claim_id: None,
             pid: None,
             card_id: None,
+            card_ids: Vec::new(),
             provider_session_id: provider.map(str::to_string),
             last_activity_at: 0,
             running: false,

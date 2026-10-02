@@ -162,6 +162,20 @@ enum SessionAction {
         #[arg(required = true, trailing_var_arg = true)]
         argv: Vec<String>,
     },
+    /// Read the provider-reported active conversation (not the launch environment).
+    Identity {
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// Report the provider's actual conversation, never a launch-time guess.
+    Identify {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        conversation: Option<String>,
+        #[arg(long)]
+        pid: u32,
+    },
     List,
     /// Print an authoritative display snapshot as JSON
     Snapshot {
@@ -503,6 +517,58 @@ fn session_command(paths: &Paths, action: SessionAction) -> Result<()> {
             env: Vec::new(),
             env_remove: Vec::new(),
         }),
+        SessionAction::Identity { id } => Request::SessionIdentity {
+            radar_id: id
+                .or_else(|| std::env::var("RADAR_SESSION_ID").ok())
+                .context("No Radar runtime identity")?,
+        },
+        SessionAction::Identify {
+            provider,
+            conversation,
+            pid,
+        } => {
+            let instance = std::env::var("RADAR_AGENT").context("No Radar worker identity")?;
+            let radar_id =
+                std::env::var("RADAR_SESSION_ID").context("No Radar runtime identity")?;
+            let conversation = match conversation {
+                Some(id) => id,
+                None => {
+                    let value: serde_json::Value = serde_json::from_reader(std::io::stdin())?;
+                    if value.get("parent_conversation_id").is_some() {
+                        println!("{{}}");
+                        return Ok(());
+                    }
+                    value["conversation_id"]
+                        .as_str()
+                        .context("Hook has no conversation ID")?
+                        .to_string()
+                }
+            };
+            match Client::request(
+                &paths.data_dir,
+                Request::SessionIdentify {
+                    radar_id,
+                    instance: instance.clone(),
+                    provider: provider.clone(),
+                    conversation: conversation.clone(),
+                    reporter_pid: pid,
+                },
+            )? {
+                Response::Ok => {}
+                other => anyhow::bail!("Could not record provider identity: {other:?}"),
+            }
+            let project: i64 = std::env::var("RADAR_PROJECT_ID")
+                .context("No Radar project identity")?
+                .parse()?;
+            radar::db::Db::open(paths)?.bind_session(
+                project,
+                &instance,
+                &provider,
+                &conversation,
+            )?;
+            println!("{{}}");
+            return Ok(());
+        }
         SessionAction::List => Request::List,
         SessionAction::Snapshot { id } | SessionAction::Stream { id } => Request::Attach { id },
         SessionAction::Watch { id } => Request::Watch { id },
@@ -1076,6 +1142,7 @@ fn main() -> Result<()> {
                         "opencode": installed.opencode,
                         "omp": installed.omp,
                         "claude": installed.claude,
+                        "session_hooks": installed.session_hooks,
                         "git_hooks_dir": installed.git_hooks_dir,
                         "git_hooks_path_set": installed.git_hooks_path_set,
                     })
@@ -1095,6 +1162,9 @@ fn main() -> Result<()> {
             }
             if let Some(path) = installed.claude {
                 println!("  claude hook     {}", path.display());
+            }
+            for path in installed.session_hooks {
+                println!("  session hook    {}", path.display());
             }
             if let Some(dir) = installed.git_hooks_dir {
                 println!("  git gate        {}", dir.join("pre-commit").display());
@@ -1267,12 +1337,12 @@ fn card_start(
         .apply_to(&global);
     let program = programs::for_slot(Slot::Agent, &preferences)
         .context("No agent is installed — set one in Preferences")?;
+    radar::setup::install_default_session_hooks()?;
     let stamp = programs::launch::now_stamp();
     let claim = format!("{}-{stamp}", program.id);
     let session_id = format!("card-{}-{stamp}", card.id);
-    // A CLI that can create a conversation under an id radar picks gets one
-    // named for this card, so the claim links to it exactly instead of a
-    // post-exit guess against the CLI's store. Others fall back to the guess.
+    // Naming a fresh conversation is a request, not proof of its identity.
+    // Every provider reports the actual active ID through its lifecycle hook.
     let provider_session_id = program
         .create_session
         .then(|| programs::launch::provider_session_id(project_id, &stamp));
@@ -1318,20 +1388,6 @@ fn card_start(
             env_remove: spec.env_unset,
         }),
     )?;
-
-    // The daemon has no exit handler for a session it owns, so bind the exact
-    // conversation now, while the catalog row from `Create` is fresh.
-    if let Some(provider_session_id) = &provider_session_id {
-        let _ = db.bind_session(project_id, &claim, &program.id, provider_session_id);
-        let _ = Client::request(
-            &paths.data_dir,
-            Request::CatalogBind {
-                radar_id: session_id.clone(),
-                provider: program.id.clone(),
-                provider_session_id: provider_session_id.clone(),
-            },
-        );
-    }
 
     let change = board_api::board_card_claim(
         &paths.data_dir,
@@ -2012,7 +2068,6 @@ fn launch_options(preferences: &Preferences, safe: bool) -> LaunchOptions {
         safe: safe || !preferences.agent_auto_flags,
         extra_args: Vec::new(),
         prompt: None,
-        resume: false,
         session: None,
         create_session: None,
         agent_instance: None,

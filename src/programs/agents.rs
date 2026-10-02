@@ -220,30 +220,19 @@ impl AgentDef {
             description: self.description.to_string(),
             args: self.args.iter().map(|s| s.to_string()).collect(),
             auto_args: self.auto.iter().map(|s| s.to_string()).collect(),
-            resume_args: Vec::new(),
             resume_session: String::new(),
             create_session: false,
+            create_session_args: String::new(),
             prompt_flag: None,
             env_unset: self.env_unset.iter().map(|s| s.to_string()).collect(),
             external: false,
             omarchy: self.omarchy,
             priority,
         };
-        // How to reopen the agent's own last conversation — CLI-specific,
-        // and radar's own knowledge: omarchy's wrapper always starts fresh.
-        // A resumed launch reopens the project's last conversation, which
-        // is the session a claimed card's agent was working in.
-        let resume: &[&str] = match self.id {
-            "opencode" | "claude" | "omp" | "pi" | "cursor-agent" => &["--continue"],
-            "codex" => &["resume", "--last"],
-            _ => &[],
-        };
-        program.resume_args = resume.iter().map(|s| s.to_string()).collect();
-        // How to reopen one exact conversation, when radar has stored the
-        // session id a claim's agent had (db::agent_sessions).
+        // Exact reopen only: "last" can be another worker's conversation.
         program.resume_session = match self.id {
             "opencode" => "--session {id}".to_string(),
-            "pi" => "--session-id {id}".to_string(),
+            "pi" => "--session {id}".to_string(),
             "claude" | "cursor-agent" => "--resume {id}".to_string(),
             "codex" => "resume {id}".to_string(),
             "omp" => "--resume={id}".to_string(),
@@ -251,10 +240,15 @@ impl AgentDef {
         };
         // OpenCode's `--session` and Pi's `--session-id` both create the
         // conversation if the id is new, so radar can name a fresh launch's
-        // conversation up front (an exact 1:1 link to the board card) instead
-        // of reading its store after the fact. The other CLIs' flags only
-        // resume; a fresh launch there stays a guess.
+        // conversation up front. The provider's lifecycle callback confirms
+        // the active ID; store timestamps never identify a launched worker.
         program.create_session = self.id == "opencode" || self.id == "pi";
+        program.create_session_args = match self.id {
+            "opencode" => "--session {id}",
+            "pi" => "--session-id {id}",
+            _ => "",
+        }
+        .to_string();
         // How a launch hands the agent its initial prompt: a bare positional
         // argument for most CLIs, a flag for the one whose positional means
         // something else — opencode's positional is its project *directory*,
@@ -380,11 +374,11 @@ mod tests {
     fn supported_agents_declare_documented_resume_forms() {
         let by_id = |id: &str| programs().into_iter().find(|p| p.id == id).unwrap();
         for id in ["opencode", "omp", "pi", "cursor-agent"] {
-            assert_eq!(by_id(id).resume_args, vec!["--continue"], "{id}");
             assert!(!by_id(id).resume_session.is_empty(), "{id}");
         }
         assert_eq!(by_id("omp").resume_session, "--resume={id}");
-        assert_eq!(by_id("pi").resume_session, "--session-id {id}");
+        assert_eq!(by_id("pi").resume_session, "--session {id}");
+        assert_eq!(by_id("pi").create_session_args, "--session-id {id}");
         assert_eq!(by_id("cursor-agent").resume_session, "--resume {id}");
         assert_eq!(by_id("opencode").resume_session, "--session {id}");
     }

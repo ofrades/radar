@@ -83,21 +83,15 @@ pub struct Program {
     pub args: Vec<String>,
     /// Arguments that skip a tool's permission prompts (agents only).
     pub auto_args: Vec<String>,
-    /// Arguments that reopen the agent's own last conversation (agents
-    /// only, e.g. `["--continue"]`). Empty when the CLI has none radar
-    /// knows — a resumed launch then just starts fresh.
-    pub resume_args: Vec<String>,
     /// How to reopen one exact conversation: a tiny template with `{id}`
     /// where the session id goes (e.g. `"--session {id}"`). Empty when
     /// the CLI has no such flag radar knows.
     pub resume_session: String,
-    /// Can the CLI *create* a conversation under an id radar picks, using
-    /// the same flag as `resume_session` (OpenCode's `--session` and Pi's
-    /// `--session-id` create one if it does not exist)? Then a fresh launch
-    /// can be given an exact conversation id up front, instead of radar
-    /// guessing one from the CLI's store after the fact. False for CLIs
-    /// whose flag only resumes.
+    /// Whether a fresh launch can request an exact conversation ID.
     pub create_session: bool,
+    /// Creation is distinct from resume; Pi must never use its create-if-missing
+    /// flag when the human asked to reopen saved history.
+    pub create_session_args: String,
     /// The flag that carries an initial prompt, for the CLIs whose bare
     /// positional argument is not a prompt: opencode's positional is its
     /// project *directory*, so its prompt goes through `--prompt`. The
@@ -131,9 +125,9 @@ impl Program {
             description: description.to_string(),
             args: Vec::new(),
             auto_args: Vec::new(),
-            resume_args: Vec::new(),
             resume_session: String::new(),
             create_session: false,
+            create_session_args: String::new(),
             prompt_flag: None,
             env_unset: Vec::new(),
             external: false,

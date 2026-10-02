@@ -251,6 +251,20 @@ impl ManagedSession {
         // whose PATH is not the login shell's; the mise entries let it find
         // agents installed under the user's home.
         command.env("PATH", crate::config::path_value());
+        // A daemon may itself have been started by an agent. Its worker context
+        // must never leak into a different session or turn a requested ID into fact.
+        for name in [
+            "RADAR_AGENT",
+            "RADAR_CARD_ID",
+            "RADAR_PROJECT_ID",
+            "RADAR_PROJECT_ROOT",
+            "RADAR_SESSION_ID",
+            "RADAR_SESSION_PROVIDER",
+            "RADAR_PROVIDER_SESSION_ID",
+            "RADAR_RESUME_SESSION_ID",
+        ] {
+            command.env_remove(name);
+        }
         for name in &spec.env_remove {
             command.env_remove(name);
         }
@@ -298,6 +312,15 @@ impl ManagedSession {
         })
     }
 
+    pub fn env_value(&self, key: &str) -> Option<&str> {
+        self.spec
+            .env
+            .iter()
+            .rev()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    }
+
     /// Cloning the display and installing the subscription share the parser's
     /// lock: the first event is exactly snapshot.sequence + 1.
     pub fn attach(&self) -> (Snapshot, Subscription<Output>) {
@@ -331,6 +354,16 @@ impl ManagedSession {
             .iter()
             .rev()
             .find(|(name, _)| name == "RADAR_CARD_ID")
+            .map(|(_, value)| value.as_str())
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn agent_id(&self) -> Option<&str> {
+        self.spec
+            .env
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "RADAR_AGENT")
             .map(|(_, value)| value.as_str())
             .filter(|value| !value.is_empty())
     }
@@ -374,14 +407,24 @@ impl Drop for ManagedSession {
 
 #[derive(Default)]
 pub struct Registry {
+    identities: Mutex<()>,
     sessions: Mutex<HashMap<String, Arc<ManagedSession>>>,
     stopping: AtomicBool,
 }
 
 impl Registry {
+    /// Serialize spawn registration with provider reports arriving during startup.
+    pub fn identity_update(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.identities.lock().unwrap()
+    }
+
     /// Stable IDs make create-or-attach idempotent, including after process exit.
     /// A conflicting command is an error, never an implicit restart.
-    pub fn create(&self, mut spec: Spawn) -> Result<Arc<ManagedSession>> {
+    pub fn create(&self, spec: Spawn) -> Result<Arc<ManagedSession>> {
+        self.create_or_attach(spec).map(|(session, _)| session)
+    }
+
+    pub fn create_or_attach(&self, mut spec: Spawn) -> Result<(Arc<ManagedSession>, bool)> {
         if spec.id.is_empty()
             || spec.id.len() > 128
             || !spec
@@ -410,14 +453,14 @@ impl Registry {
             {
                 bail!("session ID already belongs to a different command or environment");
             }
-            return Ok(session.clone());
+            return Ok((session.clone(), false));
         }
         if sessions.len() >= 128 {
             bail!("session limit reached; forget an ended session first");
         }
         let session = Arc::new(ManagedSession::spawn(spec.clone())?);
         sessions.insert(spec.id, session.clone());
-        Ok(session)
+        Ok((session, true))
     }
 
     pub fn get(&self, id: &str) -> Result<Arc<ManagedSession>> {

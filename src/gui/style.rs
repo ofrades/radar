@@ -774,6 +774,12 @@ popover.menu separator {
 .hud-filter {
   margin: 8px 2px 6px;
 }
+.hud-creation {
+  margin: 10px 4px 4px;
+}
+.hud-task .card-panel-title {
+  font-size: 1.4em;
+}
 .hud-list {
   background: none;
 }

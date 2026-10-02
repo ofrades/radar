@@ -367,7 +367,11 @@ impl BeadsBoardStore {
 
     pub fn state(&self, project_id: i64) -> Result<BoardState> {
         let dir = self.ensure(project_id)?;
-        self.cached_state(project_id, &dir)
+        let mut state = self.cached_state(project_id, &dir)?;
+        for card in &mut state.cards {
+            card.revision = self.effective_revision(project_id, card);
+        }
+        Ok(state)
     }
 
     pub fn add_card(
@@ -599,7 +603,7 @@ impl BeadsBoardStore {
                     && card.claim.is_none()
                     && filter
                         .as_deref()
-                        .map_or(true, |status| beads::status_for_lane(&card.lane) == status)
+                        .is_none_or(|status| beads::status_for_lane(&card.lane) == status)
             })
             .cloned();
         let Some(card) = found else {
@@ -817,6 +821,26 @@ mod tests {
         assert_eq!(claimed.card.title, "first");
         assert_eq!(claimed.card.lane, "In progress");
         assert_eq!(claimed.card.claim.as_deref(), Some("codex-1"));
+    }
+
+    #[test]
+    fn snapshots_expose_the_revision_issued_by_the_daemon() {
+        let Some((store, _dir)) = store(None) else {
+            return;
+        };
+        let card = store.add_card(1, None, "Task", "", None).unwrap().card;
+        // Simulate multiple mutations within Beads' coarse timestamp.
+        store.note_revision(1, &card.id, card.revision + 1000);
+        let state = store.state(1).unwrap();
+        let current = state
+            .cards
+            .iter()
+            .find(|current| current.id == card.id)
+            .unwrap();
+        assert_eq!(current.revision, card.revision + 1000);
+        store
+            .update_card(1, &card.id, Some("Edited"), None, Some(current.revision))
+            .unwrap();
     }
 
     #[test]

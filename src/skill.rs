@@ -134,6 +134,7 @@ pub fn install(db: &crate::db::Db, project: &Path) -> Result<Vec<PathBuf>> {
     .into_iter()
     .flatten()
     .collect();
+    written.extend(installed.session_hooks);
     written.shrink_to_fit();
     Ok(written)
 }

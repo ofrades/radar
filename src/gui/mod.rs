@@ -229,7 +229,7 @@ struct App {
     theme: RefCell<Theme>,
     window: adw::ApplicationWindow,
     workspace_bar: gtk::Box,
-    workspace_title: gtk::Button,
+    workspace_title: gtk::Label,
     toggles: RefCell<HashMap<Slot, gtk::ToggleButton>>,
     /// Home leads the dock; it is checked while the home panel shows.
     /// True while the home panel is on screen instead of a project's
@@ -262,8 +262,6 @@ struct App {
     /// Where Home is drilled in: empty means the cockpit, otherwise a stack of
     /// board/card views with a way back.
     home_nav: RefCell<Vec<HomeView>>,
-    /// Exact pane to return to after opening its todo; never a "last session".
-    todo_origin: Cell<Option<(i64, TabKey)>>,
     board_summaries: RefCell<HashMap<i64, board::BoardSummary>>,
     notified_attention: RefCell<HashSet<(i64, String)>>,
     /// Attention responses the Home cockpit has sent but not yet heard back
@@ -542,18 +540,7 @@ struct Extras {
 /// bound session).
 enum Resume {
     No,
-    Last,
     Session(String),
-}
-
-/// How a launched agent's conversation is known, for binding its claim.
-enum LaunchBinding {
-    /// Radar named the conversation and the CLI created it under that id, so
-    /// the claim links to it exactly.
-    Exact(String),
-    /// No exact id: read the CLI's own store after exit and take the newest
-    /// conversation created since this instant.
-    Guess(u128),
 }
 
 /// A unique command id for a board mutation issued by the GUI.
@@ -607,24 +594,6 @@ fn add_session_environment(
         ),
         ("RADAR_SESSION_ID".to_string(), session_id.to_string()),
     ]);
-}
-
-/// Adopt a provider conversation for a radar-spawned session once the CLI's
-/// own store reveals which session the run had. Fire-and-forget: the catalog
-/// row upgrades in place, and the sidebar gains an exact reopen link.
-fn bind_provider_session(
-    home: &std::path::Path,
-    radar_id: &str,
-    program_id: &str,
-    provider_session_id: &str,
-) {
-    use crate::session::daemon::{Client, Command};
-    let request = Command::CatalogBind {
-        radar_id: radar_id.to_string(),
-        provider: program_id.to_string(),
-        provider_session_id: provider_session_id.to_string(),
-    };
-    let _ = Client::request(home, request);
 }
 
 fn publish_session_lifecycle(
@@ -683,15 +652,13 @@ fn build_window(
     // The project's board lives in Home; this is the way back to it.
     board_button.set_action_name(Some("win.workspace-project"));
     board_button.set_tooltip_text(Some("This project's board (to-dos and lanes) · Alt+K"));
-    workspace_bar.append(&board_button);
-    let workspace_title = gtk::Button::new();
-    workspace_title.add_css_class("flat");
+    let workspace_title = gtk::Label::new(None);
     workspace_title.add_css_class("heading");
     workspace_title.set_hexpand(true);
-    workspace_title.set_halign(gtk::Align::Start);
-    workspace_title.set_action_name(Some("win.workspace-project"));
-    workspace_title.set_tooltip_text(Some("Back to this project's tasks and conversations"));
+    workspace_title.set_xalign(0.0);
+    workspace_title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     workspace_bar.append(&workspace_title);
+    workspace_bar.append(&board_button);
     let toggles = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     toggles.add_css_class("dock");
     let mut toggle_buttons = HashMap::new();
@@ -714,16 +681,11 @@ fn build_window(
     // without leaving for Home. Works while another agent panel is on screen.
     let new_session = gtk::Button::from_icon_name("list-add-symbolic");
     new_session.add_css_class("flat");
-    new_session.set_tooltip_text(Some("New agent session on a to-do"));
-    new_session.set_action_name(Some("win.new-session"));
-    workspace_bar.append(&new_session);
-    let arrange = gtk::Button::with_label("Auto arrange");
-    arrange.add_css_class("flat");
-    arrange.set_tooltip_text(Some(
-        "Fit all panels to the available space; reset manual arrangement",
+    new_session.set_tooltip_text(Some(
+        "To-dos & sessions: create work, choose an agent, or open a conversation",
     ));
-    arrange.set_action_name(Some("win.workspace-auto-arrange"));
-    workspace_bar.append(&arrange);
+    new_session.set_action_name(Some("win.new-session"));
+    toggles.append(&new_session);
     let tools = gtk::Button::with_label("Tools & shortcuts");
     tools.add_css_class("flat");
     tools.set_action_name(Some("win.hud"));
@@ -820,7 +782,6 @@ fn build_window(
     let alerts = alert::Alerts::new();
     root.add_overlay(alerts.widget());
     window.set_content(Some(&root));
-    window.set_tooltip_text(Some(&format!("state: {}", paths.database().display())));
 
     let (status_tx, status_rx) = std::sync::mpsc::channel();
     let (activity_tx, activity_rx) = std::sync::mpsc::sync_channel(512);
@@ -855,7 +816,6 @@ fn build_window(
         activity_tx,
         board_states: RefCell::new(HashMap::new()),
         home_nav: RefCell::new(Vec::new()),
-        todo_origin: Cell::new(None),
         board_summaries: RefCell::new(HashMap::new()),
         notified_attention: RefCell::new(HashSet::new()),
         home_pending_attention: Rc::new(RefCell::new(HashSet::new())),
@@ -1281,6 +1241,13 @@ fn start_agent_session_drainer(app: &SharedApp) {
         app.agent_scan_pending.set(false);
         let sessions_changed = app.agent_sessions.borrow_mut().apply(result);
         if sessions_changed {
+            let index = app.agent_sessions.borrow();
+            for rows in index.by_project.values() {
+                for session in rows {
+                    app.track_panel_conversation(session);
+                }
+            }
+            drop(index);
             app.sync_board_sessions();
             app.refresh_home();
         }
@@ -1896,9 +1863,27 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             else {
                 return;
             };
+            app_for_action.hud.close_tasks(&app_for_action);
             app_for_action.select_project(project_id);
             if let Some(workspace) = app_for_action.current_workspace() {
                 app_for_action.open_agent_session(&workspace, &claim);
+            }
+        });
+        app.window.add_action(&action);
+    }
+    {
+        let action = gio::SimpleAction::new(
+            "card-worker",
+            Some(glib::VariantTy::new("(xsss)").expect("project, card, kind and worker")),
+        );
+        let state = app.clone();
+        action.connect_activate(move |_, parameter| {
+            if let Some((project_id, card_id, kind, worker)) =
+                parameter.and_then(|value| value.get::<(i64, String, String, String)>())
+            {
+                state.without_navigation(|| {
+                    state.assign_card_worker(project_id, &card_id, &kind, &worker)
+                });
             }
         });
         app.window.add_action(&action);
@@ -1956,6 +1941,35 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
     }
     {
         let action = gio::SimpleAction::new(
+            "card-session-open",
+            Some(glib::VariantTy::new("(xs)").expect("project and card")),
+        );
+        let state = app.clone();
+        action.connect_activate(move |_, parameter| {
+            if let Some((project, card)) = parameter.and_then(|value| value.get::<(i64, String)>())
+            {
+                state.open_card_session(project, &card, None);
+            }
+        });
+        app.window.add_action(&action);
+    }
+    {
+        let action = gio::SimpleAction::new(
+            "card-conversation-open",
+            Some(glib::VariantTy::new("(xss)").expect("project, card and conversation")),
+        );
+        let state = app.clone();
+        action.connect_activate(move |_, parameter| {
+            if let Some((project, card, conversation)) =
+                parameter.and_then(|value| value.get::<(i64, String, String)>())
+            {
+                state.open_card_session(project, &card, Some(&conversation));
+            }
+        });
+        app.window.add_action(&action);
+    }
+    {
+        let action = gio::SimpleAction::new(
             "todo-session",
             Some(glib::VariantTy::new("(xs)").expect("a project and session identity")),
         );
@@ -1964,6 +1978,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             if let Some((project_id, identity)) =
                 parameter.and_then(|value| value.get::<(i64, String)>())
             {
+                app_for_action.hud.close_tasks(&app_for_action);
                 app_for_action.open_catalog_session(project_id, &identity);
             }
         });
@@ -2016,7 +2031,22 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             else {
                 return;
             };
-            app_for_action.add_home_todo(project_id, &title);
+            app_for_action.add_home_todo(project_id, &title, false);
+        });
+        app.window.add_action(&action);
+    }
+    {
+        let action = gio::SimpleAction::new(
+            "home-add-work",
+            Some(glib::VariantTy::new("(xs)").expect("project and task")),
+        );
+        let state = app.clone();
+        action.connect_activate(move |_, parameter| {
+            if let Some((project_id, title)) =
+                parameter.and_then(|value| value.get::<(i64, String)>())
+            {
+                state.add_home_todo(project_id, &title, true);
+            }
         });
         app.window.add_action(&action);
     }
@@ -2611,7 +2641,6 @@ impl App {
             safe: !preferences.agent_auto_flags,
             extra_args: Vec::new(),
             prompt: None,
-            resume: false,
             session: None,
             create_session: None,
             agent_instance: None,
@@ -2794,7 +2823,7 @@ impl App {
     /// Add a to-do from Home: a new card on the project's board, in the store's
     /// default lane (Todo). Home is rebuilt so the lane shows it, and the
     /// input that submitted it gets the keys back for the next one.
-    fn add_home_todo(&self, project_id: i64, title: &str) {
+    fn add_home_todo(&self, project_id: i64, title: &str, start: bool) {
         let title = title.trim();
         if title.is_empty() {
             return;
@@ -2817,10 +2846,16 @@ impl App {
             None,
             &command,
         ) {
-            Ok(_) => {
-                self.home_focus_todo.set(Some(project_id));
+            Ok(change) => {
                 self.home_todo_drafts.borrow_mut().remove(&project_id);
+                if !start {
+                    self.home_focus_todo.set(Some(project_id));
+                }
                 self.refresh_board_summary(project_id);
+                if start {
+                    self.start_card_session(project_id, &change.card.id);
+                    self.open_home_card(project_id, &change.card.id);
+                }
             }
             Err(error) => self.toast(&format!("Could not add the to-do: {error}")),
         }
@@ -2828,18 +2863,35 @@ impl App {
 
     /// Open a card as a conversation inside Home.
     fn open_home_card(&self, project_id: i64, card_id: &str) {
+        if !self.home_shown.get() && *self.current.borrow() == Some(project_id) {
+            self.hud.present_task(self, project_id, card_id);
+            return;
+        }
         self.enter_home_view(HomeView::Card(project_id, card_id.to_string()));
     }
 
     fn open_session_todo(&self, project_id: i64, key: TabKey, card_id: &str) {
-        if self.tab_card_id(project_id, key).as_deref() != Some(card_id)
-            || self.card_title(project_id, card_id).is_none()
-        {
+        let primitive = self
+            .workspaces
+            .borrow()
+            .get(&project_id)
+            .and_then(|workspace| workspace.tab(key));
+        let linked = primitive.as_ref().is_some_and(|primitive| {
+            let runtime = stable_session_id(project_id, key, &primitive.program_id);
+            self.catalog_card_sessions(project_id, card_id)
+                .is_ok_and(|sessions| {
+                    sessions.iter().any(|session| {
+                        session.radar_session_id.as_deref() == Some(runtime.as_str())
+                            || (live_agents::exact_provider_session_id(session).is_some()
+                                && session.provider_session_id.as_deref()
+                                    == primitive.launched_session.borrow().as_deref())
+                    })
+                })
+        });
+        if !linked || self.card_title(project_id, card_id).is_none() {
             self.toast("This session's to-do is no longer available");
             return;
         }
-        self.home_nav.borrow_mut().clear();
-        self.todo_origin.set(Some((project_id, key)));
         self.open_home_card(project_id, card_id);
     }
 
@@ -2895,15 +2947,6 @@ impl App {
         gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
         self.home_nav.borrow_mut().pop();
         if self.home_nav.borrow().is_empty() {
-            if let Some((project_id, key)) = self.todo_origin.take() {
-                self.select_project(project_id);
-                if let Some(workspace) = self.current_workspace() {
-                    if workspace.tab(key).is_some() {
-                        self.activate_primitive(&workspace, key);
-                    }
-                }
-                return;
-            }
             self.show_home();
             return;
         }
@@ -2915,6 +2958,26 @@ impl App {
             self.stack.set_visible_child_name("_home");
             self.refresh_home();
         }
+    }
+
+    /// Run a card command without treating its session as a navigation request.
+    fn without_navigation(&self, run: impl FnOnce()) {
+        let current = *self.current.borrow();
+        let last_project = self.db.ui_prefs().ok().map(|prefs| prefs.last_project);
+        let home = self.home_shown.get();
+        let visible = self.stack.visible_child_name();
+        run();
+        *self.current.borrow_mut() = current;
+        self.home_shown.set(home);
+        if let Some(last_project) = last_project {
+            let _ = self.db.remember_last_project(last_project);
+        }
+        if let Some(visible) = visible {
+            self.stack.set_visible_child_name(&visible);
+        }
+        self.sync_toggles();
+        self.refresh_headers();
+        self.refresh_home();
     }
 
     /// Move a card to another lane through the store.
@@ -2933,12 +2996,13 @@ impl App {
         }
     }
 
-    /// Route a human message on a card: a **live** claimed agent gets it typed
-    /// into its terminal (only when it is not mid-turn); a **dormant** claimed
-    /// agent is resumed — first on the exact conversation bound to the claim,
-    /// else its last; a **to-do** starts the project's default agent attached
-    /// to the card and claims it. The comment is always recorded on the thread.
+    /// Record the reply and route it to the live worker or exact conversation.
+    /// An unclaimed to-do starts the default agent. None of these is navigation.
     fn message_card(&self, project_id: i64, card_id: &str, text: &str) {
+        self.without_navigation(|| self.deliver_card_message(project_id, card_id, text));
+    }
+
+    fn deliver_card_message(&self, project_id: i64, card_id: &str, text: &str) {
         card::publish_comment(
             &self.session_home,
             &self.activity_tx,
@@ -2947,74 +3011,201 @@ impl App {
             text.to_string(),
         );
         let card = self
-            .board_states
-            .borrow()
-            .get(&project_id)
-            .and_then(|state| state.cards.iter().find(|card| card.id == card_id).cloned());
+            .fetch_board_state(project_id)
+            .and_then(|state| state.cards.into_iter().find(|card| card.id == card_id));
         let Some(card) = card else {
             self.toast("That card is no longer on the board");
             return;
         };
+        let Some(card) = self.prepare_card_work(project_id, card) else {
+            return;
+        };
         let prompt = format!(
-            "A human sent a message on board card \"{}\":\n\n{}\n\nRead the card and its \
-             thread with `radar card show \"{}\"` and continue.",
+            "A human sent a message on board card \"{}\":\n\n{}\n\nRead its thread with radar card show \"{}\" and continue.",
             card.title, text, card.id
         );
         if self.current.borrow().as_ref() != Some(&project_id) {
-            self.select_project(project_id);
+            self.select_project_with(project_id, false);
         }
         let Some(workspace) = self.current_workspace() else {
             return;
         };
-
-        if let Some(claim) = card.claim.clone() {
-            let live = workspace.tabs_of_kind(Slot::Agent).into_iter().find(|key| {
-                workspace
-                    .tab(*key)
-                    .and_then(|primitive| {
-                        primitive.pane.as_ref().and_then(|pane| pane.session_pid())
-                    })
-                    .and_then(programs::launch::radar_agent_of)
-                    .is_some_and(|agent| agent == claim)
-            });
-            if let Some(key) = live {
-                self.activate_primitive(&workspace, key);
-                self.inject_if_idle(project_id, &workspace, key, text);
-                return;
+        let worker = card
+            .claim
+            .as_deref()
+            .and_then(|claim| self.live_card_worker(project_id, card_id, Some(claim)))
+            .or_else(|| self.live_card_worker(project_id, card_id, None));
+        if let Some((key, claim, _)) = worker {
+            if card.claim.as_deref() != Some(claim.as_str()) {
+                if let Err(error) = crate::session::daemon::board_card_claim(
+                    &self.session_home,
+                    project_id,
+                    card_id,
+                    Some(&claim),
+                    Some(card.revision),
+                    &gui_command_id("follow-up"),
+                ) {
+                    self.toast(&format!("Could not reconnect the worker: {error}"));
+                    return;
+                }
+                self.refresh_board_summary(project_id);
             }
-            // Dormant: resume the agent that holds the claim.
-            self.open_agent_session_with(&workspace, &claim, Some(prompt));
-            self.toast("Message sent; resuming the agent on this card");
+            self.inject_if_idle(project_id, &workspace, key, &prompt);
             return;
         }
-
-        // No claim: a to-do. Start the project's default agent attached to it.
-        if self.spawn_agent_for_card(project_id, card_id, prompt) {
-            self.toast("Started an agent on this to-do");
+        let sessions = match self.catalog_card_sessions(project_id, card_id) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                self.toast(&format!("Could not read linked conversations: {error}"));
+                return;
+            }
+        };
+        if let Some(session) = sessions.into_iter().max_by_key(|session| {
+            (
+                session.card_id.as_deref() == Some(card_id),
+                session.running,
+                session.last_activity_at,
+            )
+        }) {
+            if session.running {
+                self.toast("This conversation is serving another to-do. Choose a new agent, or continue it when stopped.");
+                return;
+            }
+            if let Some(conversation) = live_agents::exact_provider_session_id(&session) {
+                self.launch_card_agent(
+                    project_id,
+                    &card,
+                    prompt,
+                    &session.program_id,
+                    Resume::Session(conversation.to_string()),
+                );
+            } else {
+                self.toast("The linked session has no exact resume identity. Choose an agent to reconnect this to-do.");
+            }
+            return;
         }
+        if let Some(claim) = card.claim.as_deref() {
+            if let Ok(Some((program, conversation))) = self.db.bound_session(project_id, claim) {
+                let sessions = match self.project_catalog(project_id, None) {
+                    Ok(sessions) => sessions,
+                    Err(error) => {
+                        self.toast(&format!(
+                            "Could not check the claimed conversation: {error}"
+                        ));
+                        return;
+                    }
+                };
+                if sessions.iter().any(|session| {
+                    session.provider == program
+                        && session.provider_session_id == conversation
+                        && session.lifecycle == "running"
+                }) {
+                    self.toast("The claimed conversation is already running on another to-do.");
+                    return;
+                }
+                self.launch_card_agent(
+                    project_id,
+                    &card,
+                    prompt,
+                    &program,
+                    Resume::Session(conversation),
+                );
+                return;
+            }
+        }
+        // No exact conversation exists: an explicit request starts fresh work.
+        self.spawn_agent_for_card(project_id, card_id, prompt);
     }
 
     /// A board card's Session control: start the project's default agent
     /// attached to the card, and claim it. The prompt points the agent at the
     /// card so it knows what it was started for.
     fn start_card_session(&self, project_id: i64, card_id: &str) {
-        // A second click must navigate to the existing worker, not spawn one
-        // more. Read the live process too: discovery may not have caught up.
-        let existing_workspace = self.workspaces.borrow().get(&project_id).cloned();
-        if let Some(workspace) = existing_workspace {
-            for key in workspace.tabs_of_kind(Slot::Agent) {
-                let linked = workspace
-                    .tab(key)
-                    .and_then(|primitive| primitive.pane.clone())
-                    .filter(|pane| pane.is_live())
-                    .and_then(|pane| pane.session_pid())
-                    .and_then(programs::launch::radar_card_of);
-                if linked.as_deref() == Some(card_id) {
-                    self.select_project(project_id);
-                    self.activate_primitive(&workspace, key);
-                    return;
+        self.without_navigation(|| self.start_card_worker(project_id, card_id));
+    }
+
+    fn project_catalog(
+        &self,
+        project_id: i64,
+        query: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::session::catalog::Entry>> {
+        let path = self
+            .projects
+            .borrow()
+            .iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.path.clone())
+            .ok_or_else(|| anyhow::anyhow!("project not available"))?;
+        match crate::session::daemon::Client::request(
+            &self.session_home,
+            crate::session::daemon::Command::CatalogList {
+                projects: vec![crate::session::daemon::CatalogProject {
+                    id: project_id,
+                    path,
+                }],
+                filter: crate::session::catalog::CatalogFilter::All,
+                query: query.map(str::to_string),
+                limit: 1000,
+            },
+        )? {
+            crate::session::daemon::Response::Catalog(entries) => Ok(entries),
+            _ => anyhow::bail!("unexpected catalog response"),
+        }
+    }
+
+    fn live_card_worker(
+        &self,
+        project_id: i64,
+        card_id: &str,
+        claim: Option<&str>,
+    ) -> Option<(TabKey, String, String)> {
+        let crate::session::daemon::Response::Sessions(sessions) =
+            crate::session::daemon::Client::request(
+                &self.session_home,
+                crate::session::daemon::Command::List,
+            )
+            .ok()?
+        else {
+            return None;
+        };
+        let bound: HashSet<String> = if claim.is_none() {
+            self.project_catalog(project_id, Some(card_id))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|entry| {
+                    entry.card_id.as_deref() == Some(card_id) && entry.lifecycle == "running"
+                })
+                .filter_map(|entry| entry.radar_session_id)
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        sessions
+            .into_iter()
+            .filter_map(|session| {
+                let (project, key, _) = parse_stable_session_id(&session.id)?;
+                if project != project_id || key.slot != Slot::Agent {
+                    return None;
                 }
-            }
+                let pid = session.pid?;
+                if claim.is_none()
+                    && programs::launch::radar_card_of(pid).as_deref() != Some(card_id)
+                    && !bound.contains(&session.id)
+                {
+                    return None;
+                }
+                let agent = programs::launch::radar_agent_of(pid)?;
+                claim
+                    .is_none_or(|claim| claim == agent)
+                    .then_some((key, agent, session.id))
+            })
+            .max_by_key(|(key, _, _)| key.instance)
+    }
+
+    fn start_card_worker(&self, project_id: i64, card_id: &str) {
+        // Background sessions need not have a mapped terminal or discovery row.
+        if self.live_card_worker(project_id, card_id, None).is_some() {
+            return;
         }
         let card = self
             .board_states
@@ -3054,52 +3245,208 @@ impl App {
         }
     }
 
+    fn assign_card_worker(&self, project_id: i64, card_id: &str, kind: &str, worker: &str) {
+        let card = self
+            .board_states
+            .borrow()
+            .get(&project_id)
+            .and_then(|state| state.cards.iter().find(|card| card.id == card_id).cloned());
+        let Some(card) = card.filter(|card| !card.done) else {
+            self.toast("Reopen this to-do before assigning a conversation");
+            return;
+        };
+        if self.card_claim_is_live(project_id, &card) {
+            self.toast("This to-do already has a running worker; its assignment cannot be stolen");
+            return;
+        };
+        let prompt = crate::session::board_store::work_prompt(&card.id, &card.title);
+        if kind == "agent" {
+            self.spawn_card_agent(project_id, card_id, prompt, Some(worker));
+            return;
+        }
+        if kind != "session" {
+            return;
+        }
+        let sessions = match self.project_catalog(project_id, None) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                self.toast(&format!("Could not read conversations: {error}"));
+                return;
+            }
+        };
+        let session = worker
+            .strip_prefix("catalog-")
+            .and_then(|id| id.parse::<i64>().ok())
+            .and_then(|id| sessions.into_iter().find(|session| session.id == id));
+        let Some(session) = session.filter(|session| session.lifecycle != "running") else {
+            self.toast("Choose a stopped conversation; a running worker cannot be reassigned");
+            return;
+        };
+        if session.radar_session_id.as_deref() == Some(session.provider_session_id.as_str()) {
+            self.toast("This conversation has no exact resume identity");
+            return;
+        }
+        self.launch_card_agent(
+            project_id,
+            &card,
+            prompt,
+            &session.provider,
+            Resume::Session(session.provider_session_id),
+        );
+    }
+
     /// Start the project's default agent on `card_id`, attached to the card
     /// (`RADAR_CARD_ID`) and claiming it for the new instance. Returns false —
     /// after toasting — when no agent is installed or the tab cannot be made.
     fn spawn_agent_for_card(&self, project_id: i64, card_id: &str, prompt: String) -> bool {
-        if self.current.borrow().as_ref() != Some(&project_id) {
-            self.select_project(project_id);
-        }
-        let Some(workspace) = self.current_workspace() else {
-            return false;
-        };
+        self.spawn_card_agent(project_id, card_id, prompt, None)
+    }
+
+    fn spawn_card_agent(
+        &self,
+        project_id: i64,
+        card_id: &str,
+        prompt: String,
+        agent: Option<&str>,
+    ) -> bool {
         let global = self.db.preferences().unwrap_or_default();
         let preferences = self
             .db
             .project_settings(project_id)
             .unwrap_or_default()
             .apply_to(&global);
-        let Some(program) = programs::for_slot(Slot::Agent, &preferences) else {
+        let program = match agent {
+            Some(id) => programs::by_id(id)
+                .filter(|program| program.kind == Kind::Agent && program.installed()),
+            None => programs::for_slot(Slot::Agent, &preferences),
+        };
+        let Some(program) = program else {
             self.toast("No agent installed — set one in Preferences");
             return false;
         };
+        let card = self
+            .board_states
+            .borrow()
+            .get(&project_id)
+            .and_then(|state| state.cards.iter().find(|card| card.id == card_id).cloned());
+        let Some(card) = card.filter(|card| !card.done) else {
+            self.toast("Reopen this to-do before starting a session");
+            return false;
+        };
+        self.launch_card_agent(project_id, &card, prompt, &program.id, Resume::No)
+    }
+
+    fn prepare_card_work(
+        &self,
+        project_id: i64,
+        card: crate::session::board_store::StoredCard,
+    ) -> Option<crate::session::board_store::StoredCard> {
+        let state = self.fetch_board_state(project_id)?;
+        let card = state
+            .cards
+            .iter()
+            .find(|current| current.id == card.id)?
+            .clone();
+        let kind = state
+            .lanes
+            .iter()
+            .find(|lane| lane.id == card.lane_id)?
+            .kind
+            .as_str();
+        if kind != "review" && kind != "done" {
+            return Some(card);
+        }
+        let lane = state.lanes.iter().find(|lane| lane.kind == "in_progress")?;
+        match crate::session::daemon::board_card_move(
+            &self.session_home,
+            project_id,
+            &card.id,
+            &lane.name,
+            Some(card.revision),
+            &gui_command_id("continue"),
+        ) {
+            Ok(change) => {
+                let continued = if let Some(claim) = card.claim.as_deref() {
+                    match crate::session::daemon::board_card_claim(
+                        &self.session_home,
+                        project_id,
+                        &card.id,
+                        Some(claim),
+                        Some(change.card.revision),
+                        &gui_command_id("continue-claim"),
+                    ) {
+                        Ok(change) => change.card,
+                        Err(error) => {
+                            self.toast(&format!("Could not keep this to-do's worker: {error}"));
+                            return None;
+                        }
+                    }
+                } else {
+                    change.card
+                };
+                self.refresh_board_summary(project_id);
+                Some(continued)
+            }
+            Err(error) => {
+                self.toast(&format!("Could not continue the to-do: {error}"));
+                None
+            }
+        }
+    }
+
+    fn launch_card_agent(
+        &self,
+        project_id: i64,
+        card: &crate::session::board_store::StoredCard,
+        prompt: String,
+        program_id: &str,
+        resume: Resume,
+    ) -> bool {
+        let Some(program) = programs::by_id(program_id)
+            .filter(|program| program.kind == Kind::Agent && program.installed())
+        else {
+            self.toast("The selected agent is not installed");
+            return false;
+        };
+        if matches!(resume, Resume::Session(_)) && program.resume_session.is_empty() {
+            self.toast("The selected agent cannot resume an exact conversation");
+            return false;
+        }
+        if self.current.borrow().as_ref() != Some(&project_id) {
+            self.select_project_with(project_id, false);
+        }
+        let Some(workspace) = self.current_workspace() else {
+            return false;
+        };
+        let card_id = card.id.as_str();
         let key = workspace.next_key(Slot::Agent);
         let stamp = crate::programs::launch::now_stamp();
         let claim = format!("{}-{}", program.id, stamp);
+        if let Err(error) = crate::session::daemon::board_card_claim(
+            &self.session_home,
+            project_id,
+            card_id,
+            Some(&claim),
+            Some(card.revision),
+            &gui_command_id("claim"),
+        ) {
+            self.toast(&format!("Could not assign the to-do: {error}"));
+            return false;
+        }
         let extras = Extras {
             prompt: Some(prompt),
             card: Some(card_id.to_string()),
             instance: Some(stamp),
         };
         if self
-            .ensure_primitive_with(&workspace, key, Some(&program.id), Resume::No, &extras)
+            .ensure_primitive_with(&workspace, key, Some(&program.id), resume, &extras)
             .is_none()
         {
-            self.toast("The agent is not installed");
+            self.toast("The agent could not start; the assignment remains on the card");
+            self.refresh_board_summary(project_id);
             return false;
         }
         self.activate_primitive(&workspace, key);
-        // Claim it for the new instance, so its gate passes and the next
-        // message routes straight back to it.
-        let _ = crate::session::daemon::board_card_claim(
-            &self.session_home,
-            project_id,
-            card_id,
-            Some(&claim),
-            None,
-            &gui_command_id("claim"),
-        );
         self.refresh_board_summary(project_id);
         true
     }
@@ -3507,7 +3854,7 @@ impl App {
     fn claim_has_exact_session(&self, project_id: i64, claim: &str) -> bool {
         self.db
             .bound_session(project_id, claim)
-            .map_or(false, |bound| bound.is_some())
+            .is_ok_and(|bound| bound.is_some())
     }
 
     /// Whether the claim's bound conversation is gone from the provider's
@@ -3684,6 +4031,118 @@ impl App {
         self.session_card_id(project_id, &session)
     }
 
+    fn card_claim_is_live(
+        &self,
+        project_id: i64,
+        card: &crate::session::board_store::StoredCard,
+    ) -> bool {
+        card.claim.as_deref().is_some_and(|claim| {
+            self.live_card_worker(project_id, &card.id, Some(claim))
+                .is_some()
+        })
+    }
+
+    fn card_sessions(&self, project_id: i64, card_id: &str) -> Vec<live_agents::AgentSession> {
+        let sessions = self
+            .agent_sessions
+            .borrow()
+            .by_project
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default();
+        sessions
+            .into_iter()
+            .filter(|session| {
+                session.card_ids.iter().any(|id| id == card_id)
+                    || self.session_card_id(project_id, session).as_deref() == Some(card_id)
+            })
+            .collect()
+    }
+
+    fn catalog_card_sessions(
+        &self,
+        project_id: i64,
+        card_id: &str,
+    ) -> anyhow::Result<Vec<live_agents::AgentSession>> {
+        Ok(self
+            .project_catalog(project_id, Some(card_id))?
+            .iter()
+            .filter(|entry| {
+                entry.card_ids.iter().any(|id| id == card_id)
+                    || entry.card_id.as_deref() == Some(card_id)
+            })
+            .map(live_agents::catalog_session)
+            .collect())
+    }
+
+    fn open_card_session(&self, project_id: i64, card_id: &str, identity: Option<&str>) {
+        let sessions = match self.catalog_card_sessions(project_id, card_id) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                self.toast(&format!(
+                    "Could not read this to-do's conversations: {error}"
+                ));
+                return;
+            }
+        };
+        let session = if let Some(identity) = identity {
+            sessions.into_iter().find(|session| session.id == identity)
+        } else {
+            sessions.into_iter().max_by_key(|session| {
+                (
+                    session.card_id.as_deref() == Some(card_id),
+                    session.running,
+                    session.last_activity_at,
+                )
+            })
+        };
+        if let Some(session) = session {
+            if session.running || live_agents::exact_provider_session_id(&session).is_some() {
+                self.hud.close_tasks(self);
+                self.open_session(project_id, &session, Some(card_id));
+                return;
+            }
+        }
+        let card = self
+            .fetch_board_state(project_id)
+            .and_then(|state| state.cards.into_iter().find(|card| card.id == card_id));
+        if let Some(claim) = card.as_ref().and_then(|card| card.claim.as_deref()) {
+            if let Some((_, _, runtime)) = self.live_card_worker(project_id, card_id, Some(claim)) {
+                self.hud.close_tasks(self);
+                self.open_linked_session(project_id, &runtime);
+                return;
+            }
+            if let Ok(Some((provider, provider_session_id))) =
+                self.db.bound_session(project_id, claim)
+            {
+                let linked = crate::session::daemon::Client::request(
+                    &self.session_home,
+                    crate::session::daemon::Command::CardSessionLink {
+                        project_id,
+                        card_id: card_id.to_string(),
+                        provider,
+                        provider_session_id,
+                    },
+                );
+                if linked.is_ok() {
+                    self.request_agent_scan();
+                    if let Ok(sessions) = self.catalog_card_sessions(project_id, card_id) {
+                        if let Some(session) = sessions.into_iter().find(|session| {
+                            session.running
+                                || live_agents::exact_provider_session_id(session).is_some()
+                        }) {
+                            self.hud.close_tasks(self);
+                            self.open_session(project_id, &session, Some(card_id));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        self.toast("No reachable conversation is linked. Choose an agent or a stopped conversation to reconnect this to-do.");
+        self.open_home_card(project_id, card_id);
+    }
+
     fn session_card_id(
         &self,
         project_id: i64,
@@ -3822,37 +4281,6 @@ impl App {
         true
     }
 
-    /// The sign for the session bound to a card's claim: the live session when
-    /// one holds it, otherwise the newest signal recorded against the card.
-    fn card_session_sign(&self, project_id: i64, card: &board::WorkCard) -> activity_sign::Sign {
-        if let Some(claim) = &card.claim {
-            if let Some(session) = self.live_claim_session(project_id, claim) {
-                return self.session_activity_sign(project_id, &session);
-            }
-        }
-        self.card_journal_sign(project_id, &card.id)
-    }
-
-    /// The newest agent signal recorded against a card itself, used when no
-    /// live session holds its claim.
-    fn card_journal_sign(&self, project_id: i64, card_id: &str) -> activity_sign::Sign {
-        let activity = self.activity.borrow();
-        let events: Vec<&crate::session::activity::ActivityEvent> = activity
-            .get(&project_id)
-            .map(|activity| {
-                activity
-                    .snapshot
-                    .events
-                    .iter()
-                    .filter(|event| {
-                        event.card_id.as_deref() == Some(card_id) && event.session_id.is_some()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        activity_sign::session_sign(false, false, &events)
-    }
-
     /// How many sessions in a project ended recently, for the lane footer's
     /// "stopped" count. Thirty minutes is long enough to notice an agent that
     /// just exited and short enough not to accumulate old runs.
@@ -3917,7 +4345,6 @@ impl App {
     /// preferences say right now. Workspaces stay alive behind it — going
     /// home looks away, it never stops anything.
     fn show_home(self: &Rc<Self>) {
-        self.todo_origin.set(None);
         self.home_shown.set(true);
         // Going Home always lands on the cockpit, not the last drill-down.
         self.home_nav.borrow_mut().clear();
@@ -3941,6 +4368,7 @@ impl App {
         // signs as Home, so they refresh together, whichever surface is
         // showing.
         self.refresh_all_panel_headers();
+        self.hud.refresh_tasks(self);
         if !self.home_shown.get() {
             return;
         }
@@ -4138,6 +4566,10 @@ impl App {
     // ---- the workspace and its panes ----
 
     fn select_project(&self, id: i64) {
+        self.select_project_with(id, true);
+    }
+
+    fn select_project_with(&self, id: i64, launch_defaults: bool) {
         let Some(project) = self
             .db
             .project(id)
@@ -4147,9 +4579,12 @@ impl App {
         else {
             return;
         };
+        if *self.current.borrow() != Some(id) {
+            self.hud.close_tasks(self);
+        }
         *self.current.borrow_mut() = Some(id);
         self.home_shown.set(false);
-        self.workspace_for(&project);
+        self.workspace_for(&project, launch_defaults);
         self.stack.set_visible_child_name(&format!("project-{id}"));
         let _ = self.db.touch_project(id);
         let _ = self.db.remember_last_project(Some(id));
@@ -4177,7 +4612,7 @@ impl App {
         }
     }
 
-    fn workspace_for(&self, project: &Project) -> Rc<Workspace> {
+    fn workspace_for(&self, project: &Project, launch_defaults: bool) -> Rc<Workspace> {
         if let Some(existing) = self.workspaces.borrow().get(&project.id) {
             return existing.clone();
         }
@@ -4254,7 +4689,7 @@ impl App {
         let mut wanted: Vec<TabKey> = Vec::new();
         let mut key_programs: HashMap<TabKey, String> = HashMap::new();
         if stored.is_empty() {
-            if saved_state.is_none() {
+            if saved_state.is_none() && launch_defaults {
                 // A fresh workspace opens with the home panel's layout
                 // preset — the agent leads, and the rest is scope. An empty
                 // saved snapshot means the user intentionally hid every
@@ -4400,10 +4835,10 @@ impl App {
         let wanted = program
             .map(|id| id.to_string())
             .or_else(|| workspace.programs.borrow().get(&key.slot).cloned());
-        let program = wanted
-            .and_then(|id| programs::by_id(&id))
-            .filter(|program| program.installed())
-            .or_else(|| programs::for_slot(key.slot, &preferences))?;
+        let program = match wanted {
+            Some(id) => programs::by_id(&id),
+            None => programs::for_slot(key.slot, &preferences),
+        }?;
 
         workspace
             .programs
@@ -4412,7 +4847,6 @@ impl App {
         let mut options = self.launch_options();
         match &resume {
             Resume::No => {}
-            Resume::Last => options.resume = true,
             Resume::Session(id) => options.session = Some(id.clone()),
         }
         options.prompt = extras.prompt.clone();
@@ -4421,8 +4855,14 @@ impl App {
         // the convention is installed before the agent draws its first frame,
         // and the launch claims work under a name unique to this instance —
         // two agents of the same kind never hold each other's cards.
-        let mut launch_record: Option<(String, LaunchBinding)> = None;
+
         if program.kind == Kind::Agent {
+            if let Err(error) = crate::setup::install_default_session_hooks() {
+                self.toast(&format!(
+                    "Could not install session identity tracking: {error}"
+                ));
+                return None;
+            }
             match self.db.board_enabled(&workspace.project.path) {
                 Ok(true) => {
                     if let Err(error) = crate::skill::install(&self.db, &workspace.project.path) {
@@ -4437,22 +4877,12 @@ impl App {
                 .clone()
                 .unwrap_or_else(crate::programs::launch::now_stamp);
             options.agent_instance = Some(stamp.clone());
-            let claim = format!("{}-{}", program.id, stamp);
-            // A fresh launch of a CLI that can create a session under an id we
-            // pick gets an exact one: the claim links to that conversation and
-            // no other session in the project can ever win the link. Every
-            // other launch (a resume, or a CLI that can only resume) still
-            // falls back to reading the CLI's store after exit.
-            let binding = match (&resume, program.create_session) {
-                (Resume::No, true) => {
-                    let id =
-                        crate::programs::launch::provider_session_id(workspace.project.id, &stamp);
-                    options.create_session = Some(id.clone());
-                    LaunchBinding::Exact(id)
-                }
-                _ => LaunchBinding::Guess(crate::programs::launch::now_millis()),
-            };
-            launch_record = Some((claim, binding));
+            if matches!(resume, Resume::No) && program.create_session {
+                options.create_session = Some(crate::programs::launch::provider_session_id(
+                    workspace.project.id,
+                    &stamp,
+                ));
+            }
         }
         let session_id = stable_session_id(workspace.project.id, key, &program.id);
         let mut spec = program.command_spec(&options);
@@ -4479,117 +4909,12 @@ impl App {
             &session_id,
             "attached",
         );
-        // Bind the claim to its conversation. An exact launch already knows
-        // it — bind now, while the session is live, so the link survives a
-        // GUI restart and no other session in the project can ever win it.
-        // Otherwise, when the program exits, ask the CLI's own session store
-        // which conversation that instance had; the store read takes ~100ms,
-        // so it runs on a worker thread and the binding lands back on the
-        // main loop.
-        if let Some((claim, binding)) = launch_record {
-            if let LaunchBinding::Exact(provider_session_id) = &binding {
-                let _ = self.db.bind_session(
-                    workspace.project.id,
-                    &claim,
-                    &program.id,
-                    provider_session_id,
-                );
-                bind_provider_session(
-                    &self.session_home,
-                    &session_id,
-                    &program.id,
-                    provider_session_id,
-                );
-            }
-            let (tx, rx) = async_channel::unbounded::<(i64, String, String, String)>();
-            let db_for_bindings = self.db.clone();
-            glib::MainContext::default().spawn_local(async move {
-                while let Ok((project_id, bound_claim, program_id, session)) = rx.recv().await {
-                    let _ = db_for_bindings.bind_session(
-                        project_id,
-                        &bound_claim,
-                        &program_id,
-                        &session,
-                    );
-                }
-            });
-            let tx_for_exit = tx;
-            let program_id = program.id.clone();
-            let cwd = workspace.project.path.clone();
-            let project_id = workspace.project.id;
-            let lifecycle_home = self.session_home.clone();
-            let lifecycle_session = session_id.clone();
-            pane.set_exit_handler(move || {
-                publish_session_lifecycle(
-                    &lifecycle_home,
-                    project_id,
-                    &lifecycle_session,
-                    "exited",
-                );
-                let LaunchBinding::Guess(launched_ms) = binding else {
-                    return;
-                };
-                let tx = tx_for_exit.clone();
-                let program_id = program_id.clone();
-                let cwd = cwd.clone();
-                let claim = claim.clone();
-                let exit_home = lifecycle_home.clone();
-                let exit_radar_session = lifecycle_session.clone();
-                std::thread::spawn(move || {
-                    if let Some(session) =
-                        crate::programs::sessions::newest_since(&program_id, &cwd, launched_ms)
-                    {
-                        let _ =
-                            tx.try_send((project_id, claim, program_id.clone(), session.clone()));
-                        bind_provider_session(
-                            &exit_home,
-                            &exit_radar_session,
-                            &program_id,
-                            &session,
-                        );
-                    }
-                });
-            });
-        } else {
-            let lifecycle_home = self.session_home.clone();
-            let lifecycle_session = session_id.clone();
-            let project_id = workspace.project.id;
-            // Without a claim there is no launch record, but an agent run
-            // still earns its exact reopen link: capture the conversation it
-            // had the same way, keyed by this session's stable id.
-            let capture = program.kind == crate::programs::Kind::Agent;
-            let capture_home = lifecycle_home.clone();
-            let capture_radar = lifecycle_session.clone();
-            let capture_program = program.id.clone();
-            let capture_cwd = workspace.project.path.clone();
-            // No launch record means no recorded stamp; the pane spawns now,
-            // so "created after this instant" is the right capture window.
-            let capture_launch = crate::session::catalog::now_millis();
-            pane.set_exit_handler(move || {
-                publish_session_lifecycle(
-                    &lifecycle_home,
-                    project_id,
-                    &lifecycle_session,
-                    "exited",
-                );
-                if capture {
-                    let bind_home = capture_home.clone();
-                    let bind_radar = capture_radar.clone();
-                    let bind_program = capture_program.clone();
-                    let bind_cwd = capture_cwd.clone();
-                    std::thread::spawn(move || {
-                        let cutoff = u128::try_from(capture_launch.max(0)).unwrap_or(0);
-                        if let Some(session) = crate::programs::sessions::newest_since(
-                            &bind_program,
-                            &bind_cwd,
-                            cutoff,
-                        ) {
-                            bind_provider_session(&bind_home, &bind_radar, &bind_program, &session);
-                        }
-                    });
-                }
-            });
-        }
+        let lifecycle_home = self.session_home.clone();
+        let lifecycle_session = session_id.clone();
+        let project_id = workspace.project.id;
+        pane.set_exit_handler(move || {
+            publish_session_lifecycle(&lifecycle_home, project_id, &lifecycle_session, "exited");
+        });
         // The panel header wants the session's name: whatever the program puts
         // in the terminal title, and its exit when it goes away. The window
         // action routes it — the pane outlives any one panel, so the observer
@@ -4704,20 +5029,7 @@ impl App {
     /// process stamp nor a stored provider conversation identifies it, leave
     /// the current agent untouched rather than guessing from its program.
     fn open_agent_session(&self, workspace: &Rc<Workspace>, claim: &str) {
-        self.open_agent_session_with(workspace, claim, None);
-    }
-
-    fn open_agent_session_with(
-        &self,
-        workspace: &Rc<Workspace>,
-        claim: &str,
-        prompt: Option<String>,
-    ) {
-        let extras = Extras {
-            prompt,
-            card: None,
-            instance: None,
-        };
+        let extras = Extras::default();
         let project_id = workspace.project.id;
         let exact_tab = workspace.tabs_of_kind(Slot::Agent).into_iter().find(|key| {
             workspace
@@ -4823,6 +5135,68 @@ impl App {
             self.toast("This session is no longer listed");
             return;
         };
+        self.open_session(project_id, &session, None);
+    }
+
+    fn track_panel_conversation(&self, session: &live_agents::AgentSession) {
+        if !session.running {
+            return;
+        }
+        let Some((project, key, _)) = session
+            .radar_session_id
+            .as_deref()
+            .and_then(parse_stable_session_id)
+        else {
+            return;
+        };
+        if let Some(primitive) = self
+            .workspaces
+            .borrow()
+            .get(&project)
+            .and_then(|workspace| workspace.tab(key))
+        {
+            if primitive.program_id == session.program_id {
+                *primitive.launched_session.borrow_mut() =
+                    live_agents::exact_provider_session_id(session).map(str::to_string);
+            }
+        }
+    }
+
+    fn open_session(
+        &self,
+        project_id: i64,
+        session: &live_agents::AgentSession,
+        card_id: Option<&str>,
+    ) {
+        let latest;
+        let session = if session.external.is_none() {
+            match self.project_catalog(project_id, None) {
+                Ok(entries) => {
+                    // Refresh live tab identities before resolving a history click: the
+                    // provider may have switched since the last three-second poll.
+                    for entry in entries.iter().filter(|entry| entry.lifecycle == "running") {
+                        self.track_panel_conversation(&live_agents::catalog_session(entry));
+                    }
+                    if let Some(entry) = entries.iter().find(|entry| {
+                        entry.provider == session.program_id
+                            && Some(entry.provider_session_id.as_str())
+                                == session.provider_session_id.as_deref()
+                    }) {
+                        latest = live_agents::catalog_session(entry);
+                        &latest
+                    } else {
+                        self.toast("This conversation is no longer in the catalog");
+                        return;
+                    }
+                }
+                Err(error) => {
+                    self.toast(&format!("Could not verify this conversation: {error}"));
+                    return;
+                }
+            }
+        } else {
+            session
+        };
         if self.current.borrow().as_ref() != Some(&project_id) {
             self.select_project(project_id);
         }
@@ -4850,11 +5224,13 @@ impl App {
         // live_agents::exact_provider_session_id). Without one there is no
         // honest reopen — "last" could be a different conversation than
         // the row the user clicked.
-        let Some(program) = programs::by_id(&session.program_id) else {
+        let Some(program) =
+            programs::by_id(&session.program_id).filter(|program| program.installed())
+        else {
             self.toast("The session's agent is not installed");
             return;
         };
-        let resume = match live_agents::exact_provider_session_id(&session) {
+        let resume = match live_agents::exact_provider_session_id(session) {
             Some(id) if !program.resume_session.is_empty() => Resume::Session(id.to_string()),
             _ => {
                 self.toast(
@@ -4878,7 +5254,9 @@ impl App {
             })
             .collect();
         let extras = Extras {
-            card: self.session_card_id(project_id, &session),
+            card: card_id
+                .map(str::to_string)
+                .or_else(|| self.session_card_id(project_id, session)),
             ..Extras::default()
         };
         let key = agent_tab_for_session(
@@ -4980,7 +5358,6 @@ impl App {
         let mut options = self.launch_options();
         match &resume {
             Resume::No => {}
-            Resume::Last => options.resume = true,
             Resume::Session(id) => options.session = Some(id.clone()),
         }
         options.prompt = extras.prompt.clone();
@@ -5005,7 +5382,7 @@ impl App {
         }
         *primitive.launched_session.borrow_mut() = match &resume {
             Resume::Session(id) => Some(id.clone()),
-            Resume::Last | Resume::No => None,
+            Resume::No => None,
         };
         self.activate_primitive(workspace, key);
     }
@@ -5504,12 +5881,11 @@ impl App {
             },
         );
         self.workspace_bar.set_visible(!self.home_shown.get());
+        if self.home_shown.get() {
+            self.hud.close_tasks(self);
+        }
         if let Some(project) = self.current_project() {
-            self.workspace_title.set_label(&project.name);
-            if let Some(label) = self.workspace_title.child().and_downcast::<gtk::Label>() {
-                label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                label.set_max_width_chars(32);
-            }
+            self.workspace_title.set_text(&project.name);
         }
         for (slot, button) in self.toggles.borrow().iter() {
             button.set_active(visible.contains(slot));
@@ -5803,6 +6179,7 @@ mod home_navigation_tests {
         }
     }
 
+    #[track_caller]
     fn wait_until(mut ready: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !ready() {
@@ -5844,9 +6221,33 @@ mod home_navigation_tests {
     fn home_navigation_replaces_the_sidebar_without_losing_project_controls() {
         gtk::init().unwrap();
         let scratch = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let bins = scratch.path().join("bin");
+        std::fs::create_dir(&bins).unwrap();
+        let launches = scratch.path().join("launches");
+        let stub = format!("#!/bin/sh\nif [ \"$1\" = session ]; then printf '[]'; exit 0; fi\nprintf 'launch\\t%s\\t%s\\t%s\\t%s\\n' \"$0\" \"$RADAR_CARD_ID\" \"$RADAR_AGENT\" \"$*\" >> {launches:?}\nwhile IFS= read -r line; do printf 'input\\t%s\\t%s\\n' \"$RADAR_CARD_ID\" \"$line\" >> {launches:?}; done\n");
+        for (name, script) in [
+            ("opencode", stub.clone()),
+            ("pi", stub),
+            ("mise", format!("#!/bin/sh\nprintf '%s\\n' {bins:?}\n")),
+        ] {
+            let file = bins.join(name);
+            std::fs::write(&file, script).unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let old_path = std::env::var_os("PATH").unwrap();
+        std::env::set_var(
+            "PATH",
+            std::env::join_paths(std::iter::once(bins).chain(std::env::split_paths(&old_path)))
+                .unwrap(),
+        );
         let paths = Rc::new(Paths::with_root(scratch.path().join("state")));
         paths.ensure().unwrap();
         let db = Rc::new(Db::open(&paths).unwrap());
+        let mut prefs = db.preferences().unwrap();
+        prefs.agent_auto_flags = false;
+        prefs.set(Slot::Agent, Some("opencode".to_string()));
+        db.set_preferences(&prefs).unwrap();
         let _daemon = TestDaemon(
             std::process::Command::new(
                 std::env::var("RADAR_TEST_BIN").expect("run scripts/home-smoke.sh"),
@@ -5854,6 +6255,10 @@ mod home_navigation_tests {
             .arg("--home")
             .arg(&paths.data_dir)
             .arg("serve")
+            .env_remove("RADAR_CARD_ID")
+            .env_remove("RADAR_AGENT")
+            .env_remove("RADAR_SESSION_ID")
+            .env_remove("RADAR_PROJECT_ID")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -5955,7 +6360,7 @@ mod home_navigation_tests {
 
         // The workspace carries a Board button: it navigates to this
         // project's board (the project view) inside Home, with Alt+K.
-        let board_button = widgets(&bar)
+        let board_button = widgets(bar)
             .into_iter()
             .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
             .find(|button| button.label().as_deref() == Some("Board"))
@@ -5980,7 +6385,61 @@ mod home_navigation_tests {
             Some(format!("project-{}", project.id).as_str())
         );
 
-        // Todo -> exact session -> todo -> Back returns to the same pane.
+        let todos = widgets(window.upcast_ref())
+            .into_iter()
+            .find(|widget| widget.has_css_class("hud-root"))
+            .unwrap();
+        let workspace_width = stack.width();
+        activate(&window, "win.new-session", None);
+        assert!(todos.is_visible());
+        assert_eq!(
+            stack.width(),
+            workspace_width,
+            "the shared dialog must not resize the workspace"
+        );
+        assert!(widgets(&todos)
+            .iter()
+            .any(|widget| widget.has_css_class("hud-card")));
+        assert_eq!(
+            widgets(bar)
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Button>())
+                .filter(|button| button.action_name().as_deref() == Some("win.new-session"))
+                .count(),
+            1
+        );
+        assert!(!widgets(bar)
+            .iter()
+            .filter_map(|widget| widget.downcast_ref::<gtk::Button>())
+            .any(|button| button.label().as_deref() == Some("To-dos")
+                || button.label().as_deref() == Some("Auto arrange")));
+        assert!(window.lookup_action("workspace-todos").is_none());
+        assert_eq!(
+            stack.visible_child_name().as_deref(),
+            Some(format!("project-{}", project.id).as_str())
+        );
+        let add = widgets(&todos)
+            .into_iter()
+            .find_map(|widget| widget.downcast::<gtk::Entry>().ok())
+            .unwrap();
+        add.grab_focus();
+        add.set_text("Created inside workspace");
+        add.emit_activate();
+        drain();
+        assert_eq!(
+            stack.visible_child_name().as_deref(),
+            Some(format!("project-{}", project.id).as_str())
+        );
+        assert!(widgets(&todos)
+            .iter()
+            .filter_map(|widget| widget.downcast_ref::<gtk::Label>())
+            .any(|label| label.text().as_str() == "Created inside workspace"));
+        assert!(widgets(&todos)
+            .iter()
+            .filter_map(|widget| widget.downcast_ref::<gtk::Entry>())
+            .any(|entry| entry.text().is_empty()));
+
+        // Todo -> exact session -> todo stays beside the same pane.
         // Use an inert daemon child, never launch a real agent in this test.
         let card = crate::session::daemon::board_card_add(
             &paths.data_dir,
@@ -5998,7 +6457,10 @@ mod home_navigation_tests {
             id: session_id.clone(),
             argv: vec!["sh".into(), "-c".into(), "sleep 60".into()],
             cwd: folder.clone(),
-            env: vec![("RADAR_CARD_ID".into(), card.id.clone())],
+            env: vec![
+                ("RADAR_CARD_ID".into(), card.id.clone()),
+                ("RADAR_AGENT".into(), "opencode-nav-test".into()),
+            ],
             env_remove: vec![],
             dims: crate::session::Dims { cols: 80, rows: 24 },
         };
@@ -6013,16 +6475,31 @@ mod home_navigation_tests {
             Some(&(project.id, card.id.as_str()).to_variant()),
         );
         wait_until(|| {
-            widgets(&stack.child_by_name("_home").unwrap())
+            for expander in widgets(&todos)
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Expander>())
+            {
+                expander.set_expanded(true);
+            }
+            widgets(&todos)
                 .into_iter()
                 .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
-                .any(|button| button.action_name().as_deref() == Some("win.todo-session"))
+                .any(|button| button.action_name().as_deref() == Some("win.card-conversation-open"))
         });
-        for _ in 0..2 {
+        for lane in ["Todo", "In progress", "Review"] {
+            crate::session::daemon::board_card_move(
+                &paths.data_dir,
+                project.id,
+                &card.id,
+                lane,
+                None,
+                &format!("session-parity-{lane}"),
+            )
+            .unwrap();
             activate(
                 &window,
-                "win.todo-session",
-                Some(&(project.id, session_id.as_str()).to_variant()),
+                "win.card-session-open",
+                Some(&(project.id, card.id.as_str()).to_variant()),
             );
             assert_eq!(
                 stack.visible_child_name().as_deref(),
@@ -6033,17 +6510,115 @@ mod home_navigation_tests {
                 "win.session-todo",
                 Some(&(project.id, "agent", card.id.as_str()).to_variant()),
             );
-            assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
-            assert!(widgets(&stack.child_by_name("_home").unwrap())
-                .into_iter()
-                .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
-                .any(|button| button.label().as_deref() == Some("Back to session")));
-            activate(&window, "win.home-back", None);
+            assert_eq!(
+                stack.visible_child_name().as_deref(),
+                Some(format!("project-{}", project.id).as_str())
+            );
+            assert!(todos.is_visible());
+            assert!(widgets(&todos)
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Button>())
+                .any(|button| button.is_visible()
+                    && button.tooltip_text().as_deref() == Some("Back to to-dos")));
+            activate(&window, "win.new-session", None);
             assert_eq!(
                 stack.visible_child_name().as_deref(),
                 Some(format!("project-{}", project.id).as_str())
             );
         }
+
+        let assigned = crate::session::daemon::board_card_add(
+            &paths.data_dir,
+            project.id,
+            None,
+            "Assign to existing session",
+            "",
+            None,
+            "nav-assignment-add",
+        )
+        .unwrap()
+        .card;
+        activate(&window, "win.home-project", Some(&project.id.to_variant()));
+        wait_until(|| {
+            widgets(window.upcast_ref())
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Label>())
+                .any(|label| label.text().as_str() == "Assign to existing session")
+        });
+        activate(
+            &window,
+            "win.card-worker",
+            Some(
+                &(
+                    project.id,
+                    assigned.id.as_str(),
+                    "session",
+                    "opencode-nav-test",
+                )
+                    .to_variant(),
+            ),
+        );
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        let crate::session::daemon::Response::BoardState(state) =
+            crate::session::daemon::Client::request(
+                &paths.data_dir,
+                crate::session::daemon::Command::BoardState {
+                    project_id: project.id,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("expected board state")
+        };
+        assert_eq!(
+            state
+                .cards
+                .iter()
+                .find(|card| card.id == assigned.id)
+                .unwrap()
+                .claim
+                .as_deref(),
+            None,
+            "running conversations cannot be rebound to a different task"
+        );
+        // An invalid second selection must not invent an assignment.
+        activate(
+            &window,
+            "win.card-worker",
+            Some(&(project.id, assigned.id.as_str(), "session", "other-agent").to_variant()),
+        );
+        let crate::session::daemon::Response::BoardState(state) =
+            crate::session::daemon::Client::request(
+                &paths.data_dir,
+                crate::session::daemon::Command::BoardState {
+                    project_id: project.id,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("expected board state")
+        };
+        assert_eq!(
+            state
+                .cards
+                .iter()
+                .find(|card| card.id == assigned.id)
+                .unwrap()
+                .claim
+                .as_deref(),
+            None
+        );
+
+        // Starting existing card work from the board never navigates away.
+        activate(&window, "win.home-project", Some(&project.id.to_variant()));
+        activate(
+            &window,
+            "win.card-session-create",
+            Some(&(project.id, card.id.as_str()).to_variant()),
+        );
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        assert!(!bar.is_visible());
+        assert!(!todos.is_visible());
 
         // Back on the cockpit, the project card grows with its to-dos but
         // keeps its width: the list scrolls only vertically, never caps the
@@ -6268,7 +6843,313 @@ mod home_navigation_tests {
         assert!(widgets(&stack.child_by_name("_home").unwrap())
             .iter()
             .any(|widget| widget.has_css_class("project-view")));
+        // End-to-end board journey with inert agent executables: create/start,
+        // review follow-up, exact stopped resume, and assignment to a conversation.
+        activate(
+            &window,
+            "win.home-add-work",
+            Some(&(created.id, "Autonomous task").to_variant()),
+        );
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        let board_state = || match crate::session::daemon::Client::request(
+            &paths.data_dir,
+            crate::session::daemon::Command::BoardState {
+                project_id: created.id,
+            },
+        )
+        .unwrap()
+        {
+            crate::session::daemon::Response::BoardState(state) => state,
+            _ => panic!("expected board state"),
+        };
+        let work = board_state()
+            .cards
+            .into_iter()
+            .find(|card| card.title == "Autonomous task")
+            .unwrap();
+        wait_until(|| {
+            std::fs::read_to_string(&launches)
+                .unwrap_or_default()
+                .contains(&work.id)
+        });
+        assert!(work.claim.is_some());
+        let runtime = match crate::session::daemon::Client::request(
+            &paths.data_dir,
+            crate::session::daemon::Command::List,
+        )
+        .unwrap()
+        {
+            crate::session::daemon::Response::Sessions(sessions) => {
+                assert_eq!(
+                    sessions
+                        .iter()
+                        .filter(|session| session
+                            .id
+                            .starts_with(&format!("project-{}-", created.id)))
+                        .count(),
+                    1,
+                    "board launches must not create an unrelated default agent"
+                );
+                sessions
+                    .into_iter()
+                    .find(|session| {
+                        session
+                            .pid
+                            .and_then(programs::launch::radar_card_of)
+                            .as_deref()
+                            == Some(work.id.as_str())
+                    })
+                    .unwrap()
+                    .id
+            }
+            _ => panic!("expected sessions"),
+        };
+        crate::session::daemon::board_card_move(
+            &paths.data_dir,
+            created.id,
+            &work.id,
+            "Review",
+            None,
+            "test-review",
+        )
+        .unwrap();
+        wait_until(|| {
+            widgets(window.upcast_ref())
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Label>())
+                .any(|label| label.has_css_class("dim-label") && label.text().as_str() == "Review")
+        });
+        activate(
+            &window,
+            "win.card-reply",
+            Some(&(created.id, work.id.as_str(), "Please add tests").to_variant()),
+        );
+        wait_until(|| {
+            std::fs::read_to_string(&launches)
+                .unwrap_or_default()
+                .contains("Please add tests")
+        });
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        assert_eq!(
+            board_state()
+                .cards
+                .iter()
+                .find(|card| card.id == work.id)
+                .unwrap()
+                .lane,
+            "In progress"
+        );
+        let catalog_entries = || match crate::session::daemon::Client::request(
+            &paths.data_dir,
+            crate::session::daemon::Command::CatalogList {
+                projects: vec![crate::session::daemon::CatalogProject {
+                    id: created.id,
+                    path: created.path.clone(),
+                }],
+                filter: crate::session::catalog::CatalogFilter::Active,
+                query: None,
+                limit: 100,
+            },
+        )
+        .unwrap()
+        {
+            crate::session::daemon::Response::Catalog(entries) => entries,
+            _ => panic!("expected catalog"),
+        };
+        let provider_id = catalog_entries()
+            .into_iter()
+            .find(|session| session.radar_session_id.as_deref() == Some(&runtime))
+            .unwrap()
+            .provider_session_id;
+        crate::session::daemon::Client::request(
+            &paths.data_dir,
+            crate::session::daemon::Command::Stop {
+                id: runtime.clone(),
+            },
+        )
+        .unwrap();
+        wait_until(|| {
+            catalog_entries().iter().any(|session| {
+                session.provider_session_id == provider_id && session.lifecycle == "ended"
+            })
+        });
+        crate::session::daemon::board_card_move(
+            &paths.data_dir,
+            created.id,
+            &work.id,
+            "Review",
+            None,
+            "test-second-review",
+        )
+        .unwrap();
+        wait_until(|| {
+            widgets(window.upcast_ref())
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Label>())
+                .any(|label| label.has_css_class("dim-label") && label.text().as_str() == "Review")
+        });
+        activate(
+            &window,
+            "win.card-reply",
+            Some(
+                &(
+                    created.id,
+                    work.id.as_str(),
+                    "Resume this exact conversation",
+                )
+                    .to_variant(),
+            ),
+        );
+        wait_until(|| {
+            std::fs::read_to_string(&launches)
+                .unwrap_or_default()
+                .contains("Resume this exact conversation")
+        });
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        assert_eq!(
+            catalog_entries()
+                .iter()
+                .filter(|session| session.provider_session_id == provider_id)
+                .count(),
+            1
+        );
+        wait_until(|| {
+            catalog_entries()
+                .iter()
+                .find(|session| session.provider_session_id == provider_id)
+                .is_some_and(|session| {
+                    session.card_id.as_deref() == Some(work.id.as_str())
+                        && session.lifecycle == "running"
+                })
+        });
+
+        crate::session::daemon::Client::request(
+            &paths.data_dir,
+            crate::session::daemon::Command::PublishActivity(
+                crate::session::activity::PublishActivity {
+                    project_id: created.id,
+                    command_id: "test-agent-summary".into(),
+                    session_id: Some(runtime.clone()),
+                    card_id: Some(work.id.clone()),
+                    kind: crate::session::activity::ActivityKind::Reported,
+                    payload: crate::session::activity::ActivityPayload::Message {
+                        text: "Implemented the requested tests.".into(),
+                    },
+                },
+            ),
+        )
+        .unwrap();
+        wait_until(|| {
+            widgets(window.upcast_ref())
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Label>())
+                .any(|label| label.text().as_str() == "Implemented the requested tests.")
+        });
+        crate::session::daemon::board_card_complete(
+            &paths.data_dir,
+            created.id,
+            &work.id,
+            None,
+            "test-human-complete",
+        )
+        .unwrap();
+        activate(
+            &window,
+            "win.card-reply",
+            Some(&(created.id, work.id.as_str(), "Follow up after completion").to_variant()),
+        );
+        wait_until(|| {
+            std::fs::read_to_string(&launches)
+                .unwrap_or_default()
+                .contains("Follow up after completion")
+        });
+        assert!(
+            !board_state()
+                .cards
+                .iter()
+                .find(|card| card.id == work.id)
+                .unwrap()
+                .done
+        );
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+
+        let ended = catalog_entries()
+            .into_iter()
+            .find(|session| session.provider_session_id == provider_id)
+            .unwrap();
+        crate::session::daemon::Client::request(
+            &paths.data_dir,
+            crate::session::daemon::Command::Stop {
+                id: ended.radar_session_id.clone().unwrap(),
+            },
+        )
+        .unwrap();
+        wait_until(|| {
+            catalog_entries()
+                .iter()
+                .any(|session| session.id == ended.id && session.lifecycle == "ended")
+        });
+        activate(
+            &window,
+            "win.home-add-todo",
+            Some(&(created.id, "Assigned conversation").to_variant()),
+        );
+        let assigned = board_state()
+            .cards
+            .into_iter()
+            .find(|card| card.title == "Assigned conversation")
+            .unwrap();
+        activate(
+            &window,
+            "win.card-worker",
+            Some(
+                &(
+                    created.id,
+                    assigned.id.as_str(),
+                    "session",
+                    format!("catalog-{}", ended.id),
+                )
+                    .to_variant(),
+            ),
+        );
+        wait_until(|| {
+            catalog_entries().iter().any(|session| {
+                session.id == ended.id
+                    && session.card_id.as_deref() == Some(assigned.id.as_str())
+                    && session.lifecycle == "running"
+            })
+        });
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        assert!(std::fs::read_to_string(&launches)
+            .unwrap()
+            .contains("Assigned conversation"));
+        activate(
+            &window,
+            "win.home-add-todo",
+            Some(&(created.id, "Chosen pi agent").to_variant()),
+        );
+        let chosen = board_state()
+            .cards
+            .into_iter()
+            .find(|card| card.title == "Chosen pi agent")
+            .unwrap();
+        activate(
+            &window,
+            "win.card-worker",
+            Some(&(created.id, chosen.id.as_str(), "agent", "pi").to_variant()),
+        );
+        wait_until(|| {
+            std::fs::read_to_string(&launches)
+                .unwrap_or_default()
+                .contains("Chosen pi agent")
+        });
+        assert!(std::fs::read_to_string(&launches)
+            .unwrap()
+            .contains("/bin/pi"));
+        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+
         window.destroy();
+        std::env::set_var("PATH", old_path);
     }
 }
 

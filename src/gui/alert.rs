@@ -14,7 +14,6 @@ use gtk::glib;
 /// How loudly an alert reads.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Tone {
-    Info,
     Success,
     Warning,
     Danger,
@@ -23,7 +22,6 @@ pub(super) enum Tone {
 impl Tone {
     fn css(self) -> &'static str {
         match self {
-            Tone::Info => "info",
             Tone::Success => "success",
             Tone::Warning => "warning",
             Tone::Danger => "danger",
@@ -32,7 +30,6 @@ impl Tone {
 
     fn icon(self) -> &'static str {
         match self {
-            Tone::Info => "dialog-information-symbolic",
             Tone::Success => "emblem-ok-symbolic",
             Tone::Warning => "dialog-warning-symbolic",
             Tone::Danger => "dialog-error-symbolic",
@@ -42,7 +39,6 @@ impl Tone {
     /// The freedesktop sound name for this tone.
     fn sound(self) -> &'static str {
         match self {
-            Tone::Info => "message",
             Tone::Success => "complete",
             Tone::Warning => "dialog-warning",
             Tone::Danger => "dialog-error",

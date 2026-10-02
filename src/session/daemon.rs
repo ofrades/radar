@@ -32,7 +32,7 @@ use super::registry::{
 };
 use super::Dims;
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 4;
 const MAX_REQUEST: usize = 128 * 1024;
 const MAX_RESPONSE: usize = 128 * 1024 * 1024;
 /// How long a client or server waits on a socket read. Generous enough for the
@@ -110,10 +110,20 @@ pub enum Command {
         program: String,
         cwd: PathBuf,
     },
-    /// Adopt a provider conversation for a radar-spawned row once the CLI's
-    /// own store reveals which session the run had (exit capture).
-    CatalogBind {
+    SessionIdentity {
         radar_id: String,
+    },
+    /// A provider's actual active conversation, scoped to one worker incarnation.
+    SessionIdentify {
+        radar_id: String,
+        instance: String,
+        provider: String,
+        conversation: String,
+        reporter_pid: u32,
+    },
+    CardSessionLink {
+        project_id: i64,
+        card_id: String,
         provider: String,
         provider_session_id: String,
     },
@@ -230,6 +240,10 @@ pub enum Response {
     AttentionChanged(AttentionMutationResult),
     AttentionStatus(Attention),
     Catalog(Vec<super::catalog::Entry>),
+    SessionIdentity {
+        provider: String,
+        conversation: String,
+    },
     BoardState(BoardState),
     CardChanged(Box<BoardChange>),
     CardNext(Option<Box<BoardChange>>),
@@ -397,10 +411,40 @@ fn serve(
     let response = match request.command {
         Command::Ping => Response::Hello { version: VERSION },
         Command::Create(spec) => {
-            let session = registry.create(spec.clone())?;
+            let _identity_update = registry.identity_update();
+            if let Some((_, conversation)) = spec
+                .env
+                .iter()
+                .rev()
+                .find(|(name, _)| name == "RADAR_RESUME_SESSION_ID")
+            {
+                let provider = spec
+                    .env
+                    .iter()
+                    .rev()
+                    .find(|(name, _)| name == "RADAR_SESSION_PROVIDER")
+                    .map(|(_, value)| value.as_str())
+                    .context("Resume has no provider identity")?;
+                crate::programs::sessions::validate_resume(
+                    provider,
+                    &spec.cwd,
+                    conversation,
+                    &spec.env,
+                    &spec.argv,
+                )?;
+            }
+            let (session, created) = registry.create_or_attach(spec.clone())?;
             let status = session.status();
-            if let Some(project_id) = catalog::project_of_session_id(&status.id) {
-                let provider = catalog::provider_of_session_id(&status.id)
+            if let Some(project_id) = session
+                .env_value("RADAR_PROJECT_ID")
+                .and_then(|id| id.parse().ok())
+                .or_else(|| catalog::project_of_session_id(&status.id))
+                .filter(|_| created)
+            {
+                let provider = session
+                    .env_value("RADAR_SESSION_PROVIDER")
+                    .map(str::to_string)
+                    .or_else(|| catalog::provider_of_session_id(&status.id))
                     .unwrap_or_else(|| "shell".to_string());
                 if let Err(error) = catalog.record_radar_with_card(
                     project_id,
@@ -411,6 +455,21 @@ fn serve(
                     session.card_id(),
                 ) {
                     eprintln!("radar session catalog: {error:#}");
+                }
+                // A validated existing target is safe before the provider's first
+                // callback (Cursor does not emit sessionStart on exact resume).
+                if let Some((_, conversation)) = spec
+                    .env
+                    .iter()
+                    .rev()
+                    .find(|(name, _)| name == "RADAR_RESUME_SESSION_ID")
+                {
+                    catalog.bind_provider(
+                        &status.id,
+                        &provider,
+                        conversation,
+                        catalog::now_millis(),
+                    )?;
                 }
             }
             Response::Status(status)
@@ -459,25 +518,28 @@ fn serve(
                     }
                 };
                 if due {
-                    if let Some(found) =
-                        crate::programs::sessions::list_provider_sessions("opencode", &project.path)
-                    {
-                        let imported = found
-                            .into_iter()
-                            .map(|session| catalog::Imported {
-                                id: session.id,
-                                title: session.title,
-                                created_ms: session.created,
-                                last_activity_ms: session.updated.unwrap_or(session.created),
-                            })
-                            .collect::<Vec<_>>();
-                        catalog.import_provider(
-                            project.id,
-                            "opencode",
+                    for provider in crate::programs::agents::SUPPORTED_AGENT_IDS {
+                        if let Some(found) = crate::programs::sessions::list_provider_sessions(
+                            provider,
                             &project.path,
-                            &imported,
-                            now,
-                        )?;
+                        ) {
+                            let imported = found
+                                .into_iter()
+                                .map(|session| catalog::Imported {
+                                    id: session.id,
+                                    title: session.title,
+                                    created_ms: session.created,
+                                    last_activity_ms: session.updated.unwrap_or(session.created),
+                                })
+                                .collect::<Vec<_>>();
+                            catalog.import_provider(
+                                project.id,
+                                provider,
+                                &project.path,
+                                &imported,
+                                now,
+                            )?;
+                        }
                     }
                 }
             }
@@ -505,17 +567,58 @@ fn serve(
             )?;
             Response::Ok
         }
-        Command::CatalogBind {
+        Command::SessionIdentity { radar_id } => {
+            let (provider, conversation) = catalog
+                .runtime_conversation(&radar_id)?
+                .context("The provider has not reported an active conversation")?;
+            Response::SessionIdentity {
+                provider,
+                conversation,
+            }
+        }
+        Command::SessionIdentify {
             radar_id,
+            instance,
+            provider,
+            conversation,
+            reporter_pid,
+        } => {
+            let _identity_update = registry.identity_update();
+            let session = registry.get(&radar_id)?;
+            if session.env_value("RADAR_AGENT") != Some(instance.as_str())
+                || session.env_value("RADAR_SESSION_PROVIDER") != Some(provider.as_str())
+            {
+                bail!("Provider identity report does not belong to this worker incarnation");
+            }
+            if matches!(provider.as_str(), "pi" | "omp")
+                && session.status().pid != Some(reporter_pid)
+            {
+                bail!("A child agent cannot replace its parent's conversation identity");
+            }
+            if conversation.is_empty()
+                || conversation.len() > 256
+                || conversation.chars().any(char::is_control)
+            {
+                bail!("Invalid provider conversation ID");
+            }
+            catalog.bind_provider(&radar_id, &provider, &conversation, catalog::now_millis())?;
+            Response::Ok
+        }
+        Command::CardSessionLink {
+            project_id,
+            card_id,
             provider,
             provider_session_id,
         } => {
-            catalog.bind_provider(
-                &radar_id,
-                &provider,
-                &provider_session_id,
-                catalog::now_millis(),
-            )?;
+            if !board
+                .state(project_id)?
+                .cards
+                .iter()
+                .any(|card| card.id == card_id)
+            {
+                bail!("This card is no longer on the board");
+            }
+            catalog.link_conversation(project_id, &provider, &provider_session_id, &card_id)?;
             Response::Ok
         }
         Command::BoardState { project_id } => Response::BoardState(board.state(project_id)?),
@@ -570,6 +673,18 @@ fn serve(
         } => {
             let change =
                 board.claim_card(project_id, &card_id, claim.as_deref(), expected_revision)?;
+            if let Some(claim) = claim.as_deref() {
+                for status in registry.list() {
+                    if catalog::project_of_session_id(&status.id) == Some(project_id)
+                        && registry
+                            .get(&status.id)
+                            .ok()
+                            .is_some_and(|session| session.agent_id() == Some(claim))
+                    {
+                        catalog.associate_card(project_id, &status.id, &card_id)?;
+                    }
+                }
+            }
             publish_board_change(&activity, project_id, &command_id, &change)?;
             Response::CardChanged(Box::new(change))
         }

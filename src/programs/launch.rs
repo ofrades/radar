@@ -15,17 +15,13 @@ pub struct LaunchOptions {
     pub extra_args: Vec<String>,
     /// An initial prompt, for agents that take one.
     pub prompt: Option<String>,
-    /// Reopen the program's own last conversation instead of starting
-    /// fresh — the agent's resume flags, when the registry knows them.
-    pub resume: bool,
     /// Reopen one exact conversation by the CLI's own session id, when
     /// radar has a binding for it (see `db::agent_sessions`).
     pub session: Option<String>,
     /// Create a fresh conversation under this exact CLI session id, when the
     /// CLI can (see [`Program::create_session`]). OpenCode creates one if the
-    /// id is new, so a fresh launch knows its conversation up front and the
-    /// board claim links to it exactly — no post-exit guess against whatever
-    /// other session in the project happened to be newest.
+    /// id is new. This is a requested identity; the provider confirms which
+    /// conversation is actually active through its lifecycle callback.
     #[serde(default)]
     pub create_session: Option<String>,
     /// A unique instance name for an agent launch, folded into `RADAR_AGENT`
@@ -90,7 +86,12 @@ pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
     if let Some(card) = &options.card {
         env_set.push(("RADAR_CARD_ID".to_string(), card.clone()));
     }
-
+    if program.kind == Kind::Agent {
+        env_set.push(("RADAR_SESSION_PROVIDER".to_string(), program.id.clone()));
+        if let Some(id) = &options.session {
+            env_set.push(("RADAR_RESUME_SESSION_ID".to_string(), id.clone()));
+        }
+    }
     // A resumed launch bypasses the omarchy wrapper (it always starts a
     // fresh agent) and the permission flags: the conversation being
     // reopened had its own. An exact session id wins over "the last one".
@@ -110,8 +111,8 @@ pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
     };
     // A fresh launch that names its own conversation: the CLI creates one
     // under this id (OpenCode's `--session` does). Radar knows the exact
-    // conversation from the first frame, so the board claim links to it
-    // without any post-exit guess. This is a *fresh* start, so it keeps the
+    // requested conversation from the first frame; the provider reports its
+    // actual active identity. This is a *fresh* start, so it keeps the
     // permission flags and the program's own arguments; only the wrapper is
     // skipped (it cannot carry a session id).
     if let Some(id) = options
@@ -119,7 +120,7 @@ pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
         .as_deref()
         .filter(|id| !id.is_empty())
     {
-        if program.create_session && !program.resume_session.is_empty() {
+        if program.create_session && !program.create_session_args.is_empty() {
             let mut argv = vec![program.command.clone()];
             argv.extend(program.args.iter().cloned());
             if !options.safe {
@@ -127,7 +128,7 @@ pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
             }
             argv.extend(
                 program
-                    .resume_session
+                    .create_session_args
                     .replace("{id}", id)
                     .split_whitespace()
                     .map(str::to_string),
@@ -156,11 +157,6 @@ pub fn command_spec(program: &Program, options: &LaunchOptions) -> CommandSpec {
                 return Some(argv);
             }
             return None;
-        }
-        if options.resume && !program.resume_args.is_empty() {
-            argv.extend(program.resume_args.iter().cloned());
-            append_tail(&mut argv);
-            return Some(argv);
         }
         None
     };
@@ -288,9 +284,9 @@ mod tests {
             description: String::new(),
             args: Vec::new(),
             auto_args: Vec::new(),
-            resume_args: Vec::new(),
             resume_session: String::new(),
             create_session: false,
+            create_session_args: String::new(),
             prompt_flag: None,
             env_unset: Vec::new(),
             external: false,
@@ -399,16 +395,20 @@ mod tests {
         let spec = command_spec(&agent, &options);
         assert_eq!(
             spec.env_set,
-            vec![("RADAR_AGENT".to_string(), "claude-mx7k2b1f".to_string())]
+            vec![
+                ("RADAR_AGENT".to_string(), "claude-mx7k2b1f".to_string()),
+                ("RADAR_SESSION_PROVIDER".to_string(), "claude".to_string())
+            ]
         );
 
         // Editors get nothing, and neither do agents without an instance.
         let mut editor = program("nvim", "nvim");
         editor.kind = Kind::Editor;
         assert!(command_spec(&editor, &options).env_set.is_empty());
-        assert!(command_spec(&agent, &LaunchOptions::default())
+        assert!(!command_spec(&agent, &LaunchOptions::default())
             .env_set
-            .is_empty());
+            .iter()
+            .any(|(name, _)| name == "RADAR_AGENT"));
     }
 
     #[test]
@@ -457,31 +457,6 @@ mod tests {
     }
 
     #[test]
-    fn a_resume_launch_reopens_the_last_conversation() {
-        let mut opencode = program("opencode", "opencode");
-        opencode.resume_args = vec!["--continue".into()];
-        let options = LaunchOptions {
-            resume: true,
-            agent_instance: Some("mx7k2b1f".into()),
-            ..Default::default()
-        };
-        let spec = command_spec(&opencode, &options);
-        // No auto flags, no omarchy wrapper: the resumed conversation had
-        // its own permission context, and the wrapper cannot carry resume.
-        assert_eq!(spec.argv, vec!["opencode", "--continue"]);
-        // The relaunch is still a radar agent with its own claim name.
-        assert_eq!(
-            spec.env_set,
-            vec![("RADAR_AGENT".to_string(), "opencode-mx7k2b1f".to_string())]
-        );
-
-        // Without resume knowledge, a resume launch is just a fresh start
-        // with the program's own arguments.
-        let fresh = command_spec(&program("crush", "crush"), &options);
-        assert_eq!(fresh.argv, vec!["crush"]);
-    }
-
-    #[test]
     fn a_stored_session_reopens_that_exact_conversation() {
         let mut opencode = program("opencode", "opencode");
         opencode.resume_session = "--session {id}".to_string();
@@ -491,6 +466,10 @@ mod tests {
         };
         let spec = command_spec(&opencode, &options);
         assert_eq!(spec.argv, vec!["opencode", "--session", "ses_abc123"]);
+        assert!(spec
+            .env_set
+            .iter()
+            .any(|(key, value)| key == "RADAR_RESUME_SESSION_ID" && value == "ses_abc123"));
 
         // A program with no template for ids starts fresh instead of
         // resuming some other conversation by accident.
@@ -505,6 +484,7 @@ mod tests {
         opencode.auto_args = vec!["--auto".into()];
         opencode.resume_session = "--session {id}".into();
         opencode.create_session = true;
+        opencode.create_session_args = "--session {id}".into();
         opencode.prompt_flag = Some("--prompt".into());
         let options = LaunchOptions {
             create_session: Some("ses_radar7abc".into()),
@@ -534,6 +514,11 @@ mod tests {
             .iter()
             .any(|(key, value)| key == "RADAR_AGENT" && value == "opencode-abc"));
 
+        assert!(!spec
+            .env_set
+            .iter()
+            .any(|(key, _)| key == "RADAR_PROVIDER_SESSION_ID"));
+
         // A CLI that cannot create a session ignores the request rather than
         // resuming some other conversation under a made-up id.
         let mut crush = program("crush", "crush");
@@ -549,38 +534,8 @@ mod tests {
     }
 
     #[test]
-    fn supported_agents_resume_last_or_exact_provider_session() {
+    fn supported_agents_resume_only_an_exact_provider_session() {
         let by_id = |id: &str| crate::programs::by_id(id).unwrap();
-        for id in ["omp", "pi", "cursor-agent"] {
-            let program = by_id(id);
-            let resumed = command_spec(
-                &program,
-                &LaunchOptions {
-                    resume: true,
-                    ..Default::default()
-                },
-            );
-            assert_eq!(
-                resumed.argv,
-                vec![program.command.clone(), "--continue".to_string()],
-                "{id}"
-            );
-        }
-        // opencode always runs a private server: its background service would
-        // attach the TUI to whatever conversation the service has open.
-        let opencode = by_id("opencode");
-        assert_eq!(
-            command_spec(
-                &opencode,
-                &LaunchOptions {
-                    resume: true,
-                    ..Default::default()
-                },
-            )
-            .argv,
-            vec!["opencode", "--standalone", "--continue"]
-        );
-
         let exact = LaunchOptions {
             session: Some("session-42".into()),
             ..Default::default()
@@ -593,11 +548,10 @@ mod tests {
             command_spec(&by_id("omp"), &exact).argv,
             vec!["omp", "--resume=session-42"]
         );
-        // Pi's `--session-id` reopens the exact conversation, or creates it
-        // when radar named a fresh one.
+        // Pi's strict reopen flag is distinct from its creation flag.
         assert_eq!(
             command_spec(&by_id("pi"), &exact).argv,
-            vec!["pi", "--session-id", "session-42"]
+            vec!["pi", "--session", "session-42"]
         );
         assert_eq!(
             command_spec(&by_id("cursor-agent"), &exact).argv,
