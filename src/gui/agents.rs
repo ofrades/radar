@@ -151,6 +151,32 @@ fn live_sessions_by_project(app: &App) -> Vec<(Project, Vec<live_agents::AgentSe
         .collect()
 }
 
+/// The sessions the Agents wall stands, in sidebar project order: daemon-hosted
+/// live work only — external terminals cannot be attached, and a session whose
+/// to-do is parked in Todo/Done (or gone) leaves the wall. The single source of
+/// truth for the wall's membership and Home's Agents count, so the card's
+/// number always describes what entering shows.
+pub(super) fn wall_sessions(app: &App) -> Vec<(Project, Vec<live_agents::AgentSession>)> {
+    let dismissed = app.dismissed_agents.borrow();
+    live_sessions_by_project(app)
+        .into_iter()
+        .map(|(project, rows)| {
+            let rows: Vec<live_agents::AgentSession> = rows
+                .into_iter()
+                .filter(|session| {
+                    session
+                        .radar_session_id
+                        .as_deref()
+                        .is_some_and(|id| !dismissed.contains(id))
+                        && wall_shows_session(app, project.id, session)
+                })
+                .collect();
+            (project, rows)
+        })
+        .filter(|(_, rows)| !rows.is_empty())
+        .collect()
+}
+
 /// The wall's policy, mirroring the project workspace's own: a session's
 /// panel stands while its to-do is live work. A card in Todo or Done — or one
 /// that left the board — keeps the session off the wall (never stopping it);
@@ -185,24 +211,15 @@ fn wall_shows_session(app: &App, project_id: i64, session: &live_agents::AgentSe
 /// sessions the human closed. The panes are attached once and never rebuilt.
 pub(super) fn sync(app: &App, page: &AgentsPage) {
     let board = &page.board;
-    let groups = live_sessions_by_project(app);
-    let dismissed = app.dismissed_agents.borrow();
-
-    // The wall's membership: (session id -> project, session), filtered by
-    // the policy and the human's closes.
-    let mut wanted: Vec<(Project, live_agents::AgentSession)> = Vec::new();
-    for (project, rows) in &groups {
-        for session in rows {
-            let Some(id) = session.radar_session_id.clone() else {
-                continue; // an external terminal cannot stand here
-            };
-            if dismissed.contains(&id) || !wall_shows_session(app, project.id, session) {
-                continue;
-            }
-            wanted.push((project.clone(), session.clone()));
-        }
-    }
-    drop(dismissed);
+    // The wall's membership: (session id -> project, session). One shared
+    // predicate with Home's Agents count — the card's number is this list.
+    let wanted: Vec<(Project, live_agents::AgentSession)> = wall_sessions(app)
+        .into_iter()
+        .flat_map(|(project, rows)| {
+            rows.into_iter()
+                .map(move |session| (project.clone(), session))
+        })
+        .collect();
 
     // Structural change? Panels come and go; the panes are never rebuilt.
     // A pid change under the same stable id is structural too: the old

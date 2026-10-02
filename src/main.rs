@@ -1126,7 +1126,7 @@ fn main() -> Result<()> {
         Some(Command::Skill) => {
             let path = radar::skill::install_default_skill()?;
             if cli.json {
-                println!("{}", serde_json::json!({ "skill": path }).to_string());
+                println!("{}", serde_json::json!({ "skill": path }));
             } else {
                 println!("board skill: {}", path.display());
             }
@@ -1146,7 +1146,6 @@ fn main() -> Result<()> {
                         "git_hooks_dir": installed.git_hooks_dir,
                         "git_hooks_path_set": installed.git_hooks_path_set,
                     })
-                    .to_string()
                 );
                 return Ok(());
             }

@@ -64,14 +64,13 @@ pub fn cockpit(app: &App) -> gtk::Widget {
 
     let needs = unresolved_attention(app);
     let projects = app.projects.borrow().clone();
-    let running = app
-        .agent_sessions
-        .borrow()
-        .by_project
-        .values()
-        .flatten()
-        .filter(|session| live_agents::sidebar_session_is_live(session))
-        .count();
+    // The Agents card's number is the wall's own membership — what entering
+    // actually shows. External terminals keep running in the project lanes
+    // below; they cannot be attached to a panel here.
+    let running = super::agents::wall_sessions(app)
+        .iter()
+        .map(|(_, rows)| rows.len())
+        .sum();
 
     // Home is a destination, not a toolbar: title and context first, then
     // large cards that lead into the workspace.
