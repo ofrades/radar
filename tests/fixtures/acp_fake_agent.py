@@ -139,14 +139,26 @@ def reader():
                 request_id,
                 {
                     "protocolVersion": 1,
-                    "agentCapabilities": {},
+                    "agentCapabilities": {"loadSession": True},
                     "agentInfo": {"name": "fake-agent", "version": "0.1.0"},
                 },
             )
         elif method == "session/new":
             reply(request_id, {"sessionId": "sess_fake_1"})
         elif method == "session/load":
-            reply(request_id, {"sessionId": params.get("sessionId", "sess_fake_1")})
+            # Reuse the session and tell the client its restored mode.
+            reply(
+                request_id,
+                {
+                    "modes": {
+                        "currentModeId": "review",
+                        "availableModes": [
+                            {"id": "review", "name": "Review"},
+                            {"id": "work", "name": "Work"},
+                        ],
+                    }
+                },
+            )
         elif method == "session/prompt":
             threading.Thread(
                 target=handle_prompt, args=(request_id, params), daemon=True

@@ -125,11 +125,31 @@ one-shot demonstration with no daemon:
 cargo run --example acp_probe -- tests/fixtures/acp_fake_agent.py "hello"
 ```
 
+## Resume
+
+An ACP session id arrives from the agent's own `session/new` reply, and radar
+binds it the moment it is confirmed: `(project, agent id) → (provider, ACP
+session)` in the same `agent_sessions` store a TUI claim binds through. A
+worker restart refreshes the binding rather than losing it; the store is keyed
+by registered project, so a forged project id is a loud stderr note, not a
+silent no-op.
+
+```sh
+# Reopen the agent's last bound conversation under its bound program.
+radar acp resume my-agent --cwd /project
+
+# Or resume with an explicit session id.
+radar acp start my-agent --resume ses_…
+```
+
+Resume sends ACP `session/load` instead of `session/new`, and the agent's load
+response feeds the same capability/mode/config state paths a first start uses.
+An agent that did not advertise `load_session` fails legibly — radar does not
+silently continue as a different conversation. Explicit `--program` that
+disagrees with the bound program fails before the agent starts.
+
 ## Deliberately not here yet
 
-- **Resume.** The ACP session id is reported in `AgentStatus`, but nothing yet
-  calls `session/load` to reopen it, and the id is not written to the session
-  catalog. A follow-up binds it so a card claim reopens the exact conversation.
 - **Cancel during a permission prompt.** Cancelling while a permission prompt
   is outstanding does not yet answer it as `Cancelled`; stop does.
 - **Attention cleanup.** If an agent dies with a permission prompt unanswered,

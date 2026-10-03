@@ -19,12 +19,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOptions,
-    SessionConfigValueId, SessionModeId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, TextContent,
+    CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest,
+    PermissionOptionKind, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigSelectOptions, SessionConfigValueId, SessionId, SessionModeId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo};
@@ -179,6 +180,9 @@ pub struct AgentStart {
     /// The board card this agent is working, when it has one.
     #[serde(default)]
     pub card_id: Option<String>,
+    /// An existing conversation to reopen instead of starting a new one.
+    #[serde(default)]
+    pub acp_session_id: Option<String>,
 }
 
 /// What a client can see about one agent session.
@@ -248,15 +252,27 @@ struct PendingPermission {
     decision: async_channel::Sender<PermissionDecision>,
 }
 
+/// What the daemon wants done when an agent's conversation id is confirmed:
+/// the binding that lets a later resume reopen the exact session.
+pub type OnSessionId = Arc<dyn Fn(&AgentStart, &str) + Send + Sync>;
+
 /// Owns every ACP agent the daemon is running. Dropping an agent's entry sends
 /// it `Stop`, which closes the connection and terminates the process group.
 #[derive(Default)]
 pub struct AgentHost {
     agents: Mutex<HashMap<String, AgentEntry>>,
     pending: Mutex<HashMap<String, PendingPermission>>,
+    on_session_id: Mutex<Option<OnSessionId>>,
 }
 
 impl AgentHost {
+    /// Install the conversation binding callback. Called once at daemon build;
+    /// every later confirmed session id goes through it exactly once.
+    pub fn on_session_id(self, callback: OnSessionId) -> Self {
+        *self.on_session_id.lock() = Some(callback);
+        self
+    }
+
     /// Start an ACP agent and its worker thread. The returned status is the
     /// `starting` snapshot; readiness and turn state arrive as activity.
     pub fn start(
@@ -444,9 +460,21 @@ impl AgentHost {
         }
     }
 
-    fn set_session_id(&self, id: &str, session_id: &str) {
-        if let Some(entry) = self.agents.lock().get_mut(id) {
+    fn set_session_id(&self, spec: &AgentStart, session_id: &str) {
+        let binder = self.on_session_id.lock().clone();
+        if let Some(entry) = self.agents.lock().get_mut(&spec.id) {
+            let fresh = entry
+                .status
+                .acp_session_id
+                .as_deref()
+                .map(|previous| previous != session_id)
+                .unwrap_or(true);
             entry.status.acp_session_id = Some(session_id.to_string());
+            if fresh {
+                if let Some(binder) = binder.as_ref() {
+                    binder(spec, session_id);
+                }
+            }
         }
     }
 
@@ -678,16 +706,56 @@ async fn connect(
                 },
             );
 
-            let new_session = connection
-                .send_request(NewSessionRequest::new(connection_spec.cwd.clone()))
-                .block_task()
-                .await?;
-            let session_id = new_session.session_id;
-            connection_host.set_session_id(&connection_spec.id, &session_id.0);
-            if let Some(modes) = &new_session.modes {
+            // Resume reopens the bound conversation; the agent must have said
+            // it can (load_session), or the request fails legibly instead of
+            // silently continuing as a different session.
+            let (session_id, modes, config_options, opening) =
+                if let Some(resume) = connection_spec.acp_session_id.clone() {
+                    if initialized.agent_capabilities.load_session {
+                        let loaded = connection
+                            .send_request(LoadSessionRequest::new(
+                                resume.clone(),
+                                connection_spec.cwd.clone(),
+                            ))
+                            .block_task()
+                            .await?;
+                        (
+                            SessionId::new(resume.clone()),
+                            loaded.modes,
+                            loaded.config_options,
+                            "resumed session",
+                        )
+                    } else {
+                        let name = initialized
+                            .agent_info
+                            .as_ref()
+                            .map(|info| info.name.as_str())
+                            .unwrap_or("agent");
+                        return Err(agent_client_protocol::schema::v1::Error::new(
+                            -32601,
+                            format!(
+                            "{name} does not support session/load; cannot resume session {resume}"
+                        )
+                            .clone(),
+                        ));
+                    }
+                } else {
+                    let created = connection
+                        .send_request(NewSessionRequest::new(connection_spec.cwd.clone()))
+                        .block_task()
+                        .await?;
+                    (
+                        created.session_id,
+                        created.modes,
+                        created.config_options,
+                        "session",
+                    )
+                };
+            connection_host.set_session_id(&connection_spec, &session_id.0);
+            if let Some(modes) = &modes {
                 connection_host.set_modes(&connection_spec.id, to_agent_modes(modes));
             }
-            if let Some(options) = &new_session.config_options {
+            if let Some(options) = &config_options {
                 connection_host.set_config_options(&connection_spec.id, config_options_of(options));
             }
             connection_host.set_status(&connection_spec.id, "ready", None);
@@ -695,7 +763,7 @@ async fn connect(
                 &connection_journal,
                 &connection_spec,
                 AgentState::Idle,
-                Some(format!("session {}", session_id.0)),
+                Some(format!("{opening} {}", session_id.0)),
             );
 
             while let Ok(command) = receiver.recv().await {
@@ -1227,6 +1295,7 @@ mod tests {
                     project_id: 1,
                     session_id: None,
                     card_id: None,
+                    acp_session_id: None,
                 }),
                 commands: async_channel::unbounded().0,
             },

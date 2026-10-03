@@ -348,6 +348,30 @@ enum AcpAction {
         /// Stable card ID (defaults to RADAR_CARD_ID)
         #[arg(long)]
         card_id: Option<String>,
+        /// Reopen an existing conversation (session/load) by its ACP session
+        /// id, as `radar acp list --json` reports it
+        #[arg(long)]
+        resume: Option<String>,
+    },
+    /// Reopen an agent's bound conversation (its last recorded ACP session)
+    Resume {
+        /// Stable id for this agent session
+        id: String,
+        /// The project directory the agent works in
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        /// The ACP agent program; defaults to the bound session's program
+        #[arg(long)]
+        program: Option<String>,
+        /// Radar project ID (defaults to RADAR_PROJECT_ID)
+        #[arg(long)]
+        project_id: Option<i64>,
+        /// Radar session ID (defaults to RADAR_SESSION_ID)
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Stable card ID (defaults to RADAR_CARD_ID)
+        #[arg(long)]
+        card_id: Option<String>,
     },
     /// Send a prompt to a running agent
     Prompt { id: String, text: String },
@@ -909,6 +933,7 @@ fn acp_command(paths: &Paths, action: AcpAction) -> Result<()> {
             project_id,
             session_id,
             card_id,
+            resume,
         } => {
             let cwd = cwd.canonicalize()?;
             let project_id = match project_id {
@@ -932,6 +957,48 @@ fn acp_command(paths: &Paths, action: AcpAction) -> Result<()> {
                 project_id,
                 session_id: session_id.or_else(|| std::env::var("RADAR_SESSION_ID").ok()),
                 card_id: card_id.or_else(|| std::env::var("RADAR_CARD_ID").ok()),
+                acp_session_id: resume,
+            })
+        }
+        AcpAction::Resume {
+            id,
+            cwd,
+            program,
+            project_id,
+            session_id,
+            card_id,
+        } => {
+            let project_id = match project_id {
+                Some(id) => id,
+                None => default_project_id()?,
+            };
+            // The bound conversation names its program; resuming it under a
+            // different program would be a different agent's session.
+            use radar::config::Paths;
+            let db = radar::db::Db::open(&Paths::with_root(paths.data_dir.clone()))?;
+            let (bound_program, conversation) = db.bound_session(project_id, &id)?.context(
+                "no bound conversation for this agent id yet; start it once and let it answer",
+            )?;
+            let conflicting = program
+                .as_ref()
+                .is_some_and(|explicit| explicit != &bound_program);
+            if conflicting {
+                anyhow::bail!(
+                    "the bound conversation for {id} belongs to {bound_program}, not {}",
+                    program.expect("conflicting program is set"),
+                );
+            }
+            let program = program.unwrap_or(bound_program);
+            Request::AgentStart(AgentStart {
+                id,
+                provider: program.clone(),
+                program,
+                args: Vec::new(),
+                cwd: cwd.canonicalize()?,
+                project_id,
+                session_id: session_id.or_else(|| std::env::var("RADAR_SESSION_ID").ok()),
+                card_id: card_id.or_else(|| std::env::var("RADAR_CARD_ID").ok()),
+                acp_session_id: Some(conversation),
             })
         }
         AcpAction::Prompt { id, text } => Request::AgentPrompt { id, text },

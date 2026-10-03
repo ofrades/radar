@@ -111,6 +111,7 @@ fn start_fixture(daemon: &Daemon, id: &str, project_id: i64) -> std::path::PathB
         project_id,
         session_id: Some(format!("project-{project_id}-agent-0-opencode")),
         card_id: Some("card-acp-1".to_string()),
+        acp_session_id: None,
     }));
     match response {
         Response::AgentStatus(status) => assert_eq!(status.state, "starting"),
@@ -251,4 +252,63 @@ fn acp_cli_starts_prompts_and_lists_an_agent() {
     assert!(list.status.success());
     let listing: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
     assert_eq!(listing["Agents"][0]["id"], id);
+}
+
+/// Resume reopens the conversation the agent bound at start, and the daemon
+/// persists the binding so a later radar process can resume with it.
+#[test]
+fn acp_resume_reloads_the_bound_conversation() {
+    let daemon = Daemon::start();
+    let id = "acp-resume";
+    // The binding is keyed by a registered project, so register one and run
+    // the agent under its id.
+    let paths = radar::config::Paths::with_root(daemon.home.path().to_path_buf());
+    let cwd = paths.data_dir.join("resume-project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let project_id = radar::db::Db::open(&paths)
+        .and_then(|db| db.add_project(&cwd))
+        .unwrap()
+        .id;
+    let fixture_start = |daemon: &Daemon, id: &str, project_id: i64, resume: Option<String>| {
+        let response = daemon.request(Request::AgentStart(AgentStart {
+            id: id.to_string(),
+            provider: "fake".to_string(),
+            program: "python3".to_string(),
+            args: vec![fixture()],
+            cwd: daemon.home.path().to_path_buf(),
+            project_id,
+            session_id: None,
+            card_id: None,
+            acp_session_id: resume,
+        }));
+        assert!(
+            matches!(response, Response::AgentStatus(_)),
+            "unexpected response {response:?}"
+        );
+    };
+    fixture_start(&daemon, id, project_id, None);
+    wait_state(&daemon, id, "ready");
+
+    // The binding lands in the same claim -> conversation store a TUI session
+    // writes, as soon as the agent confirms its session id.
+    until(|| {
+        radar::db::Db::open(&paths)
+            .and_then(|db| db.bound_session(project_id, id))
+            .is_ok_and(|bound| bound.is_some())
+    });
+
+    // The load request (not process continuity) is what the test proves: the
+    // reopened agent takes its mode state from the load response.
+    daemon.request(Request::AgentStop { id: id.to_string() });
+    wait_state(&daemon, id, "exited");
+    fixture_start(&daemon, id, project_id, Some(String::from("sess_fake_1")));
+    wait_state(&daemon, id, "ready");
+    until(|| {
+        daemon
+            .agents()
+            .iter()
+            .find(|agent| agent.id == id)
+            .and_then(|agent| agent.modes.as_ref())
+            .is_some_and(|modes| modes.current == "review")
+    });
 }

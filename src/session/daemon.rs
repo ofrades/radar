@@ -323,6 +323,37 @@ impl Server {
         let listener = UnixListener::bind(&path).context("bind session socket")?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
+        // ACP agents bind their conversation id into the same claim ->
+        // conversation store a TUI session writes, so a resume reopens the
+        // exact conversation and a restart refreshes it rather than loses it.
+        // The store is keyed by registered project, so a forged project id has
+        // nothing to bind to; that stays a loud stderr note, not a silent no-op.
+        let binding_paths = crate::config::Paths::with_root(home.to_path_buf());
+        let binder: crate::session::agent::OnSessionId =
+            Arc::new(move |spec: &AgentStart, session: &str| {
+                let db = match crate::db::Db::open(&binding_paths) {
+                    Ok(db) => db,
+                    Err(error) => {
+                        eprintln!("radar acp: session binding: {error:#}");
+                        return;
+                    }
+                };
+                let registered = db.projects().ok().is_some_and(|projects| {
+                    projects.iter().any(|project| project.id == spec.project_id)
+                });
+                if !registered {
+                    eprintln!(
+                        "radar acp: session binding skipped: project {} is not registered in radar",
+                        spec.project_id
+                    );
+                    return;
+                }
+                if let Err(error) =
+                    db.bind_session(spec.project_id, &spec.id, &spec.provider, session)
+                {
+                    eprintln!("radar acp: session binding: {error:#}");
+                }
+            });
         Ok(Self {
             listener,
             path,
@@ -332,7 +363,7 @@ impl Server {
                 activity,
                 catalog,
                 board,
-                agents: Arc::new(AgentHost::default()),
+                agents: Arc::new(AgentHost::default().on_session_id(binder)),
                 imports: Arc::new(Mutex::new(HashMap::new())),
                 stopping: Arc::new(AtomicBool::new(false)),
                 workers: crate::session::driver::Workers::default(),
