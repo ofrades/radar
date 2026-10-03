@@ -315,12 +315,19 @@ impl Server {
                 agents: Arc::new(AgentHost::default()),
                 imports: Arc::new(Mutex::new(HashMap::new())),
                 stopping: Arc::new(AtomicBool::new(false)),
+                workers: crate::session::driver::Workers::default(),
             },
         })
     }
 
     pub fn run(self) -> Result<()> {
         let mut workers = Vec::new();
+        let driver = {
+            let services = self.services.clone();
+            std::thread::Builder::new()
+                .name("radar-driver".to_string())
+                .spawn(move || crate::session::driver::run(services))?
+        };
         while !self.services.stopping.load(Ordering::Acquire) {
             workers.retain(|worker: &std::thread::JoinHandle<()>| !worker.is_finished());
             match self.listener.accept() {
@@ -332,15 +339,17 @@ impl Server {
                     }
                     stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
                     stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
-                    let services = self.services.clone();
-                    workers.push(std::thread::spawn(move || {
-                        let mut stream = stream;
-                        if let Err(error) = serve(&mut stream, services) {
-                            let _ = write_frame(
-                                &mut stream,
-                                &Response::Error(error.to_string()),
-                                MAX_RESPONSE,
-                            );
+                    workers.push(std::thread::spawn({
+                        let services = self.services.clone();
+                        move || {
+                            let mut stream = stream;
+                            if let Err(error) = serve(&mut stream, services) {
+                                let _ = write_frame(
+                                    &mut stream,
+                                    &Response::Error(error.to_string()),
+                                    MAX_RESPONSE,
+                                );
+                            }
                         }
                     }));
                 }
@@ -355,6 +364,7 @@ impl Server {
         for worker in workers {
             let _ = worker.join();
         }
+        let _ = driver.join();
         Ok(())
     }
 }
@@ -371,15 +381,17 @@ impl Drop for Server {
 /// The daemon's shared domains, cloned per connection so one request cannot
 /// block another.
 #[derive(Clone)]
-struct Services {
-    registry: Arc<Registry>,
-    activity: Arc<ActivityJournal>,
-    catalog: Arc<SessionCatalog>,
-    board: Arc<dyn Board>,
-    agents: Arc<AgentHost>,
+pub(crate) struct Services {
+    pub(crate) registry: Arc<Registry>,
+    pub(crate) activity: Arc<ActivityJournal>,
+    pub(crate) catalog: Arc<SessionCatalog>,
+    pub(crate) board: Arc<dyn Board>,
+    pub(crate) agents: Arc<AgentHost>,
     /// Last provider-history refresh per project root.
-    imports: Arc<Mutex<HashMap<PathBuf, Instant>>>,
-    stopping: Arc<AtomicBool>,
+    pub(crate) imports: Arc<Mutex<HashMap<PathBuf, Instant>>>,
+    pub(crate) stopping: Arc<AtomicBool>,
+    /// The driver's card bindings for spawned worker sessions.
+    pub(crate) workers: crate::session::driver::Workers,
 }
 
 fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
@@ -440,6 +452,11 @@ fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
                     session.card_id(),
                 ) {
                     eprintln!("radar session catalog: {error:#}");
+                }
+                // A card-carrying launch becomes the driver's end-of-turn
+                // binding: the worker's session exit hands the card back.
+                if let Some(card_id) = session.card_id() {
+                    services.workers.note(&status.id, project_id, card_id);
                 }
                 // A validated existing target is safe before the provider's first
                 // callback (Cursor does not emit sessionStart on exact resume).
@@ -895,7 +912,7 @@ fn associate_live_card(
 /// Publish the `BoardChanged` activity event a card mutation produced, so
 /// every watcher — Home, the board pane, the web client — refreshes through
 /// the stream it already listens to.
-fn publish_board_change(
+pub(crate) fn publish_board_change(
     activity: &ActivityJournal,
     project_id: i64,
     command_id: &str,
@@ -1460,6 +1477,7 @@ mod tests {
                 agents: Arc::new(AgentHost::default()),
                 imports: Arc::new(Mutex::new(HashMap::new())),
                 stopping: stopping.clone(),
+                workers: crate::session::driver::Workers::default(),
             },
         )
         .unwrap_err();
@@ -1490,6 +1508,7 @@ mod tests {
                 agents: Arc::new(AgentHost::default()),
                 imports: Arc::new(Mutex::new(HashMap::new())),
                 stopping: Arc::new(AtomicBool::new(false)),
+                workers: crate::session::driver::Workers::default(),
             },
         )
         .unwrap();
@@ -1540,6 +1559,7 @@ mod tests {
                 agents: Arc::new(AgentHost::default()),
                 imports: Arc::new(Mutex::new(HashMap::new())),
                 stopping: Arc::new(AtomicBool::new(false)),
+                workers: crate::session::driver::Workers::default(),
             },
         )
         .unwrap();

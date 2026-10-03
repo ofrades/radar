@@ -17,6 +17,7 @@ pub mod catalog;
 pub mod client;
 pub mod daemon;
 pub mod dispatch;
+pub mod driver;
 pub mod registry;
 mod schema;
 

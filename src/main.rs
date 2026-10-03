@@ -164,6 +164,9 @@ enum SessionAction {
         cols: u16,
         #[arg(long, default_value_t = 24)]
         rows: u16,
+        /// Extra environment, KEY=VALUE, repeatable (e.g. RADAR_CARD_ID)
+        #[arg(long = "env")]
+        env: Vec<String>,
         #[arg(required = true, trailing_var_arg = true)]
         argv: Vec<String>,
     },
@@ -526,15 +529,27 @@ fn session_command(paths: &Paths, action: SessionAction) -> Result<()> {
             cwd,
             cols,
             rows,
+            env,
             argv,
-        } => Request::Create(Spawn {
-            id,
-            cwd: cwd.canonicalize()?,
-            argv,
-            dims: Dims { cols, rows },
-            env: Vec::new(),
-            env_remove: Vec::new(),
-        }),
+        } => {
+            let pairs: Result<Vec<(String, String)>, anyhow::Error> = env
+                .iter()
+                .map(|pair| {
+                    let (name, value) = pair
+                        .split_once('=')
+                        .with_context(|| format!("--env {pair} is not KEY=VALUE"))?;
+                    Ok((name.to_string(), value.to_string()))
+                })
+                .collect();
+            Request::Create(Spawn {
+                id,
+                cwd: cwd.canonicalize()?,
+                argv,
+                dims: Dims { cols, rows },
+                env: pairs?,
+                env_remove: Vec::new(),
+            })
+        }
         SessionAction::Identity { id } => Request::SessionIdentity {
             radar_id: id
                 .or_else(|| std::env::var("RADAR_SESSION_ID").ok())
