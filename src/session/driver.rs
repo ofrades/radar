@@ -71,6 +71,21 @@ impl Workers {
         }
     }
 
+    /// A read view of one binding: which card the session was launched for.
+    pub fn binding(&self, session_id: &str) -> Option<WorkerCard> {
+        self.bindings.lock().unwrap().get(session_id).cloned()
+    }
+
+    /// Every launch record, for the derived-board read.
+    pub fn launch_records(&self) -> Vec<(String, WorkerCard)> {
+        self.bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(session_id, worker)| (session_id.clone(), worker.clone()))
+            .collect()
+    }
+
     fn worker(&self, session_id: &str) -> Option<WorkerCard> {
         self.bindings.lock().unwrap().get(session_id).cloned()
     }
@@ -164,6 +179,18 @@ fn hand_off(services: &Services, db: Option<&Db>, worker: &WorkerCard) -> Result
         .find(|lane| lane.kind == "review")
         .map(|lane| lane.name.clone())
         .ok_or_else(|| anyhow::anyhow!("no review lane"))?;
+    // An open attention on the card keeps the person's turn first: a worker
+    // that died mid-question left a decision outstanding, and a reviewer
+    // agent would be second in line behind the human's answer.
+    let attention_open = services
+        .activity
+        .unresolved_attention(worker.project_id)
+        .map(|requests| {
+            requests
+                .iter()
+                .any(|request| request.card_id.as_deref() == Some(worker.card_id.as_str()))
+        })
+        .unwrap_or(false);
     let change = services
         .board
         .move_card(worker.project_id, &worker.card_id, &review, None)?;
@@ -174,6 +201,13 @@ fn hand_off(services: &Services, db: Option<&Db>, worker: &WorkerCard) -> Result
         &change,
     )?;
     if let Some(db) = db {
+        if attention_open {
+            eprintln!(
+                "radar driver: reviewer skipped for {}: an attention request is still open",
+                worker.card_id
+            );
+            return Ok(true);
+        }
         if let Err(error) = dispatch_reviewer(services, db, worker) {
             eprintln!(
                 "radar driver: no reviewer dispatched for {}: {error:#}",

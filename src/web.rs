@@ -22,8 +22,8 @@ use crate::session::activity::{
     ActivityKind, ActivityPayload, ActivitySnapshot, AttentionChange, AttentionResponse,
     ChangeAttention, PublishActivity,
 };
-use crate::session::board_store::BoardState;
 use crate::session::catalog::CatalogFilter;
+use crate::session::daemon::DerivedBoard;
 use crate::session::daemon::{self, Client, Command, Response};
 use crate::session::registry::{Lifecycle, Output, Spawn, Status};
 use crate::session::Dims;
@@ -451,14 +451,14 @@ async fn activity(
 async fn board_snapshot(
     RoutePath(project_id): RoutePath<i64>,
     State(state): State<WebState>,
-) -> ApiResult<Json<Option<BoardState>>> {
+) -> ApiResult<Json<Option<DerivedBoard>>> {
     Ok(Json(board_for(&state.home, project_id)?))
 }
 
 /// The project's board if its board is enabled, `None` otherwise. Shared by the
 /// read route and every card mutation, so a mutation returns the refreshed
 /// board in one trip.
-fn board_for(home: &Path, project_id: i64) -> ApiResult<Option<BoardState>> {
+fn board_for(home: &Path, project_id: i64) -> ApiResult<Option<DerivedBoard>> {
     let db = open_db(home)?;
     let Some(project) = db.project(project_id).map_err(ApiError::internal)? else {
         return Ok(None);
@@ -493,7 +493,7 @@ async fn add_card(
     State(state): State<WebState>,
     headers: HeaderMap,
     Json(card): Json<NewCard>,
-) -> ApiResult<Json<Option<BoardState>>> {
+) -> ApiResult<Json<Option<DerivedBoard>>> {
     require_same_origin(&headers)?;
     let db = open_db(&state.home)?;
     let Some(project) = db.project(project_id).map_err(ApiError::internal)? else {
@@ -582,7 +582,7 @@ async fn mutate_card(
     State(state): State<WebState>,
     headers: HeaderMap,
     Json(mutation): Json<CardMutation>,
-) -> ApiResult<Json<Option<BoardState>>> {
+) -> ApiResult<Json<Option<DerivedBoard>>> {
     require_same_origin(&headers)?;
     require_project(&state.home, project_id)?;
     let now = SystemTime::now()

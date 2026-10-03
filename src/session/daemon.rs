@@ -224,6 +224,28 @@ pub enum Command {
     AgentList,
 }
 
+/// The stored board plus what its reads derive from live facts. Lanes and
+/// cards are intent; the derived set is the work's live face, computed at
+/// read time and never persisted. Reading it like a stored board (deref)
+/// keeps every existing consumer untouched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DerivedBoard {
+    #[serde(flatten)]
+    pub state: BoardState,
+    /// Whose turn each card's loop is in: computed at read time, never
+    /// stored. Keyed by card id.
+    #[serde(default)]
+    pub derived: Vec<crate::session::lane::DerivedCard>,
+}
+
+impl std::ops::Deref for DerivedBoard {
+    type Target = BoardState;
+
+    fn deref(&self) -> &BoardState {
+        &self.state
+    }
+}
+
 /// A project as the catalog knows it: the client supplies the roster, since
 /// projects live in radar's own database, not the daemon's.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,7 +286,8 @@ pub enum Response {
         provider: String,
         conversation: String,
     },
-    BoardState(BoardState),
+    /// The stored board plus what its reads derive from live facts.
+    BoardState(DerivedBoard),
     CardChanged(Box<BoardChange>),
     CardNext(Option<Box<BoardChange>>),
     AgentStatus(AgentStatus),
@@ -709,7 +732,15 @@ fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
             Response::Ok
         }
         Command::BoardState { project_id } => {
-            Response::BoardState(services.board.state(project_id)?)
+            let state = services.board.state(project_id)?;
+            let derived = crate::session::lane::derive_board(
+                &state,
+                &services.workers,
+                &services.registry.list(),
+                &services.agents.list(),
+                &services.activity.unresolved_attention(project_id)?,
+            );
+            Response::BoardState(DerivedBoard { state, derived })
         }
         Command::CardAdd {
             project_id,
@@ -1285,7 +1316,7 @@ fn board_request(home: &Path, command: Command) -> Result<Response> {
     }
 }
 
-pub fn board_state(home: &Path, project_id: i64) -> Result<BoardState> {
+pub fn board_state(home: &Path, project_id: i64) -> Result<DerivedBoard> {
     match board_request(home, Command::BoardState { project_id })? {
         Response::BoardState(state) => Ok(state),
         other => bail!("unexpected board response: {other:?}"),
@@ -1295,7 +1326,7 @@ pub fn board_state(home: &Path, project_id: i64) -> Result<BoardState> {
 /// Like [`board_state`], but never starts the daemon. An edit-time gate runs on
 /// every tool call and must fail open rather than pay to spawn a daemon; a
 /// connection error means "cannot judge", and the caller allows the edit.
-pub fn board_state_quick(home: &Path, project_id: i64) -> Result<BoardState> {
+pub fn board_state_quick(home: &Path, project_id: i64) -> Result<DerivedBoard> {
     match Client::request(home, Command::BoardState { project_id })? {
         Response::BoardState(state) => Ok(state),
         Response::Error(message) => bail!("{message}"),

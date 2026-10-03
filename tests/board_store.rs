@@ -90,7 +90,7 @@ fn until(mut condition: impl FnMut() -> bool) {
 
 fn state(daemon: &Daemon, project_id: i64) -> BoardState {
     match daemon.request(Request::BoardState { project_id }) {
-        Response::BoardState(state) => state,
+        Response::BoardState(board) => board.state,
         other => panic!("unexpected board state response: {other:?}"),
     }
 }
@@ -282,4 +282,103 @@ fn the_board_survives_a_daemon_restart() {
     assert_eq!(also.lane, "Review");
     // The schema migrated and stamped itself.
     assert!(board.cards.iter().any(|c| c.title == "Persisted"));
+}
+
+/// The board read carries derived facts that follow the live stores, not the
+/// last move: an unresolved attention reads Human, a resolved one does not,
+/// and a card with no claim reads Nobody.
+#[test]
+fn the_board_read_derives_whose_turn_it_is() {
+    use radar::session::activity::{
+        AttentionActionKind, AttentionChange, AttentionKind, AttentionResponse, ChangeAttention,
+        CreateAttention,
+    };
+
+    let daemon = Daemon::start();
+    add(&daemon, 21, "Todo", "Derived card");
+    let board = {
+        let board = match daemon.request(Request::BoardState { project_id: 21 }) {
+            Response::BoardState(board) => board,
+            other => panic!("unexpected board response: {other:?}"),
+        };
+        let Some(card) = board
+            .state
+            .cards
+            .iter()
+            .find(|card| card.title == "Derived card")
+        else {
+            panic!("card missing from the board");
+        };
+        let claim = change(daemon.request(Request::CardClaim {
+            project_id: 21,
+            card_id: card.id.clone(),
+            claim: Some("op".into()),
+            expected_revision: Some(card.revision),
+            command_id: "claim-derived".into(),
+        }));
+        match daemon.request(Request::BoardState { project_id: 21 }) {
+            Response::BoardState(board) => (claim.card.id, board),
+            other => panic!("unexpected board response: {other:?}"),
+        }
+    };
+    let (card_id, claimed) = board;
+    let derived = |board: &radar::session::daemon::DerivedBoard| {
+        board
+            .derived
+            .iter()
+            .find(|derived| derived.card_id == card_id)
+            .cloned()
+            .expect("derived card present")
+    };
+
+    // Claimed, nothing attached, nothing asked: a person's turn is still due
+    // (the card has a claim whose work has not started under this read).
+    assert_eq!(
+        derived(&claimed).turn,
+        radar::session::lane::LoopTurn::Human
+    );
+
+    // An open attention on the card is the person's turn by definition.
+    let request = match daemon.request(Request::CreateAttention(CreateAttention {
+        project_id: 21,
+        command_id: "derive-attention".into(),
+        session_id: None,
+        card_id: Some(card_id.clone()),
+        kind: AttentionKind::Question,
+        reason: "Which driver powers lane derivation?".into(),
+        allowed_actions: vec![AttentionActionKind::Answer, AttentionActionKind::Dismiss],
+    })) {
+        Response::AttentionCreated(result) => result,
+        other => panic!("unexpected response {other:?}"),
+    };
+    let after_attention = match daemon.request(Request::BoardState { project_id: 21 }) {
+        Response::BoardState(board) => board,
+        other => panic!("unexpected board response: {other:?}"),
+    };
+    assert_eq!(
+        derived(&after_attention).turn,
+        radar::session::lane::LoopTurn::Human
+    );
+
+    // Resolving the attention changes the read, never the stored lane.
+    daemon.request(Request::ChangeAttention(ChangeAttention {
+        project_id: 21,
+        request_id: request.attention.id,
+        command_id: "resolve-derive".into(),
+        expected_revision: request.attention.revision,
+        change: AttentionChange::Respond(AttentionResponse::Dismiss),
+    }));
+    let resolved = match daemon.request(Request::BoardState { project_id: 21 }) {
+        Response::BoardState(board) => board,
+        other => panic!("unexpected board response: {other:?}"),
+    };
+    assert_eq!(
+        derived(&resolved).turn,
+        radar::session::lane::LoopTurn::Human
+    );
+    assert_eq!(
+        derived(&resolved).claim.as_deref(),
+        Some("op"),
+        "the stored claim never changed underneath the derive"
+    );
 }

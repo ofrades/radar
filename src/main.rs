@@ -1497,7 +1497,8 @@ fn show_board(paths: &Paths, db: &Db, path: Option<PathBuf>, json: bool) -> Resu
 
     let (project_id, root) = board_context(db, path)?;
     db.require_board_enabled(&root)?;
-    let state = board_api::board_state(&paths.data_dir, project_id)?;
+    let board = board_api::board_state(&paths.data_dir, project_id)?;
+    let state = board.state;
     if json {
         println!("{}", serde_json::to_string_pretty(&state)?);
         return Ok(());
@@ -1568,7 +1569,8 @@ fn card_start(
 
     let (project_id, root) = board_context(db, path)?;
     db.require_board_enabled(&root)?;
-    let state = board_api::board_state(&paths.data_dir, project_id)?;
+    let board = board_api::board_state(&paths.data_dir, project_id)?;
+    let state = board.state;
     let card = find_stored(&state, needle)
         .with_context(|| format!("no card {needle}"))?
         .clone();
@@ -1646,7 +1648,8 @@ fn card_claim(
 
     let (project_id, root) = board_context(db, path)?;
     db.require_board_enabled(&root)?;
-    let state = board_api::board_state(&paths.data_dir, project_id)?;
+    let board = board_api::board_state(&paths.data_dir, project_id)?;
+    let state = board.state;
     let card_id = find_stored_mut(&state, needle)?.id.clone();
     let change = board_api::board_card_claim(
         &paths.data_dir,
@@ -1678,7 +1681,8 @@ fn card_move(
 
     let (project_id, root) = board_context(db, path)?;
     db.require_board_enabled(&root)?;
-    let state = board_api::board_state(&paths.data_dir, project_id)?;
+    let board = board_api::board_state(&paths.data_dir, project_id)?;
+    let state = board.state;
     let card_id = find_stored_mut(&state, needle)?.id.clone();
     let change = board_api::board_card_move(
         &paths.data_dir,
@@ -1706,7 +1710,8 @@ fn card_done(
 
     let (project_id, root) = board_context(db, path)?;
     db.require_board_enabled(&root)?;
-    let state = board_api::board_state(&paths.data_dir, project_id)?;
+    let board = board_api::board_state(&paths.data_dir, project_id)?;
+    let state = board.state;
     let card_id = find_stored_mut(&state, needle)?.id.clone();
     let change = board_api::board_card_complete(
         &paths.data_dir,
@@ -1795,7 +1800,8 @@ fn card_show(
 
     let (project_id, root) = board_context(db, path)?;
     db.require_board_enabled(&root)?;
-    let state = board_api::board_state(&paths.data_dir, project_id)?;
+    let board = board_api::board_state(&paths.data_dir, project_id)?;
+    let state = board.state;
     let card = find_stored_mut(&state, needle)?.clone();
     let lane = state
         .lanes
@@ -1871,7 +1877,8 @@ fn card_comment(
 
     let (project_id, root) = board_context(db, path)?;
     db.require_board_enabled(&root)?;
-    let state = board_api::board_state(&paths.data_dir, project_id)?;
+    let board = board_api::board_state(&paths.data_dir, project_id)?;
+    let state = board.state;
     let card_id = find_stored_mut(&state, needle)?.id.clone();
     let command = Request::PublishActivity(PublishActivity {
         project_id,
@@ -1907,7 +1914,8 @@ fn card_edit(
 
     let (project_id, root) = board_context(db, path)?;
     db.require_board_enabled(&root)?;
-    let state = board_api::board_state(&paths.data_dir, project_id)?;
+    let board = board_api::board_state(&paths.data_dir, project_id)?;
+    let state = board.state;
     let card_id = find_stored_mut(&state, needle)?.id.clone();
     let change = board_api::board_card_update(
         &paths.data_dir,
@@ -1931,7 +1939,9 @@ fn card_edit(
 fn claim_holds(paths: &Paths, db: &Db, dir: &Path, who: &str) -> Option<bool> {
     let (project_id, _root) = board_context(db, Some(dir.to_path_buf())).ok()?;
     // Never spawn a daemon here: an edit-time gate must fail open.
-    let state = radar::session::daemon::board_state_quick(&paths.data_dir, project_id).ok()?;
+    let state = radar::session::daemon::board_state_quick(&paths.data_dir, project_id)
+        .ok()
+        .map(|board| board.state)?;
     Some(
         state
             .cards

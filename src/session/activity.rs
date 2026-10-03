@@ -642,6 +642,29 @@ impl ActivityJournal {
         load_attention(&inner.connection, project_id, request_id)
     }
 
+    /// Every unresolved request of a project, oldest first: the derived
+    /// board read consults this, not the bounded event page.
+    pub fn unresolved_attention(&self, project_id: i64) -> Result<Vec<Attention>> {
+        validate_project(project_id)?;
+        let inner = self.inner.lock();
+        let connection = &inner.connection;
+        let mut stmt = connection.prepare(
+            "SELECT data FROM attention_requests WHERE project_id = ?1 AND resolved = 0
+             ORDER BY request_id ASC",
+        )?;
+        let rows = stmt.query_map([project_id], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            serde_json::from_str(&row?).map_err(|error| {
+                anyhow::Error::from(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                ))
+            })
+        })
+        .collect()
+    }
+
     /// Replay and register under the same lock as append. More than 200
     /// missed events asks the client to take a fresh bounded snapshot first.
     pub fn watch(&self, project_id: i64, after_sequence: u64) -> Result<WatchResult> {

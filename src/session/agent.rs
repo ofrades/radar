@@ -210,6 +210,9 @@ pub struct AgentStatus {
     pub state: String,
     #[serde(default)]
     pub detail: Option<String>,
+    /// The board card this agent was launched for, when it carried one.
+    #[serde(default)]
+    pub card_id: Option<String>,
     /// Feature matrix from the initialize handshake.
     #[serde(default)]
     pub capabilities: Option<AgentCapabilities>,
@@ -230,6 +233,7 @@ impl AgentStatus {
             acp_session_id: None,
             state: "starting".to_string(),
             detail: None,
+            card_id: spec.card_id.clone(),
             capabilities: None,
             modes: None,
             config_options: Vec::new(),

@@ -249,8 +249,8 @@ fn call_tool(ctx: &Ctx, name: &str, args: &Value) -> Result<String, String> {
     };
     let home = &ctx.paths.data_dir;
     let card_id = |project_id: i64, needle: &str| -> Result<String, String> {
-        let state = board_api::board_state(home, project_id).map_err(|error| error.to_string())?;
-        find_card(&state, needle)
+        let board = board_api::board_state(home, project_id).map_err(|error| error.to_string())?;
+        find_card(&board.state, needle)
             .map(|card| card.id.clone())
             .ok_or_else(|| format!("no card matching \"{needle}\""))
     };
@@ -258,8 +258,8 @@ fn call_tool(ctx: &Ctx, name: &str, args: &Value) -> Result<String, String> {
     match name {
         "board_list" => {
             let (project_id, _) = resolve(ctx, project)?;
-            let state = board_api::board_state(home, project_id).map_err(|e| e.to_string())?;
-            Ok(pretty(board_json(&state)))
+            let board = board_api::board_state(home, project_id).map_err(|e| e.to_string())?;
+            Ok(pretty(board_json(&board.state)))
         }
         "card_add" => {
             let title = required(args, "title")?;
@@ -357,11 +357,12 @@ fn call_tool(ctx: &Ctx, name: &str, args: &Value) -> Result<String, String> {
         "card_show" => {
             let needle = required(args, "card")?;
             let (project_id, _) = resolve(ctx, project)?;
-            let state = board_api::board_state(home, project_id).map_err(|e| e.to_string())?;
-            let card = find_card(&state, &needle)
+            let board = board_api::board_state(home, project_id).map_err(|e| e.to_string())?;
+            let card = find_card(&board.state, &needle)
                 .cloned()
                 .ok_or_else(|| format!("no card matching \"{needle}\""))?;
-            let lane = state
+            let lane = board
+                .state
                 .lanes
                 .iter()
                 .find(|lane| lane.id == card.lane_id)
@@ -423,8 +424,8 @@ fn call_tool(ctx: &Ctx, name: &str, args: &Value) -> Result<String, String> {
         "card_start" => {
             let needle = required(args, "card")?;
             let (project_id, root) = resolve(ctx, project)?;
-            let state = board_api::board_state(home, project_id).map_err(|e| e.to_string())?;
-            let card = find_card(&state, &needle)
+            let board = board_api::board_state(home, project_id).map_err(|e| e.to_string())?;
+            let card = find_card(&board.state, &needle)
                 .cloned()
                 .ok_or_else(|| format!("no card matching \"{needle}\""))?;
             match crate::session::dispatch::start_card(
