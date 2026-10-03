@@ -21,8 +21,10 @@ use std::time::{Duration, Instant};
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind,
     PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigOption, SessionModeId, SessionNotification,
-    SessionUpdate, SetSessionModeRequest, TextContent,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOptions,
+    SessionConfigValueId, SessionModeId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo};
@@ -54,12 +56,73 @@ pub struct AgentModes {
     pub available: Vec<AgentMode>,
 }
 
-/// One tunable session config option (`session/set_config_option`), as the
-/// agent advertised it. Model choice lands here on agents that expose it.
+/// One selectable value on a config option.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConfigValue {
+    pub id: String,
+    pub name: String,
+}
+
+/// One tunable session config option (`session/set_config_option`). Model
+/// choice lands here on agents that expose it, alongside effort, thinking,
+/// and the agent's own categories.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentConfigOption {
     pub id: String,
     pub name: String,
+    /// model | model-config | thought-level | mode | <agent's own>
+    pub category: String,
+    pub kind: AgentConfigKind,
+}
+
+/// What the option can switch to, and what it is at right now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentConfigKind {
+    Select {
+        current: String,
+        options: Vec<AgentConfigValue>,
+    },
+    Boolean {
+        current: bool,
+    },
+}
+
+impl AgentConfigOption {
+    /// Human-readable label of the current value, as the agent named it.
+    pub fn current_label(&self) -> Option<String> {
+        match &self.kind {
+            AgentConfigKind::Select { current, options } => options
+                .iter()
+                .find(|value| &value.id == current)
+                .map(|value| value.name.clone()),
+            AgentConfigKind::Boolean { current } => Some(if *current {
+                "on".to_string()
+            } else {
+                "off".to_string()
+            }),
+        }
+    }
+
+    /// Turn a caller's string into a protocol value for this option, or `None`
+    /// when the value does not fit the option's kind or shape.
+    pub fn parse_value(&self, value: &str) -> Option<SessionConfigOptionValue> {
+        match &self.kind {
+            AgentConfigKind::Select { options, .. } => {
+                if options.iter().any(|option| option.id == value) {
+                    Some(SessionConfigOptionValue::value_id(
+                        SessionConfigValueId::new(value),
+                    ))
+                } else {
+                    None
+                }
+            }
+            AgentConfigKind::Boolean { .. } => match value {
+                "true" => Some(SessionConfigOptionValue::boolean(true)),
+                "false" => Some(SessionConfigOptionValue::boolean(false)),
+                _ => None,
+            },
+        }
+    }
 }
 
 /// What an agent said it can do — the ACP initialize handshake, flattened to
@@ -162,6 +225,8 @@ enum AgentCommand {
     Prompt(String),
     /// Switch the session mode; the driver keeps its own id reused per turn.
     SetMode(SessionModeId),
+    /// Switch a session config option (model, effort, …).
+    SetConfigOption(String, SessionConfigOptionValue),
     Cancel,
     Stop,
 }
@@ -267,6 +332,57 @@ impl AgentHost {
         bail!("agent did not confirm session mode {mode_id} in time")
     }
 
+    /// Switch one config option (model choice, effort, …). The value is
+    /// validated against the option's tracked kind; the confirmation comes
+    /// back on the agent's echo, which replaces the daemon state.
+    pub fn set_config_option_status(
+        self: &Arc<Self>,
+        id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Vec<AgentConfigOption>> {
+        let tracked = self
+            .config_option(id, config_id)
+            .context("agent does not advertise this config option (yet)")?;
+        let parsed = tracked.parse_value(value).with_context(|| {
+            format!(
+                "value {value:?} does not fit {}: {}",
+                tracked.name,
+                match &tracked.kind {
+                    AgentConfigKind::Select { options, .. } => format!(
+                        "pick one of: {}",
+                        options
+                            .iter()
+                            .map(|option| option.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    AgentConfigKind::Boolean { .. } => "pick true or false".to_string(),
+                }
+            )
+        })?;
+        self.send(
+            id,
+            AgentCommand::SetConfigOption(config_id.to_string(), parsed),
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if self
+                .config_option(id, config_id)
+                .is_some_and(|after| agent_config_current_matches(&after, value))
+            {
+                return Ok(self
+                    .list()
+                    .into_iter()
+                    .find(|status| status.id == id)
+                    .map(|status| status.config_options)
+                    .unwrap_or_default());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        bail!("agent did not confirm {config_id} = {value} in time")
+    }
+
     /// Ask the agent to cancel its current turn.
     pub fn cancel(&self, id: &str) -> Result<()> {
         self.send(id, AgentCommand::Cancel)
@@ -347,11 +463,61 @@ impl AgentHost {
         }
     }
 
-    /// Replace the config-option list the agent advertised.
-    fn set_config_options(&self, id: &str, options: Vec<AgentConfigOption>) {
-        if let Some(entry) = self.agents.lock().get_mut(id) {
-            entry.status.config_options = options;
+    /// Merge the agent's config-option snapshot into the tracked state.
+    /// Agents may send the full set (ConfigOptionUpdate) or just the options
+    /// they changed (a set_config_option response), so unknown ids keep their
+    /// previous entry. Returns the options whose current value really
+    /// changed, as `(name, label)` pairs — the daemon reports those to the
+    /// project feed. Mode-category options are excluded:
+    /// `CurrentModeUpdate` already reports mode changes.
+    fn set_config_options(
+        &self,
+        id: &str,
+        options: Vec<AgentConfigOption>,
+    ) -> Vec<(String, String)> {
+        let mut agents = self.agents.lock();
+        let Some(entry) = agents.get_mut(id) else {
+            return Vec::new();
+        };
+        let previous = std::mem::take(&mut entry.status.config_options);
+        let mut changes = Vec::new();
+        let mut update = options.into_iter().peekable();
+        let mut merged: Vec<AgentConfigOption> = Vec::with_capacity(previous.len());
+        for old in previous {
+            let next = match update.peek() {
+                Some(incoming) if incoming.id == old.id => update.next().expect("peeked match"),
+                _ => {
+                    // The agent's snapshot does not mention this option; keep it.
+                    merged.push(old);
+                    continue;
+                }
+            };
+            if next != old && next.category != "mode" {
+                // CurrentModeUpdate already reports mode changes.
+                if let Some(label) = next.current_label() {
+                    changes.push((next.name.clone(), label));
+                }
+            }
+            merged.push(next);
         }
+        merged.extend(update);
+        entry.status.config_options = merged;
+        changes
+    }
+
+    /// Find one tracked config option.
+    fn config_option(&self, id: &str, config_id: &str) -> Option<AgentConfigOption> {
+        self.agents
+            .lock()
+            .get(id)
+            .and_then(|entry| {
+                entry
+                    .status
+                    .config_options
+                    .iter()
+                    .find(|o| o.id == config_id)
+            })
+            .cloned()
     }
 
     /// Record the agent's new current mode and return the previous one, so a
@@ -522,7 +688,7 @@ async fn connect(
                 connection_host.set_modes(&connection_spec.id, to_agent_modes(modes));
             }
             if let Some(options) = &new_session.config_options {
-                connection_host.set_config_options(&connection_spec.id, config_option_ids(options));
+                connection_host.set_config_options(&connection_spec.id, config_options_of(options));
             }
             connection_host.set_status(&connection_spec.id, "ready", None);
             publish_state(
@@ -596,6 +762,29 @@ async fn connect(
                             }
                         }
                     }
+                    AgentCommand::SetConfigOption(config_id, value) => {
+                        // The response carries the authoritative updated set.
+                        let request = SetSessionConfigOptionRequest::new(
+                            session_id.clone(),
+                            SessionConfigId::new(config_id.clone()),
+                            value,
+                        );
+                        match connection.send_request(request).block_task().await {
+                            Ok(response) => publish_config_changes(
+                                &connection_journal,
+                                &connection_host,
+                                &connection_spec,
+                                response.config_options.as_slice(),
+                            ),
+                            Err(error) => {
+                                connection_host.set_status(
+                                    &connection_spec.id,
+                                    "failed",
+                                    Some(format!("config {config_id}: {error}")),
+                                );
+                            }
+                        }
+                    }
                     AgentCommand::Cancel => {
                         let _ = connection
                             .send_notification(CancelNotification::new(session_id.clone()));
@@ -651,7 +840,7 @@ fn observe_update(
             }
         }
         SessionUpdate::ConfigOptionUpdate(update) => {
-            host.set_config_options(&spec.id, config_option_ids(&update.config_options));
+            publish_config_changes(journal, host, spec, &update.config_options);
         }
         _ => {}
     }
@@ -760,6 +949,33 @@ fn publish_report(journal: &ActivityJournal, spec: &AgentStart, text: &str) {
     });
 }
 
+/// Replace the daemon's config-option state with the agent's and feed each
+/// real value change to the project feed ("model: Opus").
+fn publish_config_changes(
+    journal: &ActivityJournal,
+    host: &AgentHost,
+    spec: &AgentStart,
+    options: &[SessionConfigOption],
+) {
+    for (name, label) in host.set_config_options(&spec.id, config_options_of(options)) {
+        publish_report(
+            journal,
+            spec,
+            &format!("{}: {}", name.to_lowercase(), label),
+        );
+    }
+}
+
+/// Whether a tracked config option's current value matches a caller's string.
+fn agent_config_current_matches(option: &AgentConfigOption, value: &str) -> bool {
+    match &option.kind {
+        AgentConfigKind::Select { current, .. } => current == value,
+        AgentConfigKind::Boolean { current } => {
+            (value == "true" && *current) || (value == "false" && !*current)
+        }
+    }
+}
+
 /// Normalize the agent's mode state. The agent is the source of truth, so a
 /// mode in `current` that never appeared in `available` is still reported.
 fn to_agent_modes(state: &agent_client_protocol::schema::v1::SessionModeState) -> AgentModes {
@@ -778,13 +994,56 @@ fn to_agent_modes(state: &agent_client_protocol::schema::v1::SessionModeState) -
     }
 }
 
-/// Flatten the agent's config options to what clients need.
-fn config_option_ids(options: &[SessionConfigOption]) -> Vec<AgentConfigOption> {
+/// Flatten the agent's config options to what clients need: category as a
+/// slug, and the kind resolved to the agent's own current value.
+fn config_options_of(options: &[SessionConfigOption]) -> Vec<AgentConfigOption> {
     options
         .iter()
-        .map(|option| AgentConfigOption {
-            id: option.id.0.to_string(),
-            name: option.name.clone(),
+        .filter_map(|option| {
+            let kind = match &option.kind {
+                SessionConfigKind::Select(select) => {
+                    let values: Vec<agent_client_protocol::schema::v1::SessionConfigSelectOption> =
+                        match &select.options {
+                            SessionConfigSelectOptions::Ungrouped(values) => values.clone(),
+                            SessionConfigSelectOptions::Grouped(groups) => groups
+                                .iter()
+                                .flat_map(|group| group.options.clone())
+                                .collect(),
+                            // A future kind the daemon cannot represent yet.
+                            _ => return None,
+                        };
+                    AgentConfigKind::Select {
+                        current: select.current_value.0.to_string(),
+                        options: values
+                            .iter()
+                            .map(|value| AgentConfigValue {
+                                id: value.value.0.to_string(),
+                                name: value.name.clone(),
+                            })
+                            .collect(),
+                    }
+                }
+                SessionConfigKind::Boolean(option) => AgentConfigKind::Boolean {
+                    current: option.current_value,
+                },
+                // A future kind the daemon cannot represent yet.
+                _ => return None,
+            };
+            let category = match option.category.as_ref() {
+                Some(SessionConfigOptionCategory::Mode) => "mode".to_string(),
+                Some(SessionConfigOptionCategory::Model) => "model".to_string(),
+                Some(SessionConfigOptionCategory::ModelConfig) => "model-config".to_string(),
+                Some(SessionConfigOptionCategory::ThoughtLevel) => "thought-level".to_string(),
+                Some(SessionConfigOptionCategory::Other(unknown)) => unknown.clone(),
+                // A future category the daemon cannot name yet.
+                None | Some(_) => "other".to_string(),
+            };
+            Some(AgentConfigOption {
+                id: option.id.0.to_string(),
+                name: option.name.clone(),
+                category,
+                kind,
+            })
         })
         .collect()
 }
@@ -895,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn config_options_flatten_to_id_and_name() {
+    fn config_options_flatten_with_category_kind_and_value_parsing() {
         use agent_client_protocol::schema::v1::{
             SessionConfigKind, SessionConfigSelect, SessionConfigSelectOption,
             SessionConfigSelectOptions, SessionConfigValueId,
@@ -904,16 +1163,118 @@ mod tests {
             "model",
             "Model",
             SessionConfigKind::Select(SessionConfigSelect::new(
-                "gpt-5",
-                SessionConfigSelectOptions::Ungrouped(vec![SessionConfigSelectOption::new(
-                    SessionConfigValueId::new("gpt-5"),
-                    "GPT-5",
-                )]),
+                "campo",
+                SessionConfigSelectOptions::Ungrouped(vec![
+                    SessionConfigSelectOption::new(SessionConfigValueId::new("campo"), "Campo"),
+                    SessionConfigSelectOption::new(SessionConfigValueId::new("zeta"), "Zeta"),
+                ]),
             )),
-        )];
-        let flattened = config_option_ids(&options);
+        )
+        .category(Some(SessionConfigOptionCategory::Model))];
+        let flattened = config_options_of(&options);
         assert_eq!(flattened.len(), 1);
         assert_eq!(flattened[0].id, "model");
         assert_eq!(flattened[0].name, "Model");
+        assert_eq!(flattened[0].category, "model");
+        assert_eq!(flattened[0].current_label().as_deref(), Some("Campo"));
+        assert!(flattened[0].parse_value("zeta").is_some());
+        assert!(flattened[0].parse_value("nonsense").is_none());
+        assert!(flattened[0].parse_value("true").is_none());
+    }
+
+    #[test]
+    fn config_options_merge_keeps_options_the_snapshot_left_out() {
+        let host = AgentHost::default();
+        let full = vec![
+            AgentConfigOption {
+                id: "model".into(),
+                name: "Model".into(),
+                category: "model".into(),
+                kind: AgentConfigKind::Select {
+                    current: "a".into(),
+                    options: vec![
+                        AgentConfigValue {
+                            id: "a".into(),
+                            name: "Alpha".into(),
+                        },
+                        AgentConfigValue {
+                            id: "b".into(),
+                            name: "Beta".into(),
+                        },
+                    ],
+                },
+            },
+            AgentConfigOption {
+                id: "effort".into(),
+                name: "Effort".into(),
+                category: "thought-level".into(),
+                kind: AgentConfigKind::Select {
+                    current: "default".into(),
+                    options: Vec::new(),
+                },
+            },
+        ];
+        // A tracked placeholder agent so the host has somewhere to keep state.
+        host.agents.lock().insert(
+            "m".into(),
+            AgentEntry {
+                status: AgentStatus::new(&AgentStart {
+                    id: "m".into(),
+                    provider: "fake".into(),
+                    program: "fake".into(),
+                    args: Vec::new(),
+                    cwd: "/tmp".into(),
+                    project_id: 1,
+                    session_id: None,
+                    card_id: None,
+                }),
+                commands: async_channel::unbounded().0,
+            },
+        );
+        host.set_config_options("m", full.clone());
+        // A partial snapshot covering only `model`, now on a different value.
+        let partial = vec![match &full[0].kind {
+            AgentConfigKind::Select { options, .. } => AgentConfigOption {
+                id: "model".into(),
+                name: "Model".into(),
+                category: "model".into(),
+                kind: AgentConfigKind::Select {
+                    current: "b".into(),
+                    options: options.clone(),
+                },
+            },
+            other => unreachable!("model is a select, not {other:?}"),
+        }];
+        let changes = host.set_config_options("m", partial);
+        assert_eq!(changes, vec![("Model".to_string(), "Beta".to_string())]);
+        let ids: Vec<String> = host
+            .list()
+            .into_iter()
+            .find(|status| status.id == "m")
+            .map(|status| {
+                status
+                    .config_options
+                    .into_iter()
+                    .map(|option| option.id)
+                    .collect()
+            })
+            .expect("m tracked");
+        assert_eq!(ids, vec!["model", "effort"]);
+    }
+
+    #[test]
+    fn boolean_config_options_parse_true_and_false_only() {
+        use agent_client_protocol::schema::v1::{SessionConfigBoolean, SessionConfigKind};
+        let options = [SessionConfigOption::new(
+            "thinking",
+            "Thinking",
+            SessionConfigKind::Boolean(SessionConfigBoolean::new(false)),
+        )];
+        let flattened = config_options_of(&options);
+        assert_eq!(flattened[0].category, "other");
+        assert_eq!(flattened[0].current_label().as_deref(), Some("off"));
+        assert!(flattened[0].parse_value("true").is_some());
+        assert!(flattened[0].parse_value("false").is_some());
+        assert!(flattened[0].parse_value("zeta").is_none());
     }
 }

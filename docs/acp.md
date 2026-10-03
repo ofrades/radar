@@ -40,9 +40,15 @@ over its stdin/stdout using the [`agent-client-protocol`][sdk] Rust SDK.
   plus available, with names and descriptions) rides on `AgentStatus`, and
   `session/set_mode` switches it while it runs. The agent's
   `CurrentModeUpdate` echo is authoritative; a real change publishes a
-  `Reported` `mode: …` line to the project feed. Config options the agent
-  advertises (model, effort, …) are surfaced as `config_options`; setting them
-  is a later card.
+  `Reported` `mode: …` line to the project feed.
+- **Config options.** The options an agent advertises (model, effort,
+  thinking, …) are surfaced as `config_options` with their category (model,
+  thought-level, mode, agent's own) and their kind: a `Select` with the
+  current value plus every value id/name, or a `Boolean` with its current
+  state. `session/set_config_option` switches them while the session runs;
+  the agent's authoritative set back is merged — not replaced — so a partial
+  echo never drops the options it did not mention, and real value changes
+  publish `Reported` `effort: …` / `model: …` lines to the project feed.
 - **Lifecycle.** Start, ready, exited, and failed are published as
   `SessionLifecycle` activity, so the board and every watcher see the agent
   come and go.
@@ -55,6 +61,8 @@ over its stdin/stdout using the [`agent-client-protocol`][sdk] Rust SDK.
 | initialize response | `AgentCapabilities` on `AgentStatus` |
 | `session/new` `modes` | `AgentModes` (current + available) on `AgentStatus` |
 | `session/set_mode` + `CurrentModeUpdate` | `radar acp mode`; `Reported` `mode: …` feed line |
+| `session/new` `config_options` | `config_options` on `AgentStatus` (category + kind) |
+| `session/set_config_option` | `radar acp config <id> <CONFIG_ID> <VALUE>`; `Reported` line |
 | `session/update` `agent_message_chunk` | `Reported` message at turn end |
 | `session/update` `tool_call` | `Reported` "tool: {title}" |
 | prompt turn start / `stopReason` | `AgentStateChanged` working / idle |
@@ -92,12 +100,16 @@ the command line. `--project-id`, `--session-id`, and `--card-id` default to the
 carries, so an agent started from a card links its activity to that card.
 
 ```sh
-# See what an agent can do and what modes it offers.
+# See what an agent can do, what modes it offers, and what else it exposes.
 radar acp list --json
 radar acp modes my-agent
+radar acp config my-agent            # every config option, current values
+radar acp config my-agent model      # just the model option
 
-# Switch its session mode; fails legibly if the agent does not confirm it.
+# Switch its session mode or a config option; both fail legibly if the
+# agent does not confirm, or the value does not fit what it exposes.
 radar acp mode my-agent plan
+radar acp config my-agent model opencode/claude-sonnet-5-5
 ```
 
 ## Tests

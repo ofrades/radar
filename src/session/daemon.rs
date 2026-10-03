@@ -22,7 +22,7 @@ use super::activity::{
     ActivitySnapshot, ActivitySubscription, Attention, AttentionMutationResult, ChangeAttention,
     CreateAttention, CreateAttentionResult, PublishActivity, WatchResult,
 };
-use super::agent::{AgentHost, AgentModes, AgentStart, AgentStatus};
+use super::agent::{AgentConfigOption, AgentHost, AgentModes, AgentStart, AgentStatus};
 use super::beads_store::BeadsBoardStore;
 use super::board_store::{Board, BoardChange, BoardState, BoardStore};
 use super::catalog::{self, CatalogFilter, SessionCatalog};
@@ -210,6 +210,12 @@ pub enum Command {
         id: String,
         mode_id: String,
     },
+    /// Switch an agent's session config option (model, effort, …).
+    AgentSetConfigOption {
+        id: String,
+        config_id: String,
+        value: String,
+    },
     /// Every ACP agent the daemon is running.
     AgentList,
 }
@@ -261,6 +267,8 @@ pub enum Response {
     Agents(Vec<AgentStatus>),
     /// The mode change was accepted; the agent's echo confirms the state.
     AgentModes(AgentModes),
+    /// The config option was switched; the agent's authoritative set is back.
+    AgentConfigOptions(Vec<AgentConfigOption>),
 }
 
 /// Socket directory is private even when the surrounding RADAR_HOME is shared.
@@ -813,6 +821,15 @@ fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
         Command::AgentSetMode { id, mode_id } => {
             Response::AgentModes(services.agents.set_mode_status(&id, &mode_id)?)
         }
+        Command::AgentSetConfigOption {
+            id,
+            config_id,
+            value,
+        } => Response::AgentConfigOptions(
+            services
+                .agents
+                .set_config_option_status(&id, &config_id, &value)?,
+        ),
         Command::AgentList => Response::Agents(services.agents.list()),
         Command::PublishActivity(input) => {
             Response::ActivityPublished(services.activity.publish(input)?)

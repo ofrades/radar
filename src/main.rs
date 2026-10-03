@@ -359,6 +359,14 @@ enum AcpAction {
     Modes { id: String },
     /// Switch a running agent's session mode
     Mode { id: String, mode_id: String },
+    /// Inspect or set an agent's session config options (model, effort, …):
+    /// `radar acp config <id>`, `radar acp config <id> <CONFIG_ID>`, or with
+    /// a VALUE appended, set it
+    Config {
+        id: String,
+        config_id: Option<String>,
+        value: Option<String>,
+    },
     /// List the agents the daemon is running
     List,
 }
@@ -855,6 +863,36 @@ fn acp_command(paths: &Paths, action: AcpAction) -> Result<()> {
         }
     }
 
+    /// The config options of one agent — all of them, or just one, whichever
+    /// the caller narrowed with `config_id`.
+    fn current_config_options(
+        home: &Path,
+        id: &str,
+        config_id: Option<String>,
+    ) -> Result<serde_json::Value> {
+        match Client::request(home, Request::AgentList)? {
+            Response::Agents(agents) => {
+                let agent = agents
+                    .into_iter()
+                    .find(|agent| agent.id == id)
+                    .context("agent session is not running")?;
+                match config_id {
+                    None => serde_json::to_value(&agent.config_options)
+                        .context("config options serialize"),
+                    Some(config_id) => {
+                        let option = agent
+                            .config_options
+                            .iter()
+                            .find(|option| option.id == config_id)
+                            .context("agent does not advertise this config option")?;
+                        Ok(serde_json::to_value(option)?)
+                    }
+                }
+            }
+            other => anyhow::bail!("unexpected daemon response: {other:?}"),
+        }
+    }
+
     daemon::ensure_running(&paths.data_dir)?;
     let default_project_id = || -> Result<i64> {
         std::env::var("RADAR_PROJECT_ID")
@@ -899,17 +937,65 @@ fn acp_command(paths: &Paths, action: AcpAction) -> Result<()> {
         AcpAction::Prompt { id, text } => Request::AgentPrompt { id, text },
         AcpAction::Cancel { id } => Request::AgentCancel { id },
         AcpAction::Stop { id } => Request::AgentStop { id },
-        // Modes and Mode read the agent space directly and print on their own;
-        // they need no generic request/response plumbing.
+        // Modes, Mode, and Config read the agent space directly and print on
+        // their own; they need no generic request/response plumbing.
         AcpAction::Modes { id } => {
-            let modes = current_modes(&paths.data_dir, &id)?;
-            println!("{}", serde_json::to_string(&modes)?);
+            println!(
+                "{}",
+                serde_json::to_string(&current_modes(&paths.data_dir, &id)?)?
+            );
             return Ok(());
         }
         AcpAction::Mode { id, mode_id } => {
             match Client::request(&paths.data_dir, Request::AgentSetMode { id, mode_id })? {
                 Response::AgentModes(modes) => {
                     println!("{}", serde_json::to_string(&modes)?);
+                }
+                other => anyhow::bail!("unexpected daemon response: {other:?}"),
+            }
+            return Ok(());
+        }
+        AcpAction::Config {
+            id,
+            config_id: None,
+            value: _,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string(&current_config_options(&paths.data_dir, &id, None)?)?
+            );
+            return Ok(());
+        }
+        AcpAction::Config {
+            id,
+            config_id: Some(config_id),
+            value: None,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string(&current_config_options(
+                    &paths.data_dir,
+                    &id,
+                    Some(config_id)
+                )?)?
+            );
+            return Ok(());
+        }
+        AcpAction::Config {
+            id,
+            config_id: Some(config_id),
+            value: Some(value),
+        } => {
+            match Client::request(
+                &paths.data_dir,
+                Request::AgentSetConfigOption {
+                    id,
+                    config_id,
+                    value,
+                },
+            )? {
+                Response::AgentConfigOptions(options) => {
+                    println!("{}", serde_json::to_string(&options)?);
                 }
                 other => anyhow::bail!("unexpected daemon response: {other:?}"),
             }
