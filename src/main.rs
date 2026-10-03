@@ -1498,11 +1498,17 @@ fn show_board(paths: &Paths, db: &Db, path: Option<PathBuf>, json: bool) -> Resu
     let (project_id, root) = board_context(db, path)?;
     db.require_board_enabled(&root)?;
     let board = board_api::board_state(&paths.data_dir, project_id)?;
-    let state = board.state;
+    let read = |card_id: &str| {
+        board
+            .derived
+            .iter()
+            .find(|derived| derived.card_id == card_id)
+    };
     if json {
-        println!("{}", serde_json::to_string_pretty(&state)?);
+        println!("{}", serde_json::to_string_pretty(&board)?);
         return Ok(());
     }
+    let state = &*board;
     for lane in &state.lanes {
         let cards: Vec<&StoredCard> = state
             .cards
@@ -1512,7 +1518,16 @@ fn show_board(paths: &Paths, db: &Db, path: Option<PathBuf>, json: bool) -> Resu
         println!("{} ({})", lane.name, cards.len());
         for card in cards {
             match &card.claim {
-                Some(who) => println!("  · {}  @{}", card.title, who),
+                Some(who) => {
+                    let turn = read(&card.id)
+                        .map(|derived| match derived.turn {
+                            radar::session::lane::LoopTurn::Agent => " (agent)",
+                            radar::session::lane::LoopTurn::Human => " (you)",
+                            radar::session::lane::LoopTurn::Nobody => " (idle)",
+                        })
+                        .unwrap_or_default();
+                    println!("  · {}  @{who}{turn}", card.title);
+                }
                 None => println!("  · {}", card.title),
             }
             for note in card.body.lines().filter(|line| !line.trim().is_empty()) {

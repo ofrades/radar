@@ -12,9 +12,10 @@
 //! The one derived answer is [`DerivedCard::turn`] (AO's "which loop is
 //! turning this card"): whose turn it is — the worker agent's, a person's, or
 //! nobody's. An open approval or question reads `Human` no matter what lane
-//! the card sits in; a worker that ended its turn hands the card to a person;
-//! an agent mid-turn reads `Agent`; a lost worker with nothing outstanding
-//! reads `Nobody`.
+//! the card sits in; a live worker or working agent reads `Agent`; a card no
+//! claim holds and that is not done reads `Nobody`. A claimed card whose
+//! worker is not alive stays `Human`: the claimant restarts the work, answers
+//! what is outstanding, or hands the card back.
 
 use std::collections::HashMap;
 
@@ -33,11 +34,10 @@ pub enum LoopTurn {
     /// The worker agent is mid-turn: a running process, or an ACP agent
     /// between prompt and echo.
     Agent,
-    /// A person is asked for something: unresolved attention on the card, or
-    /// the worker handed the card back and the next move is a person's.
+    /// A person's next move: an open approval or question on the card, a
+    /// review to give, or a claimed card whose worker has not been started.
     Human,
-    /// The worker is gone and nothing asks for anything; the lane is exactly
-    /// where the last move left it.
+    /// A card no claim holds, done: nothing turns it.
     Nobody,
 }
 
