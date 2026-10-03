@@ -197,9 +197,9 @@ impl Hud {
 
     /// One workspace entry point for creating work and opening task conversations.
     pub fn present_cards(&self, app: &App, project_id: i64) {
-        gtk::prelude::GtkWindowExt::set_focus(&app.window, None::<&gtk::Widget>);
         if self.task_project.get() != Some(project_id) {
             self.search.set_text("");
+            self.scroll.vadjustment().set_value(0.0);
         }
         self.task_project.set(Some(project_id));
         self.task_card.borrow_mut().take();
@@ -228,12 +228,19 @@ impl Hud {
         self.details.set_visible(true);
         self.details
             .set_height_request((app.window.height() - 160).clamp(240, 600));
-        self.replace_task(app, project_id, card_id);
+        self.replace_task(app, project_id, card_id, false);
         self.root.set_visible(true);
         self.back.grab_focus();
     }
 
-    fn replace_task(&self, app: &App, project_id: i64, card_id: &str) {
+    fn replace_task(&self, app: &App, project_id: i64, card_id: &str, preserve_scroll: bool) {
+        let scroll_position = preserve_scroll.then(|| {
+            self.details
+                .first_child()
+                .and_then(|detail| detail.first_child())
+                .and_then(|scroll| scroll.downcast::<gtk::ScrolledWindow>().ok())
+                .map(|scroll| scroll.vadjustment().value())
+        }).flatten();
         if app
             .window
             .focus_widget()
@@ -244,8 +251,14 @@ impl Hud {
         while let Some(child) = self.details.first_child() {
             self.details.remove(&child);
         }
-        self.details
-            .append(&super::card::detail(app, project_id, card_id));
+        let detail = super::card::detail(app, project_id, card_id);
+        let scroller = detail
+            .first_child()
+            .and_then(|scroll| scroll.downcast::<gtk::ScrolledWindow>().ok());
+        self.details.append(&detail);
+        if let (Some(position), Some(scroller)) = (scroll_position, scroller) {
+            super::restore_scroll_position(&scroller, position);
+        }
     }
 
     pub fn refresh_tasks(&self, app: &App) {
@@ -263,7 +276,7 @@ impl Hud {
         }
         let card_id = self.task_card.borrow().clone();
         if let Some(card_id) = card_id {
-            self.replace_task(app, project_id, &card_id);
+            self.replace_task(app, project_id, &card_id, true);
         } else {
             if app
                 .window
@@ -277,8 +290,10 @@ impl Hud {
             }
             self.creation
                 .append(&super::home::todo_add_entry(app, project_id));
+            let position = self.scroll.vadjustment().value();
             self.rebuild_cards(app, project_id);
             self.apply_filter(&self.search.text());
+            super::restore_scroll_position(&self.scroll, position);
         }
     }
 

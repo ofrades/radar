@@ -69,6 +69,45 @@ const PRIMITIVES: [Slot; 4] = [Slot::Agent, Slot::Diff, Slot::Shell, Slot::Edito
 
 type ZoomState = (Vec<Rc<Panel>>, Option<split::Node<Panel>>);
 
+pub(super) fn restore_scroll_position(scroller: &gtk::ScrolledWindow, position: f64) {
+    let scroller = scroller.clone();
+    glib::idle_add_local_once(move || {
+        let adjustment = scroller.vadjustment();
+        let settled = Rc::new(Cell::new(false));
+        let apply = {
+            let settled = settled.clone();
+            move |adjustment: &gtk::Adjustment| {
+                if settled.get() {
+                    return;
+                }
+                let maximum = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+                let value = position.clamp(adjustment.lower(), maximum);
+                adjustment.set_value(value);
+                // Once the saved position is reachable, the restore is done.
+                if value >= position - 0.5 {
+                    settled.set(true);
+                }
+            }
+        };
+        apply(&adjustment);
+        // The rebuilt child may not have its content allocated yet; re-apply
+        // as it grows so a saved offset survives the first layout pass.
+        adjustment.connect_upper_notify(move |adjustment| {
+            apply(adjustment);
+        });
+    });
+}
+
+fn home_card_scroller(view: &gtk::Widget) -> Option<gtk::ScrolledWindow> {
+    if !view.has_css_class("card-view") {
+        return None;
+    }
+    view.last_child()?
+        .first_child()?
+        .downcast::<gtk::ScrolledWindow>()
+        .ok()
+}
+
 /// Open the app.
 pub fn run(paths: Paths, db: Db) -> Result<()> {
     crate::session::daemon::ensure_running(&paths.data_dir)?;
@@ -115,6 +154,9 @@ struct Workspace {
     programs: RefCell<HashMap<Slot, String>>,
     /// The panes, in layout order.
     panels: RefCell<Vec<Rc<Panel>>>,
+    /// Agent panels the user hid while their card requests them shown;
+    /// refreshes keep that choice until the visibility policy changes.
+    manual_hidden_agents: RefCell<HashMap<TabKey, String>>,
     /// Divider positions the user dragged, keyed by layout signature.
     positions: RefCell<HashMap<String, i32>>,
     /// Focusable dividers in the currently rendered layout.
@@ -1743,7 +1785,11 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
                 return;
             };
             let key = workspace.resolve_tab(TabKey::parse(&name));
+            let existing_tab = workspace.tab(key).is_some();
             app_for_action.toggle_primitive(&workspace, key);
+            if existing_tab {
+                app_for_action.remember_agent_panel_visibility(&workspace, key);
+            }
         });
         app.window.add_action(&action);
     }
@@ -3183,6 +3229,14 @@ impl App {
         sessions
             .into_iter()
             .filter_map(|session| {
+                // A retained but ended session must not swallow a follow-up:
+                // the next message relaunches the agent, resumed.
+                if !matches!(
+                    session.lifecycle,
+                    crate::session::registry::Lifecycle::Running
+                ) {
+                    return None;
+                }
                 let (project, key, _) = parse_stable_session_id(&session.id)?;
                 if project != project_id || key.slot != Slot::Agent {
                     return None;
@@ -4173,9 +4227,32 @@ impl App {
             })
     }
 
-    /// The workspace mirrors the board: a session whose to-do is done or gone
-    /// is hidden, and a session whose to-do is In progress or Review is shown.
-    /// A to-do still in Todo leaves its session as it is.
+    /// The user hid this card's agent panel while the board asked for it
+    /// shown: remember the choice so a passive refresh leaves it hidden.
+    fn remember_agent_panel_visibility(&self, workspace: &Workspace, key: TabKey) {
+        if key.slot != Slot::Agent {
+            return;
+        }
+        let project_id = workspace.project.id;
+        let card_id = self.tab_card_id(project_id, key);
+        let visibility = card_id.as_deref().and_then(|card_id| {
+            self.board_states
+                .borrow()
+                .get(&project_id)
+                .map(|board| board.workspace_visibility(card_id))
+        });
+        let mut manual_hidden = workspace.manual_hidden_agents.borrow_mut();
+        if visibility == Some(crate::session::board_store::CardWorkspaceVisibility::Show)
+            && !workspace.is_visible(key)
+        {
+            if let Some(card_id) = card_id {
+                manual_hidden.insert(key, card_id);
+            }
+        } else {
+            manual_hidden.remove(&key);
+        }
+    }
+
     fn sync_board_sessions(&self) {
         let workspaces: Vec<Rc<Workspace>> = self.workspaces.borrow().values().cloned().collect();
         for workspace in workspaces {
@@ -4183,27 +4260,48 @@ impl App {
         }
     }
 
+    /// The workspace mirrors the board: a session whose to-do is done or gone
+    /// is hidden, and a session whose to-do is In progress or Review is shown.
+    /// A to-do still in Todo leaves its session as it is — unless the user
+    /// hid that panel, which stays hidden until the policy changes.
     fn sync_workspace_sessions(&self, workspace: &Rc<Workspace>) {
         let project_id = workspace.project.id;
         let mut decisions: Vec<(TabKey, bool)> = Vec::new();
+        use crate::session::board_store::CardWorkspaceVisibility;
         for key in workspace.tabs_of_kind(Slot::Agent) {
             let Some(card_id) = self.tab_card_id(project_id, key) else {
                 continue;
             };
-            let want = {
+            let visibility = {
                 let states = self.board_states.borrow();
                 let Some(board) = states.get(&project_id) else {
                     return;
                 };
-                use crate::session::board_store::CardWorkspaceVisibility;
-                match board.workspace_visibility(&card_id) {
-                    CardWorkspaceVisibility::Show => Some(true),
-                    CardWorkspaceVisibility::Hide => Some(false),
-                    CardWorkspaceVisibility::Preserve => None,
+                board.workspace_visibility(&card_id)
+            };
+            let manually_hidden = {
+                let mut hidden = workspace.manual_hidden_agents.borrow_mut();
+                if visibility == CardWorkspaceVisibility::Show {
+                    match hidden.get(&key) {
+                        Some(manual_card) if manual_card == &card_id => true,
+                        Some(_) => {
+                            hidden.remove(&key);
+                            false
+                        }
+                        None => false,
+                    }
+                } else {
+                    hidden.remove(&key);
+                    false
                 }
             };
-            if let Some(want) = want {
-                decisions.push((key, want));
+            if manually_hidden {
+                continue;
+            }
+            match visibility {
+                CardWorkspaceVisibility::Show => decisions.push((key, true)),
+                CardWorkspaceVisibility::Hide => decisions.push((key, false)),
+                CardWorkspaceVisibility::Preserve => {}
             }
         }
 
@@ -4409,6 +4507,17 @@ impl App {
                 }
             }
         }
+        let card_scroll_position = matches!(
+            self.home_nav.borrow().last(),
+            Some(HomeView::Card(_, _))
+        )
+        .then(|| {
+            self.stack
+                .child_by_name("_home")
+                .and_then(|view| home_card_scroller(&view))
+                .map(|scroller| scroller.vadjustment().value())
+        })
+        .flatten();
         // Clear focus before destroying the view so GTK holds no stale widget.
         gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
         while let Some(child) = self.stack.child_by_name("_home") {
@@ -4416,6 +4525,15 @@ impl App {
         }
         self.stack.add_named(&home::view(self), Some("_home"));
         self.stack.set_visible_child_name("_home");
+        if let Some(position) = card_scroll_position {
+            if let Some(scroller) = self
+                .stack
+                .child_by_name("_home")
+                .and_then(|view| home_card_scroller(&view))
+            {
+                restore_scroll_position(&scroller, position);
+            }
+        }
     }
 
     /// Open Home's combined Add-a-project picker, switching to Home from
@@ -4624,6 +4742,7 @@ impl App {
         let workspace = Rc::new(Workspace {
             project: project.clone(),
             tabs: RefCell::new(HashMap::new()),
+            manual_hidden_agents: RefCell::new(HashMap::new()),
             programs: RefCell::new(HashMap::new()),
             panels: RefCell::new(Vec::new()),
             positions: RefCell::new(HashMap::new()),
@@ -6225,6 +6344,8 @@ mod home_navigation_tests {
         let bins = scratch.path().join("bin");
         std::fs::create_dir(&bins).unwrap();
         let launches = scratch.path().join("launches");
+        // The stub answers `session list` empty and records every launch and
+        // input line for assertions.
         let stub = format!("#!/bin/sh\nif [ \"$1\" = session ]; then printf '[]'; exit 0; fi\nprintf 'launch\\t%s\\t%s\\t%s\\t%s\\n' \"$0\" \"$RADAR_CARD_ID\" \"$RADAR_AGENT\" \"$*\" >> {launches:?}\nwhile IFS= read -r line; do printf 'input\\t%s\\t%s\\n' \"$RADAR_CARD_ID\" \"$line\" >> {launches:?}; done\n");
         for (name, script) in [
             ("opencode", stub.clone()),
@@ -6389,6 +6510,19 @@ mod home_navigation_tests {
             .into_iter()
             .find(|widget| widget.has_css_class("hud-root"))
             .unwrap();
+        for index in 0..16 {
+            crate::session::daemon::board_card_add(
+                &paths.data_dir,
+                project.id,
+                None,
+                &format!("List scroll {index}"),
+                "",
+                None,
+                &format!("nav-list-{index}"),
+            )
+            .unwrap();
+        }
+
         let workspace_width = stack.width();
         activate(&window, "win.new-session", None);
         assert!(todos.is_visible());
@@ -6397,6 +6531,27 @@ mod home_navigation_tests {
             workspace_width,
             "the shared dialog must not resize the workspace"
         );
+        let list_scroll = widgets(&todos)
+            .into_iter()
+            .find_map(|widget| widget.downcast::<gtk::ScrolledWindow>().ok())
+            .expect("the to-do list is scrollable");
+        wait_until(|| list_scroll.vadjustment().upper() > list_scroll.vadjustment().page_size() + 20.0);
+        list_scroll.vadjustment().set_value(40.0);
+        activate(
+            &window,
+            "win.card-saved",
+            Some(&project.id.to_variant()),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            drain();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            (list_scroll.vadjustment().value() - 40.0).abs() < 1.0,
+            "passive board refreshes preserve the filtered to-do list position"
+        );
+
         assert!(widgets(&todos)
             .iter()
             .any(|widget| widget.has_css_class("hud-card")));
@@ -6446,7 +6601,7 @@ mod home_navigation_tests {
             project.id,
             None,
             "Navigation todo",
-            "",
+            &(0..100).map(|i| format!("Paragraph {i}\n\n")).collect::<String>(),
             None,
             "nav-add",
         )
@@ -6688,23 +6843,94 @@ mod home_navigation_tests {
             Some(&(project.id, card.id.as_str()).to_variant()),
         );
         assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        let home_thread_scroll = || {
+            widgets(&stack.child_by_name("_home").unwrap())
+                .into_iter()
+                .find(|widget| widget.has_css_class("card-thread"))
+                .unwrap()
+                .downcast::<gtk::ScrolledWindow>()
+                .unwrap()
+        };
+        wait_until(|| home_thread_scroll().vadjustment().upper() > 1000.0);
+        home_thread_scroll().vadjustment().set_value(500.0);
+        gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
+        activate(
+            &window,
+            "win.card-saved",
+            Some(&project.id.to_variant()),
+        );
+        wait_until(|| home_thread_scroll().vadjustment().upper() > 1000.0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            drain();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            (home_thread_scroll().vadjustment().value() - 500.0).abs() < 1.0,
+            "Home refreshes preserve a manually scrolled conversation"
+        );
         activate(&window, "win.home-back", None);
         assert_eq!(stack.visible_child_name().as_deref(), Some("_agents"));
         assert_eq!(stack.child_by_name("_agents").unwrap(), agents_page);
         activate(&window, "win.home-back", None);
         assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
         activate(&window, "win.open-project", Some(&project.id.to_variant()));
-
-        // The header's done control, beside the to-do title: mark the
-        // session's to-do done from the workspace. The store records done,
-        // the panel hides, the program keeps running.
         let workspace_child = stack
             .child_by_name(&format!("project-{}", project.id))
             .unwrap();
-        assert!(widgets(&workspace_child)
-            .iter()
-            .filter_map(|widget| widget.downcast_ref::<gtk::Button>())
-            .any(|button| button.action_name().as_deref() == Some("win.session-todo")));
+        let has_agent_header = || {
+            widgets(&workspace_child)
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Button>())
+                .any(|button| button.action_name().as_deref() == Some("win.session-todo"))
+        };
+        wait_until(|| has_agent_header());
+        activate(&window, "win.primitive-toggle", Some(&"agent".to_variant()));
+        assert!(!has_agent_header(), "the user can hide the agent panel");
+        activate(
+            &window,
+            "win.card-saved",
+            Some(&project.id.to_variant()),
+        );
+        assert!(
+            !has_agent_header(),
+            "a passive board refresh must not undo the user's panel toggle"
+        );
+        activate(&window, "win.primitive-toggle", Some(&"agent".to_variant()));
+        assert!(has_agent_header(), "the user can show the panel again");
+
+        // Refreshing an open card detail must preserve its manual scroll offset.
+        activate(
+            &window,
+            "win.open-card",
+            Some(&(project.id, card.id.as_str()).to_variant()),
+        );
+        let thread_scroll = || {
+            widgets(&todos)
+                .into_iter()
+                .find(|widget| widget.has_css_class("card-thread"))
+                .unwrap()
+                .downcast::<gtk::ScrolledWindow>()
+                .unwrap()
+        };
+        wait_until(|| thread_scroll().vadjustment().upper() > 1000.0);
+        thread_scroll().vadjustment().set_value(500.0);
+        gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
+        activate(
+            &window,
+            "win.card-saved",
+            Some(&project.id.to_variant()),
+        );
+        wait_until(|| thread_scroll().vadjustment().upper() > 1000.0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            drain();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            (thread_scroll().vadjustment().value() - 500.0).abs() < 1.0,
+            "passive updates preserve a manually scrolled conversation"
+        );
         activate(
             &window,
             "win.session-todo-done",

@@ -16,6 +16,12 @@ work, agent activity, and requests for human attention together. Opening a
 session is a drill-down; returning to the board must preserve the tool layout
 and leave sessions running. Notifications invite action without stealing focus.
 
+Passive refreshes preserve the person's workspace state: a manually hidden
+agent panel stays hidden while the card's visibility policy requests it shown,
+and to-do lists and conversations retain their scroll position when rebuilt.
+When the card's visibility policy changes, the board reconciles the panel
+again.
+
 ## Current ownership and remaining gaps
 
 The original phase-1 concerns about widget-owned process lifetime, blocking
