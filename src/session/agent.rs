@@ -484,10 +484,14 @@ impl AgentHost {
     fn send(&self, id: &str, command: AgentCommand) -> Result<()> {
         let agents = self.agents.lock();
         let entry = agents.get(id).context("unknown agent session")?;
-        entry
-            .commands
-            .try_send(command)
-            .map_err(|error| anyhow::anyhow!("agent session is not accepting commands: {error}"))
+        match entry.commands.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_closed() => {
+                let state = entry.status.state.clone();
+                bail!("agent session {id} is {state}; it no longer accepts commands")
+            }
+            Err(error) => bail!("agent session is not accepting commands: {error}"),
+        }
     }
 
     fn set_status(&self, id: &str, state: &str, detail: Option<String>) {
