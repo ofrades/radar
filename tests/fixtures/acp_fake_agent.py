@@ -139,12 +139,29 @@ def reader():
                 request_id,
                 {
                     "protocolVersion": 1,
-                    "agentCapabilities": {"loadSession": True},
+                    "agentCapabilities": {
+                        "loadSession": True,
+                        "sessionCapabilities": {"list": {}},
+                    },
                     "agentInfo": {"name": "fake-agent", "version": "0.1.0"},
                 },
             )
         elif method == "session/new":
             reply(request_id, {"sessionId": "sess_fake_1"})
+        elif method == "session/list":
+            # One conversation the agent still has.
+            reply(
+                request_id,
+                {
+                    "sessions": [
+                        {
+                            "sessionId": "sess_fake_1",
+                            "cwd": params.get("cwd") or "/tmp",
+                            "title": "the fake conversation",
+                        }
+                    ]
+                },
+            )
         elif method == "session/load":
             # Reuse the session and tell the client its restored mode.
             reply(

@@ -391,6 +391,15 @@ enum AcpAction {
         config_id: Option<String>,
         value: Option<String>,
     },
+    /// List the conversations the agent itself still has (ACP session/list)
+    Sessions { id: String },
+    /// Bind one of the agent's conversations as the resume target, so
+    /// `radar acp resume <id>` reopens it
+    Adopt {
+        id: String,
+        /// The ACP session id, as `radar acp sessions` lists it
+        session_id: String,
+    },
     /// List the agents the daemon is running
     List,
 }
@@ -1066,6 +1075,51 @@ fn acp_command(paths: &Paths, action: AcpAction) -> Result<()> {
                 }
                 other => anyhow::bail!("unexpected daemon response: {other:?}"),
             }
+            return Ok(());
+        }
+        AcpAction::Sessions { id } => {
+            match Client::request(&paths.data_dir, Request::AgentSessions { id })? {
+                Response::AgentSessions(sessions) => {
+                    println!("{}", serde_json::to_string(&sessions)?);
+                }
+                other => anyhow::bail!("unexpected daemon response: {other:?}"),
+            }
+            return Ok(());
+        }
+        AcpAction::Adopt { id, session_id } => {
+            match Client::request(&paths.data_dir, Request::AgentSessions { id: id.clone() })? {
+                Response::AgentSessions(sessions) => {
+                    let listed = sessions
+                        .iter()
+                        .any(|session| session.session_id == session_id);
+                    anyhow::ensure!(
+                        listed,
+                        "agent {id} does not list session {session_id}; adopt what it actually offers"
+                    );
+                }
+                other => anyhow::bail!("unexpected daemon response: {other:?}"),
+            }
+            // The same binding a session/read a TUI claim writes; the resume
+            // mechanic is one, regardless of where the conversation came from.
+            let project_id = default_project_id()?;
+            use radar::config::Paths;
+            let db = radar::db::Db::open(&Paths::with_root(paths.data_dir.clone()))?;
+            let Response::Agents(agents) = Client::request(&paths.data_dir, Request::AgentList)?
+            else {
+                anyhow::bail!("unexpected daemon response while locating {id}");
+            };
+            let agent = agents
+                .into_iter()
+                .find(|agent| agent.id == id)
+                .context("agent session is not running")?;
+            if agent
+                .capabilities
+                .as_ref()
+                .is_none_or(|capabilities| !capabilities.load_session)
+            {
+                anyhow::bail!("agent {id} cannot reload sessions; adopting would have no effect");
+            }
+            db.bind_session(project_id, &id, &agent.provider, &session_id)?;
             return Ok(());
         }
         AcpAction::List => Request::AgentList,

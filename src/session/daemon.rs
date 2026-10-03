@@ -216,6 +216,10 @@ pub enum Command {
         config_id: String,
         value: String,
     },
+    /// The conversations the agent itself still holds (`session/list`).
+    AgentSessions {
+        id: String,
+    },
     /// Every ACP agent the daemon is running.
     AgentList,
 }
@@ -269,6 +273,8 @@ pub enum Response {
     AgentModes(AgentModes),
     /// The config option was switched; the agent's authoritative set is back.
     AgentConfigOptions(Vec<AgentConfigOption>),
+    /// The agent's own conversations.
+    AgentSessions(Vec<super::agent::AgentSessionInfo>),
 }
 
 /// Socket directory is private even when the surrounding RADAR_HOME is shared.
@@ -861,6 +867,7 @@ fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
                 .agents
                 .set_config_option_status(&id, &config_id, &value)?,
         ),
+        Command::AgentSessions { id } => Response::AgentSessions(services.agents.sessions(&id)?),
         Command::AgentList => Response::Agents(services.agents.list()),
         Command::PublishActivity(input) => {
             Response::ActivityPublished(services.activity.publish(input)?)

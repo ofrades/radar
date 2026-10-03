@@ -19,13 +19,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest,
-    PermissionOptionKind, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigSelectOptions, SessionConfigValueId, SessionId, SessionModeId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
-    TextContent,
+    CancelNotification, ContentBlock, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
+    NewSessionRequest, PermissionOptionKind, PromptRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigSelectOptions, SessionConfigValueId, SessionId,
+    SessionModeId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionModeRequest, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo};
@@ -40,6 +40,18 @@ use super::activity::{
 
 /// Unique-enough idempotency token for the activity this adapter publishes.
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// One conversation an agent already has, from `session/list`. The cwd and
+/// title are the agent's own; the id is what `acp resume` reopens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSessionInfo {
+    pub session_id: String,
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
 
 /// One selectable session mode on a running agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +243,9 @@ enum AgentCommand {
     SetMode(SessionModeId),
     /// Switch a session config option (model, effort, …).
     SetConfigOption(String, SessionConfigOptionValue),
+    /// Ask for the agent's own conversation list; the reply travels back on
+    /// the given channel.
+    ListSessions(async_channel::Sender<Result<Vec<AgentSessionInfo>, String>>),
     Cancel,
     Stop,
 }
@@ -402,6 +417,28 @@ impl AgentHost {
     /// Ask the agent to cancel its current turn.
     pub fn cancel(&self, id: &str) -> Result<()> {
         self.send(id, AgentCommand::Cancel)
+    }
+
+    /// The conversations the agent itself still has, from `session/list`.
+    pub fn sessions(&self, id: &str) -> Result<Vec<AgentSessionInfo>> {
+        let (sender, receiver) = async_channel::bounded(1);
+        self.send(id, AgentCommand::ListSessions(sender))?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match receiver.try_recv() {
+                Ok(Ok(sessions)) => return Ok(sessions),
+                Ok(Err(message)) => bail!("{message}"),
+                Err(async_channel::TryRecvError::Closed) => {
+                    bail!("agent session stopped while listing its conversations")
+                }
+                Err(async_channel::TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(async_channel::TryRecvError::Empty) => {
+                    bail!("agent never answered the session list")
+                }
+            }
+        }
     }
 
     /// Stop an agent: end the connection, unblocking any permission prompt it
@@ -852,6 +889,38 @@ async fn connect(
                                 );
                             }
                         }
+                    }
+                    AgentCommand::ListSessions(reply) => {
+                        // Agents that cannot list stay legible, not silent.
+                        let outcome = match initialized.agent_capabilities.session_capabilities.list
+                        {
+                            None => Err("agent does not support session/list".to_string()),
+                            Some(_) => {
+                                match connection
+                                    .send_request(
+                                        ListSessionsRequest::new()
+                                            .cwd(Some(connection_spec.cwd.clone())),
+                                    )
+                                    .block_task()
+                                    .await
+                                {
+                                    Ok(response) => Ok(response
+                                        .sessions
+                                        .into_iter()
+                                        .map(|info| AgentSessionInfo {
+                                            session_id: info.session_id.0.to_string(),
+                                            cwd: info.cwd,
+                                            title: info.title,
+                                            updated_at: info.updated_at,
+                                        })
+                                        .collect()),
+                                    Err(error) => Err(error.to_string()),
+                                }
+                            }
+                        };
+                        // Awaiting is what makes the send real: an unawaited
+                        // send future is a dropped message and a closed channel.
+                        let _ = reply.send(outcome).await;
                     }
                     AgentCommand::Cancel => {
                         let _ = connection

@@ -292,9 +292,9 @@ fn acp_resume_reloads_the_bound_conversation() {
     // The binding lands in the same claim -> conversation store a TUI session
     // writes, as soon as the agent confirms its session id.
     until(|| {
-        radar::db::Db::open(&paths)
-            .and_then(|db| db.bound_session(project_id, id))
-            .is_ok_and(|bound| bound.is_some())
+        let bound = radar::db::Db::open(&paths).and_then(|db| db.bound_session(project_id, id));
+        eprintln!("adopt: binding = {bound:?}");
+        bound.is_ok_and(|bound| bound.is_some())
     });
 
     // The load request (not process continuity) is what the test proves: the
@@ -310,5 +310,72 @@ fn acp_resume_reloads_the_bound_conversation() {
             .find(|agent| agent.id == id)
             .and_then(|agent| agent.modes.as_ref())
             .is_some_and(|modes| modes.current == "review")
+    });
+}
+
+/// A conversation the agent itself holds (session/list) becomes the resume
+/// target via adopt, through the same binding mechanism a fresh session uses.
+#[test]
+fn acp_sessions_lists_and_adopts_a_conversation() {
+    let daemon = Daemon::start();
+    let id = "acp-adopt";
+    let paths = radar::config::Paths::with_root(daemon.home.path().to_path_buf());
+    let cwd = paths.data_dir.join("adopt-project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let project_id = radar::db::Db::open(&paths)
+        .and_then(|db| db.add_project(&cwd))
+        .unwrap()
+        .id;
+
+    daemon.request(Request::AgentStart(AgentStart {
+        id: id.to_string(),
+        provider: "fake".to_string(),
+        program: "python3".to_string(),
+        args: vec![fixture()],
+        cwd: daemon.home.path().to_path_buf(),
+        project_id,
+        session_id: None,
+        card_id: None,
+        acp_session_id: None,
+    }));
+    wait_state(&daemon, id, "ready");
+
+    let listed = daemon.request(Request::AgentSessions { id: id.to_string() });
+    match listed {
+        Response::AgentSessions(sessions) => {
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].session_id, "sess_fake_1");
+            assert_eq!(sessions[0].title.as_deref(), Some("the fake conversation"));
+        }
+        other => panic!("unexpected response {other:?}"),
+    }
+
+    daemon.request(Request::AgentStop { id: id.to_string() });
+    wait_state(&daemon, id, "exited");
+
+    // Adopt binds the listed conversation; resume then reopens it.
+    radar::db::Db::open(&paths)
+        .and_then(|db| db.bind_session(project_id, id, "python3", "sess_fake_1"))
+        .unwrap();
+    let resumed = daemon.request(Request::AgentStart(AgentStart {
+        id: id.to_string(),
+        provider: "fake".to_string(),
+        program: "python3".to_string(),
+        args: vec![fixture()],
+        cwd: daemon.home.path().to_path_buf(),
+        project_id,
+        session_id: None,
+        card_id: None,
+        acp_session_id: Some(String::from("sess_fake_1")),
+    }));
+    assert!(
+        matches!(resumed, Response::AgentStatus(_)),
+        "unexpected response {resumed:?}"
+    );
+    wait_state(&daemon, id, "ready");
+    until(|| {
+        let bound = radar::db::Db::open(&paths).and_then(|db| db.bound_session(project_id, id));
+        eprintln!("resume binding = {bound:?}");
+        bound.is_ok_and(|bound| bound.is_some_and(|(_program, session)| session == "sess_fake_1"))
     });
 }

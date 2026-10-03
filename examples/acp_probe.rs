@@ -14,9 +14,9 @@
 use std::str::FromStr;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionNotification, SessionUpdate, TextContent,
+    ContentBlock, InitializeRequest, ListSessionsRequest, NewSessionRequest, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo};
@@ -83,11 +83,22 @@ fn main() -> anyhow::Result<()> {
                 println!("[init] {:?}", init.agent_info);
 
                 let new_session = connection
-                    .send_request(NewSessionRequest::new(cwd))
+                    .send_request(NewSessionRequest::new(cwd.clone()))
                     .block_task()
                     .await?;
                 let session_id = new_session.session_id;
                 println!("[session] {}", session_id.0);
+
+                let listing = connection
+                    .send_request(ListSessionsRequest::new().cwd(Some(cwd.clone())))
+                    .block_task()
+                    .await?;
+                for info in &listing.sessions {
+                    println!(
+                        "[list] {} {:?} {:?}",
+                        info.session_id.0, info.title, info.cwd
+                    );
+                }
 
                 let response = connection
                     .send_request(PromptRequest::new(
