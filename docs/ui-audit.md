@@ -10,10 +10,10 @@ and keep developer tools explicit, rather than copying Basecamp's colours.
 | --- | --- | --- |
 | Home | Small title and Agents hidden in a top-right count | Hero title with context below; a large Agents card with running count, explanation and drill-down arrow |
 | Projects on Home | The strongest existing pattern | Preserve the card grid and inline actions; give cards more breathing room |
-| Project board | Compact utility header and flat lane dividers | Shared hero/back header, framed lane cards and individually surfaced to-dos |
+| Project board | Compact utility header and flat lane dividers | Shared horizontal hero/back header: title and context share a stack; project actions sit at the right; framed lane cards and individually surfaced to-dos |
 | Card conversation | Project heading competes with a small task title; dense comments | Parent project becomes quiet context; the task owns the hero title; roomier conversation cards |
-| Agents | Different compact header despite being a Home destination | Same hero/back header; retain persistent live panes and their arrangement |
-| Add project | Another custom toolbar header | Same hero/back header with an explicit Choose folder action; keep the existing search/add/create flow |
+| Agents | Different compact header despite being a Home destination | Same hero/back header with the running count under the title and Auto arrange at the right; retain persistent live panes and their arrangement |
+| Add project | Another custom toolbar header | Same hero/back header with Choose folder at the right; keep the existing search/add/create flow |
 | Empty Home | Already project-first | Keep the single Add a project action |
 | Developer workspace | Fixed kind-based splits and window-based nested-divider sizes waste available space | Shared responsive tiler with the global Agents workspace; keep compact pane headers and keyboard shortcuts |
 | Preferences, edit dialogs and shortcuts | Focused secondary controls, not primary destinations | Keep them secondary; no new navigation or duplicated settings on Home |

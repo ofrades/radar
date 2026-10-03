@@ -149,16 +149,21 @@ fn card_view(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
     root.upcast()
 }
 
-/// A readable way back, followed by the destination's hero title.
+/// A readable way back, title and optional context, with actions kept at the
+/// edge of the same header row.
 fn view_header(title: &str, meta: Option<&str>) -> gtk::Widget {
     let meta = meta.map(|text| gtk::Label::new(Some(text)));
-    page_header(title, meta.as_ref()).upcast()
+    page_header(title, meta.as_ref(), None).upcast()
 }
 
-/// Shared by persistent pages too: their metadata can update without
+/// Shared by drill-down and persistent pages: metadata can update without
 /// rebuilding the header or any live terminal beneath it.
-pub(super) fn page_header(title: &str, meta: Option<&gtk::Label>) -> gtk::Box {
-    let bar = gtk::Box::new(gtk::Orientation::Vertical, 10);
+pub(super) fn page_header(
+    title: &str,
+    meta: Option<&gtk::Label>,
+    action: Option<gtk::Widget>,
+) -> gtk::Box {
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     bar.add_css_class("home-view-bar");
     let back = gtk::Button::builder()
         .label("← Back")
@@ -166,21 +171,31 @@ pub(super) fn page_header(title: &str, meta: Option<&gtk::Label>) -> gtk::Box {
         .build();
     back.add_css_class("flat");
     back.set_halign(gtk::Align::Start);
+    back.set_valign(gtk::Align::Start);
     back.set_action_name(Some("win.home-back"));
     bar.append(&back);
+
+    let identity = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    identity.set_hexpand(true);
     let name = gtk::Label::new(Some(title));
     name.set_xalign(0.0);
     name.add_css_class("hero-title");
     name.set_wrap(true);
     name.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    bar.append(&name);
+    identity.append(&name);
     if let Some(meta) = meta {
         meta.add_css_class("caption");
         meta.add_css_class("dim-label");
         meta.set_xalign(0.0);
         meta.set_wrap(true);
         meta.set_hexpand(true);
-        bar.append(meta);
+        identity.append(meta);
+    }
+    bar.append(&identity);
+
+    if let Some(action) = action {
+        action.set_valign(gtk::Align::Start);
+        bar.append(&action);
     }
     bar
 }
@@ -877,7 +892,30 @@ fn project_view(app: &App, project_id: i64) -> gtk::Widget {
         .borrow()
         .get(&project_id)
         .map(|status| status.summary());
-    root.append(&view_header(&project.name, git.as_deref()));
+    let mut context = project.subtitle();
+    if let Some(git) = git {
+        context.push_str(" · ");
+        context.push_str(&git);
+    }
+    let meta = gtk::Label::new(Some(&context));
+    meta.set_selectable(true);
+
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let open_workspace = gtk::Button::with_label("Open workspace");
+    open_workspace.add_css_class("flat");
+    open_workspace.set_tooltip_text(Some(
+        "Open agent and developer tools; Home keeps running behind them",
+    ));
+    open_workspace.set_action_name(Some("win.open-project"));
+    open_workspace.set_action_target_value(Some(&project_id.to_variant()));
+    open_workspace.set_sensitive(!project.is_missing());
+    actions.append(&open_workspace);
+    actions.append(&project_menu(&project));
+    root.append(&page_header(
+        &project.name,
+        Some(&meta),
+        Some(actions.upcast()),
+    ));
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
     content.add_css_class("home-cockpit");
@@ -889,25 +927,6 @@ fn project_view(app: &App, project_id: i64) -> gtk::Widget {
     content.set_margin_end(22);
     content.set_halign(gtk::Align::Fill);
     content.set_hexpand(true);
-
-    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let open_workspace = gtk::Button::with_label("Open workspace");
-    open_workspace.add_css_class("flat");
-    open_workspace.set_tooltip_text(Some(
-        "Open agent and developer tools; Home keeps running behind them",
-    ));
-    open_workspace.set_action_name(Some("win.open-project"));
-    open_workspace.set_action_target_value(Some(&project_id.to_variant()));
-    actions.append(&open_workspace);
-    open_workspace.set_sensitive(!project.is_missing());
-    actions.append(&project_menu(&project));
-    content.append(&actions);
-    let path = gtk::Label::new(Some(&project.subtitle()));
-    path.set_xalign(0.0);
-    path.set_selectable(true);
-    path.add_css_class("caption");
-    path.add_css_class("dim-label");
-    content.append(&path);
 
     content.append(&todo_add_entry(app, project_id));
 
@@ -1471,7 +1490,8 @@ mod tests {
             assert!(card.is_sensitive());
         }
         let meta = gtk::Label::new(Some("3 running"));
-        let header = page_header("Agents", Some(&meta));
+        let action = gtk::Button::with_label("Auto arrange");
+        let header = page_header("Agents", Some(&meta), Some(action.clone().upcast()));
         let back = header
             .first_child()
             .unwrap()
@@ -1479,14 +1499,20 @@ mod tests {
             .unwrap();
         assert_eq!(back.label().as_deref(), Some("← Back"));
         assert_eq!(back.action_name().as_deref(), Some("win.home-back"));
-        let title = back
-            .next_sibling()
+        let identity = back.next_sibling().unwrap().downcast::<gtk::Box>().unwrap();
+        let title = identity
+            .first_child()
             .unwrap()
             .downcast::<gtk::Label>()
             .unwrap();
         assert!(title.has_css_class("hero-title"));
         assert!(title.wraps());
         meta.set_text("4 running");
-        assert_eq!(header.last_child().unwrap(), meta.upcast::<gtk::Widget>());
+        assert_eq!(
+            identity.last_child().unwrap(),
+            meta.clone().upcast::<gtk::Widget>()
+        );
+        assert_eq!(header.last_child().unwrap(), action.upcast::<gtk::Widget>());
+        assert_eq!(header.orientation(), gtk::Orientation::Horizontal);
     }
 }

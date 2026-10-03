@@ -79,15 +79,13 @@ pub(super) fn page() -> AgentsPage {
     root.add_css_class("agents-view");
 
     let meta = gtk::Label::new(None);
-    let header = super::home::page_header("Agents", Some(&meta));
     let arrange = gtk::Button::with_label("Auto arrange");
     arrange.add_css_class("flat");
-    arrange.set_halign(gtk::Align::Start);
     arrange.set_tooltip_text(Some(
         "Fit all panels to the available space; reset manual arrangement",
     ));
     arrange.set_action_name(Some("win.agents-auto-arrange"));
-    header.append(&arrange);
+    let header = super::home::page_header("Agents", Some(&meta), Some(arrange.upcast()));
     root.append(&header);
 
     // The wall: the workspace's arrangement, filling the page — panels side

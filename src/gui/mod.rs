@@ -754,13 +754,11 @@ fn build_window(
     let adder = gtk::Box::new(gtk::Orientation::Vertical, 0);
     adder.add_css_class("home-view");
     adder.add_css_class("add-project-view");
-    let adder_header = home::page_header("Add a project", None);
     let adder_choose = gtk::Button::with_label("Choose folder…");
     adder_choose.add_css_class("flat");
-    adder_choose.set_halign(gtk::Align::Start);
     adder_choose.set_tooltip_text(Some("Add a folder anywhere, with the system chooser"));
     adder_choose.set_action_name(Some("win.home-import-dialog"));
-    adder_header.append(&adder_choose);
+    let adder_header = home::page_header("Add a project", None, Some(adder_choose.clone().upcast()));
 
     let adder_body = gtk::Box::new(gtk::Orientation::Vertical, 10);
     adder_body.add_css_class("home-cockpit");
