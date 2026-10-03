@@ -195,14 +195,6 @@ impl GridRef {
     }
 }
 
-/// `GhosttyPointCoordinate`.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct PointCoordinate {
-    x: u16,
-    y: u32,
-}
-
 /// `GhosttyPoint`: a tagged point in the terminal grid.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -214,12 +206,12 @@ struct Point {
 
 impl Point {
     /// A viewport point; `y` is the row within the visible viewport.
+    ///
+    /// Packed arithmetically, not through a cast: `PointCoordinate` carries
+    /// two bytes of padding, and transmuting them into the value poisons the
+    /// result, which the optimizer folds into `unreachable` under `-O2`.
     fn viewport(x: u16, y: u32) -> Self {
-        let coordinate = PointCoordinate { x, y };
-        let packed = unsafe {
-            let bytes: [u8; 8] = std::mem::transmute(coordinate);
-            u64::from_le_bytes(bytes)
-        };
+        let packed = (x as u64) | ((y as u64) << 32);
         Self {
             tag: POINT_TAG_VIEWPORT,
             _padding: 0,
