@@ -674,16 +674,7 @@ fn serve(
             let change =
                 board.claim_card(project_id, &card_id, claim.as_deref(), expected_revision)?;
             if let Some(claim) = claim.as_deref() {
-                for status in registry.list() {
-                    if catalog::project_of_session_id(&status.id) == Some(project_id)
-                        && registry
-                            .get(&status.id)
-                            .ok()
-                            .is_some_and(|session| session.agent_id() == Some(claim))
-                    {
-                        catalog.associate_card(project_id, &status.id, &card_id)?;
-                    }
-                }
+                associate_live_card(&registry, &catalog, project_id, &card_id, claim)?;
             }
             publish_board_change(&activity, project_id, &command_id, &change)?;
             Response::CardChanged(Box::new(change))
@@ -725,6 +716,7 @@ fn serve(
         } => {
             let result = board.next_card(project_id, &who, lane.as_deref())?;
             if let Some(change) = &result {
+                associate_live_card(&registry, &catalog, project_id, &change.card.id, &who)?;
                 publish_board_change(&activity, project_id, &command_id, change)?;
             }
             Response::CardNext(result.map(Box::new))
@@ -827,6 +819,29 @@ fn serve(
         }
     };
     write_frame(stream, &response, MAX_RESPONSE)
+}
+
+/// Keep a card claimed from inside a live agent attached to that agent's
+/// durable session. `card next` is the normal worker workflow, so it must do
+/// the same association as the explicit `card claim` command.
+fn associate_live_card(
+    registry: &Registry,
+    catalog: &SessionCatalog,
+    project_id: i64,
+    card_id: &str,
+    claim: &str,
+) -> Result<()> {
+    for status in registry.list() {
+        if catalog::project_of_session_id(&status.id) == Some(project_id)
+            && registry
+                .get(&status.id)
+                .ok()
+                .is_some_and(|session| session.agent_id() == Some(claim))
+        {
+            catalog.associate_card(project_id, &status.id, card_id)?;
+        }
+    }
+    Ok(())
 }
 
 /// Publish the `BoardChanged` activity event a card mutation produced, so

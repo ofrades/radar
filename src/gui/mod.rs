@@ -1839,6 +1839,23 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         app.window.add_action(&action);
     }
     {
+        // Explicitly request a fresh conversation instead of making the
+        // normal Open/Resume action unexpectedly create a duplicate.
+        let action = gio::SimpleAction::new(
+            "card-session-new",
+            Some(glib::VariantTy::new("(xs)").expect("a project and card ID")),
+        );
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            if let Some((project_id, card_id)) =
+                parameter.and_then(|value| value.get::<(i64, String)>())
+            {
+                app_for_action.start_new_card_session(project_id, &card_id);
+            }
+        });
+        app.window.add_action(&action);
+    }
+    {
         let action = gio::SimpleAction::new(
             "project-agent-open",
             Some(glib::VariantTy::new("(xs)").expect("a project/tab tuple")),
@@ -3166,6 +3183,29 @@ impl App {
     /// card so it knows what it was started for.
     fn start_card_session(&self, project_id: i64, card_id: &str) {
         self.without_navigation(|| self.start_card_worker(project_id, card_id));
+    }
+
+    /// Explicitly start a fresh agent conversation for a card. This is kept
+    /// separate from `start_card_worker`, whose job is to open or resume the
+    /// card's existing worker when one is available.
+    fn start_new_card_session(&self, project_id: i64, card_id: &str) {
+        self.without_navigation(|| {
+            if self.live_card_worker(project_id, card_id, None).is_some() {
+                self.toast("This to-do already has a running worker; open that session first");
+                return;
+            }
+            let title = self
+                .board_states
+                .borrow()
+                .get(&project_id)
+                .and_then(|state| state.cards.iter().find(|card| card.id == card_id))
+                .map(|card| card.title.clone())
+                .unwrap_or_else(|| "the linked to-do".to_string());
+            let prompt = crate::session::board_store::work_prompt(card_id, &title);
+            if self.spawn_agent_for_card(project_id, card_id, prompt) {
+                self.toast("Started a new agent session on this to-do");
+            }
+        });
     }
 
     fn project_catalog(

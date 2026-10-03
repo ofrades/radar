@@ -1113,10 +1113,6 @@ fn todo_row(
 /// Reach the task's conversation independently of its lane and mutable claim.
 /// Activation resolves the catalog again, even when sidebar history is bounded.
 fn card_session_chip(app: &App, project_id: i64, card: &board::WorkCard) -> gtk::Widget {
-    let button = gtk::Button::new();
-    button.add_css_class("flat");
-    button.add_css_class("card-session");
-    button.set_valign(gtk::Align::Center);
     let session = app
         .card_sessions(project_id, &card.id)
         .into_iter()
@@ -1127,6 +1123,10 @@ fn card_session_chip(app: &App, project_id: i64, card: &board::WorkCard) -> gtk:
                 session.last_activity_at,
             )
         });
+    let primary = gtk::Button::new();
+    primary.add_css_class("flat");
+    primary.add_css_class("card-session");
+    primary.set_valign(gtk::Align::Center);
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 5);
     let label = match &session {
         Some(session) if session.running => "Open session",
@@ -1136,7 +1136,7 @@ fn card_session_chip(app: &App, project_id: i64, card: &board::WorkCard) -> gtk:
         Some(_) => "Reconnect",
         None => "Find session",
     };
-    if let Some(session) = session {
+    if let Some(ref session) = session {
         let sign = app.session_activity_sign(project_id, &session);
         let dot = gtk::Label::new(Some("●"));
         dot.add_css_class("agent-state-dot");
@@ -1144,13 +1144,27 @@ fn card_session_chip(app: &App, project_id: i64, card: &board::WorkCard) -> gtk:
         content.append(&dot);
     }
     content.append(&gtk::Label::new(Some(label)));
-    button.set_child(Some(&content));
-    button.set_tooltip_text(Some(
+    primary.set_child(Some(&content));
+    primary.set_tooltip_text(Some(
         "Open this to-do's linked conversation, or reconnect it if no exact link exists",
     ));
-    button.set_action_name(Some("win.card-session-open"));
-    button.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
-    button.upcast()
+    primary.set_action_name(Some("win.card-session-open"));
+    primary.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
+
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+    actions.append(&primary);
+    if session.as_ref().is_some_and(|session| !session.running) {
+        let new = gtk::Button::with_label("New");
+        new.add_css_class("flat");
+        new.add_css_class("card-session");
+        new.add_css_class("card-session-new");
+        new.set_valign(gtk::Align::Center);
+        new.set_tooltip_text(Some("Start a new session for this to-do"));
+        new.set_action_name(Some("win.card-session-new"));
+        new.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
+        actions.append(&new);
+    }
+    actions.upcast()
 }
 
 /// The human's way in: an underlined input just under a project's board chips.

@@ -757,6 +757,62 @@ fn catalog_list(daemon: &Daemon, filter: radar::session::catalog::CatalogFilter)
     }
 }
 
+/// The normal agent workflow (`card next`) must attach the claimed card to
+/// the live session, just like an explicit `card claim` does.
+#[test]
+fn card_next_attaches_a_live_agent_session_to_the_card() {
+    use radar::session::catalog::CatalogFilter;
+
+    let daemon = Daemon::start();
+    let project = daemon.home.path().join("project-99");
+    std::fs::create_dir_all(&project).unwrap();
+    let id = "project-99-agent-0-opencode";
+    match daemon.request(Request::Create(Spawn {
+        id: id.into(),
+        argv: vec!["/bin/sh".into(), "-c".into(), "sleep 60".into()],
+        cwd: project,
+        env: vec![
+            ("RADAR_PROJECT_ID".into(), "99".into()),
+            ("RADAR_SESSION_PROVIDER".into(), "opencode".into()),
+            ("RADAR_AGENT".into(), "worker-1".into()),
+        ],
+        env_remove: Vec::new(),
+        dims: Dims { cols: 80, rows: 24 },
+    })) {
+        Response::Status(_) => {}
+        other => panic!("unexpected create response {other:?}"),
+    }
+    let card_id = match daemon.request(Request::CardAdd {
+        project_id: 99,
+        lane: None,
+        title: "Attach me".into(),
+        body: "from card next".into(),
+        claim: None,
+        command_id: "add-card-next-test".into(),
+    }) {
+        Response::CardChanged(change) => change.card.id,
+        other => panic!("unexpected card add response {other:?}"),
+    };
+
+    match daemon.request(Request::CardNext {
+        project_id: 99,
+        who: "worker-1".into(),
+        lane: None,
+        command_id: "next-card-test".into(),
+    }) {
+        Response::CardNext(Some(change)) => assert_eq!(change.card.id, card_id),
+        other => panic!("unexpected card next response {other:?}"),
+    }
+
+    let entries = catalog_entries(&daemon, catalog_list(&daemon, CatalogFilter::Active));
+    let session = entries
+        .iter()
+        .find(|entry| entry.radar_session_id.as_deref() == Some(id))
+        .expect("live agent should remain in the catalog");
+    assert_eq!(session.card_id.as_deref(), Some(card_id.as_str()));
+    assert_eq!(session.card_ids, [card_id]);
+}
+
 /// A created session lands in the catalog immediately, inherits its
 /// terminal's title, and ends when its process does.
 #[test]

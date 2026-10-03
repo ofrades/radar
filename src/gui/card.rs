@@ -490,6 +490,19 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
         }
         session_box.append(&open);
     }
+    let can_start_new = !linked
+        .iter()
+        .any(super::live_agents::sidebar_session_is_live);
+    if !linked.is_empty() && can_start_new && !card.done {
+        let new = gtk::Button::with_label("Start new session");
+        new.set_halign(gtk::Align::Start);
+        new.set_tooltip_text(Some(
+            "Start a fresh agent conversation; it will not resume an existing one",
+        ));
+        new.set_action_name(Some("win.card-session-new"));
+        new.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
+        session_box.append(&new);
+    }
     for session in linked {
         let running = super::live_agents::sidebar_session_is_live(&session);
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
