@@ -1137,7 +1137,7 @@ fn card_session_chip(app: &App, project_id: i64, card: &board::WorkCard) -> gtk:
         None => "Find session",
     };
     if let Some(ref session) = session {
-        let sign = app.session_activity_sign(project_id, &session);
+        let sign = app.session_activity_sign(project_id, session);
         let dot = gtk::Label::new(Some("●"));
         dot.add_css_class("agent-state-dot");
         dot.add_css_class(sign.css_class());

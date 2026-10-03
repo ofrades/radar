@@ -11,10 +11,12 @@ pub mod activity;
 pub mod agent;
 pub mod beads;
 pub mod beads_store;
+pub mod board;
 pub mod board_store;
 pub mod catalog;
 pub mod client;
 pub mod daemon;
+pub mod dispatch;
 pub mod registry;
 mod schema;
 

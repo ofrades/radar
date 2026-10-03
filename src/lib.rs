@@ -16,6 +16,7 @@ pub mod ghostty;
 pub mod git;
 #[cfg(feature = "gui")]
 pub mod gui;
+pub mod mcp;
 pub mod programs;
 pub mod session;
 pub mod setup;

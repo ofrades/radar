@@ -59,33 +59,56 @@ pub(super) fn plan_snapshot(
     (withdraw, raise)
 }
 
+/// What one `AttentionRequested` event contributes to a notification plan.
+pub(super) struct AttentionRequest<'a> {
+    pub project_id: i64,
+    pub request_id: &'a str,
+    pub kind: AttentionKind,
+    pub reason: &'a str,
+    pub card_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+}
+
 /// For a single `AttentionRequested` event: the notification to raise, unless
 /// the request is already outstanding or already raised.
 pub(super) fn plan_request(
-    project_id: i64,
+    request: &AttentionRequest<'_>,
     notified: &Notified,
     already_outstanding: bool,
-    request_id: &str,
-    kind: AttentionKind,
-    reason: &str,
-    card_id: Option<&str>,
-    session_id: Option<&str>,
 ) -> Option<Raise> {
-    if already_outstanding || notified.contains(&(project_id, request_id.to_string())) {
+    if already_outstanding
+        || notified.contains(&(request.project_id, request.request_id.to_string()))
+    {
         return None;
     }
     Some(Raise {
-        request_id: request_id.to_string(),
-        kind,
-        reason: reason.to_string(),
-        card_id: card_id.map(str::to_string),
-        session_id: session_id.map(str::to_string),
+        request_id: request.request_id.to_string(),
+        kind: request.kind,
+        reason: request.reason.to_string(),
+        card_id: request.card_id.map(str::to_string),
+        session_id: request.session_id.map(str::to_string),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request<'a>(
+        request_id: &'a str,
+        kind: AttentionKind,
+        card_id: Option<&'a str>,
+        session_id: Option<&'a str>,
+    ) -> AttentionRequest<'a> {
+        AttentionRequest {
+            project_id: 1,
+            request_id,
+            kind,
+            reason: "why",
+            card_id,
+            session_id,
+        }
+    }
 
     fn attention(id: &str, kind: AttentionKind) -> Attention {
         Attention {
@@ -146,39 +169,20 @@ mod tests {
     fn an_event_raises_once_and_never_when_outstanding() {
         let mut notified = Notified::new();
         let first = plan_request(
-            1,
+            &request(
+                "attention-9",
+                AttentionKind::Question,
+                Some("card-1"),
+                Some("session-1"),
+            ),
             &notified,
             false,
-            "attention-9",
-            AttentionKind::Question,
-            "why",
-            Some("card-1"),
-            Some("session-1"),
         );
         assert!(first.is_some());
         assert_eq!(first.unwrap().card_id.as_deref(), Some("card-1"));
         notified.insert((1, "attention-9".to_string()));
-        assert!(plan_request(
-            1,
-            &notified,
-            false,
-            "attention-9",
-            AttentionKind::Question,
-            "why",
-            None,
-            None,
-        )
-        .is_none());
-        assert!(plan_request(
-            1,
-            &Notified::new(),
-            true,
-            "attention-9",
-            AttentionKind::Question,
-            "why",
-            None,
-            None,
-        )
-        .is_none());
+        let again = request("attention-9", AttentionKind::Question, None, None);
+        assert!(plan_request(&again, &notified, false).is_none());
+        assert!(plan_request(&again, &Notified::new(), true).is_none());
     }
 }

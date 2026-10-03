@@ -579,7 +579,7 @@ pub(super) fn forget(app: &App, board: &Rc<AgentsBoard>, session_id: &str) {
 /// that panic takes the whole app down, so this is the one safe way to
 /// "find and remove" from a `RefCell<Vec<_>>`.
 fn take_first<T>(items: &RefCell<Vec<T>>, predicate: impl Fn(&T) -> bool) -> Option<T> {
-    let position = items.borrow().iter().position(|item| predicate(item))?;
+    let position = items.borrow().iter().position(predicate)?;
     Some(items.borrow_mut().remove(position))
 }
 

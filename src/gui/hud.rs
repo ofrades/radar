@@ -234,13 +234,15 @@ impl Hud {
     }
 
     fn replace_task(&self, app: &App, project_id: i64, card_id: &str, preserve_scroll: bool) {
-        let scroll_position = preserve_scroll.then(|| {
-            self.details
-                .first_child()
-                .and_then(|detail| detail.first_child())
-                .and_then(|scroll| scroll.downcast::<gtk::ScrolledWindow>().ok())
-                .map(|scroll| scroll.vadjustment().value())
-        }).flatten();
+        let scroll_position = preserve_scroll
+            .then(|| {
+                self.details
+                    .first_child()
+                    .and_then(|detail| detail.first_child())
+                    .and_then(|scroll| scroll.downcast::<gtk::ScrolledWindow>().ok())
+                    .map(|scroll| scroll.vadjustment().value())
+            })
+            .flatten();
         if app
             .window
             .focus_widget()

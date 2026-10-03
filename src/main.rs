@@ -60,6 +60,11 @@ enum Command {
         #[command(subcommand)]
         action: AcpAction,
     },
+    /// Speak MCP (Model Context Protocol) for the board
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
     /// List projects with their git status
     List,
     /// Add one or more project directories
@@ -347,6 +352,19 @@ enum AcpAction {
     Stop { id: String },
     /// List the agents the daemon is running
     List,
+}
+
+#[derive(Subcommand, Debug)]
+enum McpAction {
+    /// Serve the board as MCP tools over stdio — point an MCP client at
+    /// `radar mcp serve` and its agents work the board like the board skill
+    /// teaches: claim, report, hand back.
+    Serve {
+        /// Project directory for the board (default: $RADAR_PROJECT_ROOT,
+        /// else the working directory)
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -974,6 +992,9 @@ fn main() -> Result<()> {
             return radar::session::daemon::Server::bind(&paths.data_dir)?.run()
         }
         Some(Command::Web { port }) => return radar::web::run(&paths.data_dir, port),
+        Some(Command::Mcp {
+            action: McpAction::Serve { project },
+        }) => return radar::mcp::serve(paths, project),
         Some(Command::Session { action }) => return session_command(&paths, action),
         Some(Command::Activity { action }) => return activity_command(&paths, action),
         Some(Command::Acp { action }) => return acp_command(&paths, action),
@@ -987,6 +1008,7 @@ fn main() -> Result<()> {
         Some(
             Command::Serve
             | Command::Web { .. }
+            | Command::Mcp { .. }
             | Command::Session { .. }
             | Command::Activity { .. }
             | Command::Acp { .. },
@@ -1184,44 +1206,21 @@ fn require_project(db: &Db, path: &PathBuf) -> Result<radar::db::Project> {
 /// The directory a board command works on: the given path, `RADAR_PROJECT_ROOT`
 /// for a radar-launched pane, or the current directory.
 fn board_dir(path: Option<PathBuf>) -> Result<PathBuf> {
-    let requested = path
-        .or_else(|| std::env::var_os("RADAR_PROJECT_ROOT").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."));
-    radar::db::normalize_path(requested)
+    radar::session::board::dir(path)
 }
 
 /// A board command's project: its id and root directory. Prefers the
 /// `RADAR_PROJECT_ID` a radar-launched pane carries, else the sidebar lookup.
 fn board_context(db: &Db, path: Option<PathBuf>) -> Result<(i64, PathBuf)> {
-    let dir = board_dir(path)?;
-    if let Ok(raw) = std::env::var("RADAR_PROJECT_ID") {
-        if let Ok(project_id) = raw.parse::<i64>() {
-            return Ok((project_id, dir));
-        }
-    }
-    let project = db.project_by_path(&dir)?.with_context(|| {
-        format!(
-            "{} is not in the sidebar — add it to radar, or run from a radar pane",
-            dir.display()
-        )
-    })?;
-    Ok((project.id, project.path))
+    radar::session::board::context(db, path)
 }
 
 fn board_command_id(prefix: &str) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("cli-{prefix}-{}-{now:x}", std::process::id())
+    radar::session::board::command_id(prefix)
 }
 
 fn find_stored<'a>(state: &'a BoardState, needle: &str) -> Option<&'a StoredCard> {
-    state
-        .cards
-        .iter()
-        .find(|card| card.id == needle)
-        .or_else(|| state.cards.iter().find(|card| card.title == needle))
+    radar::session::board::find_card(state, needle)
 }
 
 fn find_stored_mut<'a>(state: &'a BoardState, needle: &str) -> Result<&'a StoredCard> {
@@ -1305,9 +1304,7 @@ fn card_start(
     json: bool,
 ) -> Result<()> {
     use radar::session::daemon as board_api;
-    use radar::session::daemon::{Client, Command as Request};
-    use radar::session::registry::Spawn;
-    use radar::session::Dims;
+    use radar::session::dispatch::{self, Dispatch};
 
     let (project_id, root) = board_context(db, path)?;
     db.require_board_enabled(&root)?;
@@ -1316,101 +1313,41 @@ fn card_start(
         .with_context(|| format!("no card {needle}"))?
         .clone();
 
-    // A card someone already holds is not dispatched again.
-    if let Some(claim) = &card.claim {
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({ "created": false, "cardId": card.id, "claim": claim })
-            );
-        } else {
-            println!("{} is already claimed by {claim}", card.title);
-        }
-        return Ok(());
-    }
-
-    let global = db.preferences().unwrap_or_default();
-    let preferences = db
-        .project_settings(project_id)
-        .unwrap_or_default()
-        .apply_to(&global);
-    let program = programs::for_slot(Slot::Agent, &preferences)
-        .context("No agent is installed — set one in Preferences")?;
-    radar::setup::install_default_session_hooks()?;
-    let stamp = programs::launch::now_stamp();
-    let claim = format!("{}-{stamp}", program.id);
-    let session_id = format!("card-{}-{stamp}", card.id);
-    // Naming a fresh conversation is a request, not proof of its identity.
-    // Every provider reports the actual active ID through its lifecycle hook.
-    let provider_session_id = program
-        .create_session
-        .then(|| programs::launch::provider_session_id(project_id, &stamp));
-    let spec = programs::launch::command_spec(
-        &program,
-        &LaunchOptions {
-            prompt: Some(radar::session::board_store::work_prompt(
-                &card.id,
-                &card.title,
-            )),
-            card: Some(card.id.clone()),
-            agent_instance: Some(stamp),
-            create_session: provider_session_id.clone(),
-            ..Default::default()
-        },
-    );
-
-    let mut env = spec.env_set.clone();
-    env.extend([
-        ("RADAR_PROJECT_ID".to_string(), project_id.to_string()),
-        (
-            "RADAR_PROJECT_ROOT".to_string(),
-            root.to_string_lossy().into_owned(),
-        ),
-        (
-            "RADAR_HOME".to_string(),
-            paths.data_dir.to_string_lossy().into_owned(),
-        ),
-        ("RADAR_SESSION_ID".to_string(), session_id.clone()),
-    ]);
-
-    Client::request(
-        &paths.data_dir,
-        Request::Create(Spawn {
-            id: session_id.clone(),
-            argv: spec.argv,
-            cwd: root,
-            dims: Dims {
-                cols: 120,
-                rows: 32,
-            },
-            env,
-            env_remove: spec.env_unset,
-        }),
-    )?;
-
-    let change = board_api::board_card_claim(
-        &paths.data_dir,
+    match dispatch::start_card(
+        paths,
+        db,
         project_id,
-        &card.id,
-        Some(&claim),
-        None,
+        &root,
+        &card,
         &board_command_id("start"),
-    )?;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "created": true,
-                "cardId": change.card.id,
-                "claim": claim,
-                "sessionId": session_id,
-            })
-        );
-    } else {
-        println!(
-            "Started {claim} on \"{}\" ({})",
-            change.card.title, change.card.id
-        );
+    )? {
+        Dispatch::AlreadyClaimed { claim } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "created": false, "cardId": card.id, "claim": claim })
+                );
+            } else {
+                println!("{} is already claimed by {claim}", card.title);
+            }
+        }
+        Dispatch::Started {
+            claim, session_id, ..
+        } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "created": true,
+                        "cardId": card.id,
+                        "claim": claim,
+                        "sessionId": session_id,
+                    })
+                );
+            } else {
+                println!("Started {claim} on \"{}\" ({})", card.title, card.id);
+            }
+        }
     }
     Ok(())
 }
@@ -1584,62 +1521,6 @@ fn human_age(at_millis: i64) -> String {
     }
 }
 
-/// A card's thread as flat entries, for `card show`.
-fn thread_json(
-    snapshot: &radar::session::activity::ActivitySnapshot,
-    card_id: &str,
-) -> Vec<serde_json::Value> {
-    use radar::session::activity::ActivityPayload;
-    let mut events: Vec<_> = snapshot
-        .events
-        .iter()
-        .filter(|event| event.card_id.as_deref() == Some(card_id))
-        .collect();
-    events.sort_by_key(|event| event.sequence);
-    events
-        .into_iter()
-        .filter_map(|event| {
-            let (author, text) = match &event.payload {
-                ActivityPayload::Message { text } => (
-                    if event.session_id.is_some() {
-                        "agent"
-                    } else {
-                        "human"
-                    },
-                    text.clone(),
-                ),
-                ActivityPayload::AttentionRequested { reason, .. } => ("agent", reason.clone()),
-                ActivityPayload::AttentionResolved { response, .. } => {
-                    ("system", format!("answered: {response:?}"))
-                }
-                ActivityPayload::BoardChanged { action, column, .. } => ("system", {
-                    let label = match action.as_str() {
-                        "added" | "board_card_added" => "added",
-                        "moved" | "board_card_moved" => "moved",
-                        "claimed" | "board_card_claimed" => "claimed",
-                        "released" | "board_card_released" => "released",
-                        "done" | "board_card_done" => "closed",
-                        "edited" | "board_card_edited" => "edited",
-                        "removed" | "board_card_removed" => "removed",
-                        other => other,
-                    };
-                    match column {
-                        Some(column) => format!("{label} · {column}"),
-                        None => label.to_string(),
-                    }
-                }),
-                _ => return None,
-            };
-            Some(serde_json::json!({
-                "author": author,
-                "text": text,
-                "at_millis": event.at_millis,
-                "sequence": event.sequence,
-            }))
-        })
-        .collect()
-}
-
 /// Read a card and its thread. The thread is a bonus: a card still shows
 /// when the daemon is down or the project is not in the sidebar.
 fn card_show(
@@ -1678,7 +1559,7 @@ fn card_show(
     if json {
         let entries = thread
             .as_ref()
-            .map(|snapshot| thread_json(snapshot, &card.id))
+            .map(|snapshot| radar::mcp::thread_json(snapshot, &card.id))
             .unwrap_or_default();
         println!(
             "{}",
@@ -1699,7 +1580,7 @@ fn card_show(
         println!("  {note}");
     }
     if let Some(snapshot) = &thread {
-        let entries = thread_json(snapshot, &card.id);
+        let entries = radar::mcp::thread_json(snapshot, &card.id);
         if !entries.is_empty() {
             println!();
             for entry in entries {

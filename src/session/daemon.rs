@@ -260,14 +260,7 @@ pub struct Server {
     listener: UnixListener,
     path: PathBuf,
     _lock: File,
-    registry: Arc<Registry>,
-    activity: Arc<ActivityJournal>,
-    catalog: Arc<SessionCatalog>,
-    board: Arc<dyn Board>,
-    agents: Arc<AgentHost>,
-    /// Last provider-history refresh per project root.
-    imports: Arc<Mutex<HashMap<PathBuf, Instant>>>,
-    stopping: Arc<AtomicBool>,
+    services: Services,
 }
 
 impl Server {
@@ -314,19 +307,21 @@ impl Server {
             listener,
             path,
             _lock: lock,
-            registry: Arc::new(Registry::default()),
-            activity,
-            catalog,
-            board,
-            agents: Arc::new(AgentHost::default()),
-            imports: Arc::new(Mutex::new(HashMap::new())),
-            stopping: Arc::new(AtomicBool::new(false)),
+            services: Services {
+                registry: Arc::new(Registry::default()),
+                activity,
+                catalog,
+                board,
+                agents: Arc::new(AgentHost::default()),
+                imports: Arc::new(Mutex::new(HashMap::new())),
+                stopping: Arc::new(AtomicBool::new(false)),
+            },
         })
     }
 
     pub fn run(self) -> Result<()> {
         let mut workers = Vec::new();
-        while !self.stopping.load(Ordering::Acquire) {
+        while !self.services.stopping.load(Ordering::Acquire) {
             workers.retain(|worker: &std::thread::JoinHandle<()>| !worker.is_finished());
             match self.listener.accept() {
                 Ok((stream, _)) => {
@@ -337,25 +332,10 @@ impl Server {
                     }
                     stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
                     stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
-                    let registry = self.registry.clone();
-                    let activity = self.activity.clone();
-                    let catalog = self.catalog.clone();
-                    let board = self.board.clone();
-                    let agents = self.agents.clone();
-                    let imports = self.imports.clone();
-                    let stopping = self.stopping.clone();
+                    let services = self.services.clone();
                     workers.push(std::thread::spawn(move || {
                         let mut stream = stream;
-                        if let Err(error) = serve(
-                            &mut stream,
-                            registry,
-                            activity,
-                            catalog,
-                            board,
-                            agents,
-                            imports,
-                            stopping,
-                        ) {
+                        if let Err(error) = serve(&mut stream, services) {
                             let _ = write_frame(
                                 &mut stream,
                                 &Response::Error(error.to_string()),
@@ -370,8 +350,8 @@ impl Server {
                 Err(error) => return Err(error.into()),
             }
         }
-        self.registry.stop_all();
-        self.agents.stop_all();
+        self.services.registry.stop_all();
+        self.services.agents.stop_all();
         for worker in workers {
             let _ = worker.join();
         }
@@ -381,23 +361,28 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.stopping.store(true, Ordering::Release);
-        self.registry.stop_all();
-        self.agents.stop_all();
+        self.services.stopping.store(true, Ordering::Release);
+        self.services.registry.stop_all();
+        self.services.agents.stop_all();
         let _ = fs::remove_file(&self.path);
     }
 }
 
-fn serve(
-    stream: &mut UnixStream,
+/// The daemon's shared domains, cloned per connection so one request cannot
+/// block another.
+#[derive(Clone)]
+struct Services {
     registry: Arc<Registry>,
     activity: Arc<ActivityJournal>,
     catalog: Arc<SessionCatalog>,
     board: Arc<dyn Board>,
     agents: Arc<AgentHost>,
+    /// Last provider-history refresh per project root.
     imports: Arc<Mutex<HashMap<PathBuf, Instant>>>,
     stopping: Arc<AtomicBool>,
-) -> Result<()> {
+}
+
+fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
     let request: Request = read_frame(stream, MAX_REQUEST)?;
     if request.version != VERSION {
         bail!(
@@ -405,13 +390,13 @@ fn serve(
             request.version
         );
     }
-    if stopping.load(Ordering::Acquire) {
+    if services.stopping.load(Ordering::Acquire) {
         bail!("session daemon is shutting down");
     }
     let response = match request.command {
         Command::Ping => Response::Hello { version: VERSION },
         Command::Create(spec) => {
-            let _identity_update = registry.identity_update();
+            let _identity_update = services.registry.identity_update();
             if let Some((_, conversation)) = spec
                 .env
                 .iter()
@@ -433,7 +418,7 @@ fn serve(
                     &spec.argv,
                 )?;
             }
-            let (session, created) = registry.create_or_attach(spec.clone())?;
+            let (session, created) = services.registry.create_or_attach(spec.clone())?;
             let status = session.status();
             if let Some(project_id) = session
                 .env_value("RADAR_PROJECT_ID")
@@ -446,7 +431,7 @@ fn serve(
                     .map(str::to_string)
                     .or_else(|| catalog::provider_of_session_id(&status.id))
                     .unwrap_or_else(|| "shell".to_string());
-                if let Err(error) = catalog.record_radar_with_card(
+                if let Err(error) = services.catalog.record_radar_with_card(
                     project_id,
                     &status.id,
                     &provider,
@@ -464,7 +449,7 @@ fn serve(
                     .rev()
                     .find(|(name, _)| name == "RADAR_RESUME_SESSION_ID")
                 {
-                    catalog.bind_provider(
+                    services.catalog.bind_provider(
                         &status.id,
                         &provider,
                         conversation,
@@ -474,27 +459,27 @@ fn serve(
             }
             Response::Status(status)
         }
-        Command::List => Response::Sessions(registry.list()),
+        Command::List => Response::Sessions(services.registry.list()),
         Command::Input { id, bytes } => {
-            registry.get(&id)?.input(bytes)?;
+            services.registry.get(&id)?.input(bytes)?;
             Response::Ok
         }
         Command::Resize { id, dims } => {
-            registry.get(&id)?.resize(dims)?;
+            services.registry.get(&id)?.resize(dims)?;
             Response::Ok
         }
         Command::Stop { id } => {
-            registry.get(&id)?.stop();
+            services.registry.get(&id)?.stop();
             Response::Ok
         }
         Command::Forget { id } => {
-            registry.forget(&id)?;
+            services.registry.forget(&id)?;
             Response::Ok
         }
         Command::Shutdown => {
-            registry.stop_all();
-            agents.stop_all();
-            stopping.store(true, Ordering::Release);
+            services.registry.stop_all();
+            services.agents.stop_all();
+            services.stopping.store(true, Ordering::Release);
             Response::Ok
         }
         Command::CatalogList {
@@ -504,11 +489,11 @@ fn serve(
             limit,
         } => {
             let now = catalog::now_millis();
-            catalog.reconcile(&registry.list(), now)?;
-            catalog.archive_stale(now)?;
+            services.catalog.reconcile(&services.registry.list(), now)?;
+            services.catalog.archive_stale(now)?;
             for project in &projects {
                 let due = {
-                    let mut pending = imports.lock();
+                    let mut pending = services.imports.lock();
                     match pending.get(&project.path) {
                         Some(seen) if seen.elapsed() < PROVIDER_IMPORT_INTERVAL => false,
                         _ => {
@@ -532,7 +517,7 @@ fn serve(
                                     last_activity_ms: session.updated.unwrap_or(session.created),
                                 })
                                 .collect::<Vec<_>>();
-                            catalog.import_provider(
+                            services.catalog.import_provider(
                                 project.id,
                                 provider,
                                 &project.path,
@@ -544,10 +529,17 @@ fn serve(
                 }
             }
             let ids: Vec<i64> = projects.iter().map(|project| project.id).collect();
-            Response::Catalog(catalog.list(&ids, filter, query.as_deref(), i64::from(limit))?)
+            Response::Catalog(services.catalog.list(
+                &ids,
+                filter,
+                query.as_deref(),
+                i64::from(limit),
+            )?)
         }
         Command::CatalogArchive { id, archived } => {
-            catalog.archive(id, archived, catalog::now_millis())?;
+            services
+                .catalog
+                .archive(id, archived, catalog::now_millis())?;
             Response::Ok
         }
         Command::CatalogSeen {
@@ -556,8 +548,8 @@ fn serve(
             program,
             cwd,
         } => {
-            let session = registry.get(&radar_id).ok();
-            catalog.seen_radar(
+            let session = services.registry.get(&radar_id).ok();
+            services.catalog.seen_radar(
                 project_id,
                 &radar_id,
                 &program,
@@ -568,7 +560,8 @@ fn serve(
             Response::Ok
         }
         Command::SessionIdentity { radar_id } => {
-            let (provider, conversation) = catalog
+            let (provider, conversation) = services
+                .catalog
                 .runtime_conversation(&radar_id)?
                 .context("The provider has not reported an active conversation")?;
             Response::SessionIdentity {
@@ -583,8 +576,8 @@ fn serve(
             conversation,
             reporter_pid,
         } => {
-            let _identity_update = registry.identity_update();
-            let session = registry.get(&radar_id)?;
+            let _identity_update = services.registry.identity_update();
+            let session = services.registry.get(&radar_id)?;
             if session.env_value("RADAR_AGENT") != Some(instance.as_str())
                 || session.env_value("RADAR_SESSION_PROVIDER") != Some(provider.as_str())
             {
@@ -601,7 +594,12 @@ fn serve(
             {
                 bail!("Invalid provider conversation ID");
             }
-            catalog.bind_provider(&radar_id, &provider, &conversation, catalog::now_millis())?;
+            services.catalog.bind_provider(
+                &radar_id,
+                &provider,
+                &conversation,
+                catalog::now_millis(),
+            )?;
             Response::Ok
         }
         Command::CardSessionLink {
@@ -610,7 +608,8 @@ fn serve(
             provider,
             provider_session_id,
         } => {
-            if !board
+            if !services
+                .board
                 .state(project_id)?
                 .cards
                 .iter()
@@ -618,10 +617,17 @@ fn serve(
             {
                 bail!("This card is no longer on the board");
             }
-            catalog.link_conversation(project_id, &provider, &provider_session_id, &card_id)?;
+            services.catalog.link_conversation(
+                project_id,
+                &provider,
+                &provider_session_id,
+                &card_id,
+            )?;
             Response::Ok
         }
-        Command::BoardState { project_id } => Response::BoardState(board.state(project_id)?),
+        Command::BoardState { project_id } => {
+            Response::BoardState(services.board.state(project_id)?)
+        }
         Command::CardAdd {
             project_id,
             lane,
@@ -630,9 +636,14 @@ fn serve(
             claim,
             command_id,
         } => {
-            let change =
-                board.add_card(project_id, lane.as_deref(), &title, &body, claim.as_deref())?;
-            publish_board_change(&activity, project_id, &command_id, &change)?;
+            let change = services.board.add_card(
+                project_id,
+                lane.as_deref(),
+                &title,
+                &body,
+                claim.as_deref(),
+            )?;
+            publish_board_change(&services.activity, project_id, &command_id, &change)?;
             Response::CardChanged(Box::new(change))
         }
         Command::CardUpdate {
@@ -643,14 +654,14 @@ fn serve(
             expected_revision,
             command_id,
         } => {
-            let change = board.update_card(
+            let change = services.board.update_card(
                 project_id,
                 &card_id,
                 title.as_deref(),
                 body.as_deref(),
                 expected_revision,
             )?;
-            publish_board_change(&activity, project_id, &command_id, &change)?;
+            publish_board_change(&services.activity, project_id, &command_id, &change)?;
             Response::CardChanged(Box::new(change))
         }
         Command::CardMove {
@@ -660,8 +671,11 @@ fn serve(
             expected_revision,
             command_id,
         } => {
-            let change = board.move_card(project_id, &card_id, &lane, expected_revision)?;
-            publish_board_change(&activity, project_id, &command_id, &change)?;
+            let change =
+                services
+                    .board
+                    .move_card(project_id, &card_id, &lane, expected_revision)?;
+            publish_board_change(&services.activity, project_id, &command_id, &change)?;
             Response::CardChanged(Box::new(change))
         }
         Command::CardClaim {
@@ -671,12 +685,22 @@ fn serve(
             expected_revision,
             command_id,
         } => {
-            let change =
-                board.claim_card(project_id, &card_id, claim.as_deref(), expected_revision)?;
+            let change = services.board.claim_card(
+                project_id,
+                &card_id,
+                claim.as_deref(),
+                expected_revision,
+            )?;
             if let Some(claim) = claim.as_deref() {
-                associate_live_card(&registry, &catalog, project_id, &card_id, claim)?;
+                associate_live_card(
+                    &services.registry,
+                    &services.catalog,
+                    project_id,
+                    &card_id,
+                    claim,
+                )?;
             }
-            publish_board_change(&activity, project_id, &command_id, &change)?;
+            publish_board_change(&services.activity, project_id, &command_id, &change)?;
             Response::CardChanged(Box::new(change))
         }
         Command::CardComplete {
@@ -685,8 +709,10 @@ fn serve(
             expected_revision,
             command_id,
         } => {
-            let change = board.complete_card(project_id, &card_id, expected_revision)?;
-            publish_board_change(&activity, project_id, &command_id, &change)?;
+            let change = services
+                .board
+                .complete_card(project_id, &card_id, expected_revision)?;
+            publish_board_change(&services.activity, project_id, &command_id, &change)?;
             Response::CardChanged(Box::new(change))
         }
         Command::CardReopen {
@@ -695,8 +721,10 @@ fn serve(
             expected_revision,
             command_id,
         } => {
-            let change = board.reopen_card(project_id, &card_id, expected_revision)?;
-            publish_board_change(&activity, project_id, &command_id, &change)?;
+            let change = services
+                .board
+                .reopen_card(project_id, &card_id, expected_revision)?;
+            publish_board_change(&services.activity, project_id, &command_id, &change)?;
             Response::CardChanged(Box::new(change))
         }
         Command::CardRemove {
@@ -704,8 +732,8 @@ fn serve(
             card_id,
             command_id,
         } => {
-            let change = board.remove_card(project_id, &card_id)?;
-            publish_board_change(&activity, project_id, &command_id, &change)?;
+            let change = services.board.remove_card(project_id, &card_id)?;
+            publish_board_change(&services.activity, project_id, &command_id, &change)?;
             Response::CardChanged(Box::new(change))
         }
         Command::CardNext {
@@ -714,52 +742,68 @@ fn serve(
             lane,
             command_id,
         } => {
-            let result = board.next_card(project_id, &who, lane.as_deref())?;
+            let result = services
+                .board
+                .next_card(project_id, &who, lane.as_deref())?;
             if let Some(change) = &result {
-                associate_live_card(&registry, &catalog, project_id, &change.card.id, &who)?;
-                publish_board_change(&activity, project_id, &command_id, change)?;
+                associate_live_card(
+                    &services.registry,
+                    &services.catalog,
+                    project_id,
+                    &change.card.id,
+                    &who,
+                )?;
+                publish_board_change(&services.activity, project_id, &command_id, change)?;
             }
             Response::CardNext(result.map(Box::new))
         }
-        Command::AgentStart(spec) => Response::AgentStatus(agents.start(spec, activity.clone())?),
+        Command::AgentStart(spec) => {
+            Response::AgentStatus(services.agents.start(spec, services.activity.clone())?)
+        }
         Command::AgentPrompt { id, text } => {
-            agents.prompt(&id, text)?;
+            services.agents.prompt(&id, text)?;
             Response::Ok
         }
         Command::AgentCancel { id } => {
-            agents.cancel(&id)?;
+            services.agents.cancel(&id)?;
             Response::Ok
         }
         Command::AgentStop { id } => {
-            agents.stop(&id)?;
+            services.agents.stop(&id)?;
             Response::Ok
         }
-        Command::AgentList => Response::Agents(agents.list()),
-        Command::PublishActivity(input) => Response::ActivityPublished(activity.publish(input)?),
+        Command::AgentList => Response::Agents(services.agents.list()),
+        Command::PublishActivity(input) => {
+            Response::ActivityPublished(services.activity.publish(input)?)
+        }
         Command::CreateAttention(input) => {
-            Response::AttentionCreated(activity.create_attention(input)?)
+            Response::AttentionCreated(services.activity.create_attention(input)?)
         }
         Command::ChangeAttention(input) => {
             let request_id = input.request_id.clone();
-            let result = activity.change_attention(input)?;
+            let result = services.activity.change_attention(input)?;
             if let Some(response) = result.attention.resolution.clone() {
-                agents.resolve(&request_id, response);
+                services.agents.resolve(&request_id, response);
             }
             Response::AttentionChanged(result)
         }
         Command::AttentionStatus {
             project_id,
             request_id,
-        } => Response::AttentionStatus(activity.attention(project_id, &request_id)?),
+        } => Response::AttentionStatus(services.activity.attention(project_id, &request_id)?),
         Command::ActivitySnapshot {
             project_id,
             after_sequence,
             limit,
-        } => Response::ActivitySnapshot(activity.snapshot(project_id, after_sequence, limit)?),
+        } => Response::ActivitySnapshot(services.activity.snapshot(
+            project_id,
+            after_sequence,
+            limit,
+        )?),
         Command::WatchActivity {
             project_id,
             after_sequence,
-        } => match activity.watch(project_id, after_sequence)? {
+        } => match services.activity.watch(project_id, after_sequence)? {
             WatchResult::Ready(snapshot, subscription) => {
                 write_frame(
                     stream,
@@ -769,12 +813,12 @@ fn serve(
                     },
                     MAX_RESPONSE,
                 )?;
-                return stream_activity(stream, subscription, stopping);
+                return stream_activity(stream, subscription, services.stopping);
             }
             WatchResult::ResyncRequired => Response::ResyncRequired,
         },
         Command::Attach { id } => {
-            let (snapshot, subscription) = registry.get(&id)?.attach();
+            let (snapshot, subscription) = services.registry.get(&id)?.attach();
             let closed = snapshot.status.stream_closed;
             write_frame(
                 stream,
@@ -784,12 +828,16 @@ fn serve(
             if closed {
                 return Ok(());
             }
-            return stream_events(stream, subscription, stopping, Response::Output, |event| {
-                matches!(event, Output::Closed)
-            });
+            return stream_events(
+                stream,
+                subscription,
+                services.stopping,
+                Response::Output,
+                |event| matches!(event, Output::Closed),
+            );
         }
         Command::Watch { id } => {
-            let (status, sequence, subscription) = registry.get(&id)?.watch();
+            let (status, sequence, subscription) = services.registry.get(&id)?.watch();
             let mut closed = status.stream_closed;
             let mut ended = !matches!(status.lifecycle, Lifecycle::Running);
             write_frame(
@@ -803,7 +851,7 @@ fn serve(
             return stream_events(
                 stream,
                 subscription,
-                stopping,
+                services.stopping,
                 Response::Feedback,
                 move |event| {
                     match event {
@@ -1404,13 +1452,15 @@ mod tests {
         let stopping = Arc::new(AtomicBool::new(false));
         let error = serve(
             &mut server,
-            Arc::new(Registry::default()),
-            Arc::new(ActivityJournal::open_in_memory().unwrap()),
-            Arc::new(SessionCatalog::open_in_memory().unwrap()),
-            Arc::new(BoardStore::open_in_memory().unwrap()),
-            Arc::new(AgentHost::default()),
-            Arc::new(Mutex::new(HashMap::new())),
-            stopping.clone(),
+            Services {
+                registry: Arc::new(Registry::default()),
+                activity: Arc::new(ActivityJournal::open_in_memory().unwrap()),
+                catalog: Arc::new(SessionCatalog::open_in_memory().unwrap()),
+                board: Arc::new(BoardStore::open_in_memory().unwrap()),
+                agents: Arc::new(AgentHost::default()),
+                imports: Arc::new(Mutex::new(HashMap::new())),
+                stopping: stopping.clone(),
+            },
         )
         .unwrap_err();
         assert!(error.to_string().contains("unsupported session protocol"));
@@ -1432,13 +1482,15 @@ mod tests {
         let registry = Arc::new(Registry::default());
         serve(
             &mut server,
-            registry.clone(),
-            Arc::new(ActivityJournal::open_in_memory().unwrap()),
-            Arc::new(SessionCatalog::open_in_memory().unwrap()),
-            Arc::new(BoardStore::open_in_memory().unwrap()),
-            Arc::new(AgentHost::default()),
-            Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(AtomicBool::new(false)),
+            Services {
+                registry: registry.clone(),
+                activity: Arc::new(ActivityJournal::open_in_memory().unwrap()),
+                catalog: Arc::new(SessionCatalog::open_in_memory().unwrap()),
+                board: Arc::new(BoardStore::open_in_memory().unwrap()),
+                agents: Arc::new(AgentHost::default()),
+                imports: Arc::new(Mutex::new(HashMap::new())),
+                stopping: Arc::new(AtomicBool::new(false)),
+            },
         )
         .unwrap();
         assert!(matches!(
@@ -1480,13 +1532,15 @@ mod tests {
         .unwrap();
         serve(
             &mut server,
-            Arc::new(Registry::default()),
-            activity.clone(),
-            Arc::new(SessionCatalog::open_in_memory().unwrap()),
-            board.clone(),
-            Arc::new(AgentHost::default()),
-            Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(AtomicBool::new(false)),
+            Services {
+                registry: Arc::new(Registry::default()),
+                activity: activity.clone(),
+                catalog: Arc::new(SessionCatalog::open_in_memory().unwrap()),
+                board: board.clone(),
+                agents: Arc::new(AgentHost::default()),
+                imports: Arc::new(Mutex::new(HashMap::new())),
+                stopping: Arc::new(AtomicBool::new(false)),
+            },
         )
         .unwrap();
         let response = read_frame::<Response>(&mut client, MAX_RESPONSE).unwrap();

@@ -758,7 +758,8 @@ fn build_window(
     adder_choose.add_css_class("flat");
     adder_choose.set_tooltip_text(Some("Add a folder anywhere, with the system chooser"));
     adder_choose.set_action_name(Some("win.home-import-dialog"));
-    let adder_header = home::page_header("Add a project", None, Some(adder_choose.clone().upcast()));
+    let adder_header =
+        home::page_header("Add a project", None, Some(adder_choose.clone().upcast()));
 
     let adder_body = gtk::Box::new(gtk::Orientation::Vertical, 10);
     adder_body.add_css_class("home-cockpit");
@@ -3623,14 +3624,16 @@ impl App {
                                 });
                         let notified = self.notified_attention.borrow();
                         notify::plan_request(
-                            project_id,
+                            &notify::AttentionRequest {
+                                project_id,
+                                request_id,
+                                kind: *attention_kind,
+                                reason,
+                                card_id: event.card_id.as_deref(),
+                                session_id: event.session_id.as_deref(),
+                            },
                             &notified,
                             already_outstanding,
-                            request_id,
-                            *attention_kind,
-                            reason,
-                            event.card_id.as_deref(),
-                            event.session_id.as_deref(),
                         )
                     }
                     _ => None,
@@ -4545,17 +4548,15 @@ impl App {
                 }
             }
         }
-        let card_scroll_position = matches!(
-            self.home_nav.borrow().last(),
-            Some(HomeView::Card(_, _))
-        )
-        .then(|| {
-            self.stack
-                .child_by_name("_home")
-                .and_then(|view| home_card_scroller(&view))
-                .map(|scroller| scroller.vadjustment().value())
-        })
-        .flatten();
+        let card_scroll_position =
+            matches!(self.home_nav.borrow().last(), Some(HomeView::Card(_, _)))
+                .then(|| {
+                    self.stack
+                        .child_by_name("_home")
+                        .and_then(|view| home_card_scroller(&view))
+                        .map(|scroller| scroller.vadjustment().value())
+                })
+                .flatten();
         // Clear focus before destroying the view so GTK holds no stale widget.
         gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
         while let Some(child) = self.stack.child_by_name("_home") {
@@ -6573,13 +6574,11 @@ mod home_navigation_tests {
             .into_iter()
             .find_map(|widget| widget.downcast::<gtk::ScrolledWindow>().ok())
             .expect("the to-do list is scrollable");
-        wait_until(|| list_scroll.vadjustment().upper() > list_scroll.vadjustment().page_size() + 20.0);
+        wait_until(|| {
+            list_scroll.vadjustment().upper() > list_scroll.vadjustment().page_size() + 20.0
+        });
         list_scroll.vadjustment().set_value(40.0);
-        activate(
-            &window,
-            "win.card-saved",
-            Some(&project.id.to_variant()),
-        );
+        activate(&window, "win.card-saved", Some(&project.id.to_variant()));
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         while std::time::Instant::now() < deadline {
             drain();
@@ -6639,7 +6638,9 @@ mod home_navigation_tests {
             project.id,
             None,
             "Navigation todo",
-            &(0..100).map(|i| format!("Paragraph {i}\n\n")).collect::<String>(),
+            &(0..100)
+                .map(|i| format!("Paragraph {i}\n\n"))
+                .collect::<String>(),
             None,
             "nav-add",
         )
@@ -6892,11 +6893,7 @@ mod home_navigation_tests {
         wait_until(|| home_thread_scroll().vadjustment().upper() > 1000.0);
         home_thread_scroll().vadjustment().set_value(500.0);
         gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
-        activate(
-            &window,
-            "win.card-saved",
-            Some(&project.id.to_variant()),
-        );
+        activate(&window, "win.card-saved", Some(&project.id.to_variant()));
         wait_until(|| home_thread_scroll().vadjustment().upper() > 1000.0);
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         while std::time::Instant::now() < deadline {
@@ -6922,14 +6919,10 @@ mod home_navigation_tests {
                 .filter_map(|widget| widget.downcast_ref::<gtk::Button>())
                 .any(|button| button.action_name().as_deref() == Some("win.session-todo"))
         };
-        wait_until(|| has_agent_header());
+        wait_until(has_agent_header);
         activate(&window, "win.primitive-toggle", Some(&"agent".to_variant()));
         assert!(!has_agent_header(), "the user can hide the agent panel");
-        activate(
-            &window,
-            "win.card-saved",
-            Some(&project.id.to_variant()),
-        );
+        activate(&window, "win.card-saved", Some(&project.id.to_variant()));
         assert!(
             !has_agent_header(),
             "a passive board refresh must not undo the user's panel toggle"
@@ -6954,11 +6947,7 @@ mod home_navigation_tests {
         wait_until(|| thread_scroll().vadjustment().upper() > 1000.0);
         thread_scroll().vadjustment().set_value(500.0);
         gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
-        activate(
-            &window,
-            "win.card-saved",
-            Some(&project.id.to_variant()),
-        );
+        activate(&window, "win.card-saved", Some(&project.id.to_variant()));
         wait_until(|| thread_scroll().vadjustment().upper() > 1000.0);
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         while std::time::Instant::now() < deadline {
