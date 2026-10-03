@@ -175,6 +175,8 @@ enum SessionAction {
         #[arg(long)]
         id: Option<String>,
     },
+    /// Report the end of this session's turn (called by session hooks)
+    TurnEnded,
     /// Report the provider's actual conversation, never a launch-time guess.
     Identify {
         #[arg(long)]
@@ -554,6 +556,9 @@ fn session_command(paths: &Paths, action: SessionAction) -> Result<()> {
             radar_id: id
                 .or_else(|| std::env::var("RADAR_SESSION_ID").ok())
                 .context("No Radar runtime identity")?,
+        },
+        SessionAction::TurnEnded => Request::TurnEnded {
+            radar_id: std::env::var("RADAR_SESSION_ID").context("No Radar runtime identity")?,
         },
         SessionAction::Identify {
             provider,
@@ -1972,6 +1977,39 @@ fn launch_options(preferences: &Preferences, safe: bool) -> LaunchOptions {
 
 fn prefs(db: &Db, slot: Option<String>, program: Option<String>, json: bool) -> Result<()> {
     match (slot, program) {
+        // The reviewer is not a pane slot: it is the agent that reviews
+        // finished board cards, so it gets its own preference.
+        (Some(slot_name), program) if slot_name == "reviewer" => {
+            let program = match program.as_deref() {
+                None | Some("none") => None,
+                Some(id) => {
+                    anyhow::ensure!(
+                        agents::is_supported(id),
+                        "selectable agents are {}",
+                        agents::SUPPORTED_AGENT_IDS.join(", ")
+                    );
+                    Some(id.to_string())
+                }
+            };
+            db.set_reviewer(program.as_deref())?;
+            db.log_event(
+                "preference_changed",
+                None,
+                &serde_json::json!({ "slot": "reviewer", "program": program }),
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "slot": "reviewer", "program": program })
+                );
+            } else {
+                match program {
+                    Some(id) => println!("reviewer: {id}"),
+                    None => println!("reviewer: none (the daemon dispatches nobody)"),
+                }
+            }
+            return Ok(());
+        }
         (Some(slot), Some(program)) => {
             let slot = match slot.as_str() {
                 "editor" => Slot::Editor,

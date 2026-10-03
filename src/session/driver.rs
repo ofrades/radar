@@ -11,12 +11,14 @@
 //! Review dispatch — claiming the finished card for a reviewer agent — is a
 //! later card.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 
+use crate::config::Paths;
+use crate::db::Db;
 use crate::session::board_store::BoardState;
 use crate::session::daemon::{publish_board_change, Services};
 use crate::session::registry::{Lifecycle, Status};
@@ -25,23 +27,25 @@ use crate::session::registry::{Lifecycle, Status};
 const TICK: Duration = Duration::from_secs(2);
 
 /// Card bindings for daemon-spawned worker sessions: which card each session
-/// was launched for. In-memory on purpose: sessions die with the daemon, so
-/// bindings cannot outlive the sessions they name.
+/// was launched for, and where it runs. In-memory on purpose: sessions die
+/// with the daemon, so bindings cannot outlive the sessions they name.
 #[derive(Clone, Default)]
 pub struct Workers {
     bindings: Arc<Mutex<HashMap<String, WorkerCard>>>,
+    turn_ended: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone)]
 pub struct WorkerCard {
     pub project_id: i64,
     pub card_id: String,
+    pub root: std::path::PathBuf,
 }
 
 impl Workers {
     /// Remember which card a session was launched for. Launches without a
     /// card are ignored.
-    pub fn note(&self, session_id: &str, project_id: i64, card_id: &str) {
+    pub fn note(&self, session_id: &str, project_id: i64, card_id: &str, root: std::path::PathBuf) {
         if card_id.is_empty() || session_id.is_empty() {
             return;
         }
@@ -50,8 +54,31 @@ impl Workers {
             WorkerCard {
                 project_id,
                 card_id: card_id.to_string(),
+                root,
             },
         );
+    }
+
+    /// A turn boundary on a live session: the driver hands the card back
+    /// (once — the guard refuses already-reviewed cards) without dropping the
+    /// binding, because the session is still alive.
+    pub fn turn_ended(&self, session_id: &str) {
+        if self.bindings.lock().unwrap().contains_key(session_id) {
+            self.turn_ended
+                .lock()
+                .unwrap()
+                .insert(session_id.to_string());
+        }
+    }
+
+    fn worker(&self, session_id: &str) -> Option<WorkerCard> {
+        self.bindings.lock().unwrap().get(session_id).cloned()
+    }
+
+    fn take_turn_ended(&self) -> Vec<String> {
+        let mut pending = self.turn_ended.lock().unwrap().drain().collect::<Vec<_>>();
+        pending.retain(|session_id| self.bindings.lock().unwrap().contains_key(session_id));
+        pending
     }
 
     /// The bindings whose sessions are no longer running. The caller owns the
@@ -73,43 +100,63 @@ impl Workers {
 
     fn forget(&self, session_id: &str) {
         self.bindings.lock().unwrap().remove(session_id);
+        self.turn_ended.lock().unwrap().remove(session_id);
     }
 }
 
-/// Runs until the daemon stops. Every tick reacts to ended worker sessions.
+/// Runs until the daemon stops. Every tick hands back cards whose workers
+/// ended a turn or exited, and dispatches a reviewer where one is configured.
+/// Settings are opened lazily, so a daemon that never reviews never opens
+/// the settings database.
 pub(crate) fn run(services: Services) {
+    let mut db: Option<Db> = None;
     while !services.stopping.load(std::sync::atomic::Ordering::Acquire) {
         std::thread::sleep(TICK);
-        if let Err(error) = tick(&services) {
-            eprintln!("radar driver: {error:#}");
+        if db.is_none() {
+            match Db::open(&Paths::with_root(services.home.clone())) {
+                Ok(opened) => db = Some(opened),
+                Err(error) => eprintln!("radar driver: settings unavailable ({error:#})"),
+            }
         }
+        tick(&services, db.as_ref());
     }
 }
 
 /// Hand every ended worker's card back: claimed, still in progress, worker
-/// gone — the card goes to Review. A card whose worker still runs, whose lane
-/// is not in progress, or that is done is left alone.
-fn tick(services: &Services) -> Result<()> {
+/// gone — the card goes to Review and a configured reviewer is dispatched.
+/// A card whose worker still runs, whose lane is not in progress, or that
+/// is done is left alone.
+fn tick(services: &Services, db: Option<&Db>) {
+    // Turn boundaries first: the same handoff, but the session stays alive,
+    // so the binding must survive for the exit pass to find it later.
+    for session_id in services.workers.take_turn_ended() {
+        let Some(worker) = services.workers.worker(&session_id) else {
+            continue;
+        };
+        if let Err(error) = hand_off(services, db, &worker) {
+            eprintln!("radar driver: {error:#}");
+        }
+    }
     for (session_id, worker) in services.workers.ended(&services.registry.list()) {
-        if let Err(error) = hand_off(services, &worker) {
+        if let Err(error) = hand_off(services, db, &worker) {
             eprintln!("radar driver: {error:#}");
         }
         services.workers.forget(&session_id);
     }
-    Ok(())
 }
 
-fn hand_off(services: &Services, worker: &WorkerCard) -> Result<()> {
+/// Returns whether the card was actually handed back.
+fn hand_off(services: &Services, db: Option<&Db>, worker: &WorkerCard) -> Result<bool> {
     let state = services.board.state(worker.project_id)?;
     let Some(card) = state.cards.iter().find(|card| card.id == worker.card_id) else {
         // The card is no longer on the board: nothing to hand back.
-        return Ok(());
+        return Ok(false);
     };
     if card.done || card.claim.is_none() {
-        return Ok(());
+        return Ok(false);
     }
     if lane_kind(&state, card.lane_id) != Some("in_progress") {
-        return Ok(());
+        return Ok(false);
     }
     let review = state
         .lanes
@@ -125,6 +172,41 @@ fn hand_off(services: &Services, worker: &WorkerCard) -> Result<()> {
         worker.project_id,
         &crate::session::board::command_id("driver-handoff"),
         &change,
+    )?;
+    if let Some(db) = db {
+        if let Err(error) = dispatch_reviewer(services, db, worker) {
+            eprintln!(
+                "radar driver: no reviewer dispatched for {}: {error:#}",
+                worker.card_id
+            );
+        }
+    }
+    Ok(true)
+}
+
+/// When the project has a reviewer configured, claim the freshly handed-back
+/// card for that agent's fresh session, carrying the review prompt.
+fn dispatch_reviewer(services: &Services, db: &Db, worker: &WorkerCard) -> Result<()> {
+    let Some(reviewer) = db.reviewer(worker.project_id)? else {
+        return Ok(());
+    };
+    let paths = Paths::with_root(services.home.clone());
+    let state = services.board.state(worker.project_id)?;
+    let Some(card) = state
+        .cards
+        .into_iter()
+        .find(|card| card.id == worker.card_id)
+    else {
+        return Ok(());
+    };
+    crate::session::dispatch::start_review(
+        &paths,
+        db,
+        worker.project_id,
+        &worker.root,
+        &card,
+        Some(&reviewer),
+        &crate::session::board::command_id("driver-review"),
     )?;
     Ok(())
 }
@@ -159,6 +241,7 @@ mod tests {
             imports: Arc::new(Mutex::new(HashMap::new())),
             stopping: Arc::new(AtomicBool::new(false)),
             workers: Workers::default(),
+            home: std::env::temp_dir(),
         }
     }
 
@@ -175,7 +258,9 @@ mod tests {
             .board
             .claim_card(project_id, &card_id, Some("agent-1"), None)
             .unwrap();
-        services.workers.note(session_id, project_id, &card_id);
+        services
+            .workers
+            .note(session_id, project_id, &card_id, std::env::temp_dir());
         services
             .board
             .state(project_id)
@@ -200,7 +285,7 @@ mod tests {
         let services = services();
         bound_card(&services, 4, "card-s-1");
 
-        tick(&services).unwrap();
+        tick(&services, None);
 
         let state = services.board.state(4).unwrap();
         let card = card_in(&state, "Fix login");
@@ -221,7 +306,7 @@ mod tests {
         )));
         // The binding is spent: a second tick does nothing.
         let sequence = snapshot.watermark;
-        tick(&services).unwrap();
+        tick(&services, None);
         assert_eq!(
             services.activity.snapshot(4, None, 50).unwrap().watermark,
             sequence
@@ -245,7 +330,7 @@ mod tests {
             })
             .unwrap();
 
-        tick(&services).unwrap();
+        tick(&services, None);
 
         let state = services.board.state(4).unwrap();
         assert_eq!(card_in(&state, "Fix login").lane, "In progress");
@@ -271,7 +356,7 @@ mod tests {
             .move_card(4, &card.id, &review, None)
             .unwrap();
 
-        tick(&services).unwrap();
+        tick(&services, None);
 
         assert_eq!(
             card_in(&services.board.state(4).unwrap(), "Fix login").lane,
@@ -285,7 +370,7 @@ mod tests {
         let card = bound_card(&services, 4, "card-s-4");
         services.board.complete_card(4, &card.id, None).unwrap();
 
-        tick(&services).unwrap();
+        tick(&services, None);
 
         assert!(card_in(&services.board.state(4).unwrap(), "Fix login").done);
     }
@@ -298,9 +383,11 @@ mod tests {
             .board
             .add_card(4, None, "Fix login", "", None)
             .unwrap();
-        services.workers.note("card-s-5", 4, &change.card.id);
+        services
+            .workers
+            .note("card-s-5", 4, &change.card.id, std::env::temp_dir());
 
-        tick(&services).unwrap();
+        tick(&services, None);
 
         assert_eq!(
             card_in(&services.board.state(4).unwrap(), "Fix login").lane,
@@ -308,16 +395,66 @@ mod tests {
         );
     }
 
+    fn live_session(services: &Services, id: &str) {
+        let _ = services
+            .registry
+            .create(crate::session::registry::Spawn {
+                id: id.into(),
+                argv: vec!["/bin/sleep".into(), "60".into()],
+                cwd: std::env::current_dir().unwrap(),
+                dims: crate::session::Dims { cols: 80, rows: 24 },
+                env: Vec::new(),
+                env_remove: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_turn_end_hands_the_card_back_while_the_binding_survives() {
+        let services = services();
+        bound_card(&services, 4, "card-s-7");
+        live_session(&services, "card-s-7");
+        services.workers.turn_ended("card-s-7");
+
+        tick(&services, None);
+
+        let state = services.board.state(4).unwrap();
+        assert_eq!(card_in(&state, "Fix login").lane, "Review");
+        // The session is still running, so the binding remains and the exit
+        // pass will find the session's true end later.
+        assert!(services.workers.worker("card-s-7").is_some());
+    }
+
+    #[test]
+    fn a_turn_end_on_an_unbound_session_is_silent() {
+        let services = services();
+        bound_card(&services, 4, "card-s-8");
+        live_session(&services, "card-s-8");
+        let fresh = workers();
+        fresh.turn_ended("card-s-8");
+
+        tick(&services, None);
+
+        assert_eq!(
+            card_in(&services.board.state(4).unwrap(), "Fix login").lane,
+            "In progress"
+        );
+    }
+
+    fn workers() -> Workers {
+        Workers::default()
+    }
+
     #[test]
     fn a_note_without_a_card_is_ignored() {
         let workers = Workers::default();
-        workers.note("s", 4, "");
+        workers.note("s", 4, "", std::env::temp_dir().join("x"));
         assert!(workers.ended(&[]).is_empty());
     }
 
     #[test]
     fn a_binding_dies_with_its_session_by_design() {
         let workers = Workers::default();
-        workers.note("s", 4, "c");
+        workers.note("s", 4, "c", std::env::temp_dir().join("x"));
     }
 }

@@ -74,6 +74,11 @@ pub enum Command {
     Forget {
         id: String,
     },
+    /// A worker's harness reports the end of its turn: the driver hands the
+    /// card back while the session itself stays alive.
+    TurnEnded {
+        radar_id: String,
+    },
     Shutdown,
     PublishActivity(PublishActivity),
     CreateAttention(CreateAttention),
@@ -316,6 +321,7 @@ impl Server {
                 imports: Arc::new(Mutex::new(HashMap::new())),
                 stopping: Arc::new(AtomicBool::new(false)),
                 workers: crate::session::driver::Workers::default(),
+                home: home.to_path_buf(),
             },
         })
     }
@@ -392,6 +398,8 @@ pub(crate) struct Services {
     pub(crate) stopping: Arc<AtomicBool>,
     /// The driver's card bindings for spawned worker sessions.
     pub(crate) workers: crate::session::driver::Workers,
+    /// The daemon's data directory: settings, credentials, the board skill.
+    pub(crate) home: PathBuf,
 }
 
 fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
@@ -456,7 +464,9 @@ fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
                 // A card-carrying launch becomes the driver's end-of-turn
                 // binding: the worker's session exit hands the card back.
                 if let Some(card_id) = session.card_id() {
-                    services.workers.note(&status.id, project_id, card_id);
+                    services
+                        .workers
+                        .note(&status.id, project_id, card_id, spec.cwd.clone());
                 }
                 // A validated existing target is safe before the provider's first
                 // callback (Cursor does not emit sessionStart on exact resume).
@@ -491,6 +501,10 @@ fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
         }
         Command::Forget { id } => {
             services.registry.forget(&id)?;
+            Response::Ok
+        }
+        Command::TurnEnded { radar_id } => {
+            services.workers.turn_ended(&radar_id);
             Response::Ok
         }
         Command::Shutdown => {
@@ -1478,6 +1492,7 @@ mod tests {
                 imports: Arc::new(Mutex::new(HashMap::new())),
                 stopping: stopping.clone(),
                 workers: crate::session::driver::Workers::default(),
+                home: std::env::temp_dir(),
             },
         )
         .unwrap_err();
@@ -1509,6 +1524,7 @@ mod tests {
                 imports: Arc::new(Mutex::new(HashMap::new())),
                 stopping: Arc::new(AtomicBool::new(false)),
                 workers: crate::session::driver::Workers::default(),
+                home: std::env::temp_dir(),
             },
         )
         .unwrap();
@@ -1560,6 +1576,7 @@ mod tests {
                 imports: Arc::new(Mutex::new(HashMap::new())),
                 stopping: Arc::new(AtomicBool::new(false)),
                 workers: crate::session::driver::Workers::default(),
+                home: std::env::temp_dir(),
             },
         )
         .unwrap();

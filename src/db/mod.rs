@@ -29,7 +29,7 @@ pub use workspace::{
 use crate::config::Paths;
 
 /// Current schema version; bump with a migration below when changing tables.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 pub struct Db {
     conn: Connection,
@@ -149,6 +149,10 @@ impl Db {
                 );
                 "#,
             )?;
+        }
+        if version < 5 {
+            self.conn
+                .execute_batch("ALTER TABLE project_settings ADD COLUMN reviewer TEXT;")?;
         }
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;

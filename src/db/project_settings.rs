@@ -16,6 +16,9 @@ pub struct ProjectSettings {
     pub agent: Option<String>,
     pub diff: Option<String>,
     pub shell: Option<String>,
+    /// Which agent reviews this project's finished cards; `None` inherits
+    /// Radar's global reviewer.
+    pub reviewer: Option<String>,
 }
 
 impl Default for ProjectSettings {
@@ -26,6 +29,7 @@ impl Default for ProjectSettings {
             agent: None,
             diff: None,
             shell: None,
+            reviewer: None,
         }
     }
 }
@@ -37,6 +41,9 @@ impl ProjectSettings {
             if let Some(program) = self.get(slot) {
                 effective.set(slot, Some(program.to_string()));
             }
+        }
+        if let Some(reviewer) = &self.reviewer {
+            effective.reviewer = Some(reviewer.clone());
         }
         effective
     }
@@ -56,7 +63,7 @@ impl Db {
     /// Project settings default to board-enabled and inherit global pane defaults.
     pub fn project_settings(&self, project_id: i64) -> Result<ProjectSettings> {
         let settings = self.conn().query_row(
-            "SELECT board_enabled, editor, agent, diff, shell FROM project_settings WHERE project_id = ?1",
+            "SELECT board_enabled, editor, agent, diff, shell, reviewer FROM project_settings WHERE project_id = ?1",
             params![project_id],
             |row| {
                 Ok(ProjectSettings {
@@ -65,10 +72,34 @@ impl Db {
                     agent: row.get(2)?,
                     diff: row.get(3)?,
                     shell: row.get(4)?,
+                    reviewer: row.get(5)?,
                 })
             },
         ).optional()?;
         Ok(settings.unwrap_or_default())
+    }
+
+    /// The agent that reviews this project's finished cards: its own
+    /// override, else Radar's global reviewer; `None` means nobody is
+    /// dispatched and review stays a human's step.
+    pub fn reviewer(&self, project_id: i64) -> Result<Option<String>> {
+        if let Some(reviewer) = self.project_settings(project_id)?.reviewer {
+            return Ok(Some(reviewer));
+        }
+        Ok(self.preferences()?.reviewer)
+    }
+
+    /// Record one project's reviewer override (`None` clears back to global).
+    pub fn set_project_reviewer(&self, project_id: i64, program_id: Option<&str>) -> Result<()> {
+        if self.project(project_id)?.is_none() {
+            anyhow::bail!("no project {project_id}");
+        }
+        self.conn().execute(
+            "INSERT INTO project_settings (project_id, reviewer) VALUES (?1, ?2)
+             ON CONFLICT(project_id) DO UPDATE SET reviewer = excluded.reviewer",
+            params![project_id, program_id],
+        )?;
+        Ok(())
     }
 
     /// Unregistered project paths have no override and retain global defaults.

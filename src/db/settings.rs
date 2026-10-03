@@ -22,6 +22,10 @@ pub struct Preferences {
     pub agent: Option<String>,
     pub diff: Option<String>,
     pub shell: Option<String>,
+    /// Which agent program reviews finished board cards. The daemon's driver
+    /// dispatches it for a card the moment that card lands in Review; `None`
+    /// keeps review a human's step.
+    pub reviewer: Option<String>,
     /// Pass agents their "don't stop to ask" flags, the way omarchy's
     /// keybinding does. Off means each agent asks for permission itself.
     pub agent_auto_flags: bool,
@@ -34,6 +38,7 @@ impl Default for Preferences {
             agent: None,
             diff: None,
             shell: None,
+            reviewer: None,
             agent_auto_flags: true,
         }
     }
@@ -179,6 +184,14 @@ impl Db {
     pub fn set_preference(&self, slot: Slot, program_id: Option<&str>) -> Result<Preferences> {
         let mut preferences = self.preferences()?;
         preferences.set(slot, program_id.map(|s| s.to_string()));
+        self.set_preferences(&preferences)?;
+        Ok(preferences)
+    }
+
+    /// The reviewer agent for finished board cards, globally.
+    pub fn set_reviewer(&self, program_id: Option<&str>) -> Result<Preferences> {
+        let mut preferences = self.preferences()?;
+        preferences.reviewer = program_id.map(str::to_string);
         self.set_preferences(&preferences)?;
         Ok(preferences)
     }

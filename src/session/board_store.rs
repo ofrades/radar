@@ -236,6 +236,19 @@ pub fn work_prompt(card_id: &str, title: &str) -> String {
     )
 }
 
+/// The prompt the reviewer agent receives when the daemon dispatches it for
+/// a card the driver handed back.
+pub fn review_prompt(card_id: &str, title: &str) -> String {
+    format!(
+        "Review board card \"{title}\" ({card_id}).\n\
+         Read the card and its thread with `radar card show \"{card_id}\"`, then check the work.\n\n\
+         You are the reviewer: only your word closes it.\n\
+         Approved: `radar card done \"{card_id}\"`.\n\
+         Needs work: `radar card move --to \"In progress\" \"{card_id}\"` and comment what failed:\n\
+         - `radar card comment \"{card_id}\" \"<what did not pass, and how to check>\"`."
+    )
+}
+
 pub struct BoardStore {
     inner: Mutex<Connection>,
 }

@@ -16,4 +16,17 @@ export default function (pi) {
   }
   pi.on("session_start", identify);
   pi.on("before_agent_start", identify);
+  // Root sessions report turn boundaries so the driver can hand cards back
+  // while the worker is still alive, not only when the process exits.
+  if (process.env.RADAR_SESSION_ID) {
+    pi.on("agent_end", () => {
+      try {
+        execFileSync("radar", ["session", "turn-ended"], {
+          timeout: 5000, stdio: ["ignore", "ignore", "pipe"],
+        });
+      } catch {
+        // The connector is advisory: a busy or absent daemon is not a turn failure.
+      }
+    });
+  }
 }
