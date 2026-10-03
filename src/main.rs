@@ -355,6 +355,10 @@ enum AcpAction {
     Cancel { id: String },
     /// Stop a running agent and close its connection
     Stop { id: String },
+    /// List a running agent's session modes
+    Modes { id: String },
+    /// Switch a running agent's session mode
+    Mode { id: String, mode_id: String },
     /// List the agents the daemon is running
     List,
 }
@@ -836,7 +840,20 @@ fn activity_command(paths: &Paths, action: ActivityAction) -> Result<()> {
 /// Drive an ACP agent through the daemon: start, prompt, cancel, stop, list.
 fn acp_command(paths: &Paths, action: AcpAction) -> Result<()> {
     use radar::session::agent::AgentStart;
+    use radar::session::daemon::Response;
     use radar::session::daemon::{self, Client, Command as Request};
+
+    /// The current mode state of one running agent, or a legible failure.
+    fn current_modes(home: &Path, id: &str) -> Result<radar::session::agent::AgentModes> {
+        match Client::request(home, Request::AgentList)? {
+            Response::Agents(agents) => agents
+                .into_iter()
+                .find(|agent| agent.id == id)
+                .and_then(|agent| agent.modes)
+                .context("agent has no modes (not ready yet, or the agent offers none)"),
+            other => anyhow::bail!("unexpected daemon response: {other:?}"),
+        }
+    }
 
     daemon::ensure_running(&paths.data_dir)?;
     let default_project_id = || -> Result<i64> {
@@ -860,11 +877,11 @@ fn acp_command(paths: &Paths, action: AcpAction) -> Result<()> {
                 Some(id) => id,
                 None => default_project_id()?,
             };
-            // `opencode acp` takes no positional: the project directory travels
-            // in `NewSessionRequest`, not on the command line. Explicit
-            // `--arg`s replace the default for other agents.
+            // Known drivers get their default ACP args; explicit `--arg`s win.
+            // The project directory never lands on the command line: it travels
+            // in `NewSessionRequest`.
             let args = if args.is_empty() {
-                vec!["acp".to_string()]
+                radar::session::agent::default_acp_args(&program).unwrap_or_default()
             } else {
                 args
             };
@@ -882,6 +899,22 @@ fn acp_command(paths: &Paths, action: AcpAction) -> Result<()> {
         AcpAction::Prompt { id, text } => Request::AgentPrompt { id, text },
         AcpAction::Cancel { id } => Request::AgentCancel { id },
         AcpAction::Stop { id } => Request::AgentStop { id },
+        // Modes and Mode read the agent space directly and print on their own;
+        // they need no generic request/response plumbing.
+        AcpAction::Modes { id } => {
+            let modes = current_modes(&paths.data_dir, &id)?;
+            println!("{}", serde_json::to_string(&modes)?);
+            return Ok(());
+        }
+        AcpAction::Mode { id, mode_id } => {
+            match Client::request(&paths.data_dir, Request::AgentSetMode { id, mode_id })? {
+                Response::AgentModes(modes) => {
+                    println!("{}", serde_json::to_string(&modes)?);
+                }
+                other => anyhow::bail!("unexpected daemon response: {other:?}"),
+            }
+            return Ok(());
+        }
         AcpAction::List => Request::AgentList,
     };
     let response = Client::request(&paths.data_dir, request)?;

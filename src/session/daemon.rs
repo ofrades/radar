@@ -22,7 +22,7 @@ use super::activity::{
     ActivitySnapshot, ActivitySubscription, Attention, AttentionMutationResult, ChangeAttention,
     CreateAttention, CreateAttentionResult, PublishActivity, WatchResult,
 };
-use super::agent::{AgentHost, AgentStart, AgentStatus};
+use super::agent::{AgentHost, AgentModes, AgentStart, AgentStatus};
 use super::beads_store::BeadsBoardStore;
 use super::board_store::{Board, BoardChange, BoardState, BoardStore};
 use super::catalog::{self, CatalogFilter, SessionCatalog};
@@ -205,6 +205,11 @@ pub enum Command {
     AgentStop {
         id: String,
     },
+    /// Switch an agent's session mode.
+    AgentSetMode {
+        id: String,
+        mode_id: String,
+    },
     /// Every ACP agent the daemon is running.
     AgentList,
 }
@@ -254,6 +259,8 @@ pub enum Response {
     CardNext(Option<Box<BoardChange>>),
     AgentStatus(AgentStatus),
     Agents(Vec<AgentStatus>),
+    /// The mode change was accepted; the agent's echo confirms the state.
+    AgentModes(AgentModes),
 }
 
 /// Socket directory is private even when the surrounding RADAR_HOME is shared.
@@ -802,6 +809,9 @@ fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
         Command::AgentStop { id } => {
             services.agents.stop(&id)?;
             Response::Ok
+        }
+        Command::AgentSetMode { id, mode_id } => {
+            Response::AgentModes(services.agents.set_mode_status(&id, &mode_id)?)
         }
         Command::AgentList => Response::Agents(services.agents.list()),
         Command::PublishActivity(input) => {

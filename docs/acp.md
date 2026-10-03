@@ -31,6 +31,18 @@ over its stdin/stdout using the [`agent-client-protocol`][sdk] Rust SDK.
   attention request through the existing `ActivityJournal`. The human's
   `approve`/`deny` response is mapped back onto the agent's offered
   `PermissionOption`s and sent as the protocol's permission outcome.
+- **Capabilities.** The initialize handshake is flattened into an
+  `AgentCapabilities` matrix on `AgentStatus`: `load_session`, prompt
+  capabilities (image, audio, embedded context), MCP transports, and
+  `session/list` / `session/delete`. Clients branch on what the agent said it
+  can do instead of hard-coding per-provider knowledge.
+- **Session modes.** The mode state the agent grants at `session/new` (current
+  plus available, with names and descriptions) rides on `AgentStatus`, and
+  `session/set_mode` switches it while it runs. The agent's
+  `CurrentModeUpdate` echo is authoritative; a real change publishes a
+  `Reported` `mode: …` line to the project feed. Config options the agent
+  advertises (model, effort, …) are surfaced as `config_options`; setting them
+  is a later card.
 - **Lifecycle.** Start, ready, exited, and failed are published as
   `SessionLifecycle` activity, so the board and every watcher see the agent
   come and go.
@@ -40,6 +52,9 @@ over its stdin/stdout using the [`agent-client-protocol`][sdk] Rust SDK.
 | ACP | radar |
 | --- | --- |
 | `initialize` / `session/new` | worker start; `acp_session_id` in `AgentStatus` |
+| initialize response | `AgentCapabilities` on `AgentStatus` |
+| `session/new` `modes` | `AgentModes` (current + available) on `AgentStatus` |
+| `session/set_mode` + `CurrentModeUpdate` | `radar acp mode`; `Reported` `mode: …` feed line |
 | `session/update` `agent_message_chunk` | `Reported` message at turn end |
 | `session/update` `tool_call` | `Reported` "tool: {title}" |
 | prompt turn start / `stopReason` | `AgentStateChanged` working / idle |
@@ -68,11 +83,22 @@ radar acp list
 radar acp stop my-agent
 ```
 
-`--arg` overrides the default `acp` argument shape for agents other than
-opencode; the working directory is sent in the ACP `session/new` request, not on
+Known drivers get their default ACP args from a small catalog in
+`src/session/agent.rs` (`opencode` and `omp` both want `acp`); explicit `--arg`
+overrides, and an unknown program starts bare, which keeps the provider set
+open. The working directory is sent in the ACP `session/new` request, not on
 the command line. `--project-id`, `--session-id`, and `--card-id` default to the
 `RADAR_PROJECT_ID`, `RADAR_SESSION_ID`, and `RADAR_CARD_ID` a radar-launched pane
 carries, so an agent started from a card links its activity to that card.
+
+```sh
+# See what an agent can do and what modes it offers.
+radar acp list --json
+radar acp modes my-agent
+
+# Switch its session mode; fails legibly if the agent does not confirm it.
+radar acp mode my-agent plan
+```
 
 ## Tests
 

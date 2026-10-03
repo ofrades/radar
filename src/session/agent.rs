@@ -16,11 +16,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind,
     PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, TextContent,
+    SelectedPermissionOutcome, SessionConfigOption, SessionModeId, SessionNotification,
+    SessionUpdate, SetSessionModeRequest, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo};
@@ -35,6 +37,58 @@ use super::activity::{
 
 /// Unique-enough idempotency token for the activity this adapter publishes.
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// One selectable session mode on a running agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMode {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// The agent's active session mode plus everything else it accepts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentModes {
+    pub current: String,
+    pub available: Vec<AgentMode>,
+}
+
+/// One tunable session config option (`session/set_config_option`), as the
+/// agent advertised it. Model choice lands here on agents that expose it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConfigOption {
+    pub id: String,
+    pub name: String,
+}
+
+/// What an agent said it can do — the ACP initialize handshake, flattened to
+/// the flags radar and its clients branch on. Absent until the handshake
+/// completes; an agent started moments ago reports none yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCapabilities {
+    pub load_session: bool,
+    pub prompt_image: bool,
+    pub prompt_audio: bool,
+    pub prompt_embedded_context: bool,
+    pub mcp_http: bool,
+    pub mcp_sse: bool,
+    pub session_list: bool,
+    pub session_delete: bool,
+}
+
+/// Per-driver default ACP args. The catalog never closes the provider set: an
+/// unknown program is still startable, it just gets no implicit args.
+const DRIVER_DEFAULT_ARGS: &[(&str, &[&str])] = &[("opencode", &["acp"]), ("omp", &["acp"])];
+
+/// Default ACP args for a known driver, or `None` when the program is not in
+/// the catalog. Explicit args always win.
+pub fn default_acp_args(program: &str) -> Option<Vec<String>> {
+    DRIVER_DEFAULT_ARGS
+        .iter()
+        .find(|(slug, _)| *slug == program)
+        .map(|(_, args)| args.iter().map(|arg| (*arg).to_string()).collect())
+}
 
 fn next_command_id(agent: &str, what: &str) -> String {
     let sequence = EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -77,6 +131,15 @@ pub struct AgentStatus {
     pub state: String,
     #[serde(default)]
     pub detail: Option<String>,
+    /// Feature matrix from the initialize handshake.
+    #[serde(default)]
+    pub capabilities: Option<AgentCapabilities>,
+    /// Session modes from the agent: the current one plus what else it accepts.
+    #[serde(default)]
+    pub modes: Option<AgentModes>,
+    /// Config options the agent exposes; settable later with set_config_option.
+    #[serde(default)]
+    pub config_options: Vec<AgentConfigOption>,
 }
 
 impl AgentStatus {
@@ -88,12 +151,17 @@ impl AgentStatus {
             acp_session_id: None,
             state: "starting".to_string(),
             detail: None,
+            capabilities: None,
+            modes: None,
+            config_options: Vec::new(),
         }
     }
 }
 
 enum AgentCommand {
     Prompt(String),
+    /// Switch the session mode; the driver keeps its own id reused per turn.
+    SetMode(SessionModeId),
     Cancel,
     Stop,
 }
@@ -137,6 +205,12 @@ impl AgentHost {
         if spec.project_id <= 0 {
             bail!("agent session needs a positive project id");
         }
+        // The daemon fills per-driver defaults so callers never repeat the
+        // `acp` argument shape; unknown programs just start bare.
+        let mut spec = spec;
+        if spec.args.is_empty() {
+            spec.args = default_acp_args(&spec.program).unwrap_or_default();
+        }
         let mut agents = self.agents.lock();
         if let Some(existing) = agents.get(&spec.id) {
             // A live agent keeps its id; a finished one may be replaced.
@@ -170,6 +244,27 @@ impl AgentHost {
     /// Send a user prompt to a ready agent.
     pub fn prompt(&self, id: &str, text: String) -> Result<()> {
         self.send(id, AgentCommand::Prompt(text))
+    }
+
+    /// Switch the agent's session mode and wait briefly for the agent's echo
+    /// so callers see the new state without re-polling.
+    pub fn set_mode_status(&self, id: &str, mode_id: &str) -> Result<AgentModes> {
+        self.send(id, AgentCommand::SetMode(SessionModeId::new(mode_id)))?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Some(modes) = self
+                .list()
+                .into_iter()
+                .find(|status| status.id == id)
+                .and_then(|status| status.modes)
+            {
+                if modes.current == mode_id {
+                    return Ok(modes);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        bail!("agent did not confirm session mode {mode_id} in time")
     }
 
     /// Ask the agent to cancel its current turn.
@@ -237,6 +332,36 @@ impl AgentHost {
         if let Some(entry) = self.agents.lock().get_mut(id) {
             entry.status.acp_session_id = Some(session_id.to_string());
         }
+    }
+
+    fn set_capabilities(&self, id: &str, capabilities: AgentCapabilities) {
+        if let Some(entry) = self.agents.lock().get_mut(id) {
+            entry.status.capabilities = Some(capabilities);
+        }
+    }
+
+    /// Swap the mode state wholesale; the agent's snapshot is authoritative.
+    fn set_modes(&self, id: &str, modes: AgentModes) {
+        if let Some(entry) = self.agents.lock().get_mut(id) {
+            entry.status.modes = Some(modes);
+        }
+    }
+
+    /// Replace the config-option list the agent advertised.
+    fn set_config_options(&self, id: &str, options: Vec<AgentConfigOption>) {
+        if let Some(entry) = self.agents.lock().get_mut(id) {
+            entry.status.config_options = options;
+        }
+    }
+
+    /// Record the agent's new current mode and return the previous one, so a
+    /// mode-change activity report is only published on real changes.
+    fn switch_mode(&self, id: &str, mode_id: &str) -> Option<String> {
+        let mut agents = self.agents.lock();
+        let entry = agents.get_mut(id)?;
+        let modes = entry.status.modes.as_mut()?;
+        let previous = std::mem::replace(&mut modes.current, mode_id.to_string());
+        Some(previous)
     }
 
     fn register_pending(
@@ -313,6 +438,7 @@ async fn connect(
     let notification_spec = spec.clone();
     let transcript = Arc::new(Mutex::new(String::new()));
     let notification_transcript = Arc::clone(&transcript);
+    let notification_host = Arc::clone(&host);
 
     let request_host = Arc::clone(&host);
     let request_journal = Arc::clone(&journal);
@@ -332,6 +458,7 @@ async fn connect(
                     &notification_journal,
                     &notification_spec,
                     &notification_transcript,
+                    &notification_host,
                     notification,
                 );
                 Ok(())
@@ -356,10 +483,34 @@ async fn connect(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(agent, move |connection: ConnectionTo<Agent>| async move {
-            connection
+            let initialized = connection
                 .send_request(InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
                 .await?;
+            connection_host.set_capabilities(
+                &connection_spec.id,
+                AgentCapabilities {
+                    load_session: initialized.agent_capabilities.load_session,
+                    prompt_image: initialized.agent_capabilities.prompt_capabilities.image,
+                    prompt_audio: initialized.agent_capabilities.prompt_capabilities.audio,
+                    prompt_embedded_context: initialized
+                        .agent_capabilities
+                        .prompt_capabilities
+                        .embedded_context,
+                    mcp_http: initialized.agent_capabilities.mcp_capabilities.http,
+                    mcp_sse: initialized.agent_capabilities.mcp_capabilities.sse,
+                    session_list: initialized
+                        .agent_capabilities
+                        .session_capabilities
+                        .list
+                        .is_some(),
+                    session_delete: initialized
+                        .agent_capabilities
+                        .session_capabilities
+                        .delete
+                        .is_some(),
+                },
+            );
 
             let new_session = connection
                 .send_request(NewSessionRequest::new(connection_spec.cwd.clone()))
@@ -367,6 +518,12 @@ async fn connect(
                 .await?;
             let session_id = new_session.session_id;
             connection_host.set_session_id(&connection_spec.id, &session_id.0);
+            if let Some(modes) = &new_session.modes {
+                connection_host.set_modes(&connection_spec.id, to_agent_modes(modes));
+            }
+            if let Some(options) = &new_session.config_options {
+                connection_host.set_config_options(&connection_spec.id, config_option_ids(options));
+            }
             connection_host.set_status(&connection_spec.id, "ready", None);
             publish_state(
                 &connection_journal,
@@ -421,6 +578,24 @@ async fn connect(
                             }
                         }
                     }
+                    AgentCommand::SetMode(mode_id) => {
+                        let request =
+                            SetSessionModeRequest::new(session_id.clone(), mode_id.clone());
+                        match connection.send_request(request).block_task().await {
+                            Ok(_) => {
+                                // The agent echoes the authoritative mode
+                                // through CurrentModeUpdate; nothing to assert
+                                // here. A failed request leaves state untouched.
+                            }
+                            Err(error) => {
+                                connection_host.set_status(
+                                    &connection_spec.id,
+                                    "failed",
+                                    Some(format!("mode {}: {error}", mode_id.0)),
+                                );
+                            }
+                        }
+                    }
                     AgentCommand::Cancel => {
                         let _ = connection
                             .send_notification(CancelNotification::new(session_id.clone()));
@@ -434,11 +609,13 @@ async fn connect(
         .map_err(|error| error.to_string())
 }
 
-/// Turn one `session/update` into project activity.
+/// Turn one `session/update` into project activity, keeping the daemon's
+/// view of modes and config options aligned with what the agent reports.
 fn observe_update(
     journal: &ActivityJournal,
     spec: &AgentStart,
     transcript: &Mutex<String>,
+    host: &AgentHost,
     notification: SessionNotification,
 ) {
     match notification.update {
@@ -450,6 +627,31 @@ fn observe_update(
         }
         SessionUpdate::ToolCall(tool) => {
             publish_report(journal, spec, &format!("tool: {}", tool.title));
+        }
+        SessionUpdate::CurrentModeUpdate(update) => {
+            let next = update.current_mode_id.0.to_string();
+            let previous = host.switch_mode(&spec.id, &next);
+            if previous.as_deref() != Some(next.as_str()) {
+                let detail = host
+                    .list()
+                    .into_iter()
+                    .find(|status| status.id == spec.id)
+                    .and_then(|status| status.modes)
+                    .and_then(|modes| {
+                        modes
+                            .available
+                            .into_iter()
+                            .find(|mode| mode.id == next)
+                            .map(|mode| mode.name)
+                    });
+                match detail {
+                    Some(name) => publish_report(journal, spec, &format!("mode: {name}")),
+                    None => publish_report(journal, spec, &format!("mode: {next}")),
+                }
+            }
+        }
+        SessionUpdate::ConfigOptionUpdate(update) => {
+            host.set_config_options(&spec.id, config_option_ids(&update.config_options));
         }
         _ => {}
     }
@@ -558,6 +760,35 @@ fn publish_report(journal: &ActivityJournal, spec: &AgentStart, text: &str) {
     });
 }
 
+/// Normalize the agent's mode state. The agent is the source of truth, so a
+/// mode in `current` that never appeared in `available` is still reported.
+fn to_agent_modes(state: &agent_client_protocol::schema::v1::SessionModeState) -> AgentModes {
+    let available = state
+        .available_modes
+        .iter()
+        .map(|mode| AgentMode {
+            id: mode.id.0.to_string(),
+            name: mode.name.clone(),
+            description: mode.description.clone(),
+        })
+        .collect();
+    AgentModes {
+        current: state.current_mode_id.0.to_string(),
+        available,
+    }
+}
+
+/// Flatten the agent's config options to what clients need.
+fn config_option_ids(options: &[SessionConfigOption]) -> Vec<AgentConfigOption> {
+    options
+        .iter()
+        .map(|option| AgentConfigOption {
+            id: option.id.0.to_string(),
+            name: option.name.clone(),
+        })
+        .collect()
+}
+
 fn publish_lifecycle(
     journal: &ActivityJournal,
     spec: &AgentStart,
@@ -638,5 +869,51 @@ mod tests {
         let cut = truncate(&text, 5);
         assert!(cut.len() <= 5);
         assert!(text.starts_with(&cut));
+    }
+
+    #[test]
+    fn known_drivers_have_defaults_and_unknown_ones_none() {
+        assert_eq!(default_acp_args("opencode").unwrap(), vec!["acp"]);
+        assert_eq!(default_acp_args("omp").unwrap(), vec!["acp"]);
+        assert_eq!(default_acp_args("unknown-agent"), None);
+    }
+
+    #[test]
+    fn agent_modes_keep_the_current_mode_even_if_unlisted() {
+        let state = agent_client_protocol::schema::v1::SessionModeState::new(
+            "beyond".to_string(),
+            vec![agent_client_protocol::schema::v1::SessionMode::new(
+                "code", "Code",
+            )],
+        );
+        let modes = to_agent_modes(&state);
+        assert_eq!(modes.current, "beyond");
+        assert_eq!(modes.available.len(), 1);
+        assert_eq!(modes.available[0].id, "code");
+        assert_eq!(modes.available[0].name, "Code");
+        assert_eq!(modes.available[0].description, None);
+    }
+
+    #[test]
+    fn config_options_flatten_to_id_and_name() {
+        use agent_client_protocol::schema::v1::{
+            SessionConfigKind, SessionConfigSelect, SessionConfigSelectOption,
+            SessionConfigSelectOptions, SessionConfigValueId,
+        };
+        let options = [SessionConfigOption::new(
+            "model",
+            "Model",
+            SessionConfigKind::Select(SessionConfigSelect::new(
+                "gpt-5",
+                SessionConfigSelectOptions::Ungrouped(vec![SessionConfigSelectOption::new(
+                    SessionConfigValueId::new("gpt-5"),
+                    "GPT-5",
+                )]),
+            )),
+        )];
+        let flattened = config_option_ids(&options);
+        assert_eq!(flattened.len(), 1);
+        assert_eq!(flattened[0].id, "model");
+        assert_eq!(flattened[0].name, "Model");
     }
 }
