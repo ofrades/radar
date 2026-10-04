@@ -382,3 +382,100 @@ fn the_board_read_derives_whose_turn_it_is() {
         "the stored claim never changed underneath the derive"
     );
 }
+
+/// A worker report carries its kind's semantics, run by the daemon:
+/// blocked opens a question for the person, done hands the card back the
+/// same way the turn-end path does.
+#[test]
+fn the_report_envelope_blocks_ask_and_done_hands_back() {
+    use radar::session::report::{Kind, Report};
+
+    let daemon = Daemon::start();
+    add(&daemon, 31, "Todo", "report card");
+    let (card_id, claimed_card) = {
+        let board = match daemon.request(Request::BoardState { project_id: 31 }) {
+            Response::BoardState(board) => board,
+            other => panic!("unexpected board response: {other:?}"),
+        };
+        let card = board
+            .cards
+            .iter()
+            .find(|card| card.title == "report card")
+            .unwrap()
+            .clone();
+        let change = change(daemon.request(Request::CardClaim {
+            project_id: 31,
+            card_id: card.id.clone(),
+            claim: Some("worker-1".into()),
+            expected_revision: Some(card.revision),
+            command_id: "claim-report".into(),
+        }));
+        (card.id, change.card.clone())
+    };
+    assert_eq!(claimed_card.lane, "In progress");
+
+    // A plain report says only.
+    let said = match daemon.request(Request::CardReport {
+        project_id: 31,
+        card_id: card_id.clone(),
+        session_id: Some("project-31-agent-0-opencode".into()),
+        root: daemon.home.path().to_path_buf(),
+        report: Report {
+            kind: Kind::Checkpoint,
+            text: "restarted the failing worker".into(),
+            artifact: None,
+        },
+        command_id: "report-1".into(),
+    }) {
+        Response::CardReported(reported) => *reported,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert!(said.attention.is_none());
+    assert!(said.handoff.is_none());
+
+    // Blocked opens a question for the person and the lane stays.
+    let held = match daemon.request(Request::CardReport {
+        project_id: 31,
+        card_id: card_id.clone(),
+        session_id: Some("project-31-agent-0-opencode".into()),
+        root: daemon.home.path().to_path_buf(),
+        report: Report {
+            kind: Kind::Blocked,
+            text: "which deployment target do we use?".into(),
+            artifact: None,
+        },
+        command_id: "report-2".into(),
+    }) {
+        Response::CardReported(reported) => *reported,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert!(held.attention.is_some());
+    assert!(held.handoff.is_none());
+
+    // Done hands the card back to Review.
+    let handed = match daemon.request(Request::CardReport {
+        project_id: 31,
+        card_id: card_id.clone(),
+        session_id: Some("project-31-agent-0-opencode".into()),
+        root: daemon.home.path().to_path_buf(),
+        report: Report {
+            kind: Kind::Done,
+            text: "the fix is up; check with cargo test".into(),
+            artifact: None,
+        },
+        command_id: "report-3".into(),
+    }) {
+        Response::CardReported(reported) => *reported,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(handed.handoff.as_deref(), Some("Review"));
+    let after = state(&daemon, 31);
+    assert_eq!(
+        after
+            .cards
+            .iter()
+            .find(|card| card.id == card_id)
+            .map(|card| card.lane.as_str()),
+        Some("Review")
+    );
+}

@@ -31,6 +31,8 @@ use super::registry::{
     Subscription,
 };
 use super::Dims;
+use crate::config::Paths;
+use crate::db::Db;
 
 pub const VERSION: u32 = 4;
 const MAX_REQUEST: usize = 128 * 1024;
@@ -166,6 +168,18 @@ pub enum Command {
         expected_revision: Option<u64>,
         command_id: String,
     },
+    /// A worker report on a card's thread, with the kind's semantics run by
+    /// the daemon rather than the caller: blocked opens a question for the
+    /// person, done hands the card back the same way the turn-end path
+    /// does.
+    CardReport {
+        project_id: i64,
+        card_id: String,
+        session_id: Option<String>,
+        root: std::path::PathBuf,
+        report: crate::session::report::Report,
+        command_id: String,
+    },
     CardComplete {
         project_id: i64,
         card_id: String,
@@ -298,6 +312,9 @@ pub enum Response {
     AgentConfigOptions(Vec<AgentConfigOption>),
     /// The agent's own conversations.
     AgentSessions(Vec<super::agent::AgentSessionInfo>),
+    /// What a worker report did: the posted event, the attention it opened
+    /// (blocked) if any, and what the hand-off did (done, if any).
+    CardReported(Box<CardReported>),
 }
 
 /// Socket directory is private even when the surrounding RADAR_HOME is shared.
@@ -478,6 +495,134 @@ pub(crate) struct Services {
     pub(crate) pr: crate::session::pr::SharedCache,
     /// The daemon's data directory: settings, credentials, the board skill.
     pub(crate) home: PathBuf,
+}
+
+/// The whole report envelope, run centrally: the typed comment posts, and
+/// the kind's semantics fire here — `blocked` opens a question for the
+/// person, `done` hands the card back the same way the turn-end handoff
+/// does (move to Review, reviewer dispatched where configured).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CardReported {
+    pub event: serde_json::Value,
+    #[serde(default)]
+    pub attention: Option<String>,
+    #[serde(default)]
+    pub handoff: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn card_report(
+    services: &Services,
+    db: Option<&Db>,
+    project_id: i64,
+    card_id: &str,
+    session_id: Option<String>,
+    root: &std::path::Path,
+    report: &crate::session::report::Report,
+    command_id: &str,
+) -> Result<CardReported> {
+    use crate::session::activity::{
+        ActivityKind, ActivityPayload, CreateAttention, PublishActivity,
+    };
+    use crate::session::report::Effect;
+
+    let event = services.activity.publish(PublishActivity {
+        project_id,
+        command_id: command_id.to_string(),
+        session_id: session_id.clone(),
+        card_id: Some(card_id.to_string()),
+        kind: ActivityKind::Reported,
+        payload: ActivityPayload::Message {
+            text: crate::session::report::format(report),
+        },
+    })?;
+    let mut out = CardReported {
+        event: serde_json::to_value(&event)?,
+        attention: None,
+        handoff: None,
+    };
+    match crate::session::report::effect(report.kind) {
+        Effect::Said => {}
+        Effect::Blocked => {
+            let created = services.activity.create_attention(CreateAttention {
+                project_id,
+                command_id: format!("{command_id}-attention"),
+                session_id: session_id.clone(),
+                card_id: Some(card_id.to_string()),
+                kind: super::activity::AttentionKind::Question,
+                reason: if report.text.is_empty() {
+                    "the worker is blocked".to_string()
+                } else {
+                    report.text.clone()
+                },
+                allowed_actions: vec![
+                    super::activity::AttentionActionKind::Answer,
+                    super::activity::AttentionActionKind::Dismiss,
+                ],
+            })?;
+            out.attention = Some(created.attention.id);
+        }
+        Effect::HandedBack => {
+            let state = services.board.state(project_id)?;
+            let Some(card) = state.cards.iter().find(|card| card.id == card_id) else {
+                out.handoff = Some("card is not on the board".to_string());
+                return Ok(out);
+            };
+            if card.done || card.claim.is_none() {
+                out.handoff = Some("not a claimed card".to_string());
+                return Ok(out);
+            }
+            let in_progress = state
+                .lanes
+                .iter()
+                .find(|lane| lane.id == card.lane_id)
+                .is_some_and(|lane| lane.kind == "in_progress");
+            if !in_progress {
+                out.handoff = Some("card is not in progress".to_string());
+                return Ok(out);
+            }
+            let Some(review) = state
+                .lanes
+                .iter()
+                .find(|lane| lane.kind == "review")
+                .map(|lane| lane.name.clone())
+            else {
+                bail!("no review lane to hand \"{}\" to", card.title);
+            };
+            let change =
+                services
+                    .board
+                    .move_card(project_id, card_id, &review, Some(card.revision))?;
+            publish_board_change(
+                &services.activity,
+                project_id,
+                &format!("{command_id}-handoff"),
+                &change,
+            )?;
+            // The reviewer, where the project configured one: the same
+            // dispatch the turn-end path uses.
+            if let Some(db) = db {
+                let paths = crate::config::Paths::with_root(services.home.clone());
+                match db.reviewer(project_id) {
+                    Ok(Some(reviewer)) => {
+                        let _ = crate::session::dispatch::start_review(
+                            &paths,
+                            db,
+                            project_id,
+                            root,
+                            card,
+                            Some(&reviewer),
+                            &format!("{command_id}-review"),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("radar card report: reviewer check: {error:#}"),
+                }
+            }
+            out.handoff = Some(review);
+        }
+    }
+    Ok(out)
 }
 
 fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
@@ -870,6 +1015,28 @@ fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
             let change = services.board.remove_card(project_id, &card_id)?;
             publish_board_change(&services.activity, project_id, &command_id, &change)?;
             Response::CardChanged(Box::new(change))
+        }
+        Command::CardReport {
+            project_id,
+            card_id,
+            session_id,
+            root,
+            report,
+            command_id,
+        } => {
+            // The reviewer preference lives in the settings db; open it for
+            // the done-handoff only.
+            let db = Db::open(&Paths::with_root(services.home.clone())).ok();
+            Response::CardReported(Box::new(card_report(
+                &services,
+                db.as_ref(),
+                project_id,
+                &card_id,
+                session_id,
+                &root,
+                &report,
+                &command_id,
+            )?))
         }
         Command::CardNext {
             project_id,

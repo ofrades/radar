@@ -506,6 +506,15 @@ enum CardAction {
         /// Stable daemon session ID (defaults to RADAR_SESSION_ID)
         #[arg(long)]
         session_id: Option<String>,
+        /// The report kind, when the comment carries the loop's semantics:
+        /// checkpoint (nothing asked), blocked (opens a question for the
+        /// human), done (hands the card back like the turn-end path),
+        /// artifact (a durable reference, with --artifact)
+        #[arg(long)]
+        kind: Option<String>,
+        /// An opaque durable reference for --kind artifact
+        #[arg(long)]
+        artifact: Option<String>,
     },
     /// Edit a card's title and/or notes
     Edit {
@@ -1339,63 +1348,84 @@ fn main() -> Result<()> {
         }
         Some(Command::Doctor) => doctor(&paths, &db),
         Some(Command::Board { path }) => show_board(&paths, &db, path, cli.json),
-        Some(Command::Card { action }) => match action {
-            CardAction::Add {
-                path,
-                title,
-                column,
-                body,
-                by,
-            } => card_add(
-                &paths,
-                &db,
-                path,
-                &title,
-                column.as_deref(),
-                body.as_deref(),
-                by.as_deref(),
-            ),
-            CardAction::Claim { path, title, by } => {
-                card_claim(&paths, &db, path, &title, Some(&by), cli.json)
+        Some(Command::Card { action }) => {
+            match action {
+                CardAction::Add {
+                    path,
+                    title,
+                    column,
+                    body,
+                    by,
+                } => card_add(
+                    &paths,
+                    &db,
+                    path,
+                    &title,
+                    column.as_deref(),
+                    body.as_deref(),
+                    by.as_deref(),
+                ),
+                CardAction::Claim { path, title, by } => {
+                    card_claim(&paths, &db, path, &title, Some(&by), cli.json)
+                }
+                CardAction::Release { path, title } => {
+                    card_claim(&paths, &db, path, &title, None, cli.json)
+                }
+                CardAction::Move { path, title, to } => {
+                    card_move(&paths, &db, path, &title, &to, cli.json)
+                }
+                CardAction::Done { path, title } => card_done(&paths, &db, path, &title, cli.json),
+                CardAction::Next {
+                    path,
+                    by,
+                    in_column,
+                } => card_next(&paths, &db, path, &by, in_column.as_deref(), cli.json),
+                CardAction::Show { path, card } => card_show(&paths, &db, path, &card, cli.json),
+                CardAction::Comment {
+                    path,
+                    card,
+                    text,
+                    session_id,
+                    kind,
+                    artifact,
+                } => {
+                    let report_kind = match kind.as_deref() {
+                    Some(given) => Some(radar::session::report::Kind::parse(given).with_context(|| {
+                        format!("--kind {given} is not one of: checkpoint, blocked, done, artifact")
+                    })?),
+                    None => None,
+                };
+                    card_report(
+                        &paths,
+                        &db,
+                        path,
+                        &card,
+                        &text,
+                        session_id,
+                        report_kind,
+                        artifact,
+                    )
+                }
+                CardAction::Edit {
+                    path,
+                    card,
+                    title,
+                    body,
+                } => card_edit(
+                    &paths,
+                    &db,
+                    path,
+                    &card,
+                    title.as_deref(),
+                    body.as_deref(),
+                    cli.json,
+                ),
+                CardAction::Associate { path, card } => {
+                    card_associate(&paths, &db, path, &card, cli.json)
+                }
+                CardAction::Start { path, card } => card_start(&paths, &db, path, &card, cli.json),
             }
-            CardAction::Release { path, title } => {
-                card_claim(&paths, &db, path, &title, None, cli.json)
-            }
-            CardAction::Move { path, title, to } => {
-                card_move(&paths, &db, path, &title, &to, cli.json)
-            }
-            CardAction::Done { path, title } => card_done(&paths, &db, path, &title, cli.json),
-            CardAction::Next {
-                path,
-                by,
-                in_column,
-            } => card_next(&paths, &db, path, &by, in_column.as_deref(), cli.json),
-            CardAction::Show { path, card } => card_show(&paths, &db, path, &card, cli.json),
-            CardAction::Comment {
-                path,
-                card,
-                text,
-                session_id,
-            } => card_comment(&paths, &db, path, &card, &text, session_id),
-            CardAction::Edit {
-                path,
-                card,
-                title,
-                body,
-            } => card_edit(
-                &paths,
-                &db,
-                path,
-                &card,
-                title.as_deref(),
-                body.as_deref(),
-                cli.json,
-            ),
-            CardAction::Associate { path, card } => {
-                card_associate(&paths, &db, path, &card, cli.json)
-            }
-            CardAction::Start { path, card } => card_start(&paths, &db, path, &card, cli.json),
-        },
+        }
         Some(Command::Hook { action }) => match action {
             HookAction::Guard { file, commit, path } => {
                 if commit {
@@ -1914,39 +1944,59 @@ fn card_show(
     Ok(())
 }
 
-/// Post a message on a card's thread — how an agent reports back to the human
-/// without burying it in terminal output. The thread lives in the daemon
-/// journal keyed by the card's stable id.
-fn card_comment(
+/// Post a report on a card's thread — how an agent reports back to the
+/// human, with the kind's semantics run by the daemon (`blocked` asks, `done`
+/// hands back). The thread lives in the daemon journal keyed by the card's
+/// stable id.
+#[allow(clippy::too_many_arguments)]
+fn card_report(
     paths: &Paths,
     db: &Db,
     path: Option<PathBuf>,
     needle: &str,
     text: &str,
     session_id: Option<String>,
+    kind: Option<radar::session::report::Kind>,
+    artifact: Option<String>,
 ) -> Result<()> {
-    use radar::session::activity::{ActivityKind, ActivityPayload, PublishActivity};
     use radar::session::daemon as board_api;
     use radar::session::daemon::{Client, Command as Request, Response};
+    use radar::session::report::Report;
 
     let (project_id, root) = board_context(db, path)?;
     db.require_board_enabled(&root)?;
     let board = board_api::board_state(&paths.data_dir, project_id)?;
     let state = board.state;
     let card_id = find_stored_mut(&state, needle)?.id.clone();
-    let command = Request::PublishActivity(PublishActivity {
+    let report = Report {
+        kind: kind.unwrap_or(radar::session::report::Kind::Checkpoint),
+        text: text.to_string(),
+        artifact,
+    };
+    let command = Request::CardReport {
         project_id,
-        command_id: board_command_id("comment"),
+        card_id: card_id.clone(),
         session_id: session_id.or_else(|| std::env::var("RADAR_SESSION_ID").ok()),
-        card_id: Some(card_id.clone()),
-        kind: ActivityKind::Reported,
-        payload: ActivityPayload::Message {
-            text: text.to_string(),
-        },
-    });
+        root: root.clone(),
+        report,
+        command_id: board_command_id("comment"),
+    };
     match Client::request(&paths.data_dir, command)? {
-        Response::ActivityPublished(event) => {
-            println!("commented on {:?} (event {})", needle, event.sequence)
+        Response::CardReported(reported) => {
+            let attention = reported
+                .attention
+                .as_deref()
+                .map(|id| format!(" - question attention {id} opened"))
+                .unwrap_or_default();
+            let handoff = reported
+                .handoff
+                .as_deref()
+                .map(|what| format!(" - handoff: {what}"))
+                .unwrap_or_default();
+            println!(
+                "reported on {:?} (event {}){attention}{handoff}",
+                needle, reported.event["sequence"]
+            )
         }
         other => anyhow::bail!("unexpected daemon response: {other:?}"),
     }

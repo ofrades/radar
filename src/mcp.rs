@@ -194,11 +194,15 @@ fn tools() -> Value {
         ),
         tool(
             "card_comment",
-            "Post a message on a card's thread — how an agent reports to the \
-             human without burying it in terminal output.",
+            "Post a report on a card's thread. kind: checkpoint (progress; \
+             the default), blocked (cannot continue — opens a question for \
+             the human), done (hands the card back like the turn-end path), \
+             artifact (a durable reference with \"artifact\").",
             json!({
                 "card": card_arg(),
-                "text": { "type": "string", "description": "The message" },
+                "text": { "type": "string", "description": "The report" },
+                "kind": { "type": "string", "description": "checkpoint | blocked | done | artifact" },
+                "artifact": { "type": "string", "description": "An opaque durable reference (URL, path)" },
                 "project": project()["project"].clone(),
             }),
             &["card", "text"],
@@ -386,20 +390,43 @@ fn call_tool(ctx: &Ctx, name: &str, args: &Value) -> Result<String, String> {
         "card_comment" => {
             let needle = required(args, "card")?;
             let text = required(args, "text")?;
-            let (project_id, _) = resolve(ctx, project)?;
+            let (project_id, root) = resolve(ctx, project)?;
             let card_id = card_id(project_id, &needle)?;
-            use crate::session::activity::{ActivityKind, ActivityPayload, PublishActivity};
-            let command = Request::PublishActivity(PublishActivity {
+            let kind = args
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(|given| {
+                    crate::session::report::Kind::parse(given).ok_or_else(|| {
+                        format!("kind {given} is not one of: checkpoint, blocked, done, artifact")
+                    })
+                })
+                .transpose()?;
+            let report = crate::session::report::Report {
+                kind: kind.unwrap_or(crate::session::report::Kind::Checkpoint),
+                text,
+                artifact: args
+                    .get("artifact")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            };
+            let command = Request::CardReport {
                 project_id,
-                command_id: crate::session::board::command_id("mcp-comment"),
+                card_id,
                 session_id: std::env::var("RADAR_SESSION_ID").ok(),
-                card_id: Some(card_id),
-                kind: ActivityKind::Reported,
-                payload: ActivityPayload::Message { text },
-            });
+                root,
+                report,
+                command_id: crate::session::board::command_id("mcp-comment"),
+            };
             match Client::request(home, command) {
-                Ok(Response::ActivityPublished(event)) => {
-                    Ok(format!("commented (event {})", event.sequence))
+                Ok(Response::CardReported(reported)) => {
+                    let mut said = format!("reported (event {})", reported.event["sequence"]);
+                    if let Some(id) = &reported.attention {
+                        said.push_str(&format!(" - question {id} opened for the human"));
+                    }
+                    if let Some(what) = &reported.handoff {
+                        said.push_str(&format!(" - handoff: {what}"));
+                    }
+                    Ok(said)
                 }
                 Ok(other) => Err(format!("unexpected daemon response: {other:?}")),
                 Err(error) => Err(error.to_string()),

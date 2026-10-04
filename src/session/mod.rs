@@ -22,6 +22,7 @@ pub mod feedback;
 pub mod lane;
 pub mod pr;
 pub mod registry;
+pub mod report;
 mod schema;
 
 /// The default grid size, before a client reports its own. Every terminal

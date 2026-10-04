@@ -50,13 +50,16 @@ out of each other's way. There is no file to edit.
    your name and prints it. Claiming starts the card: a card claimed from Todo
    moves to In progress for you, and releasing it moves it back.
 2. Work one card at a time, and only what the card describes.
-3. Blocked, or the card is wrong? Leave a note on it
-   (`radar card comment "<card id or title>" "…"`), release it with
+3. Blocked, or the card is wrong? Report it:
+   `radar card comment "<card id or title>" "…" --kind blocked`
+   (opens a question for the human), release it with
    `radar card release --title "…"`, and claim the next card.
-4. Finished? Leave a short summary for the reviewer as a comment on the card —
-   what changed, how to check it — then move it to Review:
-   `radar card move --title "…" --to Review`. Moving hands your claim over:
-   from that moment the card is not yours.
+4. Progress worth recording? `radar card comment "<id>" "…" --kind checkpoint`.
+   A durable output (PR, document, dashboard)? `--kind artifact --artifact <ref>`.
+5. Finished? Hand the card back with a report the reviewer can read:
+   `radar card comment "<id>" "<what changed, how to check>" --kind done`.
+   That is the same handoff the driver runs at turn end: the card moves to
+   Review and a configured reviewer gets dispatched.
 
 ## The conversation
 

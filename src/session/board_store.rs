@@ -229,9 +229,11 @@ pub fn work_prompt(card_id: &str, title: &str) -> String {
     format!(
         "Work on board card \"{title}\" ({card_id}).\n\
          Read it and its thread with `radar card show \"{card_id}\"`.\n\n\
-         After each turn where you made progress, comment on the card:\n\
-         - `radar card comment \"{card_id}\" \"<what changed>\"`\n\
-         When it is ready for review: `radar card move --to Review \"{card_id}\"`.\n\
+         After each turn where you made progress, report on the card:\n\
+         - `radar card comment \"{card_id}\" \"<what changed>\" --kind checkpoint`\n\
+         Blocked, or a decision is needed: `--kind blocked` (asks the human).\n\
+         A durable output (PR, document): `--kind artifact --artifact <ref>`.\n\
+         When the work is handed back: `radar card comment \"{card_id}\" \"<summary>\" --kind done`.\n\
          When it is done: `radar card done \"{card_id}\"`."
     )
 }
