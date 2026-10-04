@@ -24,6 +24,7 @@ pub mod pr;
 pub mod registry;
 pub mod report;
 mod schema;
+pub mod verdict;
 
 /// The default grid size, before a client reports its own. Every terminal
 /// starts here if nothing better is known in time.

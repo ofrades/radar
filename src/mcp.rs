@@ -182,8 +182,15 @@ fn tools() -> Value {
         tool(
             "card_done",
             "Mark a card done: checked, and moved to the last lane. The \
-             reviewer's word, never the worker's.",
-            json!({ "card": card_arg(), "project": project()["project"].clone() }),
+             reviewer's word, never the worker's. words carries the closing \
+             message; an approved/rework verb in it becomes a verdict fact \
+             the board shows.",
+            json!({
+                "card": card_arg(),
+                "words": { "type": "string", "description": "The reviewer's closing words (optional)" },
+                "by": { "type": "string", "description": "agent | human (default human)" },
+                "project": project()["project"].clone(),
+            }),
             &["card"],
         ),
         tool(
@@ -348,11 +355,19 @@ fn call_tool(ctx: &Ctx, name: &str, args: &Value) -> Result<String, String> {
             let needle = required(args, "card")?;
             let (project_id, _) = resolve(ctx, project)?;
             let card_id = card_id(project_id, &needle)?;
+            let by = match args.get("by").and_then(Value::as_str) {
+                Some("agent") => Some(crate::session::verdict::VerdictBy::Agent),
+                Some("human") => Some(crate::session::verdict::VerdictBy::Human),
+                Some(other) => return Err(format!("by {other} is not agent or human")),
+                None => None,
+            };
             let change = board_api::board_card_complete(
                 home,
                 project_id,
                 &card_id,
                 None,
+                args.get("words").and_then(Value::as_str),
+                by,
                 &crate::session::board::command_id("mcp-done"),
             )
             .map_err(|e| e.to_string())?;

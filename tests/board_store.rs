@@ -208,6 +208,8 @@ fn the_card_lifecycle_and_conversation_round_trip() {
         card_id: card_id.clone(),
         expected_revision: None,
         command_id: "done-1".into(),
+        words: Some("rework: the test still fails".into()),
+        by: Some(radar::session::verdict::VerdictBy::Agent),
     }));
     assert!(done.card.done);
     assert_eq!(done.card.lane, "Done");

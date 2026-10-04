@@ -168,6 +168,13 @@ pub enum ActivityPayload {
         state: String,
         detail: Option<String>,
     },
+    /// A review verdict, recorded beside the lane move it accompanied. The
+    /// words travel with it so the fact stays checkable.
+    Verdict {
+        outcome: crate::session::verdict::Outcome,
+        by: crate::session::verdict::VerdictBy,
+        words: String,
+    },
     CommandResult {
         command_id: String,
         ok: bool,
@@ -642,6 +649,36 @@ impl ActivityJournal {
         load_attention(&inner.connection, project_id, request_id)
     }
 
+    /// The cards whose last recorded review verdict was a rework, so the
+    /// derived board read can show the word `(returned)`. The journal is the
+    /// fact store; the board never stores verdicts itself.
+    pub fn reworked_cards(&self, project_id: i64) -> Result<Vec<String>> {
+        validate_project(project_id)?;
+        let inner = self.inner.lock();
+        let connection = &inner.connection;
+        let mut stmt = connection.prepare(
+            "SELECT data FROM activity_events WHERE project_id = ?1 AND kind = 'reported'
+             ORDER BY sequence DESC LIMIT 500",
+        )?;
+        let rows = stmt.query_map([project_id], |row| row.get::<_, String>(0))?;
+        let mut seen = Vec::new();
+        for row in rows {
+            let event: ActivityEvent = serde_json::from_str(&row?).map_err(anyhow::Error::from)?;
+            if let (Some(card), ActivityPayload::Verdict { outcome, .. }) =
+                (&event.card_id, &event.payload)
+            {
+                if seen.iter().all(|(existing, _)| existing != card) {
+                    seen.push((card.clone(), *outcome));
+                }
+            }
+        }
+        Ok(seen
+            .into_iter()
+            .filter(|(_, outcome)| *outcome == crate::session::verdict::Outcome::Rework)
+            .map(|(card, _)| card)
+            .collect())
+    }
+
     /// Every unresolved request of a project, oldest first: the derived
     /// board read consults this, not the bounded event page.
     pub fn unresolved_attention(&self, project_id: i64) -> Result<Vec<Attention>> {
@@ -742,6 +779,7 @@ fn validate_activity(kind: &ActivityKind, payload: &ActivityPayload) -> Result<(
                 ActivityKind::SessionLifecycle,
                 ActivityPayload::SessionLifecycle { .. }
             )
+            | (ActivityKind::Reported, ActivityPayload::Verdict { .. })
             | (
                 ActivityKind::CommandResult,
                 ActivityPayload::CommandResult { .. }
@@ -751,6 +789,11 @@ fn validate_activity(kind: &ActivityKind, payload: &ActivityPayload) -> Result<(
         bail!("activity kind does not match its payload");
     }
     match payload {
+        ActivityPayload::Verdict { words, .. } => {
+            if words.len() > MAX_TEXT {
+                bail!("verdict words exceed {MAX_TEXT} bytes");
+            }
+        }
         ActivityPayload::AgentState { message, .. } => {
             if message.as_ref().is_some_and(|value| value.len() > MAX_TEXT) {
                 bail!("agent state message exceeds {MAX_TEXT} bytes");

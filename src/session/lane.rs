@@ -17,7 +17,7 @@
 //! worker is not alive stays `Human`: the claimant restarts the work, answers
 //! what is outstanding, or hands the card back.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -97,6 +97,15 @@ pub struct DerivedCard {
     /// read time and never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub column: Option<Column>,
+    /// A reviewer sent this card back for rework, from the last recorded
+    /// verdict fact. Nothing about the stored lane changes; the board
+    /// merely shows the word `(returned)` until the work moves on.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub returned: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Derive one card's facts. `worker` is the PTY session bound to this card
@@ -110,6 +119,7 @@ pub fn derive_card(
     agent: Option<&AgentStatus>,
     attention: Option<&Attention>,
     pr: Option<PrFacts>,
+    returned: bool,
 ) -> DerivedCard {
     let attention_open = attention.is_some_and(Attention::is_unresolved);
     let worker = worker.map(|(status, receipt)| match status.lifecycle {
@@ -148,6 +158,7 @@ pub fn derive_card(
         worker: worker.or(agent),
         pr,
         column,
+        returned,
     }
 }
 
@@ -183,6 +194,7 @@ pub fn derive_board(
     agents: &[AgentStatus],
     attention: &[Attention],
     prs: &HashMap<String, PrFacts>,
+    returned: &HashSet<String>,
 ) -> Vec<DerivedCard> {
     // session id -> card id, from the driver's launch records.
     let session_card: HashMap<String, String> = workers
@@ -211,7 +223,8 @@ pub fn derive_board(
                 .find(|request| request.card_id.as_deref() == Some(card.id.as_str()))
                 .filter(|request| request.is_unresolved());
             let pr = prs.get(&card.id).cloned();
-            derive_card(card, worker, agent, open, pr)
+            let retried = returned.contains(&card.id);
+            derive_card(card, worker, agent, open, pr, retried)
         })
         .collect()
 }
@@ -303,6 +316,7 @@ mod tests {
             None,
             Some(&attention),
             None,
+            false,
         );
         assert_eq!(derived.turn, LoopTurn::Human);
     }
@@ -315,6 +329,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(derived.turn, LoopTurn::Agent);
         assert_eq!(derived.worker, Some(WorkerFact::Running));
@@ -328,6 +343,7 @@ mod tests {
             Some(&agent_in("working")),
             None,
             None,
+            false,
         );
         assert_eq!(derived.turn, LoopTurn::Agent);
         assert_eq!(derived.worker, Some(WorkerFact::AgentWorking));
@@ -337,6 +353,7 @@ mod tests {
             Some(&agent_in("ready")),
             None,
             None,
+            false,
         );
         assert_eq!(derived.worker, Some(WorkerFact::AgentReady));
     }
@@ -348,7 +365,14 @@ mod tests {
             code: 0,
             signal: None,
         });
-        let derived = derive_card(&card("op", false), Some((&ended, None)), None, None, None);
+        let derived = derive_card(
+            &card("op", false),
+            Some((&ended, None)),
+            None,
+            None,
+            None,
+            false,
+        );
         assert_eq!(derived.turn, LoopTurn::Human);
         assert_eq!(derived.worker, Some(WorkerFact::Exited));
     }
@@ -358,11 +382,11 @@ mod tests {
         let mut unclaimed = card("op", false);
         unclaimed.claim = None;
         assert_eq!(
-            derive_card(&unclaimed, None, None, None, None).turn,
+            derive_card(&unclaimed, None, None, None, None, false).turn,
             LoopTurn::Nobody
         );
         assert_eq!(
-            derive_card(&card("op", true), None, None, None, None).turn,
+            derive_card(&card("op", true), None, None, None, None, false).turn,
             LoopTurn::Nobody
         );
     }
@@ -378,6 +402,7 @@ mod tests {
             None,
             Some(&attention),
             None,
+            false,
         );
         assert_eq!(derived.turn, LoopTurn::Human);
     }
@@ -421,6 +446,7 @@ mod column_tests {
             None,
             None,
             Some(open(CiState::Passing, "")),
+            false,
         );
         assert_eq!(derived.column, Some(Column::Validating));
 
@@ -431,6 +457,7 @@ mod column_tests {
             None,
             None,
             Some(open(CiState::Passing, "APPROVED")),
+            false,
         );
         assert_eq!(derived.column, Some(Column::Validating));
     }
@@ -443,6 +470,7 @@ mod column_tests {
             None,
             None,
             Some(pr_facts(CiState::None, "", "UNKNOWN", true, "OPEN")),
+            false,
         );
         assert_eq!(derived.column, Some(Column::Validating));
     }
@@ -451,12 +479,20 @@ mod column_tests {
     fn failing_ci_and_changes_requested_are_a_persons_moment() {
         let failing = open(CiState::Failing, "");
         assert_eq!(
-            derive_card(&card("op", false), None, None, None, Some(failing.clone())).column,
+            derive_card(
+                &card("op", false),
+                None,
+                None,
+                None,
+                Some(failing.clone()),
+                false
+            )
+            .column,
             Some(Column::NeedsReview)
         );
         let changes = open(CiState::Passing, "CHANGES_REQUESTED");
         assert_eq!(
-            derive_card(&card("op", false), None, None, None, Some(changes)).column,
+            derive_card(&card("op", false), None, None, None, Some(changes), false).column,
             Some(Column::NeedsReview)
         );
     }
@@ -470,7 +506,7 @@ mod column_tests {
             let mut pr = pr;
             pr.mergeable = "MERGEABLE".into();
             assert_eq!(
-                derive_card(&card("op", false), None, None, None, Some(pr)).column,
+                derive_card(&card("op", false), None, None, None, Some(pr), false).column,
                 Some(Column::Ready)
             );
         }
@@ -480,7 +516,7 @@ mod column_tests {
     fn in_the_cycle_with_nobody_turning_is_needs_review() {
         let pr = open(CiState::Pending, "");
         assert_eq!(
-            derive_card(&card("op", false), None, None, None, Some(pr)).column,
+            derive_card(&card("op", false), None, None, None, Some(pr), false).column,
             Some(Column::NeedsReview)
         );
     }
@@ -490,7 +526,7 @@ mod column_tests {
         for state in ["MERGED", "CLOSED"] {
             let pr = pr_facts(CiState::Passing, "APPROVED", "MERGEABLE", false, state);
             assert_eq!(
-                derive_card(&card("op", false), None, None, None, Some(pr)).column,
+                derive_card(&card("op", false), None, None, None, Some(pr), false).column,
                 None
             );
         }
@@ -504,10 +540,11 @@ mod column_tests {
                 Some((&running("s1"), None)),
                 None,
                 None,
-                None
+                None,
+                false,
             )
             .column,
-            None
+            None,
         );
     }
 }

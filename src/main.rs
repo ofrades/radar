@@ -466,13 +466,22 @@ enum CardAction {
         #[arg(long)]
         to: String,
     },
-    /// Mark a card done: checked, and moved to the last column
+    /// Mark a card done: checked, and moved to the last column. The reviewer's
+    /// closing words carry the verdict: approved/rework words become a fact
+    /// the board shows
     Done {
         /// Project directory (default: the current directory)
         #[arg(long)]
         path: Option<PathBuf>,
         /// The card's title
         title: String,
+        /// The reviewer's closing words (approved/rework verb becomes a
+        /// verdict fact)
+        #[arg(long)]
+        words: Option<String>,
+        /// Who closed it: agent (a dispatched reviewer) or human (default)
+        #[arg(long)]
+        by: Option<String>,
     },
     /// Claim the first unclaimed card and print it — how an agent asks for work
     Next {
@@ -1374,7 +1383,12 @@ fn main() -> Result<()> {
                 CardAction::Move { path, title, to } => {
                     card_move(&paths, &db, path, &title, &to, cli.json)
                 }
-                CardAction::Done { path, title } => card_done(&paths, &db, path, &title, cli.json),
+                CardAction::Done {
+                    path,
+                    title,
+                    words,
+                    by,
+                } => card_done(&paths, &db, path, &title, words, by, cli.json),
                 CardAction::Next {
                     path,
                     by,
@@ -1788,10 +1802,18 @@ fn card_done(
     db: &Db,
     path: Option<PathBuf>,
     needle: &str,
+    words: Option<String>,
+    by: Option<String>,
     json: bool,
 ) -> Result<()> {
     use radar::session::daemon as board_api;
 
+    let closer = match by.as_deref() {
+        Some("agent") => radar::session::verdict::VerdictBy::Agent,
+        Some("human") => radar::session::verdict::VerdictBy::Human,
+        Some(other) => anyhow::bail!("--by {other} is not agent or human"),
+        None => radar::session::verdict::VerdictBy::Human,
+    };
     let (project_id, root) = board_context(db, path)?;
     db.require_board_enabled(&root)?;
     let board = board_api::board_state(&paths.data_dir, project_id)?;
@@ -1802,6 +1824,8 @@ fn card_done(
         project_id,
         &card_id,
         None,
+        words.as_deref(),
+        Some(closer),
         &board_command_id("done"),
     )?;
     if json {

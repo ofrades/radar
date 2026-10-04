@@ -650,8 +650,16 @@ async fn mutate_card(
             .map_err(ApiError::internal)?;
         }
         CardMutation::Complete { revision } => {
-            daemon::board_card_complete(home, project_id, &card_id, revision, &command("done"))
-                .map_err(ApiError::internal)?;
+            daemon::board_card_complete(
+                home,
+                project_id,
+                &card_id,
+                revision,
+                None,
+                Some(crate::session::verdict::VerdictBy::Human),
+                &command("done"),
+            )
+            .map_err(ApiError::internal)?;
         }
         CardMutation::Reopen { revision } => {
             daemon::board_card_reopen(home, project_id, &card_id, revision, &command("reopen"))

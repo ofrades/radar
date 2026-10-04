@@ -185,6 +185,13 @@ pub enum Command {
         card_id: String,
         expected_revision: Option<u64>,
         command_id: String,
+        /// The reviewer's closing words, when the closer offered them: the
+        /// verb becomes a verdict fact recorded beside the lane move.
+        #[serde(default)]
+        words: Option<String>,
+        /// Who closed it, when the caller knows — agent reviewer or human.
+        #[serde(default)]
+        by: Option<crate::session::verdict::VerdictBy>,
     },
     CardReopen {
         project_id: i64,
@@ -905,6 +912,12 @@ fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
                 &services.agents.list(),
                 &services.activity.unresolved_attention(project_id)?,
                 &pr_join,
+                &services
+                    .activity
+                    .reworked_cards(project_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
             );
             Response::BoardState(DerivedBoard { state, derived })
         }
@@ -988,7 +1001,28 @@ fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
             card_id,
             expected_revision,
             command_id,
+            words,
+            by,
         } => {
+            // The verdict fact lands before the move, so a reader never sees
+            // the card done without knowing why. No words, no verdict — the
+            // move still runs.
+            if let Some(words) = words.as_deref().filter(|words| !words.trim().is_empty()) {
+                if let Some(outcome) = crate::session::verdict::parse(words) {
+                    let _ = services.activity.publish(super::activity::PublishActivity {
+                        project_id,
+                        command_id: format!("{command_id}-verdict"),
+                        session_id: None,
+                        card_id: Some(card_id.clone()),
+                        kind: super::activity::ActivityKind::Reported,
+                        payload: super::activity::ActivityPayload::Verdict {
+                            outcome,
+                            by: by.unwrap_or(crate::session::verdict::VerdictBy::Human),
+                            words: words.to_string(),
+                        },
+                    });
+                }
+            }
             let change = services
                 .board
                 .complete_card(project_id, &card_id, expected_revision)?;
@@ -1618,11 +1652,14 @@ pub fn board_card_claim(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn board_card_complete(
     home: &Path,
     project_id: i64,
     card_id: &str,
     expected_revision: Option<u64>,
+    words: Option<&str>,
+    by: Option<crate::session::verdict::VerdictBy>,
     command_id: &str,
 ) -> Result<BoardChange> {
     match board_request(
@@ -1632,6 +1669,8 @@ pub fn board_card_complete(
             card_id: card_id.to_string(),
             expected_revision,
             command_id: command_id.to_string(),
+            words: words.map(str::to_string),
+            by,
         },
     )? {
         Response::CardChanged(change) => Ok(*change),
