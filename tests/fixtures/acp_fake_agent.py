@@ -16,6 +16,8 @@ Behaviour:
 """
 
 import json
+import os
+import re
 import sys
 import threading
 
@@ -24,6 +26,16 @@ _lock = threading.Lock()
 _write_lock = threading.Lock()
 _responses = {}
 _response_event = threading.Event()
+_cancel_event = threading.Event()
+_config_options = [
+    {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "model-a", "options": [{"value": "model-a", "name": "Model A"}, {"value": "model-b", "name": "Model B"}]},
+    {"id": "thinking", "name": "Thinking", "type": "boolean", "currentValue": False},
+]
+
+
+def modes(current):
+    return {"currentModeId": current, "availableModes": [{"id": "review", "name": "Review"}, {"id": "work", "name": "Work"}]}
+
 
 
 def send(message):
@@ -89,8 +101,16 @@ def handle_prompt(request_id, params):
     session_id = params["sessionId"]
     text = prompt_text(params)
     stream(session_id, "echo: " + text)
+    if "show radar environment" in text:
+        stream(session_id, " " + json.dumps({key: os.environ.get(key) for key in ["RADAR_AGENT", "RADAR_HOME", "RADAR_PROJECT_ID", "RADAR_PROJECT_ROOT", "RADAR_CARD_ID", "RADAR_SESSION_ID"]}))
+    if "wait for cancellation" in text:
+        _cancel_event.clear()
+        stream(session_id, " (waiting for cancellation)")
+        _cancel_event.wait(20)
+        reply(request_id, {"stopReason": "cancelled"})
+        return
 
-    if "ask" in text:
+    if re.search(r"\bask\b", text):
         permission_id = next_id()
         send(
             {
@@ -147,9 +167,9 @@ def reader():
                 },
             )
         elif method == "session/new":
-            reply(request_id, {"sessionId": "sess_fake_1"})
+            reply(request_id, {"sessionId": "sess_fake_1", "modes": modes("work"), "configOptions": _config_options})
         elif method == "session/list":
-            # One conversation the agent still has.
+            # The current conversation and one created outside Radar.
             reply(
                 request_id,
                 {
@@ -158,7 +178,13 @@ def reader():
                             "sessionId": "sess_fake_1",
                             "cwd": params.get("cwd") or "/tmp",
                             "title": "the fake conversation",
-                        }
+                        },
+                        {
+                            "sessionId": "sess_imported_2",
+                            "cwd": params.get("cwd") or "/tmp",
+                            "title": "an existing conversation",
+                            "updatedAt": "2026-10-04T12:00:00Z",
+                        },
                     ]
                 },
             )
@@ -167,21 +193,24 @@ def reader():
             reply(
                 request_id,
                 {
-                    "modes": {
-                        "currentModeId": "review",
-                        "availableModes": [
-                            {"id": "review", "name": "Review"},
-                            {"id": "work", "name": "Work"},
-                        ],
-                    }
+                    "modes": modes("review"),
+                    "configOptions": _config_options,
                 },
             )
+        elif method == "session/set_mode":
+            notify("session/update", {"sessionId": params["sessionId"], "update": {"sessionUpdate": "current_mode_update", "currentModeId": params["modeId"]}})
+            reply(request_id, {})
+        elif method == "session/set_config_option":
+            for option in _config_options:
+                if option["id"] == params["configId"]:
+                    option["currentValue"] = params["value"]
+            reply(request_id, {"configOptions": _config_options})
         elif method == "session/prompt":
             threading.Thread(
                 target=handle_prompt, args=(request_id, params), daemon=True
             ).start()
         elif method == "session/cancel":
-            continue
+            _cancel_event.set()
         elif request_id is not None:
             send(
                 {

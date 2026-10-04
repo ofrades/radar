@@ -11,6 +11,37 @@ for exact resume. This adapter supplies all three from the agent itself.
 
 [acp]: https://agentclientprotocol.com/
 
+## Native conversation UI
+
+Open a card's **Agent session → Agent conversation…** to use the daemon-owned
+conversation UI. Installed OpenCode and OMP drivers can start a conversation;
+linked ACP sessions are also available through the card's **Conversation**
+button and the global **Agents** page. Terminal sessions retain their own panels.
+
+The conversation window offers a message editor (**Ctrl+Enter** sends), saved
+activity, approval and question actions, **Cancel turn**, **Stop agent**, and
+**Resume conversation** for the exact bound conversation. Closing the window
+keeps the agent running. Mode, model, effort and other selectors appear only
+when the agent advertises them; confirmed daemon state controls their values.
+Reports appear when a turn finishes. An unanswered request takes priority over
+another prompt, and completed tasks must be reopened before more work is sent.
+While working, a spinner and elapsed wait time make the active turn visible;
+you can draft the next message or close the window and return later. Approval
+and question requests replace the working indicator with a request for your
+response. Cancel and Stop remain available during the wait.
+
+For providers that support listing and loading saved sessions, **Browse existing
+conversations…** lists conversations for this project. Choose one and use
+**Open selected conversation** to stop the current session and load that exact
+conversation. Task history is retained. The picker shows the provider's title,
+session ID and last update when available, and is disabled while working or
+awaiting a response. Start the provider first to discover its saved sessions.
+
+The adapter records outgoing prompts in the activity journal and gives agents
+their task, project, claim and Radar home environment. Cancellation reaches a
+running prompt rather than waiting behind it; cancel and stop also dismiss an
+outstanding permission request they interrupt.
+
 ## What runs today
 
 `radar acp start` asks the session daemon to own one ACP agent session. The
@@ -150,8 +181,6 @@ disagrees with the bound program fails before the agent starts.
 
 ## Deliberately not here yet
 
-- **Cancel during a permission prompt.** Cancelling while a permission prompt
-  is outstanding does not yet answer it as `Cancelled`; stop does.
 - **Attention cleanup.** If an agent dies with a permission prompt unanswered,
   the attention request stays outstanding for the human to dismiss.
 - **MSRV.** The SDK requires Rust 1.88; the crate's declared `rust-version`

@@ -343,7 +343,7 @@ fn acp_sessions_lists_and_adopts_a_conversation() {
     let listed = daemon.request(Request::AgentSessions { id: id.to_string() });
     match listed {
         Response::AgentSessions(sessions) => {
-            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions.len(), 2);
             assert_eq!(sessions[0].session_id, "sess_fake_1");
             assert_eq!(sessions[0].title.as_deref(), Some("the fake conversation"));
         }
@@ -378,4 +378,54 @@ fn acp_sessions_lists_and_adopts_a_conversation() {
         eprintln!("resume binding = {bound:?}");
         bound.is_ok_and(|bound| bound.is_some_and(|(_program, session)| session == "sess_fake_1"))
     });
+}
+
+#[test]
+fn acp_cancel_reaches_an_active_prompt_and_stop_does_not_wait_for_turn_end() {
+    let daemon = Daemon::start();
+    let project_id = 7;
+    let id = "acp-cancel";
+    start_fixture(&daemon, id, project_id);
+    wait_state(&daemon, id, "ready");
+    daemon.request(Request::AgentPrompt {
+        id: id.into(),
+        text: "wait for cancellation".into(),
+    });
+    wait_state(&daemon, id, "working");
+    std::thread::sleep(Duration::from_millis(100));
+    daemon.request(Request::AgentCancel { id: id.into() });
+    wait_state(&daemon, id, "ready");
+    assert!(daemon.reported(project_id, "waiting for cancellation"));
+    daemon.request(Request::AgentPrompt {
+        id: id.into(),
+        text: "wait for cancellation".into(),
+    });
+    wait_state(&daemon, id, "working");
+    daemon.request(Request::AgentStop { id: id.into() });
+    wait_state(&daemon, id, "exited");
+}
+
+#[test]
+fn acp_cancel_permission_resolves_attention_and_records_user_prompt() {
+    let daemon = Daemon::start();
+    let id = "acp-permission-cancel";
+    start_fixture(&daemon, id, 7);
+    wait_state(&daemon, id, "ready");
+    daemon.request(Request::AgentPrompt {
+        id: id.into(),
+        text: "ask before proceeding".into(),
+    });
+    let attention = first_attention(&daemon, 7);
+    assert!(daemon.reported(7, "You: ask before proceeding"));
+    daemon.request(Request::AgentCancel { id: id.into() });
+    wait_state(&daemon, id, "ready");
+    match daemon.request(Request::AttentionStatus {
+        project_id: 7,
+        request_id: attention.id,
+    }) {
+        Response::AttentionStatus(attention) => {
+            assert_eq!(attention.resolution, Some(AttentionResponse::Dismiss))
+        }
+        other => panic!("Unexpected attention response: {other:?}"),
+    }
 }

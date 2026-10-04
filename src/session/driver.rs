@@ -746,6 +746,7 @@ mod receipt_tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             derived.worker,
@@ -760,6 +761,7 @@ mod receipt_tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             derived.worker,

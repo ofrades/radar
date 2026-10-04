@@ -12,7 +12,7 @@
 //!
 //! [acp]: https://agentclientprotocol.com/
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -34,8 +34,9 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use super::activity::{
-    ActivityJournal, ActivityKind, ActivityPayload, AgentState, AttentionActionKind, AttentionKind,
-    AttentionResponse, CreateAttention, PublishActivity,
+    ActivityJournal, ActivityKind, ActivityPayload, AgentState, AttentionActionKind,
+    AttentionChange, AttentionKind, AttentionResponse, ChangeAttention, CreateAttention,
+    PublishActivity,
 };
 
 /// Unique-enough idempotency token for the activity this adapter publishes.
@@ -198,7 +199,7 @@ pub struct AgentStart {
 }
 
 /// What a client can see about one agent session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStatus {
     pub id: String,
     pub provider: String,
@@ -282,9 +283,17 @@ pub struct AgentHost {
     agents: Mutex<HashMap<String, AgentEntry>>,
     pending: Mutex<HashMap<String, PendingPermission>>,
     on_session_id: Mutex<Option<OnSessionId>>,
+    home: Option<PathBuf>,
 }
 
 impl AgentHost {
+    pub fn for_home(home: &std::path::Path) -> Self {
+        Self {
+            home: Some(home.to_path_buf()),
+            ..Self::default()
+        }
+    }
+
     /// Install the conversation binding callback. Called once at daemon build;
     /// every later confirmed session id goes through it exactly once.
     pub fn on_session_id(self, callback: OnSessionId) -> Self {
@@ -420,7 +429,9 @@ impl AgentHost {
 
     /// Ask the agent to cancel its current turn.
     pub fn cancel(&self, id: &str) -> Result<()> {
-        self.send(id, AgentCommand::Cancel)
+        self.send(id, AgentCommand::Cancel)?;
+        self.cancel_pending_for(id);
+        Ok(())
     }
 
     /// The conversations the agent itself still has, from `session/list`.
@@ -665,12 +676,28 @@ async fn connect(
     journal: Arc<ActivityJournal>,
     receiver: async_channel::Receiver<AgentCommand>,
 ) -> Result<(), String> {
-    let config = AcpAgentConfig::new(spec.program.as_str())
+    let mut config = AcpAgentConfig::new(spec.program.as_str())
         .args(spec.args.clone())
         .env(
             "PATH",
             crate::config::path_value().to_string_lossy().into_owned(),
         );
+    config = config
+        .env("RADAR_AGENT", spec.id.clone())
+        .env("RADAR_PROJECT_ID", spec.project_id.to_string())
+        .env(
+            "RADAR_PROJECT_ROOT",
+            spec.cwd.to_string_lossy().into_owned(),
+        );
+    if let Some(home) = &host.home {
+        config = config.env("RADAR_HOME", home.to_string_lossy().into_owned());
+    }
+    if let Some(card) = &spec.card_id {
+        config = config.env("RADAR_CARD_ID", card.clone());
+    }
+    if let Some(session) = &spec.session_id {
+        config = config.env("RADAR_SESSION_ID", session.clone());
+    }
     let agent = AcpAgent::new(config);
 
     let notification_journal = Arc::clone(&journal);
@@ -811,9 +838,22 @@ async fn connect(
                 Some(format!("{opening} {}", session_id.0)),
             );
 
-            while let Ok(command) = receiver.recv().await {
+            let mut deferred = VecDeque::new();
+            loop {
+                let command = match deferred.pop_front() {
+                    Some(command) => command,
+                    None => match receiver.recv().await {
+                        Ok(command) => command,
+                        Err(_) => break,
+                    },
+                };
                 match command {
                     AgentCommand::Prompt(text) => {
+                        publish_report(
+                            &connection_journal,
+                            &connection_spec,
+                            &format!("You: {text}"),
+                        );
                         connection_host.set_status(&connection_spec.id, "working", None);
                         publish_state(
                             &connection_journal,
@@ -825,7 +865,38 @@ async fn connect(
                             session_id.clone(),
                             vec![ContentBlock::Text(TextContent::new(text))],
                         );
-                        match connection.send_request(request).block_task().await {
+                        // Keep control commands flowing while the agent works.
+                        // Other requests retain their order after this turn.
+                        let mut prompt =
+                            std::pin::pin!(connection.send_request(request).block_task());
+                        let response = loop {
+                            match futures_util::future::select(
+                                prompt.as_mut(),
+                                Box::pin(receiver.recv()),
+                            )
+                            .await
+                            {
+                                futures_util::future::Either::Left((response, _)) => {
+                                    break response
+                                }
+                                futures_util::future::Either::Right((
+                                    Ok(AgentCommand::Cancel),
+                                    _,
+                                )) => {
+                                    connection.send_notification(CancelNotification::new(
+                                        session_id.clone(),
+                                    ))?;
+                                }
+                                futures_util::future::Either::Right((
+                                    Ok(AgentCommand::Stop) | Err(_),
+                                    _,
+                                )) => return Ok(()),
+                                futures_util::future::Either::Right((Ok(command), _)) => {
+                                    deferred.push_back(command)
+                                }
+                            }
+                        };
+                        match response {
                             Ok(response) => {
                                 let message = {
                                     let mut transcript = connection_transcript.lock();
@@ -1015,7 +1086,11 @@ fn ask_permission(
         card_id: spec.card_id.clone(),
         kind: AttentionKind::Approval,
         reason,
-        allowed_actions: vec![AttentionActionKind::Approve, AttentionActionKind::Deny],
+        allowed_actions: vec![
+            AttentionActionKind::Approve,
+            AttentionActionKind::Deny,
+            AttentionActionKind::Dismiss,
+        ],
     }) {
         Ok(created) => created,
         Err(error) => {
@@ -1035,9 +1110,23 @@ fn ask_permission(
         }
     }
 
-    receiver
+    let decision = receiver
         .recv_blocking()
-        .unwrap_or(PermissionDecision::Cancelled)
+        .unwrap_or(PermissionDecision::Cancelled);
+    if matches!(decision, PermissionDecision::Cancelled) {
+        if let Ok(attention) = journal.attention(spec.project_id, &request_id) {
+            if attention.is_unresolved() {
+                let _ = journal.change_attention(ChangeAttention {
+                    project_id: spec.project_id,
+                    request_id,
+                    command_id: next_command_id(&spec.id, "permission-cancel"),
+                    expected_revision: attention.revision,
+                    change: AttentionChange::Respond(AttentionResponse::Dismiss),
+                });
+            }
+        }
+    }
+    decision
 }
 
 /// Map a human decision onto one of the agent's offered permission options.
