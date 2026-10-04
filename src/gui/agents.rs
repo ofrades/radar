@@ -71,6 +71,7 @@ pub(super) struct AgentsPage {
     pub root: gtk::Widget,
     pub meta: gtk::Label,
     pub board: Rc<AgentsBoard>,
+    conversations: gtk::Box,
 }
 
 pub(super) fn page() -> AgentsPage {
@@ -101,11 +102,17 @@ pub(super) fn page() -> AgentsPage {
     board.holder.set_hexpand(true);
     board.holder.append(&empty_state());
     root.append(&board.holder);
+    let conversations = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    conversations.set_margin_start(18);
+    conversations.set_margin_end(18);
+    conversations.set_margin_bottom(18);
+    root.append(&conversations);
 
     AgentsPage {
         root: root.upcast(),
         meta,
         board,
+        conversations,
     }
 }
 
@@ -320,9 +327,32 @@ pub(super) fn sync(app: &App, page: &AgentsPage) {
         }
     }
 
-    // The page's count describes the wall.
-    page.meta
-        .set_text(&super::home::agents_count_text(board.panels.borrow().len()));
+    // Protocol conversations have no terminal to tile; their rows open the
+    // native conversation controls while the terminal wall stays attached.
+    while let Some(child) = page.conversations.first_child() {
+        page.conversations.remove(&child);
+    }
+    let conversations = app.live_acp_cards();
+    for (project_id, agent) in &conversations {
+        let Some(card_id) = agent.card_id.as_deref() else {
+            continue;
+        };
+        let title = app
+            .card_title(*project_id, card_id)
+            .unwrap_or_else(|| card_id.into());
+        let button =
+            gtk::Button::with_label(&format!("{title} · {} · {}", agent.provider, agent.state));
+        button.set_action_name(Some("win.acp-card-open"));
+        button.set_action_target_value(Some(&(*project_id, card_id).to_variant()));
+        page.conversations.append(&button);
+    }
+    page.conversations.set_visible(!conversations.is_empty());
+    board
+        .holder
+        .set_visible(!board.panels.borrow().is_empty() || conversations.is_empty());
+    page.meta.set_text(&super::home::agents_count_text(
+        board.panels.borrow().len() + conversations.len(),
+    ));
 }
 
 fn auto_node(board: &AgentsBoard, panels: &[Rc<AgentPanel>]) -> Option<Node<AgentPanel>> {

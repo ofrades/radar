@@ -1,9 +1,8 @@
-//! The card detail: a board card opened as a conversation, inside the app.
+//! The card detail: editable work, agent session access, and activity history.
 //!
-//! A card is the unit of work and the place the human and the agent talk
-//! about it. This view shows the card (its body rendered as Markdown), its
-//! thread (comments, board moves, and the agent's questions), and the controls
-//! to act on it: reply, edit, move it between lanes, or close it.
+//! This view shows the card (its body rendered as Markdown), its activity
+//! history (comments, board moves, and agent questions), and controls to edit,
+//! assign work, open a session, move it between lanes, or close it.
 //!
 //! The thread is the project's durable activity journal filtered to this
 //! card's stable id — a human comment is an event with no session, an agent
@@ -16,16 +15,14 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::mpsc::SyncSender;
 
 use adw::prelude::*;
 
 use super::{board, markdown, App};
 use crate::session::activity::{
-    ActivityEvent, ActivityKind, ActivityPayload, Attention, AttentionActionKind, AttentionChange,
-    AttentionResponse, PublishActivity,
+    ActivityEvent, ActivityPayload, Attention, AttentionActionKind, AttentionChange,
+    AttentionResponse,
 };
-use crate::session::daemon::{Client, Command};
 
 /// The card's inline editor: the title and description each swap between the
 /// text they read and a field that edits them, and the controls row swaps to
@@ -34,6 +31,7 @@ struct CardEditor {
     title: gtk::Stack,
     body: gtk::Stack,
     controls: gtk::Stack,
+    actions: gtk::Box,
 }
 
 /// Turn off text selection throughout a read view. A selectable label claims
@@ -325,11 +323,12 @@ fn card_editor(
         title: title_out,
         body: body_out,
         controls: controls_out,
+        actions: view_controls,
     }
 }
 
 /// Build the in-app card detail. Rebuilt by `App::refresh_home` whenever the
-/// journal or board changes, so it always shows the current conversation.
+/// journal or board changes, so it always shows the current history.
 pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("card-panel");
@@ -403,24 +402,23 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
     meta.add_css_class("caption");
     meta.add_css_class("dim-label");
     reading.append(&meta);
+    if let Some(facts) = state.derived.iter().find(|facts| facts.card_id == card.id) {
+        reading.append(&board::facts_widget(project_id, facts));
+    }
     let kind = state
         .lanes
         .iter()
         .find(|current| current.id == card.lane_id)
         .map(|lane| lane.kind.as_str());
     let hint = board::activity_label(
-        if missing_link {
-            "No reachable conversation is linked. Choose an agent or a stopped conversation below to reconnect this to-do."
+        if missing_link && !card.done {
+            "Use Agent session to assign an agent or resume a conversation."
         } else {
             match kind {
-                Some("review") => {
-                    "Ready for your review. Mark complete, or send a follow-up below."
-                }
-                Some("done") => "Complete. Send a follow-up below to reopen this to-do.",
-                Some("in_progress") => {
-                    "Work is assigned. Updates and questions appear in this conversation."
-                }
-                _ => "Send a request below to start work. Opening an agent terminal is optional.",
+                Some("review") => "This to-do is in Review. Open Agent session to follow up.",
+                Some("done") => "Complete. Reopen the to-do to assign more work.",
+                Some("in_progress") => "Open Agent session to continue work.",
+                _ => "Use Agent session to start work. Updates appear in the history below.",
             }
         },
         true,
@@ -458,51 +456,31 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
 
     inner.append(&reading);
 
-    let session_details = gtk::Expander::new(Some("Agent conversations (optional)"));
+    let agent = gtk::MenuButton::builder().label("Agent session").build();
+    agent.add_css_class("suggested-action");
+    let popover = gtk::Popover::new();
     let session_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    session_details.set_child(Some(&session_box));
-    let (linked, unavailable) = match linked_result {
-        Ok(sessions) => (sessions, false),
+    session_box.set_margin_top(12);
+    session_box.set_margin_bottom(12);
+    session_box.set_margin_start(12);
+    session_box.set_margin_end(12);
+    popover.set_child(Some(&session_box));
+    agent.set_popover(Some(&popover));
+    editor.actions.prepend(&agent);
+    let (linked, loaded) = match linked_result {
+        Ok(sessions) => (sessions, true),
         Err(error) => {
             session_box.append(&board::activity_label(
-                &format!("Could not load conversations: {error}"),
+                &format!("Could not load sessions: {error}"),
                 true,
             ));
-            (Vec::new(), true)
+            (Vec::new(), false)
         }
     };
-    let reconnect = missing_link && !unavailable;
-    if reconnect {
-        session_box.append(&board::activity_label("No reachable conversation is linked. Choose an agent or a stopped conversation below to reconnect this to-do.", true));
-        let open = gtk::Button::with_label(if card.claim.is_some() {
-            "Open claimed session"
-        } else {
-            "Start session"
-        });
-        open.set_halign(gtk::Align::Start);
-        if card.claim.is_some() {
-            open.set_action_name(Some("win.card-session-open"));
-            open.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
-        } else {
-            open.set_action_name(Some("win.card-session-create"));
-            open.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
-            open.set_sensitive(!card.done);
-        }
-        session_box.append(&open);
-    }
-    let can_start_new = !linked
-        .iter()
-        .any(super::live_agents::sidebar_session_is_live);
-    if !linked.is_empty() && can_start_new && !card.done {
-        let new = gtk::Button::with_label("Start new session");
-        new.set_halign(gtk::Align::Start);
-        new.set_tooltip_text(Some(
-            "Start a fresh agent conversation; it will not resume an existing one",
-        ));
-        new.set_action_name(Some("win.card-session-new"));
-        new.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
-        session_box.append(&new);
-    }
+    let has_reachable = linked.iter().any(|session| {
+        super::live_agents::sidebar_session_is_live(session)
+            || super::live_agents::exact_provider_session_id(session).is_some()
+    });
     for session in linked {
         let running = super::live_agents::sidebar_session_is_live(&session);
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -537,11 +515,44 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
         if !can_open {
             open.set_tooltip_text(Some("The agent did not report an exact conversation id; a different session will not be opened instead."));
         }
+        let popover = popover.clone();
+        open.connect_clicked(move |_| popover.popdown());
         row.append(&open);
         session_box.append(&row);
     }
 
-    let thread_heading = gtk::Label::new(Some("Conversation"));
+    if app.has_card_acp_conversation(project_id, &card.id)
+        || crate::programs::candidates_for_slot(
+            crate::db::Slot::Agent,
+            &app.db.preferences().unwrap_or_default(),
+        )
+        .iter()
+        .any(|program| crate::session::agent::default_acp_args(&program.id).is_some())
+    {
+        let conversation = gtk::Button::with_label("Agent conversation…");
+        conversation.set_action_name(Some("win.acp-card-open"));
+        conversation.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
+        let popover = popover.clone();
+        conversation.connect_clicked(move |_| popover.popdown());
+        session_box.prepend(&conversation);
+    }
+
+    let live_claim = app.card_claim_is_live(project_id, &card);
+    if loaded && !card.done && !live_claim {
+        session_box.append(&worker_picker(app, project_id, &card.id, &popover));
+    } else if loaded && live_claim && !has_reachable {
+        let open = gtk::Button::with_label("Open assigned agent");
+        open.set_action_name(Some("win.card-session-open"));
+        open.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
+        let popover = popover.clone();
+        open.connect_clicked(move |_| popover.popdown());
+        session_box.append(&open);
+    }
+    if session_box.first_child().is_none() {
+        session_box.append(&board::activity_label("No linked agent sessions.", true));
+    }
+
+    let thread_heading = gtk::Label::new(Some("Session history"));
     thread_heading.set_xalign(0.0);
     thread_heading.add_css_class("lane-section");
     inner.append(&thread_heading);
@@ -554,8 +565,6 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
     feedback.set_visible(false);
     append_thread(app, &inner, project_id, &card.id, &pending, &feedback);
     inner.append(&feedback);
-    session_details.set_expanded(reconnect);
-    inner.append(&session_details);
 
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -565,61 +574,10 @@ pub(super) fn detail(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
     scroller.add_css_class("card-thread");
     root.append(&scroller);
 
-    if !card.done && !app.card_claim_is_live(project_id, &card) {
-        let choose = gtk::Expander::new(Some("Choose an agent or existing conversation"));
-        choose.set_margin_start(16);
-        choose.set_margin_end(16);
-        choose.set_margin_bottom(8);
-        choose.set_child(Some(&worker_picker(app, project_id, &card.id)));
-        choose.set_expanded(reconnect);
-        root.append(&choose);
-    }
-    // Replying is the default way to start or continue work; sessions are optional.
-    let reply_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    reply_row.set_margin_start(16);
-    reply_row.set_margin_end(16);
-    reply_row.set_margin_bottom(12);
-    let reply = gtk::Entry::new();
-    reply.set_placeholder_text(Some(if card.done {
-        "Describe a follow-up to reopen this to-do…"
-    } else {
-        "Tell the agent what to do, or send a follow-up…"
-    }));
-    reply.set_hexpand(true);
-    let send = gtk::Button::with_label("Send to agent");
-    send.add_css_class("suggested-action");
-    {
-        let card_id = card.id.clone();
-        let activate: Rc<dyn Fn(&gtk::Entry)> = Rc::new(move |entry: &gtk::Entry| {
-            let text = entry.text().trim().to_string();
-            if text.is_empty() {
-                return;
-            }
-            entry.set_text("");
-            let _ = gtk::prelude::WidgetExt::activate_action(
-                entry,
-                "win.card-reply",
-                Some(&(project_id, card_id.as_str(), text.as_str()).to_variant()),
-            );
-        });
-        let reply_button = reply.clone();
-        {
-            let activate = activate.clone();
-            send.connect_clicked(move |_| activate(&reply_button));
-        }
-        {
-            let activate = activate.clone();
-            reply.connect_activate(move |entry| activate(entry));
-        }
-    }
-    reply_row.append(&reply);
-    reply_row.append(&send);
-    root.append(&reply_row);
-
     root.upcast()
 }
 
-fn worker_picker(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
+fn worker_picker(app: &App, project_id: i64, card_id: &str, popover: &gtk::Popover) -> gtk::Widget {
     let mut workers: Vec<(String, String, String)> =
         crate::programs::installed_of(crate::programs::Kind::Agent)
             .into_iter()
@@ -635,36 +593,30 @@ fn worker_picker(app: &App, project_id: i64, card_id: &str) -> gtk::Widget {
         for session in sessions.iter().filter(|session| {
             !session.running
                 && session.external.is_none()
+                && !session.card_ids.iter().any(|id| id == card_id)
                 && super::live_agents::exact_provider_session_id(session).is_some()
         }) {
             workers.push((
-                format!("Continue {}", session.title),
+                format!("Assign and resume {}", session.title),
                 "session".to_string(),
                 session.id.clone(),
             ));
         }
     }
     let row = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    let labels: Vec<&str> = workers.iter().map(|worker| worker.0.as_str()).collect();
-    let picker = gtk::DropDown::from_strings(&labels);
-    picker.set_hexpand(true);
-    picker.set_tooltip_text(Some("Start a new agent or continue a stopped conversation. Running workers keep their current to-do."));
-    let assign = gtk::Button::with_label("Assign and start");
-    assign.set_halign(gtk::Align::Start);
-    assign.set_sensitive(!workers.is_empty());
-    let card_id = card_id.to_string();
-    let selected = picker.clone();
-    assign.connect_clicked(move |button| {
-        if let Some((_, kind, worker)) = workers.get(selected.selected() as usize) {
-            let _ = gtk::prelude::WidgetExt::activate_action(
-                button,
-                "win.card-worker",
-                Some(&(project_id, card_id.as_str(), kind.as_str(), worker.as_str()).to_variant()),
-            );
-        }
-    });
-    row.append(&picker);
-    row.append(&assign);
+    if workers.is_empty() {
+        row.append(&board::activity_label("No agents installed.", true));
+    }
+    for (label, kind, worker) in workers {
+        let assign = gtk::Button::with_label(&label);
+        assign.set_action_name(Some("win.card-worker"));
+        assign.set_action_target_value(Some(
+            &(project_id, card_id, kind.as_str(), worker.as_str()).to_variant(),
+        ));
+        let popover = popover.clone();
+        assign.connect_clicked(move |_| popover.popdown());
+        row.append(&assign);
+    }
     row.upcast()
 }
 
@@ -918,39 +870,6 @@ fn thread_system(text: &str) -> gtk::Widget {
     label.add_css_class("dim-label");
     label.add_css_class("thread-system");
     label.upcast()
-}
-
-/// Publish a human comment on a card. Fire-and-forget on a worker thread, the
-/// same shape as the board's attention responses; the journal echoes the event
-/// back through the project watcher.
-pub(super) fn publish_comment(
-    home: &Path,
-    tx: &SyncSender<super::ActivityNotice>,
-    project_id: i64,
-    card_id: &str,
-    text: String,
-) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let command = Command::PublishActivity(PublishActivity {
-        project_id,
-        command_id: format!("gui-comment-{}-{now:x}", std::process::id()),
-        session_id: None,
-        card_id: Some(card_id.to_string()),
-        kind: ActivityKind::Reported,
-        payload: ActivityPayload::Message { text },
-    });
-    let home = home.to_path_buf();
-    let tx = tx.clone();
-    std::thread::spawn(move || {
-        let error = match Client::request(&home, command) {
-            Ok(_) => None,
-            Err(error) => Some(error.to_string()),
-        };
-        let _ = tx.send(super::ActivityNotice::CardComment { project_id, error });
-    });
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@
 //! Hiding a primitive detaches its widget; the program keeps running, so putting
 //! the agent away for a moment never interrupts it.
 
+mod acp;
 mod activity_sign;
 mod agents;
 mod alert;
@@ -272,8 +273,6 @@ struct App {
     window: adw::ApplicationWindow,
     workspace_bar: gtk::Box,
     workspace_title: gtk::Label,
-    toggles: RefCell<HashMap<Slot, gtk::ToggleButton>>,
-    /// Home leads the dock; it is checked while the home panel shows.
     /// True while the home panel is on screen instead of a project's
     /// workspace — the empty state, or the user's explicit "go home".
     home_shown: Cell<bool>,
@@ -300,11 +299,12 @@ struct App {
     activity_rx: RefCell<std::sync::mpsc::Receiver<ActivityNotice>>,
     /// The last board store state per project, so Home and card conversations
     /// render without re-fetching on every rebuild.
-    board_states: RefCell<HashMap<i64, crate::session::board_store::BoardState>>,
+    board_states: RefCell<HashMap<i64, crate::session::daemon::DerivedBoard>>,
     /// Where Home is drilled in: empty means the cockpit, otherwise a stack of
     /// board/card views with a way back.
     home_nav: RefCell<Vec<HomeView>>,
     board_summaries: RefCell<HashMap<i64, board::BoardSummary>>,
+    acp_agents: RefCell<Vec<crate::session::agent::AgentStatus>>,
     notified_attention: RefCell<HashSet<(i64, String)>>,
     /// Attention responses the Home cockpit has sent but not yet heard back
     /// about. Home is rebuilt often, so the pending set outlives its widgets.
@@ -374,11 +374,6 @@ enum ActivityNotice {
         project_id: i64,
         request_id: String,
         result: std::result::Result<Box<crate::session::activity::AttentionMutationResult>, String>,
-    },
-    /// A card comment sent from the GUI came back from the daemon (or failed).
-    CardComment {
-        project_id: i64,
-        error: Option<String>,
     },
 }
 
@@ -701,24 +696,11 @@ fn build_window(
     workspace_title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     workspace_bar.append(&workspace_title);
     workspace_bar.append(&board_button);
-    let toggles = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    toggles.add_css_class("dock");
-    let mut toggle_buttons = HashMap::new();
-    for slot in PRIMITIVES {
-        let button = gtk::ToggleButton::builder()
-            .icon_name(icon_name(slot))
-            .tooltip_text(format!("{}\t{}", label_for(slot), accel_hint(slot)))
-            .build();
-        button.add_css_class("flat");
-        if let Some(image) = button.child().and_downcast::<gtk::Image>() {
-            image.set_pixel_size(14);
-        }
-        button.set_action_name(Some("win.primitive-toggle"));
-        button.set_action_target_value(Some(&slot.as_str().to_variant()));
-        toggles.append(&button);
-        toggle_buttons.insert(slot, button);
-    }
-    workspace_bar.append(&toggles);
+    let open_panel = gtk::Button::with_label("Open panel");
+    open_panel.add_css_class("flat");
+    open_panel.set_action_name(Some("win.panel-open"));
+    open_panel.set_tooltip_text(Some("Choose content for a new panel"));
+    workspace_bar.append(&open_panel);
     // A new session from the workspace: pick a to-do, start an agent on it —
     // without leaving for Home. Works while another agent panel is on screen.
     let new_session = gtk::Button::from_icon_name("list-add-symbolic");
@@ -727,7 +709,7 @@ fn build_window(
         "To-dos & sessions: create work, choose an agent, or open a conversation",
     ));
     new_session.set_action_name(Some("win.new-session"));
-    toggles.append(&new_session);
+    workspace_bar.append(&new_session);
     let tools = gtk::Button::with_label("Tools & shortcuts");
     tools.add_css_class("flat");
     tools.set_action_name(Some("win.hud"));
@@ -835,7 +817,6 @@ fn build_window(
         window: window.clone(),
         workspace_bar,
         workspace_title,
-        toggles: RefCell::new(toggle_buttons),
         home_shown: Cell::new(true),
         stack,
         toasts,
@@ -858,6 +839,7 @@ fn build_window(
         board_states: RefCell::new(HashMap::new()),
         home_nav: RefCell::new(Vec::new()),
         board_summaries: RefCell::new(HashMap::new()),
+        acp_agents: RefCell::new(Vec::new()),
         notified_attention: RefCell::new(HashSet::new()),
         home_pending_attention: Rc::new(RefCell::new(HashSet::new())),
         home_focus_todo: Cell::new(None),
@@ -929,6 +911,7 @@ fn build_window(
     App::refresh_projects(&state);
     state.request_agent_scan();
     start_agent_session_polling(&state);
+    start_board_fact_polling(&state);
     // Development aid: exercise the new-project flow — folder creation, add,
     // open — without the file chooser. RADAR_NEW_PROJECT=/some/path.
     if let Ok(path) = std::env::var("RADAR_NEW_PROJECT") {
@@ -1042,9 +1025,8 @@ fn accel_hint(slot: Slot) -> &'static str {
         Slot::Editor => "Alt+E",
         Slot::Agent => "Alt+A",
         Slot::Diff => "Alt+G",
-        Slot::Board => "",
+        Slot::Board | Slot::Custom => "",
         Slot::Shell => "Alt+T",
-        Slot::Custom => "",
     }
 }
 
@@ -1300,6 +1282,80 @@ fn start_agent_session_polling(app: &SharedApp) {
     let app = app.clone();
     glib::timeout_add_local(Duration::from_secs(3), move || {
         app.request_agent_scan();
+        glib::ControlFlow::Continue
+    });
+}
+
+/// PR observations can change without a board mutation or activity event.
+/// Read the daemon cache off the GTK thread, with at most one batch in flight.
+fn start_board_fact_polling(app: &SharedApp) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let pending = Rc::new(Cell::new(false));
+    let app_for_poll = app.clone();
+    let pending_for_poll = pending.clone();
+    glib::timeout_add_local(Duration::from_secs(5), move || {
+        if pending_for_poll.replace(true) {
+            return glib::ControlFlow::Continue;
+        }
+        let projects: Vec<i64> = app_for_poll.board_states.borrow().keys().copied().collect();
+        let home = app_for_poll.session_home.clone();
+        let tx = tx.clone();
+        if std::thread::Builder::new()
+            .name("radar-board-facts".into())
+            .spawn(move || {
+                let boards: Vec<_> = projects
+                    .into_iter()
+                    .filter_map(|project_id| {
+                        crate::session::daemon::board_state(&home, project_id).ok()
+                    })
+                    .collect();
+                let agents = match crate::session::daemon::Client::request(
+                    &home,
+                    crate::session::daemon::Command::AgentList,
+                ) {
+                    Ok(crate::session::daemon::Response::Agents(agents)) => Some(agents),
+                    _ => None,
+                };
+                let _ = tx.send((boards, agents));
+            })
+            .is_err()
+        {
+            pending_for_poll.set(false);
+        }
+        glib::ControlFlow::Continue
+    });
+    let app = app.clone();
+    glib::timeout_add_local(Duration::from_millis(120), move || {
+        if let Ok((boards, agents)) = rx.try_recv() {
+            pending.set(false);
+            let mut changed = false;
+            if let Some(mut agents) = agents {
+                agents.sort_by(|a, b| a.id.cmp(&b.id));
+                if *app.acp_agents.borrow() != agents {
+                    *app.acp_agents.borrow_mut() = agents;
+                    changed = true;
+                }
+            }
+            for board in boards {
+                let project_id = board.project_id;
+                let mut states = app.board_states.borrow_mut();
+                let Some(current) = states.get_mut(&project_id) else {
+                    continue;
+                };
+                // An intervening mutation owns the newer stored state; the
+                // next poll will catch up rather than overwrite that change.
+                if current.state == board.state && current.derived != board.derived {
+                    app.board_summaries
+                        .borrow_mut()
+                        .insert(project_id, board::summarize_derived(&board));
+                    *current = board;
+                    changed = true;
+                }
+            }
+            if changed {
+                app.refresh_home();
+            }
+        }
         glib::ControlFlow::Continue
     });
 }
@@ -1769,6 +1825,45 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
         );
     }
 
+    {
+        let action =
+            gio::SimpleAction::new("panel-split", Some(glib::VariantTy::new("(ss)").unwrap()));
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, parameter| {
+            let Some((key, zone)) = parameter.and_then(|value| value.get::<(String, String)>())
+            else {
+                return;
+            };
+            if app_for_action.home_shown.get() || !matches!(zone.as_str(), "right" | "bottom") {
+                return;
+            }
+            let Some(workspace) = app_for_action.current_workspace() else {
+                return;
+            };
+            let Some(target) = workspace.panel_of(TabKey::parse(&key)) else {
+                return;
+            };
+            app_for_action.open_panel_chooser(&workspace, Some((target, zone)));
+        });
+        app.window.add_action(&action);
+    }
+    {
+        let action = gio::SimpleAction::new("panel-open", None);
+        let app_for_action = app.clone();
+        action.connect_activate(move |_, _| {
+            let Some(workspace) = app_for_action.current_workspace() else {
+                return;
+            };
+            let target = workspace
+                .panels()
+                .last()
+                .cloned()
+                .map(|panel| (panel, "right".into()));
+            app_for_action.open_panel_chooser(&workspace, target);
+        });
+        app.window.add_action(&action);
+    }
+
     // ---- primitives: the only content there is ----
     {
         // The dock and the Alt-chords toggle by kind; the key resolves to
@@ -1943,9 +2038,7 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
             if let Some((project_id, card_id, kind, worker)) =
                 parameter.and_then(|value| value.get::<(i64, String, String, String)>())
             {
-                state.without_navigation(|| {
-                    state.assign_card_worker(project_id, &card_id, &kind, &worker)
-                });
+                state.assign_card_worker(project_id, &card_id, &kind, &worker);
             }
         });
         app.window.add_action(&action);
@@ -1998,6 +2091,18 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
                 return;
             };
             app_for_action.complete_session_todo(project_id, &card_id);
+        });
+        app.window.add_action(&action);
+    }
+    {
+        let action =
+            gio::SimpleAction::new("acp-card-open", Some(glib::VariantTy::new("(xs)").unwrap()));
+        let state = app.clone();
+        action.connect_activate(move |_, parameter| {
+            if let Some((project, card)) = parameter.and_then(|value| value.get::<(i64, String)>())
+            {
+                acp::open(&state, project, &card);
+            }
         });
         app.window.add_action(&action);
     }
@@ -2262,22 +2367,6 @@ fn register_actions(app: &SharedApp, gtk_app: &adw::Application) {
                 parameter.and_then(|value| value.get::<(i64, String, String)>())
             {
                 app_for_action.move_home_card(project_id, &card_id, &column);
-            }
-        });
-        app.window.add_action(&action);
-    }
-    {
-        // The card detail's reply box.
-        let action = gio::SimpleAction::new(
-            "card-reply",
-            Some(glib::VariantTy::new("(xss)").expect("a project, card and text")),
-        );
-        let app_for_action = app.clone();
-        action.connect_activate(move |_, parameter| {
-            if let Some((project_id, card_id, text)) =
-                parameter.and_then(|value| value.get::<(i64, String, String)>())
-            {
-                app_for_action.message_card(project_id, &card_id, &text);
             }
         });
         app.window.add_action(&action);
@@ -2776,7 +2865,7 @@ impl App {
         } else if let Some(state) = self.fetch_board_state(project_id) {
             self.board_summaries
                 .borrow_mut()
-                .insert(project_id, board::summarize(&state));
+                .insert(project_id, board::summarize_derived(&state));
             self.board_states.borrow_mut().insert(project_id, state);
         } else {
             self.board_summaries.borrow_mut().remove(&project_id);
@@ -2786,12 +2875,9 @@ impl App {
     }
 
     /// Fetch a project's board from the daemon store.
-    fn fetch_board_state(
-        &self,
-        project_id: i64,
-    ) -> Option<crate::session::board_store::BoardState> {
+    fn fetch_board_state(&self, project_id: i64) -> Option<crate::session::daemon::DerivedBoard> {
         match crate::session::daemon::board_state(&self.session_home, project_id) {
-            Ok(state) => Some(state),
+            Ok(board) => Some(board),
             Err(error) => {
                 eprintln!("radar: board state: {error}");
                 None
@@ -2823,6 +2909,8 @@ impl App {
             &self.session_home,
             project_id,
             card_id,
+            None,
+            None,
             None,
             &command,
         ) {
@@ -2863,6 +2951,8 @@ impl App {
                 &self.session_home,
                 project_id,
                 card_id,
+                None,
+                None,
                 None,
                 &command,
             )
@@ -3058,127 +3148,6 @@ impl App {
         }
     }
 
-    /// Record the reply and route it to the live worker or exact conversation.
-    /// An unclaimed to-do starts the default agent. None of these is navigation.
-    fn message_card(&self, project_id: i64, card_id: &str, text: &str) {
-        self.without_navigation(|| self.deliver_card_message(project_id, card_id, text));
-    }
-
-    fn deliver_card_message(&self, project_id: i64, card_id: &str, text: &str) {
-        card::publish_comment(
-            &self.session_home,
-            &self.activity_tx,
-            project_id,
-            card_id,
-            text.to_string(),
-        );
-        let card = self
-            .fetch_board_state(project_id)
-            .and_then(|state| state.cards.into_iter().find(|card| card.id == card_id));
-        let Some(card) = card else {
-            self.toast("That card is no longer on the board");
-            return;
-        };
-        let Some(card) = self.prepare_card_work(project_id, card) else {
-            return;
-        };
-        let prompt = format!(
-            "A human sent a message on board card \"{}\":\n\n{}\n\nRead its thread with radar card show \"{}\" and continue.",
-            card.title, text, card.id
-        );
-        if self.current.borrow().as_ref() != Some(&project_id) {
-            self.select_project_with(project_id, false);
-        }
-        let Some(workspace) = self.current_workspace() else {
-            return;
-        };
-        let worker = card
-            .claim
-            .as_deref()
-            .and_then(|claim| self.live_card_worker(project_id, card_id, Some(claim)))
-            .or_else(|| self.live_card_worker(project_id, card_id, None));
-        if let Some((key, claim, _)) = worker {
-            if card.claim.as_deref() != Some(claim.as_str()) {
-                if let Err(error) = crate::session::daemon::board_card_claim(
-                    &self.session_home,
-                    project_id,
-                    card_id,
-                    Some(&claim),
-                    Some(card.revision),
-                    &gui_command_id("follow-up"),
-                ) {
-                    self.toast(&format!("Could not reconnect the worker: {error}"));
-                    return;
-                }
-                self.refresh_board_summary(project_id);
-            }
-            self.inject_if_idle(project_id, &workspace, key, &prompt);
-            return;
-        }
-        let sessions = match self.catalog_card_sessions(project_id, card_id) {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                self.toast(&format!("Could not read linked conversations: {error}"));
-                return;
-            }
-        };
-        if let Some(session) = sessions.into_iter().max_by_key(|session| {
-            (
-                session.card_id.as_deref() == Some(card_id),
-                session.running,
-                session.last_activity_at,
-            )
-        }) {
-            if session.running {
-                self.toast("This conversation is serving another to-do. Choose a new agent, or continue it when stopped.");
-                return;
-            }
-            if let Some(conversation) = live_agents::exact_provider_session_id(&session) {
-                self.launch_card_agent(
-                    project_id,
-                    &card,
-                    prompt,
-                    &session.program_id,
-                    Resume::Session(conversation.to_string()),
-                );
-            } else {
-                self.toast("The linked session has no exact resume identity. Choose an agent to reconnect this to-do.");
-            }
-            return;
-        }
-        if let Some(claim) = card.claim.as_deref() {
-            if let Ok(Some((program, conversation))) = self.db.bound_session(project_id, claim) {
-                let sessions = match self.project_catalog(project_id, None) {
-                    Ok(sessions) => sessions,
-                    Err(error) => {
-                        self.toast(&format!(
-                            "Could not check the claimed conversation: {error}"
-                        ));
-                        return;
-                    }
-                };
-                if sessions.iter().any(|session| {
-                    session.provider == program
-                        && session.provider_session_id == conversation
-                        && session.lifecycle == "running"
-                }) {
-                    self.toast("The claimed conversation is already running on another to-do.");
-                    return;
-                }
-                self.launch_card_agent(
-                    project_id,
-                    &card,
-                    prompt,
-                    &program,
-                    Resume::Session(conversation),
-                );
-                return;
-            }
-        }
-        // No exact conversation exists: an explicit request starts fresh work.
-        self.spawn_agent_for_card(project_id, card_id, prompt);
-    }
-
     /// A board card's Session control: start the project's default agent
     /// attached to the card, and claim it. The prompt points the agent at the
     /// card so it knows what it was started for.
@@ -3268,8 +3237,7 @@ impl App {
         sessions
             .into_iter()
             .filter_map(|session| {
-                // A retained but ended session must not swallow a follow-up:
-                // the next message relaunches the agent, resumed.
+                // Retained ended sessions are resumable history, not live workers.
                 if !matches!(
                     session.lifecycle,
                     crate::session::registry::Lifecycle::Running
@@ -3429,64 +3397,6 @@ impl App {
         self.launch_card_agent(project_id, &card, prompt, &program.id, Resume::No)
     }
 
-    fn prepare_card_work(
-        &self,
-        project_id: i64,
-        card: crate::session::board_store::StoredCard,
-    ) -> Option<crate::session::board_store::StoredCard> {
-        let state = self.fetch_board_state(project_id)?;
-        let card = state
-            .cards
-            .iter()
-            .find(|current| current.id == card.id)?
-            .clone();
-        let kind = state
-            .lanes
-            .iter()
-            .find(|lane| lane.id == card.lane_id)?
-            .kind
-            .as_str();
-        if kind != "review" && kind != "done" {
-            return Some(card);
-        }
-        let lane = state.lanes.iter().find(|lane| lane.kind == "in_progress")?;
-        match crate::session::daemon::board_card_move(
-            &self.session_home,
-            project_id,
-            &card.id,
-            &lane.name,
-            Some(card.revision),
-            &gui_command_id("continue"),
-        ) {
-            Ok(change) => {
-                let continued = if let Some(claim) = card.claim.as_deref() {
-                    match crate::session::daemon::board_card_claim(
-                        &self.session_home,
-                        project_id,
-                        &card.id,
-                        Some(claim),
-                        Some(change.card.revision),
-                        &gui_command_id("continue-claim"),
-                    ) {
-                        Ok(change) => change.card,
-                        Err(error) => {
-                            self.toast(&format!("Could not keep this to-do's worker: {error}"));
-                            return None;
-                        }
-                    }
-                } else {
-                    change.card
-                };
-                self.refresh_board_summary(project_id);
-                Some(continued)
-            }
-            Err(error) => {
-                self.toast(&format!("Could not continue the to-do: {error}"));
-                None
-            }
-        }
-    }
-
     fn launch_card_agent(
         &self,
         project_id: i64,
@@ -3505,7 +3415,7 @@ impl App {
             self.toast("The selected agent cannot resume an exact conversation");
             return false;
         }
-        if self.current.borrow().as_ref() != Some(&project_id) {
+        if self.current.borrow().as_ref() != Some(&project_id) || self.home_shown.get() {
             self.select_project_with(project_id, false);
         }
         let Some(workspace) = self.current_workspace() else {
@@ -3542,41 +3452,6 @@ impl App {
         self.activate_primitive(&workspace, key);
         self.refresh_board_summary(project_id);
         true
-    }
-
-    /// Type a message into a running agent's terminal, but only when it is not
-    /// mid-turn; otherwise the message stays in the thread for its next turn.
-    fn inject_if_idle(&self, project_id: i64, workspace: &Rc<Workspace>, key: TabKey, text: &str) {
-        let Some(primitive) = workspace.tab(key) else {
-            return;
-        };
-        let session_id = stable_session_id(project_id, key, &primitive.program_id);
-        let state = self
-            .agent_sessions
-            .borrow()
-            .by_project
-            .get(&project_id)
-            .and_then(|sessions| {
-                sessions
-                    .iter()
-                    .find(|session| {
-                        session.radar_session_id.as_deref() == Some(session_id.as_str())
-                    })
-                    .cloned()
-            })
-            .and_then(|session| self.latest_agent_activity(project_id, &session))
-            .map(|(state, _, _)| state);
-        if matches!(state, Some(crate::session::activity::AgentState::Working)) {
-            self.toast("Agent is working; the message is in the card thread");
-            return;
-        }
-        let command = crate::session::daemon::Command::Input {
-            id: session_id,
-            bytes: format!("{text}\r").into_bytes(),
-        };
-        if let Err(error) = crate::session::daemon::Client::request(&self.session_home, command) {
-            self.toast(&format!("Could not reach the agent: {error}"));
-        }
     }
 
     fn apply_activity_notice(&self, notice: ActivityNotice) -> i64 {
@@ -3689,14 +3564,6 @@ impl App {
             }
             ActivityNotice::Connection { project_id, online } => {
                 self.activity_online.borrow_mut().insert(project_id, online);
-                project_id
-            }
-            ActivityNotice::CardComment {
-                project_id, error, ..
-            } => {
-                if let Some(error) = &error {
-                    self.toast(&format!("Could not post the comment: {error}"));
-                }
                 project_id
             }
             ActivityNotice::Mutation {
@@ -3901,32 +3768,6 @@ impl App {
             .or_else(|| parse_stable_session_id(&session.id).map(|_| session.id.as_str()))
     }
 
-    fn latest_agent_activity(
-        &self,
-        project_id: i64,
-        session: &live_agents::AgentSession,
-    ) -> Option<(crate::session::activity::AgentState, i64, Option<String>)> {
-        let identity = Self::activity_identity(session)?;
-        self.activity
-            .borrow()
-            .get(&project_id)?
-            .snapshot
-            .events
-            .iter()
-            .rev()
-            .find_map(|event| {
-                if event.session_id.as_deref() != Some(identity) {
-                    return None;
-                }
-                match &event.payload {
-                    crate::session::activity::ActivityPayload::AgentState { state, message } => {
-                        Some((*state, event.at_millis, message.clone()))
-                    }
-                    _ => None,
-                }
-            })
-    }
-
     /// The listed session a board claim names, if one is present. Claims are
     /// exact `RADAR_AGENT` values, so this is the same match the @claim link
     /// uses — the card's session chip opens it directly.
@@ -3995,7 +3836,19 @@ impl App {
                     .count()
             })
             .unwrap_or(0);
-        let sessions = self.live_session_signs(project_id);
+        let mut sessions = self.live_session_signs(project_id);
+        sessions.extend(
+            self.live_acp_cards()
+                .into_iter()
+                .filter(|(id, _)| *id == project_id)
+                .map(|(_, agent)| {
+                    if agent.state == "working" {
+                        activity_sign::Sign::Working
+                    } else {
+                        activity_sign::Sign::Idle
+                    }
+                }),
+        );
         activity_sign::project_sign(attention, &sessions)
     }
 
@@ -4170,7 +4023,71 @@ impl App {
             .collect())
     }
 
+    fn live_acp_cards(&self) -> Vec<(i64, crate::session::agent::AgentStatus)> {
+        let projects = self.projects.borrow();
+        let states = self.board_states.borrow();
+        self.acp_agents
+            .borrow()
+            .iter()
+            .filter(|agent| matches!(agent.state.as_str(), "starting" | "ready" | "working"))
+            .filter_map(|agent| {
+                let project = projects.iter().find(|project| project.path == agent.cwd)?;
+                let card_id = agent.card_id.as_deref()?;
+                let card = states
+                    .get(&project.id)?
+                    .cards
+                    .iter()
+                    .find(|card| card.id == card_id)?;
+                (!card.done).then(|| (project.id, agent.clone()))
+            })
+            .collect()
+    }
+
+    fn card_acp_agent(
+        &self,
+        project_id: i64,
+        card_id: &str,
+    ) -> Option<crate::session::agent::AgentStatus> {
+        let project = self
+            .projects
+            .borrow()
+            .iter()
+            .find(|project| project.id == project_id)
+            .cloned()?;
+        self.acp_agents
+            .borrow()
+            .iter()
+            .filter(|agent| agent.cwd == project.path && agent.card_id.as_deref() == Some(card_id))
+            .min_by_key(|agent| {
+                (
+                    !matches!(agent.state.as_str(), "starting" | "ready" | "working"),
+                    agent.id.clone(),
+                )
+            })
+            .cloned()
+    }
+
+    fn prefer_card_acp_conversation(&self, project_id: i64, card_id: &str) -> bool {
+        self.has_card_acp_conversation(project_id, card_id)
+            && !self
+                .card_sessions(project_id, card_id)
+                .iter()
+                .any(live_agents::sidebar_session_is_live)
+    }
+
+    fn has_card_acp_conversation(&self, project_id: i64, card_id: &str) -> bool {
+        self.card_acp_agent(project_id, card_id).is_some()
+            || self
+                .db
+                .bound_session(project_id, &acp::card_agent_id(project_id, card_id))
+                .is_ok_and(|binding| binding.is_some())
+    }
+
     fn open_card_session(&self, project_id: i64, card_id: &str, identity: Option<&str>) {
+        if identity.is_none() && self.prefer_card_acp_conversation(project_id, card_id) {
+            acp::open(self, project_id, card_id);
+            return;
+        }
         let sessions = match self.catalog_card_sessions(project_id, card_id) {
             Ok(sessions) => sessions,
             Err(error) => {
@@ -4198,9 +4115,13 @@ impl App {
                 return;
             }
         }
-        let card = self
-            .fetch_board_state(project_id)
-            .and_then(|state| state.cards.into_iter().find(|card| card.id == card_id));
+        let card = self.fetch_board_state(project_id).and_then(|state| {
+            state
+                .state
+                .cards
+                .into_iter()
+                .find(|card| card.id == card_id)
+        });
         if let Some(claim) = card.as_ref().and_then(|card| card.claim.as_deref()) {
             if let Some((_, _, runtime)) = self.live_card_worker(project_id, card_id, Some(claim)) {
                 self.hud.close_tasks(self);
@@ -4234,7 +4155,7 @@ impl App {
                 }
             }
         }
-        self.toast("No reachable conversation is linked. Choose an agent or a stopped conversation to reconnect this to-do.");
+        self.toast("No reachable conversation is linked. Use Agent session to assign an agent or resume a conversation.");
         self.open_home_card(project_id, card_id);
     }
 
@@ -4502,7 +4423,43 @@ impl App {
     /// surface current without re-running show_home (which clears navigation
     /// and forgets the last project). Only the cockpit is rebuilt
     /// from here — the empty state needs the `Rc` only show_home holds.
+    /// Facts keep updating even while an editor or question answer has focus
+    /// and the rest of Home deliberately defers its passive rebuild.
+    fn refresh_card_fact_widgets(&self) {
+        let Some(home) = self.stack.child_by_name("_home") else {
+            return;
+        };
+        let facts: HashMap<_, _> = self
+            .board_states
+            .borrow()
+            .iter()
+            .flat_map(|(project_id, board)| {
+                board.derived.iter().map(|facts| {
+                    (
+                        board::facts_widget_name(*project_id, &facts.card_id),
+                        facts.clone(),
+                    )
+                })
+            })
+            .collect();
+        let mut widgets = vec![home];
+        while let Some(widget) = widgets.pop() {
+            if let Some(facts) = facts.get(widget.widget_name().as_str()) {
+                if let Some(body) = widget.downcast_ref::<gtk::Box>() {
+                    board::update_facts_widget(body, facts);
+                }
+                continue;
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                child = current.next_sibling();
+                widgets.push(current);
+            }
+        }
+    }
+
     fn refresh_home(&self) {
+        self.refresh_card_fact_widgets();
         // The panel headers carry the same session names, to-dos and activity
         // signs as Home, so they refresh together, whichever surface is
         // showing.
@@ -4530,7 +4487,7 @@ impl App {
         if self.projects.borrow().is_empty() && self.home_nav.borrow().is_empty() {
             return;
         }
-        // Passive updates must not destroy an unfinished to-do or reply.
+        // Passive updates must not destroy unfinished edits or question answers.
         // Navigation clears focus; a submitted to-do marks its focus handoff.
         if self.home_focus_todo.get().is_none() {
             if let (Some(focus), Some(home)) = (
@@ -5103,6 +5060,152 @@ impl App {
         Some(primitive)
     }
 
+    /// Split first; choosing content commits the new panel. Empty choosers
+    /// are transient and never become saved tabs or start a process.
+    fn open_panel_chooser(
+        self: &Rc<Self>,
+        workspace: &Rc<Workspace>,
+        target: Option<(Rc<Panel>, String)>,
+    ) {
+        self.restore_zoom(workspace);
+        let panel = Panel::new();
+        let title = gtk::Label::new(Some("Choose panel"));
+        title.set_hexpand(true);
+        title.set_xalign(0.0);
+        panel.header.append(&title);
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.set_tooltip_text(Some("Cancel split"));
+        close.add_css_class("flat");
+        panel.header.append(&close);
+        let app = Rc::downgrade(self);
+        let ws = Rc::downgrade(workspace);
+        let pending = Rc::downgrade(&panel);
+        close.connect_clicked(move |_| {
+            if let (Some(app), Some(ws), Some(panel)) =
+                (app.upgrade(), ws.upgrade(), pending.upgrade())
+            {
+                ws.forget_panel(&panel);
+                app.layout(&ws);
+                app.persist_primitives(&ws);
+            }
+        });
+
+        let choices = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        choices.set_halign(gtk::Align::Center);
+        choices.set_valign(gtk::Align::Center);
+        let heading = gtk::Label::new(Some("What goes in this panel?"));
+        heading.add_css_class("heading");
+        choices.append(&heading);
+        let preferences = self
+            .db
+            .project_settings(workspace.project.id)
+            .unwrap_or_default()
+            .apply_to(&self.db.preferences().unwrap_or_default());
+        let mut entries = Vec::new();
+        for slot in [Slot::Shell, Slot::Editor, Slot::Diff] {
+            entries.push((
+                format!("New {}", label_for(slot)),
+                workspace.next_key(slot),
+                slot == Slot::Shell || programs::for_slot(slot, &preferences).is_some(),
+                true,
+            ));
+        }
+        let mut hidden: Vec<_> = workspace
+            .tabs
+            .borrow()
+            .keys()
+            .copied()
+            .filter(|key| !workspace.is_visible(*key))
+            .collect();
+        hidden.sort();
+        for key in hidden {
+            entries.push((
+                format!("Reopen {}", self.panel_session_name(workspace, key)),
+                key,
+                true,
+                false,
+            ));
+        }
+        for (label, key, available, fresh) in entries {
+            let button = gtk::Button::with_label(&label);
+            button.set_sensitive(available);
+            if !available {
+                button.set_tooltip_text(Some("No program installed — configure Preferences"));
+            }
+            let app = Rc::downgrade(self);
+            let ws = Rc::downgrade(workspace);
+            let pending = Rc::downgrade(&panel);
+            button.connect_clicked(move |_| {
+                let (Some(app), Some(ws), Some(panel)) =
+                    (app.upgrade(), ws.upgrade(), pending.upgrade())
+                else {
+                    return;
+                };
+                let key = if fresh { ws.next_key(key.slot) } else { key };
+                if ws.is_visible(key) {
+                    app.toast("That panel is already open");
+                    return;
+                }
+                let Some(primitive) = app.ensure_primitive(&ws, key, None, Resume::No) else {
+                    app.toast("Could not open panel — check Preferences");
+                    return;
+                };
+                panel.insert(key, &primitive.widget);
+                panel.rebuild_header();
+                app.refresh_workspace_headers(&ws);
+                app.sync_toggles();
+                app.persist_primitives(&ws);
+                primitive.focus();
+            });
+            choices.append(&button);
+        }
+        let sessions = gtk::Button::with_label("To-dos & agent sessions…");
+        let app = Rc::downgrade(self);
+        let ws = Rc::downgrade(workspace);
+        let pending = Rc::downgrade(&panel);
+        sessions.connect_clicked(move |_| {
+            if let (Some(app), Some(ws), Some(panel)) =
+                (app.upgrade(), ws.upgrade(), pending.upgrade())
+            {
+                ws.forget_panel(&panel);
+                app.layout(&ws);
+                app.persist_primitives(&ws);
+                let _ =
+                    gtk::prelude::WidgetExt::activate_action(&app.window, "win.new-session", None);
+            }
+        });
+        choices.append(&sessions);
+        panel.choose_content(&choices.upcast());
+        let mut tree = workspace
+            .tree
+            .borrow_mut()
+            .take()
+            .or_else(|| auto_node(workspace, &workspace.panels()));
+        if let Some((target, zone)) = target {
+            if let Some(tree) = tree.as_mut() {
+                let axis = if zone == "bottom" {
+                    split::Axis::Vertical
+                } else {
+                    split::Axis::Horizontal
+                };
+                tree.replace(
+                    &target,
+                    split::Node::split(
+                        axis,
+                        0.5,
+                        format!("choose-{}", crate::programs::launch::now_stamp()),
+                        split::Node::leaf(&target),
+                        split::Node::leaf(&panel),
+                    ),
+                );
+            }
+        }
+        workspace.push_panel(panel);
+        *workspace.tree.borrow_mut() = tree;
+        self.layout(workspace);
+        self.sync_toggles();
+    }
+
     /// Show or hide a primitive. Hiding never stops the program.
     fn toggle_primitive(&self, workspace: &Rc<Workspace>, key: TabKey) {
         if key.slot == Slot::Custom {
@@ -5355,8 +5458,8 @@ impl App {
         } else {
             session
         };
-        if self.current.borrow().as_ref() != Some(&project_id) {
-            self.select_project(project_id);
+        if self.current.borrow().as_ref() != Some(&project_id) || self.home_shown.get() {
+            self.select_project_with(project_id, false);
         }
         let Some(workspace) = self.current_workspace() else {
             return;
@@ -5448,7 +5551,10 @@ impl App {
             Some(primitive) => {
                 let on_conversation = primitive.launched_session.borrow().as_deref()
                     == session.provider_session_id.as_deref();
-                if primitive.pane.as_ref().is_some_and(|pane| pane.is_live()) && on_conversation {
+                if session.running
+                    && primitive.pane.as_ref().is_some_and(|pane| pane.is_live())
+                    && on_conversation
+                {
                     // The conversation asked for is this live tab: showing
                     // it is all the row can do.
                     self.activate_primitive(&workspace, key);
@@ -5828,8 +5934,8 @@ impl App {
             workspace.holder.append(&status_page(
                 "view-list-symbolic",
                 "Every pane is hidden",
-                "Use the dock along the bottom to bring one back.",
-                None,
+                "Use Open panel to choose what to show.",
+                Some(("Open panel", "win.panel-open")),
             ));
             return;
         }
@@ -5862,8 +5968,8 @@ impl App {
             workspace.holder.append(&status_page(
                 "view-list-symbolic",
                 "Every pane is hidden",
-                "Use the dock along the bottom to bring one back.",
-                None,
+                "Use Open panel to choose what to show.",
+                Some(("Open panel", "win.panel-open")),
             ));
             return;
         }
@@ -6021,38 +6127,26 @@ impl App {
         }
     }
 
-    /// Make the dock match the layout. The dock speaks in kinds: a toggle is
-    /// on while any tab of that kind is on screen.
+    /// Refresh workspace navigation and arrangement-derived session marks.
     fn sync_toggles(&self) {
-        let visible = self
-            .current_workspace()
-            .map(|workspace| workspace.visible_kinds())
-            .unwrap_or_default();
-        let global_preferences = self.db.preferences().unwrap_or_default();
-        let preferences = self.current_workspace().map_or_else(
-            || global_preferences.clone(),
-            |workspace| {
-                self.db
-                    .project_settings(workspace.project.id)
-                    .unwrap_or_default()
-                    .apply_to(&global_preferences)
-            },
-        );
         self.workspace_bar.set_visible(!self.home_shown.get());
+        for name in ["panel-open", "panel-split"] {
+            if let Some(action) = self
+                .window
+                .lookup_action(name)
+                .and_downcast::<gio::SimpleAction>()
+            {
+                action.set_enabled(!self.home_shown.get());
+            }
+        }
         if self.home_shown.get() {
             self.hud.close_tasks(self);
         }
         if let Some(project) = self.current_project() {
             self.workspace_title.set_text(&project.name);
         }
-        for (slot, button) in self.toggles.borrow().iter() {
-            button.set_active(visible.contains(slot));
-            let available =
-                *slot == Slot::Shell || programs::for_slot(*slot, &preferences).is_some();
-            button.set_sensitive(available);
-        }
-        // The sidebar's active-agent marks are arrangement-derived state,
-        // like the dock: every path that relayouts panes lands here.
+        // Active-agent marks are arrangement-derived state: every path that
+        // relayouts panes lands here.
         self.refresh_home();
     }
 
@@ -6178,16 +6272,19 @@ fn save_layout(node: &split::Node<Panel>) -> Option<WorkspaceLayout> {
             key,
             first,
             second,
-        } => Some(WorkspaceLayout::Split {
-            axis: match axis {
-                split::Axis::Horizontal => WorkspaceAxis::Horizontal,
-                split::Axis::Vertical => WorkspaceAxis::Vertical,
-            },
-            ratio: *ratio,
-            key: key.clone(),
-            first: Box::new(save_layout(first)?),
-            second: Box::new(save_layout(second)?),
-        }),
+        } => match (save_layout(first), save_layout(second)) {
+            (Some(first), Some(second)) => Some(WorkspaceLayout::Split {
+                axis: match axis {
+                    split::Axis::Horizontal => WorkspaceAxis::Horizontal,
+                    split::Axis::Vertical => WorkspaceAxis::Vertical,
+                },
+                ratio: *ratio,
+                key: key.clone(),
+                first: Box::new(first),
+                second: Box::new(second),
+            }),
+            (first, second) => first.or(second),
+        },
     }
 }
 
@@ -6372,6 +6469,145 @@ mod home_navigation_tests {
         drain();
     }
 
+    fn check_panel_open_flow(window: &adw::ApplicationWindow, db: &Db, project: &Project) {
+        let bar = widgets(window.upcast_ref())
+            .into_iter()
+            .find(|widget| widget.has_css_class("workspace-bar"))
+            .unwrap();
+        assert!(!widgets(&bar)
+            .iter()
+            .any(|widget| widget.is::<gtk::ToggleButton>()));
+        let click = |label: &str| {
+            widgets(window.upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                .find(|button| button.label().as_deref() == Some(label))
+                .unwrap_or_else(|| panic!("missing button: {label}"))
+                .emit_clicked();
+            drain();
+        };
+        activate(window, "win.panel-open", None);
+        assert!(
+            db.tabs(project.id).unwrap().is_empty(),
+            "choosing starts no program"
+        );
+        click("New Commands");
+        let first = db.workspace_state(project.id).unwrap().unwrap().panels[0].slot;
+        activate(
+            window,
+            "win.panel-split",
+            Some(&(first.as_str(), "bottom").to_variant()),
+        );
+        assert_eq!(db.tabs(project.id).unwrap().len(), 1);
+        // Cancel the empty half without affecting the existing program.
+        widgets(window.upcast_ref())
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| button.tooltip_text().as_deref() == Some("Cancel split"))
+            .unwrap()
+            .emit_clicked();
+        drain();
+        assert_eq!(
+            db.workspace_state(project.id)
+                .unwrap()
+                .unwrap()
+                .panels
+                .len(),
+            1
+        );
+        activate(
+            window,
+            "win.panel-split",
+            Some(&(first.as_str(), "right").to_variant()),
+        );
+        click("New Commands");
+        let saved = db.workspace_state(project.id).unwrap().unwrap();
+        assert_eq!(saved.panels.len(), 2);
+        assert_ne!(saved.panels[0].slot, saved.panels[1].slot);
+        assert!(matches!(
+            saved.layout,
+            Some(WorkspaceLayout::Split {
+                axis: WorkspaceAxis::Horizontal,
+                ..
+            })
+        ));
+        activate(
+            window,
+            "win.panel-split",
+            Some(&(first.as_str(), "bottom").to_variant()),
+        );
+        click("New Commands");
+        let saved = db.workspace_state(project.id).unwrap().unwrap();
+        assert_eq!(saved.panels.len(), 3);
+        let Some(WorkspaceLayout::Split { first: nested, .. }) = &saved.layout else {
+            panic!("expected saved split");
+        };
+        assert!(matches!(
+            **nested,
+            WorkspaceLayout::Split {
+                axis: WorkspaceAxis::Vertical,
+                ..
+            }
+        ));
+        for panel in saved.panels {
+            activate(
+                window,
+                "win.primitive-close",
+                Some(&panel.slot.as_str().to_variant()),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a private D-Bus session and GTK display"]
+    fn panels_split_before_choosing_content() {
+        gtk::init().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = Rc::new(Paths::with_root(scratch.path().join("state")));
+        paths.ensure().unwrap();
+        let db = Rc::new(Db::open(&paths).unwrap());
+        let _daemon = TestDaemon(
+            std::process::Command::new(
+                std::env::var("RADAR_TEST_BIN")
+                    .expect("set RADAR_TEST_BIN to the debug radar binary"),
+            )
+            .arg("--home")
+            .arg(&paths.data_dir)
+            .arg("serve")
+            .env_remove("RADAR_CARD_ID")
+            .env_remove("RADAR_AGENT")
+            .env_remove("RADAR_SESSION_ID")
+            .env_remove("RADAR_PROJECT_ID")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+        );
+        wait_until(|| {
+            crate::session::daemon::Client::request(
+                &paths.data_dir,
+                crate::session::daemon::Command::Ping,
+            )
+            .is_ok()
+        });
+        let folder = scratch.path().join("demo");
+        std::fs::create_dir(&folder).unwrap();
+        let project = db.add_project(&folder).unwrap();
+        db.set_workspace_state(project.id, &WorkspaceState::default())
+            .unwrap();
+        let app = adw::Application::builder()
+            .application_id("dev.omarchy.Radar.PanelTest")
+            .build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        style::install(&Theme::load());
+        let window = build_window(&app, &paths, &db);
+        window.present();
+        activate(&window, "win.open-project", Some(&project.id.to_variant()));
+        check_panel_open_flow(&window, &db, &project);
+        window.close();
+        drain();
+    }
+
     /// Run on a private session bus and GTK Broadway display (see
     /// scripts/home-smoke.sh), never against the user's real application.
     #[test]
@@ -6383,9 +6619,9 @@ mod home_navigation_tests {
         let bins = scratch.path().join("bin");
         std::fs::create_dir(&bins).unwrap();
         let launches = scratch.path().join("launches");
-        // The stub answers `session list` empty and records every launch and
-        // input line for assertions.
-        let stub = format!("#!/bin/sh\nif [ \"$1\" = session ]; then printf '[]'; exit 0; fi\nprintf 'launch\\t%s\\t%s\\t%s\\t%s\\n' \"$0\" \"$RADAR_CARD_ID\" \"$RADAR_AGENT\" \"$*\" >> {launches:?}\nwhile IFS= read -r line; do printf 'input\\t%s\\t%s\\n' \"$RADAR_CARD_ID\" \"$line\" >> {launches:?}; done\n");
+        // The stub records launches and reports exact identities and saved
+        // transcripts so resume validation follows the real provider path.
+        let stub = format!("#!/bin/sh\nif [ \"$1\" = session ]; then\n  if [ \"$2\" = export ]; then printf '{{\"messages\":[{{\"type\":\"user\"}}]}}';\n  elif [ -f .test-opencode-history ]; then cat .test-opencode-history;\n  else printf '[]'; fi\n  exit 0\nfi\nprintf 'launch\\t%s\\t%s\\t%s\\t%s\\n' \"$0\" \"$RADAR_CARD_ID\" \"$RADAR_AGENT\" \"$*\" >> {launches:?}\nprevious=\nconversation=\nfor arg in \"$@\"; do\n  if [ \"$previous\" = --session ]; then conversation=$arg; fi\n  previous=$arg\ndone\nif [ -n \"$conversation\" ]; then\n  printf '[{{\"id\":\"%s\",\"directory\":\"%s\",\"created\":1}}]' \"$conversation\" \"$PWD\" > .test-opencode-history\n  \"$RADAR_TEST_BIN\" session identify --provider \"$RADAR_SESSION_PROVIDER\" --conversation \"$conversation\" --pid \"$$\"\nfi\nwhile IFS= read -r line; do printf 'input\\t%s\\t%s\\n' \"$RADAR_CARD_ID\" \"$line\" >> {launches:?}; done\n");
         for (name, script) in [
             ("opencode", stub.clone()),
             ("pi", stub),
@@ -6517,6 +6753,7 @@ mod home_navigation_tests {
             Some(format!("project-{}", project.id).as_str())
         );
         assert!(bar.is_visible());
+        check_panel_open_flow(&window, &db, &project);
 
         // The workspace carries a Board button: it navigates to this
         // project's board (the project view) inside Home, with Alt+K.
@@ -7097,7 +7334,7 @@ mod home_navigation_tests {
             .iter()
             .any(|widget| widget.has_css_class("project-view")));
         // End-to-end board journey with inert agent executables: create/start,
-        // review follow-up, exact stopped resume, and assignment to a conversation.
+        // exact stopped resume, history, and assignment to a conversation.
         activate(
             &window,
             "win.home-add-work",
@@ -7112,7 +7349,7 @@ mod home_navigation_tests {
         )
         .unwrap()
         {
-            crate::session::daemon::Response::BoardState(state) => state,
+            crate::session::daemon::Response::BoardState(board) => board.state,
             _ => panic!("expected board state"),
         };
         let work = board_state()
@@ -7172,26 +7409,6 @@ mod home_navigation_tests {
                 .filter_map(|widget| widget.downcast_ref::<gtk::Label>())
                 .any(|label| label.has_css_class("dim-label") && label.text().as_str() == "Review")
         });
-        activate(
-            &window,
-            "win.card-reply",
-            Some(&(created.id, work.id.as_str(), "Please add tests").to_variant()),
-        );
-        wait_until(|| {
-            std::fs::read_to_string(&launches)
-                .unwrap_or_default()
-                .contains("Please add tests")
-        });
-        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
-        assert_eq!(
-            board_state()
-                .cards
-                .iter()
-                .find(|card| card.id == work.id)
-                .unwrap()
-                .lane,
-            "In progress"
-        );
         let catalog_entries = || match crate::session::daemon::Client::request(
             &paths.data_dir,
             crate::session::daemon::Command::CatalogList {
@@ -7209,6 +7426,12 @@ mod home_navigation_tests {
             crate::session::daemon::Response::Catalog(entries) => entries,
             _ => panic!("expected catalog"),
         };
+        wait_until(|| {
+            catalog_entries().iter().any(|session| {
+                session.radar_session_id.as_deref() == Some(&runtime)
+                    && session.provider_session_id != runtime
+            })
+        });
         let provider_id = catalog_entries()
             .into_iter()
             .find(|session| session.radar_session_id.as_deref() == Some(&runtime))
@@ -7243,22 +7466,9 @@ mod home_navigation_tests {
         });
         activate(
             &window,
-            "win.card-reply",
-            Some(
-                &(
-                    created.id,
-                    work.id.as_str(),
-                    "Resume this exact conversation",
-                )
-                    .to_variant(),
-            ),
+            "win.card-session-open",
+            Some(&(created.id, work.id.as_str()).to_variant()),
         );
-        wait_until(|| {
-            std::fs::read_to_string(&launches)
-                .unwrap_or_default()
-                .contains("Resume this exact conversation")
-        });
-        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
         assert_eq!(
             catalog_entries()
                 .iter()
@@ -7276,6 +7486,24 @@ mod home_navigation_tests {
                 })
         });
 
+        assert_ne!(stack.visible_child_name().as_deref(), Some("_home"));
+        activate(
+            &window,
+            "win.open-card",
+            Some(&(created.id, work.id.as_str()).to_variant()),
+        );
+        let card_widgets = widgets(&stack.child_by_name("_home").unwrap());
+        assert!(card_widgets.iter().any(|widget| {
+            widget
+                .downcast_ref::<gtk::MenuButton>()
+                .is_some_and(|button| button.label().as_deref() == Some("Agent session"))
+        }));
+        assert!(!card_widgets.iter().any(|widget| {
+            widget
+                .downcast_ref::<gtk::Button>()
+                .is_some_and(|button| button.label().as_deref() == Some("Send to agent"))
+        }));
+        assert!(window.lookup_action("card-reply").is_none());
         crate::session::daemon::Client::request(
             &paths.data_dir,
             crate::session::daemon::Command::PublishActivity(
@@ -7303,29 +7531,11 @@ mod home_navigation_tests {
             created.id,
             &work.id,
             None,
+            None,
+            None,
             "test-human-complete",
         )
         .unwrap();
-        activate(
-            &window,
-            "win.card-reply",
-            Some(&(created.id, work.id.as_str(), "Follow up after completion").to_variant()),
-        );
-        wait_until(|| {
-            std::fs::read_to_string(&launches)
-                .unwrap_or_default()
-                .contains("Follow up after completion")
-        });
-        assert!(
-            !board_state()
-                .cards
-                .iter()
-                .find(|card| card.id == work.id)
-                .unwrap()
-                .done
-        );
-        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
-
         let ended = catalog_entries()
             .into_iter()
             .find(|session| session.provider_session_id == provider_id)
@@ -7372,7 +7582,7 @@ mod home_navigation_tests {
                     && session.lifecycle == "running"
             })
         });
-        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        assert_ne!(stack.visible_child_name().as_deref(), Some("_home"));
         assert!(std::fs::read_to_string(&launches)
             .unwrap()
             .contains("Assigned conversation"));
@@ -7399,7 +7609,7 @@ mod home_navigation_tests {
         assert!(std::fs::read_to_string(&launches)
             .unwrap()
             .contains("/bin/pi"));
-        assert_eq!(stack.visible_child_name().as_deref(), Some("_home"));
+        assert_ne!(stack.visible_child_name().as_deref(), Some("_home"));
 
         window.destroy();
         std::env::set_var("PATH", old_path);

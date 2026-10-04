@@ -671,6 +671,18 @@ paned > separator:hover {
   color: @radar_muted;
 }
 
+/* Protocol conversations use the same theme canvas as task editors. */
+.agent-conversation textview,
+.agent-conversation textview text {
+  background-color: @radar_bg;
+  color: @radar_fg;
+}
+.agent-conversation textview.conversation-history,
+.agent-conversation textview.conversation-prompt {
+  border: 1px solid @radar_hairline;
+  border-radius: {control_radius};
+}
+
 /* Board: quiet columns, lightly outlined cards, and a single warm claim marker. */
 /* Text on the accent flips by luminance, so light and dark themes both read. */
 .suggested-action {

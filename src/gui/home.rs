@@ -70,7 +70,8 @@ pub fn cockpit(app: &App) -> gtk::Widget {
     let running = super::agents::wall_sessions(app)
         .iter()
         .map(|(_, rows)| rows.len())
-        .sum();
+        .sum::<usize>()
+        + app.live_acp_cards().len();
 
     // Home is a destination, not a toolbar: title and context first, then
     // large cards that lead into the workspace.
@@ -1004,17 +1005,24 @@ fn lane_column(app: &App, project_id: i64, lane: &board::LaneSummary) -> gtk::Wi
 
 /// How many of a project's sessions are live, for the lane's footer pulse.
 fn live_session_count(app: &App, project_id: i64) -> usize {
-    app.agent_sessions
-        .borrow()
-        .by_project
-        .get(&project_id)
-        .map(|sessions| {
-            sessions
-                .iter()
-                .filter(|session| live_agents::sidebar_session_is_live(session))
-                .count()
-        })
-        .unwrap_or(0)
+    let acp_count = app
+        .live_acp_cards()
+        .iter()
+        .filter(|(id, _)| *id == project_id)
+        .count();
+    acp_count
+        + app
+            .agent_sessions
+            .borrow()
+            .by_project
+            .get(&project_id)
+            .map(|sessions| {
+                sessions
+                    .iter()
+                    .filter(|session| live_agents::sidebar_session_is_live(session))
+                    .count()
+            })
+            .unwrap_or(0)
 }
 
 /// One to-do: a checkbox that closes it, its title (which opens the card
@@ -1103,7 +1111,13 @@ fn todo_row(
         texts.append(&note_label);
     }
     button.set_child(Some(&texts));
-    row.append(&button);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    content.set_hexpand(true);
+    content.append(&button);
+    if let Some(facts) = &card.facts {
+        content.append(&board::facts_widget(project_id, facts));
+    }
+    row.append(&content);
     if !done {
         row.append(&card_session_chip(app, project_id, card));
     }
@@ -1113,6 +1127,14 @@ fn todo_row(
 /// Reach the task's conversation independently of its lane and mutable claim.
 /// Activation resolves the catalog again, even when sidebar history is bounded.
 fn card_session_chip(app: &App, project_id: i64, card: &board::WorkCard) -> gtk::Widget {
+    if app.prefer_card_acp_conversation(project_id, &card.id) {
+        let button = gtk::Button::with_label("Conversation");
+        button.add_css_class("flat");
+        button.add_css_class("card-session");
+        button.set_action_name(Some("win.acp-card-open"));
+        button.set_action_target_value(Some(&(project_id, card.id.as_str()).to_variant()));
+        return button.upcast();
+    }
     let session = app
         .card_sessions(project_id, &card.id)
         .into_iter()

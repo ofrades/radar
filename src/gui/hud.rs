@@ -585,7 +585,7 @@ impl Hud {
             .board_states
             .borrow()
             .get(&project_id)
-            .map(card_rows)
+            .map(|board| card_rows(&board.state))
             .unwrap_or_default();
         if rows.is_empty() {
             let row = self.row_widget(None, "No open to-dos — create one above", None, None);

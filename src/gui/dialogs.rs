@@ -84,6 +84,8 @@ pub fn preferences<F: Fn() + 'static>(
         });
     }
 
+    slots.append(&reviewer_row(db, None, on_changed.clone()));
+
     let flags_item = gtk::ListBoxRow::new();
     flags_item.set_activatable(false);
     let flags_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -214,6 +216,8 @@ pub fn project_preferences<F: Fn() + 'static>(
         });
     }
 
+    slots.append(&reviewer_row(db, Some(project_id), on_changed.clone()));
+
     page.append(&slots);
     let note = gtk::Label::new(Some(
         "New panes use these defaults. Use global keeps the matching Preferences setting.",
@@ -225,4 +229,155 @@ pub fn project_preferences<F: Fn() + 'static>(
     page.append(&note);
     dialog.set_child(Some(&page));
     dialog.present();
+}
+
+/// Reviewer selection is separate from the agent pane default: None means
+/// manual review globally, and inheritance for a project.
+fn reviewer_row(
+    db: &SharedDb,
+    project_id: Option<i64>,
+    on_changed: Rc<dyn Fn()>,
+) -> gtk::ListBoxRow {
+    let prefs = db.preferences().unwrap_or_default();
+    let current = match project_id {
+        Some(id) => db
+            .project_settings(id)
+            .ok()
+            .and_then(|settings| settings.reviewer),
+        None => prefs.reviewer.clone(),
+    };
+    let global = prefs
+        .reviewer
+        .as_deref()
+        .map(|id| {
+            programs::by_id(id)
+                .map(|program| program.name)
+                .unwrap_or_else(|| id.to_string())
+        })
+        .unwrap_or_else(|| "Off".into());
+    let mut choices: Vec<(Option<String>, String)> = vec![(
+        None,
+        match project_id {
+            Some(_) => format!("Use global ({global})"),
+            None => "Off — review manually".into(),
+        },
+    )];
+    choices.extend(
+        programs::candidates_for_slot(Slot::Agent, &prefs)
+            .into_iter()
+            .map(|program| {
+                (
+                    Some(program.id.clone()),
+                    format!("{} — {}", program.name, program.id),
+                )
+            }),
+    );
+    if let Some(id) = current.as_ref() {
+        if !choices.iter().any(|(value, _)| value.as_ref() == Some(id)) {
+            choices.push((Some(id.clone()), format!("{id} — unavailable")));
+        }
+    }
+    let labels: Vec<&str> = choices.iter().map(|(_, label)| label.as_str()).collect();
+    let dropdown = gtk::DropDown::from_strings(&labels);
+    dropdown.set_selected(
+        choices
+            .iter()
+            .position(|(value, _)| *value == current)
+            .unwrap_or(0) as u32,
+    );
+    dropdown.set_widget_name("reviewer-choice");
+    dropdown.set_valign(gtk::Align::Center);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.set_margin_top(10);
+    row.set_margin_bottom(10);
+    row.set_margin_start(12);
+    row.set_margin_end(12);
+    let texts = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    texts.set_hexpand(true);
+    let title = gtk::Label::new(Some("Automatic reviewer"));
+    title.set_xalign(0.0);
+    texts.append(&title);
+    let note = gtk::Label::new(Some(
+        "Choose an agent to review finished work automatically.",
+    ));
+    note.set_xalign(0.0);
+    note.set_wrap(true);
+    note.add_css_class("caption");
+    note.add_css_class("dim-label");
+    texts.append(&note);
+    let error = gtk::Label::new(None);
+    error.set_xalign(0.0);
+    error.set_wrap(true);
+    error.add_css_class("error");
+    error.set_visible(false);
+    texts.append(&error);
+    row.append(&texts);
+    row.append(&dropdown);
+    let item = gtk::ListBoxRow::new();
+    item.set_activatable(false);
+    item.set_child(Some(&row));
+    let db = db.clone();
+    dropdown.connect_selected_notify(move |dropdown| {
+        let Some((program, _)) = choices.get(dropdown.selected() as usize) else {
+            return;
+        };
+        let result = match project_id {
+            Some(id) => db.set_project_reviewer(id, program.as_deref()),
+            None => db.set_reviewer(program.as_deref()).map(|_| ()),
+        };
+        match result {
+            Ok(()) => {
+                error.set_visible(false);
+                on_changed();
+            }
+            Err(message) => {
+                error.set_text(&format!("Could not save reviewer: {message}"));
+                error.set_visible(true);
+            }
+        }
+    });
+    item
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a private D-Bus session and GTK display"]
+    fn reviewer_choices_persist_override_and_inheritance() {
+        gtk::init().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let db = Rc::new(Db::open(&crate::config::Paths::with_root(home.path())).unwrap());
+        let project_dir = home.path().join("project");
+        std::fs::create_dir(&project_dir).unwrap();
+        let project = db.add_project(&project_dir).unwrap();
+        db.set_reviewer(Some("custom-reviewer")).unwrap();
+        db.set_project_reviewer(project.id, Some("project-reviewer"))
+            .unwrap();
+        fn dropdown(row: &gtk::ListBoxRow) -> gtk::DropDown {
+            row.child()
+                .unwrap()
+                .last_child()
+                .unwrap()
+                .downcast()
+                .unwrap()
+        }
+        let global = dropdown(&reviewer_row(&db, None, Rc::new(|| {})));
+        assert_ne!(
+            global.selected(),
+            0,
+            "unavailable saved choice remains selected"
+        );
+        let project_choice = dropdown(&reviewer_row(&db, Some(project.id), Rc::new(|| {})));
+        assert_ne!(project_choice.selected(), 0);
+        project_choice.set_selected(0);
+        assert_eq!(
+            db.reviewer(project.id).unwrap().as_deref(),
+            Some("custom-reviewer")
+        );
+        assert!(db.project_settings(project.id).unwrap().reviewer.is_none());
+        global.set_selected(0);
+        assert!(db.reviewer(project.id).unwrap().is_none());
+    }
 }

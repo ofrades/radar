@@ -179,25 +179,29 @@ Opening a panel's to-do uses that same dialog without navigating away.
 Task session controls resolve exact conversations independently of Todo,
 In progress or Review. Links survive releasing claims and reusing a conversation
 for another task; missing links expose agent/conversation recovery controls. Asking for an agent when
-none is on screen — the dock's Agent button, `Alt+A` — opens the same picker;
+none is on screen — `Alt+A` — opens the same picker;
 the overlay's Actions row does too, while an agent is already up. An agent
 panel's header shows the to-do its session works on: the title opens the
 card's conversation, and a check beside it marks the to-do done — the panel
 then hides, the program keeps running.
 
-**Every pane header carries its own controls, right on the chip**: the
-program's live info beside its name, a ▾ dropdown to change that program —
-filtered to the chip's own primitive, so an agent chip lists agents and an
-editor chip lists editors — a ＋ that adds **another tab of the same
-primitive** (a second agent tab, grouped under the same header, its own
-process; the list is the same kind-filtered one), and an × to close it — the
-program keeps running in the background either way. Tabs of the same
-primitive number from the second: "Agent 2". The ⋮ menu keeps the
-pane-level actions: group with, split out, move, zoom, close.
+**Open panels by splitting**, not by toggling a fixed list of primitives.
+Each workspace panel has **Split right** and **Split below** controls. The
+new half asks what belongs there: new Commands, Editor or Changes, or a
+hidden panel to reopen (including agent sessions). Choosing a new tool
+creates its own process, so two Commands panels can coexist. Missing tools
+are disabled; configure them in Preferences. **Open panel** in the workspace
+bar also works when every panel is hidden.
 
-**Adding a different primitive to a pane** is a drag of one header onto
-another — or the pane menu's "Group with …". The dock and the chords keep
-aiming at a primitive's first tab.
+An unchosen half starts no process and is not restored on relaunch; its ×
+cancels the split. **To-dos & agent sessions…** dismisses the empty half and
+opens the existing task/session picker: new agents still require a to-do.
+Once content is chosen, the split and its divider are saved. Closing a filled
+panel hides it without stopping its program. `bash scripts/panel-smoke.sh`
+checks choosing, cancellation, independent terminals and nested splits on an
+isolated native display. Drag headers to split an existing
+panel at an edge or swap places in the middle. Keyboard shortcuts still target
+a primitive's first tab.
 
 **Preferences** is where "preferred editor / agent / diff / shell" lives. Leave a
 slot on *Auto* and radar picks the best installed one; the resolved choice is
@@ -358,6 +362,11 @@ global **Preferences** choice until a project override is selected. Board and
 pane defaults are per-project Radar settings and are never written to project
 files.
 
+**Automatic reviewer** in Preferences selects an agent to review finished work;
+**Off — review manually** leaves review to you. Project defaults can choose a
+different reviewer or **Use global** to inherit that selection. The reviewer
+is independent of the agent you use to do the work.
+
 When disabled, Radar does not create or open the board and its claim guards
 allow edits and commits. A lane is a named status (`Todo`, `In progress`,
 `Review`, `Done`, or your own); a card has a title, a markdown body, a claim,
@@ -399,20 +408,36 @@ A human reply is a comment with no session; an agent's carries its session, so
 the thread reads as a conversation. On **Home**, every to-do shows its latest
 agent note — the "what was done" — and its checkbox closes the to-do right
 there. Basecamp-style, **Home drills down in place**: clicking a to-do opens
-the **card** (its body rendered as Markdown, its thread, a reply box, and
-controls to edit, move and close it), and **Open board** opens the project's
-board as columns of cards — each with a **Back** arrow to the cockpit. Session
-rows are clickable too: the whole row opens the session. Starting work or
-sending a reply stays on the current surface; opening a session is explicit.
-The conversation is the main surface; agent conversations are an optional
-collapsed section. **Send to agent** starts work or delivers a follow-up,
-including after Review releases the claim. A follow-up on a completed task
-reopens it. Exact conversation links survive process exit; no unrelated "last"
-conversation is substituted.
-An unassigned card offers **Assign and start** to choose an installed agent or
-continue a stopped conversation, binding its new run to this task. Running
-workers are not reassigned, and claimed cards cannot be stolen through that
-control.
+the **card** (its Markdown body, session history, and controls to edit, move
+and close it), and **Open board** opens the project's board as columns of
+cards — each with a **Back** arrow to the cockpit. Session rows are clickable
+too: the whole row opens the session.
+The card's top **Agent session** button is the single entry point to open a
+running linked session, resume an exact stopped conversation, or assign a
+new agent. Assignment opens the agent workspace; follow-ups belong in that
+session, not a separate card chat. The card keeps agent reports, board changes,
+and answerable questions as history. Exact conversation links survive process
+exit; no unrelated "last" conversation is substituted. An unassigned card can
+also adopt a stopped conversation, binding its new run to this task. Running
+workers are not reassigned, and claimed cards cannot be stolen through this
+control. Reopen completed cards before assigning more work.
+
+**Agent conversation…** in the card's Agent session menu opens the native ACP
+conversation view. Choose installed OpenCode or OMP, then start or resume the
+exact bound conversation. Send messages, answer approvals and questions, cancel
+a turn, stop the agent, and change the mode or model options it advertises.
+Closing the conversation window keeps the session running. Linked conversations
+are reachable from Home and the Agents page; terminal agents keep their panels.
+See [ACP agent sessions](docs/acp.md).
+
+Native Home to-dos, board cards, and card details also show the daemon's live
+card facts alongside the stored lane: whether an agent is running or working,
+needs you, is ready, or has stopped. Open questions and approvals take precedence
+over a running worker. When a card has a linked PR, these surfaces show its
+link, check status, review decision, and merge conflicts; failing check names
+appear in the status tooltip. The GUI refreshes cached facts in the background,
+including PR changes that produce no board move. These facts do not move cards
+or change their claims.
 
 ### The convention
 

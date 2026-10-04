@@ -9,7 +9,7 @@
 //! A panel's header says what it is and what it is for: the session's name
 //! and, for an agent, the board to-do it corresponds to — the to-do title
 //! opens its card view, and a check beside it marks the to-do done. Nothing
-//! else but close: the panel is a view, not a control surface.
+//! else but split and close: content is chosen in the new half.
 //!
 //! Both sides talk to the window through actions, so this module needs no
 //! reference back to the app.
@@ -88,8 +88,7 @@ pub fn edge_margins(zone: &str, width: i32, height: i32, pad: i32) -> (i32, i32,
 }
 
 /// A panel's header: the activity sign, the session's name, the to-do it
-/// corresponds to, and a close on the right. Nothing else — the panel is a
-/// view, not a control surface.
+/// corresponds to, with split and close controls on the right.
 struct Chip {
     /// The row as one unit, which drags hit-test and focus lookups walk.
     widget: gtk::Box,
@@ -312,8 +311,17 @@ impl Panel {
         panel.widget.add_controller(target);
     }
 
+    /// An uncommitted split chooses its content before starting a program.
+    pub fn choose_content(&self, widget: &gtk::Widget) {
+        self.content.add_named(widget, Some("choose"));
+        self.content.set_visible_child_name("choose");
+    }
+
     /// Set this panel's tab and show its widget.
     pub fn insert(&self, key: TabKey, widget: &gtk::Widget) {
+        if let Some(chooser) = self.content.child_by_name("choose") {
+            self.content.remove(&chooser);
+        }
         // A primitive's widget always has a parent — its old panel's stack —
         // and GTK refuses, silently, to add a widget that already has one.
         // Detach it first or the panel comes up empty.
@@ -466,7 +474,7 @@ impl Panel {
     }
 
     /// The header: the session's name and the to-do it corresponds to, with a
-    /// close on the right. Rebuilt whenever the panel's tab changes.
+    /// split and close on the right. Rebuilt whenever the panel's tab changes.
     pub fn rebuild_header(&self) {
         while let Some(child) = self.header.first_child() {
             self.header.remove(&child);
@@ -530,7 +538,15 @@ impl Panel {
         spacer.set_hexpand(true);
         row.append(&spacer);
 
-        // Closing hides the tab; its program keeps running, and the dock or
+        for (label, zone) in [("Split right", "right"), ("Split below", "bottom")] {
+            let split = gtk::Button::with_label(label);
+            split.add_css_class("flat");
+            split.set_action_name(Some("win.panel-split"));
+            split.set_action_target_value(Some(&(key.as_str(), zone).to_variant()));
+            row.append(&split);
+        }
+
+        // Closing hides the tab; its program keeps running, and the chooser or
         // the HUD brings it back.
         let close = gtk::Button::builder()
             .icon_name("window-close-symbolic")
