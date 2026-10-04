@@ -18,6 +18,7 @@ pub mod client;
 pub mod daemon;
 pub mod dispatch;
 pub mod driver;
+pub mod feedback;
 pub mod lane;
 pub mod pr;
 pub mod registry;

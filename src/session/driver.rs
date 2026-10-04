@@ -263,14 +263,121 @@ fn observe_prs(services: &Services, db: Option<&Db>) {
         return;
     };
     for project in projects {
+        let previous: Vec<crate::session::pr::PrFacts> = services.pr.facts(project.id);
         match crate::session::pr::observe(&project.path) {
-            Ok(facts) => services.pr.put(project.id, facts),
+            Ok(facts) => {
+                route_transitions(services, db, project.id, &project.path, &previous, &facts);
+                services.pr.put(project.id, facts);
+            }
             Err(error) => {
                 eprintln!(
                     "radar pr: {} on {}: {error:#}",
                     crate::session::pr::gh(),
                     project.path.display()
                 );
+            }
+        }
+    }
+}
+
+/// Turn PR transitions into turns in the owning agent's session. The deciding
+/// cache updates before routing starts, so one transition routes at most
+/// once; a card with an open attention keeps the person first.
+fn route_transitions(
+    services: &Services,
+    db: &Db,
+    project_id: i64,
+    root: &std::path::Path,
+    previous: &[crate::session::pr::PrFacts],
+    facts: &[crate::session::pr::PrFacts],
+) {
+    let changes = crate::session::pr::transitions(previous, facts);
+    if changes.is_empty() {
+        return;
+    }
+    let Ok(state) = services.board.state(project_id) else {
+        return;
+    };
+    // Reuse the read's branch join so a transition lands on the same card
+    // the board shows it on.
+    let mut branches: HashMap<String, String> = HashMap::new();
+    for (session_id, worker) in services.workers.launch_records() {
+        if let Some(session) = services.registry.list().iter().find(|s| s.id == session_id) {
+            if let Some(branch) = crate::git::status(&session.cwd).branch {
+                branches.insert(worker.card_id, branch);
+            }
+        }
+    }
+    let card_prs = crate::session::pr::join(&state.cards, facts, branches);
+    let attention_open = |card_id: &str| {
+        services
+            .activity
+            .unresolved_attention(project_id)
+            .map(|requests| {
+                requests
+                    .iter()
+                    .any(|request| request.card_id.as_deref() == Some(card_id))
+            })
+            .unwrap_or(false)
+    };
+    for feedback in crate::session::pr::feedback_on_cards(&changes, &card_prs) {
+        if attention_open(&feedback.card_id) {
+            eprintln!(
+                "radar feedback: {} held; card {} has an open attention",
+                feedback.reason, feedback.card_id
+            );
+            continue;
+        }
+        let claim = state
+            .cards
+            .iter()
+            .find(|card| card.id == feedback.card_id)
+            .and_then(|card| card.claim.clone());
+        // The ACP agent's own id is what the binding keyed on: the daemon's
+        // start binder writes spec.id. The running agent for this card is
+        // that id; a claimed-but-not-running card still needs to find it.
+        let agent_claim = services
+            .agents
+            .list()
+            .iter()
+            .find(|agent| agent.card_id.as_deref() == Some(feedback.card_id.as_str()))
+            .map(|agent| agent.id.clone())
+            .or(claim.map(|claim| format!("acp-{claim}")));
+        match crate::session::feedback::route(
+            &Paths::with_root(services.home.clone()).data_dir,
+            db,
+            project_id,
+            root,
+            agent_claim.as_deref(),
+            &feedback,
+        ) {
+            Ok(outcome) => {
+                let _ = services
+                    .activity
+                    .publish(crate::session::activity::PublishActivity {
+                        project_id,
+                        command_id: crate::session::board::command_id("feedback-route"),
+                        session_id: None,
+                        card_id: Some(feedback.card_id.clone()),
+                        kind: crate::session::activity::ActivityKind::Reported,
+                        payload: crate::session::activity::ActivityPayload::Message {
+                            text: format!("[feedback] {}: {outcome}", feedback.reason),
+                        },
+                    });
+            }
+            Err(error) => {
+                let _ = services
+                    .activity
+                    .publish(crate::session::activity::PublishActivity {
+                        project_id,
+                        command_id: crate::session::board::command_id("feedback-fail"),
+                        session_id: None,
+                        card_id: Some(feedback.card_id.clone()),
+                        kind: crate::session::activity::ActivityKind::Reported,
+                        payload: crate::session::activity::ActivityPayload::Message {
+                            text: format!("[feedback] {}: {error:#}", feedback.reason),
+                        },
+                    });
             }
         }
     }

@@ -230,6 +230,28 @@ pub fn join(
     hits
 }
 
+/// Feedback joined onto cards: a transition names a PR URL; the card is the
+/// one whose live PR matches. No branch, no card, no route.
+pub fn feedback_on_cards(
+    changes: &[(String, String)],
+    card_prs: &HashMap<String, PrFacts>,
+) -> Vec<Feedback> {
+    changes
+        .iter()
+        .filter_map(|(url, reason)| {
+            card_prs
+                .iter()
+                .find(|(_, pr)| &pr.url == url)
+                .map(|(card_id, pr)| Feedback {
+                    card_id: card_id.clone(),
+                    pr: pr.clone(),
+                    reason: reason.clone(),
+                })
+                .or(None)
+        })
+        .collect()
+}
+
 impl PrFacts {
     /// A terminal PR does not drive a card: another branch (or none) is live.
     fn is_terminal(&self) -> bool {
@@ -239,6 +261,46 @@ impl PrFacts {
 
 /// Parent project id's per project facts for the read route.
 pub type SharedCache = Arc<Cache>;
+
+/// A PR change worth routing back to the work's own agent: what changed, and
+/// the card whose work flows through it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Feedback {
+    pub card_id: String,
+    pub pr: PrFacts,
+    /// One line a human can read on the thread and an agent can act on.
+    pub reason: String,
+}
+
+/// The transitions the previous cache turns into feedback. Deliberately few:
+/// failing CI and review requests are the two things an agent should be
+/// re-prompted for; a mergeable or approved PR is a human's moment, not a
+/// prompt. A PR gone (closed, merged, branch deleted) is exactly that, not
+/// a message.
+pub fn transitions(before: &[PrFacts], after: &[PrFacts]) -> Vec<(String, String)> {
+    let mut changes = Vec::new();
+    for now in after {
+        if now.is_terminal() {
+            continue;
+        }
+        let previous = before.iter().find(|pr| pr.url == now.url);
+        match previous {
+            None => {}
+            Some(pr) => {
+                if pr.ci != CiState::Failing && now.ci == CiState::Failing {
+                    changes.push((
+                        now.url.clone(),
+                        format!("CI failed: {}", now.failing.join(", ")),
+                    ));
+                }
+                if pr.review != "CHANGES_REQUESTED" && now.review == "CHANGES_REQUESTED" {
+                    changes.push((now.url.clone(), "changes requested".to_string()));
+                }
+            }
+        }
+    }
+    changes
+}
 
 #[cfg(test)]
 mod tests {
@@ -276,5 +338,90 @@ mod tests {
             "headRefName": "card/z", "mergeable": "MERGEABLE"}]"#;
         let facts = parse(raw).unwrap();
         assert_eq!(facts[0].ci, CiState::None);
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+    use crate::session::feedback::feedback_prompt;
+
+    fn pr(number: i64, url: &str, ci: CiState, review: &str, state: &str) -> PrFacts {
+        PrFacts {
+            number,
+            url: url.into(),
+            title: "t".into(),
+            branch: format!("card/{number}"),
+            draft: false,
+            state: state.into(),
+            ci,
+            failing: if ci == CiState::Failing {
+                vec!["unit (shard 3)".to_string()]
+            } else {
+                Vec::new()
+            },
+            review: review.into(),
+            mergeable: "MERGEABLE".into(),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn passing_then_failing_is_one_transition_with_the_failing_name() {
+        let before = vec![pr(7, "u7", CiState::Passing, "", "OPEN")];
+        let after = vec![pr(7, "u7", CiState::Failing, "", "OPEN")];
+        let changes = transitions(&before, &after);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].1, "CI failed: unit (shard 3)");
+    }
+
+    #[test]
+    fn a_failing_check_that_stays_failing_routes_nothing() {
+        let before = vec![pr(7, "u7", CiState::Failing, "", "OPEN")];
+        let after = vec![pr(7, "u7", CiState::Failing, "", "OPEN")];
+        assert!(transitions(&before, &after).is_empty());
+    }
+
+    #[test]
+    fn changes_requested_routes_once_and_not_twice() {
+        let before = vec![pr(7, "u7", CiState::Passing, "", "OPEN")];
+        let after = vec![pr(7, "u7", CiState::Passing, "CHANGES_REQUESTED", "OPEN")];
+        assert_eq!(transitions(&before, &after).len(), 1);
+        assert!(transitions(&after, &after).is_empty());
+    }
+
+    #[test]
+    fn a_new_pr_is_not_feedback_and_a_merged_one_neither() {
+        let none: Vec<PrFacts> = Vec::new();
+        let open = vec![pr(7, "u7", CiState::Passing, "", "OPEN")];
+        assert!(transitions(&none, &open).is_empty());
+        let merged = vec![pr(7, "u7", CiState::Passing, "", "MERGED")];
+        let open_before = vec![pr(7, "u7", CiState::Failing, "", "OPEN")];
+        assert!(transitions(&open_before, &merged).is_empty());
+    }
+
+    #[test]
+    fn the_prompt_names_the_pr_and_asks_for_the_fix() {
+        let prompt = feedback_prompt(
+            "CI failed: tests",
+            &pr(9, "u9", CiState::Failing, "", "OPEN"),
+        );
+        assert!(prompt.contains("PR #9"));
+        assert!(prompt.contains("CI failed: tests"));
+        assert!(prompt.contains("Fix what failed and push"));
+    }
+
+    #[test]
+    fn feedback_joins_only_cards_whose_pr_carries_the_url() {
+        let changes = vec![("u7".to_string(), "CI failed".to_string())];
+        let card_prs = HashMap::from([(
+            "card-1".to_string(),
+            pr(7, "u7", CiState::Failing, "", "OPEN"),
+        )]);
+        let joined = feedback_on_cards(&changes, &card_prs);
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].card_id, "card-1");
+        let empty: HashMap<String, PrFacts> = HashMap::new();
+        assert!(feedback_on_cards(&changes, &empty).is_empty());
     }
 }
