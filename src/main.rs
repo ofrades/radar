@@ -1556,8 +1556,16 @@ fn show_board(paths: &Paths, db: &Db, path: Option<PathBuf>, json: bool) -> Resu
                 } else {
                     ""
                 };
+                let column = turn
+                    .and_then(|d| d.column)
+                    .map(|column| match column {
+                        radar::session::lane::Column::Validating => " (validating)",
+                        radar::session::lane::Column::NeedsReview => " (needs review)",
+                        radar::session::lane::Column::Ready => " (ready)",
+                    })
+                    .unwrap_or_default();
                 println!(
-                    "      PR #{} {} {}{review}{conflict}",
+                    "      PR #{} {} {}{review}{conflict}{column}",
                     pr.number, pr.title, ci
                 );
             }

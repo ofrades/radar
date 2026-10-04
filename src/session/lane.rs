@@ -43,6 +43,24 @@ pub enum LoopTurn {
     Nobody,
 }
 
+/// Where a git-backed card sits in the delivery lifecycle, derived from PR
+/// facts plus the turn (AO's column vocabulary). Only cards whose work
+/// flows through an open PR get one: local-only work keeps the turn
+/// vocabulary and never gets a fake lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Column {
+    /// The PR is open and something is turning it: a live worker or agent,
+    /// or the PR is still a draft.
+    Validating,
+    /// The PR is in its review cycle and no loop is turning it: a person's
+    /// turn — review to give, feedback to answer, or a failing check to
+    /// decide about.
+    NeedsReview,
+    /// The PR is mergeable or approved: a merge decision.
+    Ready,
+}
+
 /// The live face of a card's worker, deduced without leaking driver internals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,6 +93,10 @@ pub struct DerivedCard {
     /// The open PR the card's work flows through, when one is live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<PrFacts>,
+    /// The delivery-lifecycle placement for PR-bearing cards, derived at
+    /// read time and never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<Column>,
 }
 
 /// Derive one card's facts. `worker` is the PTY session bound to this card
@@ -118,13 +140,35 @@ pub fn derive_card(
     } else {
         LoopTurn::Human
     };
+    let column = column_of(&turn, pr.as_ref());
     DerivedCard {
         card_id: card.id.clone(),
         claim: card.claim.clone(),
         turn,
         worker: worker.or(agent),
         pr,
+        column,
     }
+}
+
+/// The delivery-lifecycle column of a PR-bearing card, from the same facts
+/// the turn came out of. The agent's live turn wins first (AO's validating:
+/// own loop is turning it), then the person's moments, then the merge.
+fn column_of(turn: &LoopTurn, pr: Option<&PrFacts>) -> Option<Column> {
+    let pr = pr?;
+    if pr.state == "MERGED" || pr.state == "CLOSED" {
+        // A terminal PR drives nothing; the card shows on turn facts alone.
+        return None;
+    }
+    let column = match turn {
+        LoopTurn::Agent => Column::Validating,
+        _ if pr.draft => Column::Validating,
+        _ if pr.ci == crate::session::pr::CiState::Failing => Column::NeedsReview,
+        _ if pr.review == "CHANGES_REQUESTED" => Column::NeedsReview,
+        _ if pr.mergeable == "MERGEABLE" || pr.review == "APPROVED" => Column::Ready,
+        _ => Column::NeedsReview,
+    };
+    Some(column)
 }
 
 /// Derive every card of a board at once. `workers` joins sessions to cards
@@ -186,7 +230,7 @@ fn agent_liveness(agent: &AgentStatus) -> Option<WorkerFact> {
 mod tests {
     use super::*;
 
-    fn card(claim: &str, done: bool) -> StoredCard {
+    pub(super) fn card(claim: &str, done: bool) -> StoredCard {
         StoredCard {
             id: "card-1".into(),
             project_id: 1,
@@ -203,7 +247,7 @@ mod tests {
         }
     }
 
-    fn running(id: &str) -> Status {
+    pub(super) fn running(id: &str) -> Status {
         Status {
             id: id.into(),
             cwd: "/tmp".into(),
@@ -336,5 +380,134 @@ mod tests {
             None,
         );
         assert_eq!(derived.turn, LoopTurn::Human);
+    }
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+    use crate::session::lane::tests::{card, running};
+    use crate::session::pr::CiState;
+
+    fn pr_facts(ci: CiState, review: &str, mergeable: &str, draft: bool, state: &str) -> PrFacts {
+        PrFacts {
+            number: 7,
+            url: "u7".into(),
+            title: "t".into(),
+            branch: "card/x".into(),
+            draft,
+            state: state.into(),
+            ci,
+            failing: if ci == CiState::Failing {
+                vec!["unit".into()]
+            } else {
+                Vec::new()
+            },
+            review: review.into(),
+            mergeable: mergeable.into(),
+            updated_at: None,
+        }
+    }
+
+    fn open(ci: CiState, review: &str) -> PrFacts {
+        pr_facts(ci, review, "UNKNOWN", false, "OPEN")
+    }
+
+    #[test]
+    fn a_live_turn_validates_whatever_the_pr_says() {
+        let mut derived = derive_card(
+            &card("op", false),
+            Some((&running("s1"), None)),
+            None,
+            None,
+            Some(open(CiState::Passing, "")),
+        );
+        assert_eq!(derived.column, Some(Column::Validating));
+
+        // Even a mergeable PR keeps validating while the loop is turning it.
+        derived = derive_card(
+            &card("op", false),
+            Some((&running("s1"), None)),
+            None,
+            None,
+            Some(open(CiState::Passing, "APPROVED")),
+        );
+        assert_eq!(derived.column, Some(Column::Validating));
+    }
+
+    #[test]
+    fn a_draft_pr_validates_on_its_own() {
+        let derived = derive_card(
+            &card("op", false),
+            None,
+            None,
+            None,
+            Some(pr_facts(CiState::None, "", "UNKNOWN", true, "OPEN")),
+        );
+        assert_eq!(derived.column, Some(Column::Validating));
+    }
+
+    #[test]
+    fn failing_ci_and_changes_requested_are_a_persons_moment() {
+        let failing = open(CiState::Failing, "");
+        assert_eq!(
+            derive_card(&card("op", false), None, None, None, Some(failing.clone())).column,
+            Some(Column::NeedsReview)
+        );
+        let changes = open(CiState::Passing, "CHANGES_REQUESTED");
+        assert_eq!(
+            derive_card(&card("op", false), None, None, None, Some(changes)).column,
+            Some(Column::NeedsReview)
+        );
+    }
+
+    #[test]
+    fn mergeable_or_approved_is_ready() {
+        for pr in [
+            open(CiState::Passing, ""),
+            open(CiState::Passing, "APPROVED"),
+        ] {
+            let mut pr = pr;
+            pr.mergeable = "MERGEABLE".into();
+            assert_eq!(
+                derive_card(&card("op", false), None, None, None, Some(pr)).column,
+                Some(Column::Ready)
+            );
+        }
+    }
+
+    #[test]
+    fn in_the_cycle_with_nobody_turning_is_needs_review() {
+        let pr = open(CiState::Pending, "");
+        assert_eq!(
+            derive_card(&card("op", false), None, None, None, Some(pr)).column,
+            Some(Column::NeedsReview)
+        );
+    }
+
+    #[test]
+    fn a_terminal_pr_drives_no_column() {
+        for state in ["MERGED", "CLOSED"] {
+            let pr = pr_facts(CiState::Passing, "APPROVED", "MERGEABLE", false, state);
+            assert_eq!(
+                derive_card(&card("op", false), None, None, None, Some(pr)).column,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn local_only_work_is_never_faked_into_a_column() {
+        assert_eq!(
+            derive_card(
+                &card("op", false),
+                Some((&running("s1"), None)),
+                None,
+                None,
+                None
+            )
+            .column,
+            None
+        );
     }
 }
