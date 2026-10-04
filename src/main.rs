@@ -1520,14 +1520,22 @@ fn show_board(paths: &Paths, db: &Db, path: Option<PathBuf>, json: bool) -> Resu
             let turn = read(&card.id);
             match &card.claim {
                 Some(who) => {
-                    let turn = turn
+                    let turn_label = turn
                         .map(|derived| match derived.turn {
                             radar::session::lane::LoopTurn::Agent => " (agent)",
                             radar::session::lane::LoopTurn::Human => " (you)",
                             radar::session::lane::LoopTurn::Nobody => " (idle)",
                         })
                         .unwrap_or_default();
-                    println!("  · {}  @{who}{turn}", card.title);
+                    let quiet = if turn
+                        .and_then(|d| d.worker)
+                        .is_some_and(|worker| worker == radar::session::lane::WorkerFact::Quiet)
+                    {
+                        " (quiet)"
+                    } else {
+                        ""
+                    };
+                    println!("  · {}  @{who}{turn_label}{quiet}", card.title);
                 }
                 None => println!("  · {}", card.title),
             }

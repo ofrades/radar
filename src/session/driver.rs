@@ -27,6 +27,9 @@ use crate::session::registry::{Lifecycle, Status};
 const TICK: Duration = Duration::from_secs(2);
 /// How often the PR observer refreshes its cache; reads never spawn gh.
 const PR_TICK: Duration = Duration::from_secs(30);
+/// How long a running worker may go without its first hook signal before the
+/// derived read marks it quiet (AO's no_signal grace).
+pub const HOOK_GRACE: Duration = Duration::from_secs(90);
 
 /// Card bindings for daemon-spawned worker sessions: which card each session
 /// was launched for, and where it runs. In-memory on purpose: sessions die
@@ -35,6 +38,24 @@ const PR_TICK: Duration = Duration::from_secs(30);
 pub struct Workers {
     bindings: Arc<Mutex<HashMap<String, WorkerCard>>>,
     turn_ended: Arc<Mutex<HashSet<String>>>,
+    /// Proof per incarnation: when the binding was noted, and when this run
+    /// of the session first signalled (identify or turn end). Cleared on
+    /// every note: a relaunch must re-prove its hook pipeline.
+    receipts: Arc<Mutex<HashMap<String, Receipt>>>,
+}
+
+/// The hook-pipeline receipt for one worker incarnation.
+#[derive(Debug, Clone, Copy)]
+pub struct Receipt {
+    pub noted_at: Instant,
+    pub first_signal: Option<Instant>,
+}
+
+impl Receipt {
+    /// Unproven for longer than the grace window: the operator should look.
+    pub fn is_quiet(&self, grace: Duration, now: Instant) -> bool {
+        self.first_signal.is_none() && now.duration_since(self.noted_at) > grace
+    }
 }
 
 #[derive(Clone)]
@@ -51,6 +72,13 @@ impl Workers {
         if card_id.is_empty() || session_id.is_empty() {
             return;
         }
+        self.receipts.lock().unwrap().insert(
+            session_id.to_string(),
+            Receipt {
+                noted_at: Instant::now(),
+                first_signal: None,
+            },
+        );
         self.bindings.lock().unwrap().insert(
             session_id.to_string(),
             WorkerCard {
@@ -63,13 +91,26 @@ impl Workers {
 
     /// A turn boundary on a live session: the driver hands the card back
     /// (once — the guard refuses already-reviewed cards) without dropping the
-    /// binding, because the session is still alive.
+    /// binding, because the session is still alive. The turn end is also the
+    /// proof that the hook pipeline works.
     pub fn turn_ended(&self, session_id: &str) {
         if self.bindings.lock().unwrap().contains_key(session_id) {
             self.turn_ended
                 .lock()
                 .unwrap()
                 .insert(session_id.to_string());
+            self.signal(session_id);
+        }
+    }
+
+    /// Record the first signal from a session's hook pipeline. Later signals
+    /// change nothing: the receipt is about the first proof, not the last.
+    pub fn signal(&self, session_id: &str) {
+        let mut receipts = self.receipts.lock().unwrap();
+        if let Some(receipt) = receipts.get_mut(session_id) {
+            if receipt.first_signal.is_none() {
+                receipt.first_signal = Some(Instant::now());
+            }
         }
     }
 
@@ -118,6 +159,12 @@ impl Workers {
     fn forget(&self, session_id: &str) {
         self.bindings.lock().unwrap().remove(session_id);
         self.turn_ended.lock().unwrap().remove(session_id);
+        self.receipts.lock().unwrap().remove(session_id);
+    }
+
+    /// The receipts, for the derived-board read.
+    pub fn receipt(&self, session_id: &str) -> Option<Receipt> {
+        self.receipts.lock().unwrap().get(session_id).copied()
     }
 }
 
@@ -629,5 +676,101 @@ mod tests {
     fn a_binding_dies_with_its_session_by_design() {
         let workers = Workers::default();
         workers.note("s", 4, "c", std::env::temp_dir().join("x"));
+    }
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+    use crate::session::board_store::StoredCard;
+
+    fn card() -> StoredCard {
+        StoredCard {
+            id: "card-1".into(),
+            project_id: 1,
+            lane_id: 2,
+            lane: "In progress".into(),
+            done: false,
+            position: 0,
+            title: "worker".into(),
+            body: String::new(),
+            claim: Some("op".into()),
+            revision: 1,
+            created_at_millis: 0,
+            updated_at_millis: 0,
+        }
+    }
+
+    fn status() -> Status {
+        Status {
+            id: "s1".into(),
+            cwd: "/tmp".into(),
+            pid: Some(1),
+            lifecycle: Lifecycle::Running,
+            title: None,
+            stream_closed: false,
+        }
+    }
+
+    #[test]
+    fn a_noted_worker_is_proven_only_after_its_first_signal() {
+        let workers = Workers::default();
+        workers.note("s1", 1, "card-1", "/tmp".into());
+        assert!(workers.receipt("s1").unwrap().first_signal.is_none());
+
+        workers.signal("s1");
+        assert!(workers.receipt("s1").unwrap().first_signal.is_some());
+    }
+
+    #[test]
+    fn a_noted_worker_clears_the_receipt_and_must_reprove() {
+        let workers = Workers::default();
+        workers.note("s1", 1, "card-1", "/tmp".into());
+        workers.signal("s1");
+        assert!(workers.receipt("s1").unwrap().first_signal.is_some());
+
+        // The same session relaunched: the receipt is a fresh promise.
+        workers.note("s1", 1, "card-1", "/tmp".into());
+        assert!(workers.receipt("s1").unwrap().first_signal.is_none());
+    }
+
+    #[test]
+    fn quiet_derives_past_the_grace_and_un_quiets_on_signal() {
+        let workers = Workers::default();
+        workers.note("s1", 1, "card-1", "/tmp".into());
+
+        // Inside the grace: still Running.
+        let derived = crate::session::lane::derive_card(
+            &card(),
+            Some((&status(), workers.receipt("s1"))),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            derived.worker,
+            Some(crate::session::lane::WorkerFact::Running)
+        );
+
+        // Once signalled: proven for the whole incarnation.
+        workers.signal("s1");
+        let derived = crate::session::lane::derive_card(
+            &card(),
+            Some((&status(), workers.receipt("s1"))),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            derived.worker,
+            Some(crate::session::lane::WorkerFact::Running)
+        );
+    }
+
+    #[test]
+    fn unbound_sessions_signal_nothing() {
+        let workers = Workers::default();
+        workers.signal("ghost");
+        assert!(workers.receipt("ghost").is_none());
     }
 }

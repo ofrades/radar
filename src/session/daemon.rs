@@ -392,7 +392,7 @@ impl Server {
                 activity,
                 catalog,
                 board,
-                agents: Arc::new(AgentHost::default().on_session_id(binder)),
+                agents: Arc::new(AgentHost::for_home(home).on_session_id(binder)),
                 imports: Arc::new(Mutex::new(HashMap::new())),
                 stopping: Arc::new(AtomicBool::new(false)),
                 workers: crate::session::driver::Workers::default(),
@@ -709,6 +709,8 @@ fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
                 &conversation,
                 catalog::now_millis(),
             )?;
+            // The identify is also the hook pipeline's proof of life.
+            services.workers.signal(&radar_id);
             Response::Ok
         }
         Command::CardSessionLink {
