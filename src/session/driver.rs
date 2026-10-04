@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -25,6 +25,8 @@ use crate::session::registry::{Lifecycle, Status};
 
 /// How often the driver re-checks its bound sessions.
 const TICK: Duration = Duration::from_secs(2);
+/// How often the PR observer refreshes its cache; reads never spawn gh.
+const PR_TICK: Duration = Duration::from_secs(30);
 
 /// Card bindings for daemon-spawned worker sessions: which card each session
 /// was launched for, and where it runs. In-memory on purpose: sessions die
@@ -125,6 +127,7 @@ impl Workers {
 /// the settings database.
 pub(crate) fn run(services: Services) {
     let mut db: Option<Db> = None;
+    let mut pr_tick = Instant::now();
     while !services.stopping.load(std::sync::atomic::Ordering::Acquire) {
         std::thread::sleep(TICK);
         if db.is_none() {
@@ -134,6 +137,11 @@ pub(crate) fn run(services: Services) {
             }
         }
         tick(&services, db.as_ref());
+        // PR facts refresh on their slower schedule, so reads never spawn gh.
+        if pr_tick.elapsed() >= PR_TICK {
+            pr_tick = Instant::now();
+            observe_prs(&services, db.as_ref());
+        }
     }
 }
 
@@ -245,6 +253,29 @@ fn dispatch_reviewer(services: &Services, db: &Db, worker: &WorkerCard) -> Resul
     Ok(())
 }
 
+/// Refresh the PR facts of every project that has a repo. One project's
+/// failure leaves the others and the last good read alone.
+fn observe_prs(services: &Services, db: Option<&Db>) {
+    let Some(db) = db else {
+        return;
+    };
+    let Ok(projects) = db.projects() else {
+        return;
+    };
+    for project in projects {
+        match crate::session::pr::observe(&project.path) {
+            Ok(facts) => services.pr.put(project.id, facts),
+            Err(error) => {
+                eprintln!(
+                    "radar pr: {} on {}: {error:#}",
+                    crate::session::pr::gh(),
+                    project.path.display()
+                );
+            }
+        }
+    }
+}
+
 fn lane_kind(state: &BoardState, lane_id: i64) -> Option<&str> {
     state
         .lanes
@@ -275,6 +306,7 @@ mod tests {
             imports: Arc::new(Mutex::new(HashMap::new())),
             stopping: Arc::new(AtomicBool::new(false)),
             workers: Workers::default(),
+            pr: Arc::new(crate::session::pr::Cache::default()),
             home: std::env::temp_dir(),
         }
     }

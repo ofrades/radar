@@ -1517,9 +1517,10 @@ fn show_board(paths: &Paths, db: &Db, path: Option<PathBuf>, json: bool) -> Resu
             .collect();
         println!("{} ({})", lane.name, cards.len());
         for card in cards {
+            let turn = read(&card.id);
             match &card.claim {
                 Some(who) => {
-                    let turn = read(&card.id)
+                    let turn = turn
                         .map(|derived| match derived.turn {
                             radar::session::lane::LoopTurn::Agent => " (agent)",
                             radar::session::lane::LoopTurn::Human => " (you)",
@@ -1529,6 +1530,28 @@ fn show_board(paths: &Paths, db: &Db, path: Option<PathBuf>, json: bool) -> Resu
                     println!("  · {}  @{who}{turn}", card.title);
                 }
                 None => println!("  · {}", card.title),
+            }
+            if let Some(pr) = turn.and_then(|d| d.pr.as_ref()) {
+                let ci = match pr.ci {
+                    radar::session::pr::CiState::Passing => "✓",
+                    radar::session::pr::CiState::Failing => "✗CI",
+                    radar::session::pr::CiState::Pending => "◌CI",
+                    radar::session::pr::CiState::None => "",
+                };
+                let review = match pr.review.as_str() {
+                    "CHANGES_REQUESTED" => " (changes requested)",
+                    "APPROVED" => " (approved)",
+                    _ => "",
+                };
+                let conflict = if pr.mergeable == "CONFLICTING" {
+                    " (conflict)"
+                } else {
+                    ""
+                };
+                println!(
+                    "      PR #{} {} {}{review}{conflict}",
+                    pr.number, pr.title, ci
+                );
             }
             for note in card.body.lines().filter(|line| !line.trim().is_empty()) {
                 println!("      {note}");

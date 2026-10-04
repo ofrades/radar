@@ -396,6 +396,7 @@ impl Server {
                 imports: Arc::new(Mutex::new(HashMap::new())),
                 stopping: Arc::new(AtomicBool::new(false)),
                 workers: crate::session::driver::Workers::default(),
+                pr: Arc::new(crate::session::pr::Cache::default()),
                 home: home.to_path_buf(),
             },
         })
@@ -473,6 +474,8 @@ pub(crate) struct Services {
     pub(crate) stopping: Arc<AtomicBool>,
     /// The driver's card bindings for spawned worker sessions.
     pub(crate) workers: crate::session::driver::Workers,
+    /// Observed pull-request facts, refreshed on the observer's tick.
+    pub(crate) pr: crate::session::pr::SharedCache,
     /// The daemon's data directory: settings, credentials, the board skill.
     pub(crate) home: PathBuf,
 }
@@ -733,12 +736,28 @@ fn serve(stream: &mut UnixStream, services: Services) -> Result<()> {
         }
         Command::BoardState { project_id } => {
             let state = services.board.state(project_id)?;
+            // PR facts join by branch: a bound session's worktree branch is
+            // the card's branch, plus the card/<id> convention `pr::join`
+            // always tries.
+            let sessions = services.registry.list();
+            let mut branches: HashMap<String, String> = HashMap::new();
+            for (session_id, worker) in services.workers.launch_records() {
+                let Some(session) = sessions.iter().find(|s| s.id == session_id) else {
+                    continue;
+                };
+                if let Some(branch) = crate::git::status(&session.cwd).branch {
+                    branches.insert(worker.card_id, branch);
+                }
+            }
+            let pr_join =
+                crate::session::pr::join(&state.cards, &services.pr.facts(project_id), branches);
             let derived = crate::session::lane::derive_board(
                 &state,
                 &services.workers,
-                &services.registry.list(),
+                &sessions,
                 &services.agents.list(),
                 &services.activity.unresolved_attention(project_id)?,
+                &pr_join,
             );
             Response::BoardState(DerivedBoard { state, derived })
         }
@@ -1588,6 +1607,7 @@ mod tests {
                 imports: Arc::new(Mutex::new(HashMap::new())),
                 stopping: stopping.clone(),
                 workers: crate::session::driver::Workers::default(),
+                pr: Arc::new(crate::session::pr::Cache::default()),
                 home: std::env::temp_dir(),
             },
         )
@@ -1620,6 +1640,7 @@ mod tests {
                 imports: Arc::new(Mutex::new(HashMap::new())),
                 stopping: Arc::new(AtomicBool::new(false)),
                 workers: crate::session::driver::Workers::default(),
+                pr: Arc::new(crate::session::pr::Cache::default()),
                 home: std::env::temp_dir(),
             },
         )
@@ -1672,6 +1693,7 @@ mod tests {
                 imports: Arc::new(Mutex::new(HashMap::new())),
                 stopping: Arc::new(AtomicBool::new(false)),
                 workers: crate::session::driver::Workers::default(),
+                pr: Arc::new(crate::session::pr::Cache::default()),
                 home: std::env::temp_dir(),
             },
         )

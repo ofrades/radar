@@ -25,6 +25,7 @@ use crate::session::activity::Attention;
 use crate::session::agent::AgentStatus;
 use crate::session::board_store::{BoardState, StoredCard};
 use crate::session::driver::Workers;
+use crate::session::pr::PrFacts;
 use crate::session::registry::{Lifecycle, Status};
 
 /// Whose turn the loop is on a card, derived from live facts at read time.
@@ -65,6 +66,9 @@ pub struct DerivedCard {
     pub claim: Option<String>,
     pub turn: LoopTurn,
     pub worker: Option<WorkerFact>,
+    /// The open PR the card's work flows through, when one is live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PrFacts>,
 }
 
 /// Derive one card's facts. `worker` is the PTY session bound to this card;
@@ -77,6 +81,7 @@ pub fn derive_card(
     worker: Option<&Status>,
     agent: Option<&AgentStatus>,
     attention: Option<&Attention>,
+    pr: Option<PrFacts>,
 ) -> DerivedCard {
     let attention_open = attention.is_some_and(Attention::is_unresolved);
     let worker = worker.map(|status| match status.lifecycle {
@@ -101,18 +106,22 @@ pub fn derive_card(
         claim: card.claim.clone(),
         turn,
         worker: worker.or(agent),
+        pr,
     }
 }
 
 /// Derive every card of a board at once. `workers` joins sessions to cards
 /// through the driver's launch bindings; `agents` through the card id its
-/// launch carried; `attention` lists the project's unresolved requests.
+/// launch carried; `attention` lists the project's unresolved requests; `prs`
+/// maps card id to the open PR its branch carries, joined upstream.
+#[allow(clippy::too_many_arguments)]
 pub fn derive_board(
     state: &BoardState,
     workers: &Workers,
     sessions: &[Status],
     agents: &[AgentStatus],
     attention: &[Attention],
+    prs: &HashMap<String, PrFacts>,
 ) -> Vec<DerivedCard> {
     // session id -> card id, from the driver's launch records.
     let session_card: HashMap<String, String> = workers
@@ -137,7 +146,8 @@ pub fn derive_board(
                 .iter()
                 .find(|request| request.card_id.as_deref() == Some(card.id.as_str()))
                 .filter(|request| request.is_unresolved());
-            derive_card(card, worker, agent, open)
+            let pr = prs.get(&card.id).cloned();
+            derive_card(card, worker, agent, open, pr)
         })
         .collect()
 }
@@ -228,23 +238,36 @@ mod tests {
             Some(&running("s1")),
             None,
             Some(&attention),
+            None,
         );
         assert_eq!(derived.turn, LoopTurn::Human);
     }
 
     #[test]
     fn a_running_worker_means_the_agent_is_turn() {
-        let derived = derive_card(&card("op", false), Some(&running("s1")), None, None);
+        let derived = derive_card(&card("op", false), Some(&running("s1")), None, None, None);
         assert_eq!(derived.turn, LoopTurn::Agent);
         assert_eq!(derived.worker, Some(WorkerFact::Running));
     }
 
     #[test]
     fn a_working_acp_agent_means_the_agent_is_turn() {
-        let derived = derive_card(&card("op", false), None, Some(&agent_in("working")), None);
+        let derived = derive_card(
+            &card("op", false),
+            None,
+            Some(&agent_in("working")),
+            None,
+            None,
+        );
         assert_eq!(derived.turn, LoopTurn::Agent);
         assert_eq!(derived.worker, Some(WorkerFact::AgentWorking));
-        let derived = derive_card(&card("op", false), None, Some(&agent_in("ready")), None);
+        let derived = derive_card(
+            &card("op", false),
+            None,
+            Some(&agent_in("ready")),
+            None,
+            None,
+        );
         assert_eq!(derived.worker, Some(WorkerFact::AgentReady));
     }
 
@@ -255,7 +278,7 @@ mod tests {
             code: 0,
             signal: None,
         });
-        let derived = derive_card(&card("op", false), Some(&ended), None, None);
+        let derived = derive_card(&card("op", false), Some(&ended), None, None, None);
         assert_eq!(derived.turn, LoopTurn::Human);
         assert_eq!(derived.worker, Some(WorkerFact::Exited));
     }
@@ -265,11 +288,11 @@ mod tests {
         let mut unclaimed = card("op", false);
         unclaimed.claim = None;
         assert_eq!(
-            derive_card(&unclaimed, None, None, None).turn,
+            derive_card(&unclaimed, None, None, None, None).turn,
             LoopTurn::Nobody
         );
         assert_eq!(
-            derive_card(&card("op", true), None, None, None).turn,
+            derive_card(&card("op", true), None, None, None, None).turn,
             LoopTurn::Nobody
         );
     }
@@ -279,7 +302,13 @@ mod tests {
         let attention = approval();
         let mut ended = running("s1");
         ended.lifecycle = Lifecycle::Failed("crash".into());
-        let derived = derive_card(&card("op", false), Some(&ended), None, Some(&attention));
+        let derived = derive_card(
+            &card("op", false),
+            Some(&ended),
+            None,
+            Some(&attention),
+            None,
+        );
         assert_eq!(derived.turn, LoopTurn::Human);
     }
 }
